@@ -9,6 +9,7 @@ use crate::projection::Projection;
 use crate::registry::SubscriptionRegistry;
 use crate::temporal::TemporalIndex;
 use crate::outcome_agent::OutcomeAgent;
+use crate::policy_store::PolicyStore;
 use crate::reflex::ReflexRegistry;
 use crate::remediation_agent::RemediationAgent;
 use crate::verification::{VerificationEngine, VerificationPolicy, VerificationReport};
@@ -50,6 +51,7 @@ pub struct Hydra {
     remediation_agent: RemediationAgent,
     action_store: ActionStore,
     outcome_agent: OutcomeAgent,
+    policy_store: PolicyStore,
     reflex_registry: ReflexRegistry,
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
@@ -114,6 +116,7 @@ impl Hydra {
             remediation_agent: RemediationAgent::new(ActorId::from_str("actor_hydra_prometheus")),
             action_store: ActionStore::new(),
             outcome_agent: OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel")),
+            policy_store: PolicyStore::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -136,6 +139,7 @@ impl Hydra {
             remediation_agent: RemediationAgent::new(ActorId::from_str("actor_hydra_prometheus")),
             action_store: ActionStore::new(),
             outcome_agent: OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel")),
+            policy_store: PolicyStore::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -234,9 +238,12 @@ impl Hydra {
         // EpistemicStore and ActionStore are both driven inline by
         // `process_with_epistemics` so the verification / remediation /
         // outcome agents see fresh state. Re-applying here would double-update.
+        // PolicyStore is driven post-cascade for now (no policy agent runs
+        // inline yet); when one is wired, move this into the cascade.
         for event in &result.events {
             self.event_log.append(event.clone());
             self.temporal.record(event);
+            self.policy_store.apply_event(event)?;
         }
 
         // I8: Persist cascade events to WAL (if configured)
@@ -309,6 +316,7 @@ impl Hydra {
         for event in &result.events {
             self.event_log.append(event.clone());
             self.temporal.record(event);
+            self.policy_store.apply_event(event)?;
         }
 
         // Persist to WAL (if configured)
@@ -373,6 +381,7 @@ impl Hydra {
             self.temporal.record(&event);
             self.epistemic_store.apply_event(&event)?;
             self.action_store.apply_event(&event)?;
+            self.policy_store.apply_event(&event)?;
             count += 1;
         }
         Ok(count)
@@ -682,6 +691,74 @@ impl Hydra {
         action_id: &hydra_core::ActionId,
     ) -> Vec<&hydra_core::Outcome> {
         self.action_store.outcomes_for_action(action_id)
+    }
+
+    // === Policy / approval store ===
+
+    /// Read access to the policy store (registered policies, decisions, approvals).
+    pub fn policy_store(&self) -> &PolicyStore {
+        &self.policy_store
+    }
+
+    pub fn policy(&self, id: &hydra_core::PolicyId) -> Option<&hydra_core::Policy> {
+        self.policy_store.policy(id)
+    }
+
+    pub fn policy_decision(
+        &self,
+        id: &hydra_core::PolicyDecisionId,
+    ) -> Option<&hydra_core::PolicyDecision> {
+        self.policy_store.decision(id)
+    }
+
+    pub fn approval(
+        &self,
+        id: &hydra_core::ApprovalId,
+    ) -> Option<&hydra_core::ApprovalRequest> {
+        self.policy_store.approval(id)
+    }
+
+    pub fn active_policies(&self) -> Vec<&hydra_core::Policy> {
+        self.policy_store.active_policies()
+    }
+
+    pub fn policies_with_kind(
+        &self,
+        kind: hydra_core::PolicyKind,
+    ) -> Vec<&hydra_core::Policy> {
+        self.policy_store.policies_with_kind(kind)
+    }
+
+    pub fn policies_for_scope(
+        &self,
+        scope: &hydra_core::PolicyScope,
+    ) -> Vec<&hydra_core::Policy> {
+        self.policy_store.policies_for_scope(scope)
+    }
+
+    pub fn decisions_for_action(
+        &self,
+        action_id: &hydra_core::ActionId,
+    ) -> Vec<&hydra_core::PolicyDecision> {
+        self.policy_store.decisions_for_action(action_id)
+    }
+
+    pub fn pending_approvals(&self) -> Vec<&hydra_core::ApprovalRequest> {
+        self.policy_store.pending_approvals()
+    }
+
+    pub fn approvals_for_action(
+        &self,
+        action_id: &hydra_core::ActionId,
+    ) -> Vec<&hydra_core::ApprovalRequest> {
+        self.policy_store.approvals_for_action(action_id)
+    }
+
+    pub fn approvals_requested_from(
+        &self,
+        actor_id: &hydra_core::ActorId,
+    ) -> Vec<&hydra_core::ApprovalRequest> {
+        self.policy_store.approvals_requested_from(actor_id)
     }
 }
 
@@ -1576,6 +1653,105 @@ mod sprint1_tests {
         }
         assert_eq!(result.events[1].caused_by, vec![result.events[0].id.clone()]);
         assert_eq!(result.events[1].cascade_id, result.events[0].cascade_id);
+    }
+
+    #[test]
+    fn hydra_materializes_policy_decision_and_approval_state() {
+        use hydra_core::{
+            ActionId, ActorId, ApprovalId, ApprovalRequest, ApprovalStatus, EventKind, Policy,
+            PolicyDecision, PolicyDecisionId, PolicyDecisionKind, PolicyId, PolicyKind,
+            PolicyScope, PolicyStatus,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = ActorId::from_str("actor_policy");
+        let accountant = ActorId::from_str("actor_accountant");
+
+        let policy = Policy {
+            id: PolicyId::new(),
+            tenant_id: None,
+            name: "Require approval for payroll runs".to_string(),
+            kind: PolicyKind::HumanApproval,
+            status: PolicyStatus::Active,
+            scope: PolicyScope::ActionKind("RunPayroll".to_string()),
+            condition: HashMap::new(),
+            metadata: HashMap::new(),
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        let policy_id = policy.id.clone();
+        hydra
+            .ingest(EventKind::PolicyRegistered { policy })
+            .unwrap();
+        assert_eq!(hydra.active_policies().len(), 1);
+        assert_eq!(
+            hydra.policy(&policy_id).unwrap().status,
+            PolicyStatus::Active
+        );
+
+        let action_id = ActionId::new();
+        let decision = PolicyDecision {
+            id: PolicyDecisionId::new(),
+            tenant_id: None,
+            policy_id: Some(policy_id),
+            action_id: action_id.clone(),
+            kind: PolicyDecisionKind::RequireApproval,
+            reason: "payroll runs require approval".to_string(),
+            evidence: vec![],
+            related_claims: vec![],
+            decided_by: actor.clone(),
+            decided_at: now,
+            caused_by: None,
+            details: HashMap::new(),
+        };
+        let decision_id = decision.id.clone();
+        hydra
+            .ingest(EventKind::PolicyDecisionRecorded { decision })
+            .unwrap();
+        assert_eq!(hydra.decisions_for_action(&action_id).len(), 1);
+        assert_eq!(
+            hydra.policy_decision(&decision_id).unwrap().kind,
+            PolicyDecisionKind::RequireApproval
+        );
+
+        let approval = ApprovalRequest {
+            id: ApprovalId::new(),
+            tenant_id: None,
+            action_id: action_id.clone(),
+            policy_decision_id: Some(decision_id),
+            status: ApprovalStatus::Requested,
+            requested_by: actor.clone(),
+            requested_from: vec![accountant.clone()],
+            reason: "accountant approval required".to_string(),
+            requested_at: now,
+            resolved_at: None,
+            resolved_by: None,
+            caused_by: None,
+            metadata: HashMap::new(),
+        };
+        let approval_id = approval.id.clone();
+        hydra
+            .ingest(EventKind::ApprovalRequested { request: approval })
+            .unwrap();
+        assert_eq!(hydra.pending_approvals().len(), 1);
+        assert_eq!(hydra.approvals_for_action(&action_id).len(), 1);
+        assert_eq!(hydra.approvals_requested_from(&accountant).len(), 1);
+
+        hydra
+            .ingest(EventKind::ApprovalGranted {
+                approval_id: approval_id.clone(),
+                approved_by: accountant.clone(),
+            })
+            .unwrap();
+        let stored = hydra.approval(&approval_id).unwrap();
+        assert_eq!(stored.status, ApprovalStatus::Approved);
+        assert_eq!(stored.resolved_by, Some(accountant));
+        assert!(stored.resolved_at.is_some());
+        assert_eq!(hydra.pending_approvals().len(), 0);
     }
 
     #[test]
