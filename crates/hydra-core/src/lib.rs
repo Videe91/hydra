@@ -4,14 +4,15 @@ pub mod event;
 pub mod epistemic;
 pub mod action;
 pub mod policy;
+pub mod commit;
 pub mod node;
 pub mod edge;
 pub mod graph;
 pub mod subscription;
 
 pub use id::{
-    ActionId, ActorId, ApprovalId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId,
-    OutcomeId, PolicyDecisionId, PolicyId, SnapshotId, SubscriptionId, TenantId,
+    ActionId, ActorId, ApprovalId, CascadeId, ClaimId, CommitId, EdgeId, EventId, EvidenceId,
+    NodeId, OutcomeId, PolicyDecisionId, PolicyId, SnapshotId, SubscriptionId, TenantId,
 };
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
@@ -43,12 +44,21 @@ pub use policy::{
     PolicyScope,
     PolicyStatus,
 };
+pub use commit::{
+    CommitBatch,
+    CommitHash,
+    CommitRecord,
+    CommitStatus,
+    EventCommitRecord,
+    EventHash,
+    IdempotencyKey,
+};
 
 /// Convenience re-exports for common types
 pub mod prelude {
     pub use crate::id::{
-        ActionId, ActorId, ApprovalId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId,
-        OutcomeId, PolicyDecisionId, PolicyId, SnapshotId, SubscriptionId, TenantId,
+        ActionId, ActorId, ApprovalId, CascadeId, ClaimId, CommitId, EdgeId, EventId, EvidenceId,
+        NodeId, OutcomeId, PolicyDecisionId, PolicyId, SnapshotId, SubscriptionId, TenantId,
     };
     pub use crate::error::{HydraError, Result};
     pub use crate::event::{Event, EventKind, Value};
@@ -62,6 +72,10 @@ pub mod prelude {
     pub use crate::policy::{
         ApprovalRequest, ApprovalStatus, Policy, PolicyDecision, PolicyDecisionKind, PolicyKind,
         PolicyScope, PolicyStatus,
+    };
+    pub use crate::commit::{
+        CommitBatch, CommitHash, CommitRecord, CommitStatus, EventCommitRecord, EventHash,
+        IdempotencyKey,
     };
     pub use crate::node::{Node, NodeMeta, NodeValidator};
     pub use crate::edge::{Edge, EdgeMeta};

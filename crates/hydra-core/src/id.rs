@@ -168,6 +168,7 @@ define_id!(EventId, "evt");
 define_id!(NodeId, "node");
 define_id!(EdgeId, "edge");
 define_id!(CascadeId, "cas");
+define_id!(CommitId, "commit");
 define_id!(TenantId, "ten");
 define_id!(SubscriptionId, "sub");
 define_id!(SnapshotId, "snap");
