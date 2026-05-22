@@ -1,5 +1,6 @@
 use crate::anomaly::{Anomaly, AnomalyEngine};
 use crate::cascade::{CascadeConfig, CascadeEngine, CascadeResult};
+use crate::commit_ledger::CommitLedger;
 use crate::coverage::{CoverageEngine, CoverageReport};
 use crate::action_store::ActionStore;
 use crate::epistemic_store::EpistemicStore;
@@ -56,6 +57,7 @@ pub struct Hydra {
     policy_store: PolicyStore,
     policy_engine: PolicyEngine,
     policy_agent: PolicyAgent,
+    commit_ledger: CommitLedger,
     reflex_registry: ReflexRegistry,
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
@@ -126,6 +128,7 @@ impl Hydra {
                 ActorId::from_str("actor_hydra_policy"),
                 ActorId::from_str("actor_hydra_approver"),
             ),
+            commit_ledger: CommitLedger::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -154,6 +157,7 @@ impl Hydra {
                 ActorId::from_str("actor_hydra_policy"),
                 ActorId::from_str("actor_hydra_approver"),
             ),
+            commit_ledger: CommitLedger::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -261,6 +265,12 @@ impl Hydra {
             self.temporal.record(event);
         }
 
+        // Record an atomic commit batch for this cascade. v0 ledger is
+        // in-memory only; storage will persist these later.
+        let _commit = self
+            .commit_ledger
+            .commit_events(result.events.clone(), None)?;
+
         // I8: Persist cascade events to WAL (if configured)
         if let Some(ref mut wal) = self.wal {
             wal.persist_cascade(&result.events)?;
@@ -335,6 +345,10 @@ impl Hydra {
             self.event_log.append(event.clone());
             self.temporal.record(event);
         }
+
+        let _commit = self
+            .commit_ledger
+            .commit_events(result.events.clone(), None)?;
 
         // Persist to WAL (if configured)
         if let Some(ref mut wal) = self.wal {
@@ -803,6 +817,28 @@ impl Hydra {
     /// invokes on `ActionProposed`.
     pub fn policy_agent(&self) -> &PolicyAgent {
         &self.policy_agent
+    }
+
+    // === Commit ledger ===
+
+    /// Read access to the in-memory commit ledger.
+    pub fn commit_ledger(&self) -> &CommitLedger {
+        &self.commit_ledger
+    }
+
+    /// Most recent commit record, if any.
+    pub fn latest_commit(&self) -> Option<&hydra_core::CommitRecord> {
+        self.commit_ledger.latest_record()
+    }
+
+    /// Number of commits recorded in the ledger.
+    pub fn commit_count(&self) -> usize {
+        self.commit_ledger.commit_count()
+    }
+
+    /// Verify the in-memory commit hash chain.
+    pub fn verify_commit_chain(&self) -> hydra_core::error::Result<()> {
+        self.commit_ledger.verify_chain()
     }
 }
 
@@ -1714,6 +1750,60 @@ mod sprint1_tests {
         }
         assert_eq!(result.events[1].caused_by, vec![result.events[0].id.clone()]);
         assert_eq!(result.events[1].cascade_id, result.events[0].cascade_id);
+    }
+
+    #[test]
+    fn hydra_records_commit_for_ingest_cascade() {
+        use hydra_core::EventKind;
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        assert_eq!(hydra.commit_count(), 0);
+
+        let result = hydra
+            .ingest(EventKind::Signal {
+                source: hydra_core::NodeId::from_str("test"),
+                name: "commit_test".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+
+        assert_eq!(hydra.commit_count(), 1);
+        let commit = hydra.latest_commit().unwrap();
+        assert_eq!(commit.sequence, 1);
+        assert_eq!(commit.event_count, result.events.len());
+        assert_eq!(commit.cascade_id, Some(result.events[0].cascade_id.clone()));
+        hydra.verify_commit_chain().unwrap();
+    }
+
+    #[test]
+    fn hydra_commit_chain_links_multiple_ingests() {
+        use hydra_core::EventKind;
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        hydra
+            .ingest(EventKind::Signal {
+                source: hydra_core::NodeId::from_str("test"),
+                name: "first".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+        let first_hash = hydra.latest_commit().unwrap().commit_hash.clone();
+
+        hydra
+            .ingest(EventKind::Signal {
+                source: hydra_core::NodeId::from_str("test"),
+                name: "second".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+
+        assert_eq!(hydra.commit_count(), 2);
+        let second = hydra.latest_commit().unwrap();
+        assert_eq!(second.sequence, 2);
+        assert_eq!(second.previous_hash, Some(first_hash));
+        hydra.verify_commit_chain().unwrap();
     }
 
     #[test]

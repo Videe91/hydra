@@ -14,6 +14,7 @@ pub mod action_store;
 pub mod policy_store;
 pub mod policy_engine;
 pub mod policy_agent;
+pub mod commit_ledger;
 pub mod remediation_agent;
 pub mod outcome_agent;
 pub mod reflex;
@@ -58,6 +59,7 @@ pub mod prelude {
         PolicyEngine, PolicyEvaluationDecision, PolicyEvaluationReport,
     };
     pub use crate::policy_agent::PolicyAgent;
+    pub use crate::commit_ledger::CommitLedger;
     pub use crate::remediation_agent::RemediationAgent;
     pub use crate::outcome_agent::OutcomeAgent;
     pub use crate::reflex::{Reflex, ReflexContext, ReflexRegistry};
