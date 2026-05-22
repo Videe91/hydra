@@ -1,6 +1,9 @@
 use crate::action_store::ActionStore;
 use crate::epistemic_store::EpistemicStore;
 use crate::outcome_agent::OutcomeAgent;
+use crate::policy_agent::PolicyAgent;
+use crate::policy_engine::PolicyEngine;
+use crate::policy_store::PolicyStore;
 use crate::projection::Projection;
 use crate::reflex::{ReflexContext, ReflexRegistry};
 use crate::registry::SubscriptionRegistry;
@@ -177,6 +180,9 @@ impl CascadeEngine {
         remediation_agent: &RemediationAgent,
         action_store: &mut ActionStore,
         outcome_agent: &OutcomeAgent,
+        policy_store: &mut PolicyStore,
+        policy_engine: &PolicyEngine,
+        policy_agent: &PolicyAgent,
         reflex_registry: &ReflexRegistry,
     ) -> hydra_core::error::Result<CascadeResult> {
         let mut queue: VecDeque<Event> = VecDeque::new();
@@ -222,6 +228,15 @@ impl CascadeEngine {
             // up the action by ID and decides whether to emit OutcomeObserved.
             action_store.apply_event(&event)?;
 
+            // 2c. Apply governance-layer mutation before policy agent reacts.
+            //
+            // ActionProposed has already touched ActionStore; PolicyAgent now
+            // sees the materialized action when it evaluates policy. Policy
+            // lifecycle events (PolicyRegistered/PolicyDecisionRecorded/
+            // ApprovalRequested/Granted/Rejected/Cancelled) are also applied
+            // here so reflexes downstream see consistent state.
+            policy_store.apply_event(&event)?;
+
             // 3. Existing registry subscriptions.
             let matching = registry.matching_subscriptions(&event);
             let mut reaction_kinds: Vec<EventKind> = Vec::new();
@@ -253,6 +268,19 @@ impl CascadeEngine {
             // Turns verified claims into proposed actions. Also event-sourced —
             // emits ActionProposed (or recovery Signals), never mutates state.
             reaction_kinds.extend(remediation_agent.react(&event, epistemic_store));
+
+            // 5b. Built-in policy reflex (governance gate).
+            //
+            // Turns proposed actions into PolicyDecisionRecorded + one of
+            // ActionApproved / ApprovalRequested / ActionRejected / Signal.
+            // Runs after remediation so it can immediately gate the
+            // ActionProposed that remediation just emitted.
+            reaction_kinds.extend(policy_agent.react(
+                &event,
+                action_store,
+                policy_store,
+                policy_engine,
+            ));
 
             // 6. Built-in outcome reflex (PROMETHEUS → SENTINEL).
             //
@@ -310,6 +338,9 @@ impl CascadeEngine {
         remediation_agent: &RemediationAgent,
         action_store: &mut ActionStore,
         outcome_agent: &OutcomeAgent,
+        policy_store: &mut PolicyStore,
+        policy_engine: &PolicyEngine,
+        policy_agent: &PolicyAgent,
         reflex_registry: &ReflexRegistry,
     ) -> hydra_core::error::Result<CascadeResult> {
         let event = Event::trigger(kind);
@@ -323,6 +354,9 @@ impl CascadeEngine {
             remediation_agent,
             action_store,
             outcome_agent,
+            policy_store,
+            policy_engine,
+            policy_agent,
             reflex_registry,
         )
     }
@@ -334,6 +368,9 @@ mod tests {
     use crate::action_store::ActionStore;
     use crate::epistemic_store::EpistemicStore;
     use crate::outcome_agent::OutcomeAgent;
+    use crate::policy_agent::PolicyAgent;
+    use crate::policy_engine::PolicyEngine;
+    use crate::policy_store::PolicyStore;
     use crate::reflex::ReflexRegistry;
     use crate::registry::SubscriptionRegistry;
     use crate::remediation_agent::RemediationAgent;
@@ -418,6 +455,12 @@ mod tests {
             RemediationAgent::new(ActorId::from_str("actor_hydra_prometheus"));
         let mut action_store = ActionStore::new();
         let outcome_agent = OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel"));
+        let mut policy_store = PolicyStore::new();
+        let policy_engine = PolicyEngine::new();
+        let policy_agent = PolicyAgent::new(
+            ActorId::from_str("actor_hydra_policy"),
+            ActorId::from_str("actor_hydra_approver"),
+        );
         let reflex_registry = ReflexRegistry::new();
 
         let evidence = evidence_with_reliability(0.95);
@@ -439,14 +482,19 @@ mod tests {
                 &remediation_agent,
                 &mut action_store,
                 &outcome_agent,
+                &mut policy_store,
+                &policy_engine,
+                &policy_agent,
                 &reflex_registry,
             )
             .unwrap();
 
-        // ClaimProposed → ClaimVerified (verification agent) → ActionProposed (remediation agent)
-        assert_eq!(result.events.len(), 3);
+        // ClaimProposed → ClaimVerified (verification agent) → ActionProposed
+        // (remediation agent) → PolicyDecisionRecorded + ActionApproved
+        // (policy agent, Allow because no matching policy).
+        assert_eq!(result.events.len(), 5);
         assert_eq!(result.mutations, 0);
-        assert_eq!(result.max_depth_reached, 2);
+        assert_eq!(result.max_depth_reached, 3);
 
         assert!(matches!(
             result.events[0].kind,
@@ -469,13 +517,25 @@ mod tests {
             }
             other => panic!("expected ActionProposed, got {other:?}"),
         }
+        assert!(matches!(
+            result.events[3].kind,
+            EventKind::PolicyDecisionRecorded { .. }
+        ));
+        assert!(matches!(
+            result.events[4].kind,
+            EventKind::ActionApproved { .. }
+        ));
 
         let stored = epistemic_store.claim(&claim_id).unwrap();
         assert_eq!(stored.status, ClaimStatus::Verified);
         assert_eq!(result.events[1].caused_by, vec![result.events[0].id.clone()]);
         assert_eq!(result.events[2].caused_by, vec![result.events[1].id.clone()]);
+        // PolicyDecisionRecorded and ActionApproved are both reactions to event[2] (ActionProposed)
+        assert_eq!(result.events[3].caused_by, vec![result.events[2].id.clone()]);
+        assert_eq!(result.events[4].caused_by, vec![result.events[2].id.clone()]);
         assert_eq!(result.events[0].cascade_id, result.events[1].cascade_id);
         assert_eq!(result.events[1].cascade_id, result.events[2].cascade_id);
+        assert_eq!(result.events[2].cascade_id, result.events[3].cascade_id);
     }
 
     #[test]
@@ -490,6 +550,12 @@ mod tests {
             RemediationAgent::new(ActorId::from_str("actor_hydra_prometheus"));
         let mut action_store = ActionStore::new();
         let outcome_agent = OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel"));
+        let mut policy_store = PolicyStore::new();
+        let policy_engine = PolicyEngine::new();
+        let policy_agent = PolicyAgent::new(
+            ActorId::from_str("actor_hydra_policy"),
+            ActorId::from_str("actor_hydra_approver"),
+        );
         let reflex_registry = ReflexRegistry::new();
 
         let evidence = evidence_with_reliability(0.95);
@@ -512,6 +578,9 @@ mod tests {
                 &remediation_agent,
                 &mut action_store,
                 &outcome_agent,
+                &mut policy_store,
+                &policy_engine,
+                &policy_agent,
                 &reflex_registry,
             )
             .unwrap();
@@ -545,6 +614,12 @@ mod tests {
             RemediationAgent::new(ActorId::from_str("actor_hydra_prometheus"));
         let mut action_store = ActionStore::new();
         let outcome_agent = OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel"));
+        let mut policy_store = PolicyStore::new();
+        let policy_engine = PolicyEngine::new();
+        let policy_agent = PolicyAgent::new(
+            ActorId::from_str("actor_hydra_policy"),
+            ActorId::from_str("actor_hydra_approver"),
+        );
         let reflex_registry = ReflexRegistry::new();
 
         let missing_evidence_id = EvidenceId::new();
@@ -562,6 +637,9 @@ mod tests {
                 &remediation_agent,
                 &mut action_store,
                 &outcome_agent,
+                &mut policy_store,
+                &policy_engine,
+                &policy_agent,
                 &reflex_registry,
             )
             .unwrap();
@@ -602,6 +680,12 @@ mod tests {
             RemediationAgent::new(ActorId::from_str("actor_hydra_prometheus"));
         let mut action_store = ActionStore::new();
         let outcome_agent = OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel"));
+        let mut policy_store = PolicyStore::new();
+        let policy_engine = PolicyEngine::new();
+        let policy_agent = PolicyAgent::new(
+            ActorId::from_str("actor_hydra_policy"),
+            ActorId::from_str("actor_hydra_approver"),
+        );
         let reflex_registry = ReflexRegistry::new();
 
         let now = chrono::Utc::now();
@@ -643,6 +727,9 @@ mod tests {
                 &remediation_agent,
                 &mut action_store,
                 &outcome_agent,
+                &mut policy_store,
+                &policy_engine,
+                &policy_agent,
                 &reflex_registry,
             )
             .unwrap();
@@ -660,6 +747,200 @@ mod tests {
             other => panic!("expected OutcomeObserved, got {other:?}"),
         }
         assert_eq!(action_store.outcomes_for_action(&action_id).len(), 1);
+    }
+
+    #[test]
+    fn policy_cascade_auto_approves_action_when_no_policy_matches() {
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionStatus, ActionTarget, PolicyDecisionKind,
+        };
+
+        let engine = CascadeEngine::with_defaults();
+        let mut projection = Projection::new();
+        let registry = SubscriptionRegistry::new();
+        let mut epistemic_store = EpistemicStore::new();
+        let verification_engine = VerificationEngine::with_default_policy();
+        let verification_agent = VerificationAgent::new(verifier_actor());
+        let remediation_agent =
+            RemediationAgent::new(ActorId::from_str("actor_hydra_prometheus"));
+        let mut action_store = ActionStore::new();
+        let outcome_agent = OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel"));
+        let mut policy_store = PolicyStore::new();
+        let policy_engine = PolicyEngine::new();
+        let policy_agent = PolicyAgent::new(
+            ActorId::from_str("actor_hydra_policy"),
+            ActorId::from_str("actor_hydra_approver"),
+        );
+        let reflex_registry = ReflexRegistry::new();
+
+        let now = chrono::Utc::now();
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: Some(tenant()),
+            kind: ActionKind::Backfill,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::Dataset(
+                "analytics.public.revenue_daily".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_prometheus"),
+            approved_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        let action_id = action.id.clone();
+
+        let result = engine
+            .trigger_with_epistemics(
+                EventKind::ActionProposed { action },
+                &mut projection,
+                &registry,
+                &mut epistemic_store,
+                &verification_engine,
+                &verification_agent,
+                &remediation_agent,
+                &mut action_store,
+                &outcome_agent,
+                &mut policy_store,
+                &policy_engine,
+                &policy_agent,
+                &reflex_registry,
+            )
+            .unwrap();
+
+        assert_eq!(result.events.len(), 3);
+        assert!(matches!(result.events[0].kind, EventKind::ActionProposed { .. }));
+        match &result.events[1].kind {
+            EventKind::PolicyDecisionRecorded { decision } => {
+                assert_eq!(decision.action_id, action_id);
+                assert_eq!(decision.kind, PolicyDecisionKind::Allow);
+            }
+            other => panic!("expected PolicyDecisionRecorded, got {other:?}"),
+        }
+        match &result.events[2].kind {
+            EventKind::ActionApproved {
+                action_id: approved_action_id,
+                ..
+            } => {
+                assert_eq!(approved_action_id, &action_id);
+            }
+            other => panic!("expected ActionApproved, got {other:?}"),
+        }
+        assert_eq!(
+            action_store.action(&action_id).unwrap().status,
+            ActionStatus::Approved
+        );
+        assert_eq!(policy_store.decisions_for_action(&action_id).len(), 1);
+    }
+
+    #[test]
+    fn policy_cascade_requests_approval_for_matching_human_policy() {
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionStatus, ActionTarget, Policy, PolicyId, PolicyKind,
+            PolicyScope, PolicyStatus,
+        };
+
+        let engine = CascadeEngine::with_defaults();
+        let mut projection = Projection::new();
+        let registry = SubscriptionRegistry::new();
+        let mut epistemic_store = EpistemicStore::new();
+        let verification_engine = VerificationEngine::with_default_policy();
+        let verification_agent = VerificationAgent::new(verifier_actor());
+        let remediation_agent =
+            RemediationAgent::new(ActorId::from_str("actor_hydra_prometheus"));
+        let mut action_store = ActionStore::new();
+        let outcome_agent = OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel"));
+        let mut policy_store = PolicyStore::new();
+        let policy_engine = PolicyEngine::new();
+        let approver = ActorId::from_str("actor_accountant");
+        let policy_agent = PolicyAgent::new(
+            ActorId::from_str("actor_hydra_policy"),
+            approver.clone(),
+        );
+        let reflex_registry = ReflexRegistry::new();
+
+        let now = chrono::Utc::now();
+        let policy = Policy {
+            id: PolicyId::new(),
+            tenant_id: Some(tenant()),
+            name: "Payroll approval required".to_string(),
+            kind: PolicyKind::HumanApproval,
+            status: PolicyStatus::Active,
+            scope: PolicyScope::ActionKind("RunPayroll".to_string()),
+            condition: HashMap::new(),
+            metadata: HashMap::new(),
+            created_by: ActorId::from_str("actor_policy_admin"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        policy_store
+            .apply_event(&Event::trigger(EventKind::PolicyRegistered { policy }))
+            .unwrap();
+
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: Some(tenant()),
+            kind: ActionKind::RunPayroll,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("payroll".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_payroll_agent"),
+            approved_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        let action_id = action.id.clone();
+
+        let result = engine
+            .trigger_with_epistemics(
+                EventKind::ActionProposed { action },
+                &mut projection,
+                &registry,
+                &mut epistemic_store,
+                &verification_engine,
+                &verification_agent,
+                &remediation_agent,
+                &mut action_store,
+                &outcome_agent,
+                &mut policy_store,
+                &policy_engine,
+                &policy_agent,
+                &reflex_registry,
+            )
+            .unwrap();
+
+        assert_eq!(result.events.len(), 3);
+        assert!(matches!(result.events[0].kind, EventKind::ActionProposed { .. }));
+        assert!(matches!(
+            result.events[1].kind,
+            EventKind::PolicyDecisionRecorded { .. }
+        ));
+        match &result.events[2].kind {
+            EventKind::ApprovalRequested { request } => {
+                assert_eq!(request.action_id, action_id);
+                assert_eq!(request.requested_from, vec![approver]);
+            }
+            other => panic!("expected ApprovalRequested, got {other:?}"),
+        }
+        assert_eq!(
+            action_store.action(&action_id).unwrap().status,
+            ActionStatus::Proposed
+        );
+        assert_eq!(policy_store.decisions_for_action(&action_id).len(), 1);
+        assert_eq!(policy_store.approvals_for_action(&action_id).len(), 1);
     }
 
     /// A handler that classifies new nodes by emitting a NodeUpdated event

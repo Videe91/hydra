@@ -766,13 +766,17 @@ mod action_outcome_query_tests {
 
         let service = QueryService::new(Arc::new(RwLock::new(hydra)));
 
-        assert_eq!(service.action(&action_id).await, Some(action));
-        assert_eq!(service.proposed_actions().await.len(), 1);
+        // PolicyAgent auto-approves when no policy matches, so the materialized
+        // action is in Approved state after a single ingest.
+        let stored = service.action(&action_id).await.unwrap();
+        assert_eq!(stored.id, action.id);
+        assert_eq!(stored.status, ActionStatus::Approved);
+        assert_eq!(service.proposed_actions().await.len(), 0);
         assert_eq!(
-            service.actions_with_status(ActionStatus::Proposed).await.len(),
+            service.actions_with_status(ActionStatus::Approved).await.len(),
             1
         );
-        assert_eq!(service.approved_actions().await.len(), 0);
+        assert_eq!(service.approved_actions().await.len(), 1);
         assert_eq!(service.executed_actions().await.len(), 0);
     }
 

@@ -9,6 +9,7 @@ use crate::projection::Projection;
 use crate::registry::SubscriptionRegistry;
 use crate::temporal::TemporalIndex;
 use crate::outcome_agent::OutcomeAgent;
+use crate::policy_agent::PolicyAgent;
 use crate::policy_engine::PolicyEngine;
 use crate::policy_store::PolicyStore;
 use crate::reflex::ReflexRegistry;
@@ -54,6 +55,7 @@ pub struct Hydra {
     outcome_agent: OutcomeAgent,
     policy_store: PolicyStore,
     policy_engine: PolicyEngine,
+    policy_agent: PolicyAgent,
     reflex_registry: ReflexRegistry,
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
@@ -120,6 +122,10 @@ impl Hydra {
             outcome_agent: OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel")),
             policy_store: PolicyStore::new(),
             policy_engine: PolicyEngine::new(),
+            policy_agent: PolicyAgent::new(
+                ActorId::from_str("actor_hydra_policy"),
+                ActorId::from_str("actor_hydra_approver"),
+            ),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -144,6 +150,10 @@ impl Hydra {
             outcome_agent: OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel")),
             policy_store: PolicyStore::new(),
             policy_engine: PolicyEngine::new(),
+            policy_agent: PolicyAgent::new(
+                ActorId::from_str("actor_hydra_policy"),
+                ActorId::from_str("actor_hydra_approver"),
+            ),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -235,19 +245,20 @@ impl Hydra {
             &self.remediation_agent,
             &mut self.action_store,
             &self.outcome_agent,
+            &mut self.policy_store,
+            &self.policy_engine,
+            &self.policy_agent,
             &self.reflex_registry,
         )?;
 
         // Record all events in the log AND the temporal index.
-        // EpistemicStore and ActionStore are both driven inline by
-        // `process_with_epistemics` so the verification / remediation /
-        // outcome agents see fresh state. Re-applying here would double-update.
-        // PolicyStore is driven post-cascade for now (no policy agent runs
-        // inline yet); when one is wired, move this into the cascade.
+        // EpistemicStore, ActionStore, and PolicyStore are all driven inline
+        // by `process_with_epistemics` so the verification / remediation /
+        // policy / outcome agents see fresh state. Re-applying here would
+        // double-update.
         for event in &result.events {
             self.event_log.append(event.clone());
             self.temporal.record(event);
-            self.policy_store.apply_event(event)?;
         }
 
         // I8: Persist cascade events to WAL (if configured)
@@ -314,13 +325,15 @@ impl Hydra {
             &self.remediation_agent,
             &mut self.action_store,
             &self.outcome_agent,
+            &mut self.policy_store,
+            &self.policy_engine,
+            &self.policy_agent,
             &self.reflex_registry,
         )?;
 
         for event in &result.events {
             self.event_log.append(event.clone());
             self.temporal.record(event);
-            self.policy_store.apply_event(event)?;
         }
 
         // Persist to WAL (if configured)
@@ -784,6 +797,12 @@ impl Hydra {
     ) -> Option<crate::policy_engine::PolicyEvaluationReport> {
         let action = self.action_store.action(action_id)?;
         Some(self.policy_engine.evaluate_action(&self.policy_store, action))
+    }
+
+    /// Read access to the built-in policy agent that the cascade engine
+    /// invokes on `ActionProposed`.
+    pub fn policy_agent(&self) -> &PolicyAgent {
+        &self.policy_agent
     }
 }
 
@@ -1491,7 +1510,9 @@ mod sprint1_tests {
             .unwrap();
         let result = hydra.ingest(EventKind::ClaimProposed { claim }).unwrap();
 
-        assert_eq!(result.events.len(), 3);
+        // ClaimProposed → ClaimVerified → ActionProposed → PolicyDecisionRecorded
+        // → ActionApproved. PolicyAgent auto-approves because no policy matches.
+        assert_eq!(result.events.len(), 5);
         assert!(matches!(
             result.events[0].kind,
             EventKind::ClaimProposed { .. }
@@ -1504,11 +1525,21 @@ mod sprint1_tests {
             result.events[2].kind,
             EventKind::ActionProposed { .. }
         ));
+        assert!(matches!(
+            result.events[3].kind,
+            EventKind::PolicyDecisionRecorded { .. }
+        ));
+        assert!(matches!(
+            result.events[4].kind,
+            EventKind::ActionApproved { .. }
+        ));
 
         assert_eq!(hydra.verified_claims().len(), 1);
-        assert_eq!(hydra.proposed_actions().len(), 1);
+        // Action auto-approved by PolicyAgent, so it sits in Approved (not Proposed).
+        assert_eq!(hydra.proposed_actions().len(), 0);
+        assert_eq!(hydra.approved_actions().len(), 1);
 
-        let action = hydra.proposed_actions()[0];
+        let action = hydra.approved_actions()[0];
         assert_eq!(action.kind, hydra_core::ActionKind::Backfill);
         assert_eq!(action.related_claims, vec![claim_id]);
         assert_eq!(
@@ -1556,8 +1587,13 @@ mod sprint1_tests {
         hydra
             .ingest(EventKind::ActionProposed { action })
             .unwrap();
-        assert_eq!(hydra.proposed_actions().len(), 1);
+        // PolicyAgent auto-approves when no policy matches, so the action is
+        // already in Approved status after a single ingest.
+        assert_eq!(hydra.proposed_actions().len(), 0);
+        assert_eq!(hydra.approved_actions().len(), 1);
 
+        // The explicit ActionApproved below is now idempotent — status stays
+        // Approved.
         hydra
             .ingest(EventKind::ActionApproved {
                 action_id: action_id.clone(),
@@ -1678,6 +1714,80 @@ mod sprint1_tests {
         }
         assert_eq!(result.events[1].caused_by, vec![result.events[0].id.clone()]);
         assert_eq!(result.events[1].cascade_id, result.events[0].cascade_id);
+    }
+
+    #[test]
+    fn hydra_policy_agent_requests_approval_for_payroll_action() {
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionStatus, ActionTarget, ActorId, EventKind, Policy,
+            PolicyId, PolicyKind, PolicyScope, PolicyStatus,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = ActorId::from_str("actor_policy_admin");
+        let policy = Policy {
+            id: PolicyId::new(),
+            tenant_id: None,
+            name: "Payroll approval required".to_string(),
+            kind: PolicyKind::HumanApproval,
+            status: PolicyStatus::Active,
+            scope: PolicyScope::ActionKind("RunPayroll".to_string()),
+            condition: HashMap::new(),
+            metadata: HashMap::new(),
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(EventKind::PolicyRegistered { policy })
+            .unwrap();
+
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: None,
+            kind: ActionKind::RunPayroll,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("payroll".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_payroll_agent"),
+            approved_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        let action_id = action.id.clone();
+        let result = hydra
+            .ingest(EventKind::ActionProposed { action })
+            .unwrap();
+
+        assert_eq!(result.events.len(), 3);
+        assert!(matches!(
+            result.events[0].kind,
+            EventKind::ActionProposed { .. }
+        ));
+        assert!(matches!(
+            result.events[1].kind,
+            EventKind::PolicyDecisionRecorded { .. }
+        ));
+        assert!(matches!(
+            result.events[2].kind,
+            EventKind::ApprovalRequested { .. }
+        ));
+        assert_eq!(hydra.decisions_for_action(&action_id).len(), 1);
+        assert_eq!(hydra.approvals_for_action(&action_id).len(), 1);
+        assert_eq!(hydra.pending_approvals().len(), 1);
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            ActionStatus::Proposed
+        );
     }
 
     #[test]
