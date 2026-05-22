@@ -1,0 +1,16 @@
+[package]
+name = "hydra-net"
+description = "Async runtime, sensor trait, event bus, and HTTP API for Hydra"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hydra-core = { path = "../hydra-core" }
+hydra-engine = { path = "../hydra-engine" }
+hydra-storage = { path = "../hydra-storage" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }

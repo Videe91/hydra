@@ -1,0 +1,17 @@
+[package]
+name = "hydra-sensor"
+description = "Cloud infrastructure sensors for Hydra — converts CloudTrail and other cloud events into Hydra signals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hydra-core = { path = "../hydra-core" }
+hydra-sentinel = { path = "../hydra-sentinel" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+hydra-engine = { path = "../hydra-engine" }

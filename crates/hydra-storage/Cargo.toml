@@ -1,0 +1,16 @@
+[package]
+name = "hydra-storage"
+description = "Storage backends for Hydra — memory, binary file, and the StorageBackend trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hydra-core = { path = "../hydra-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

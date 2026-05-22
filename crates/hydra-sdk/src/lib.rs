@@ -1,0 +1,12 @@
+pub mod builder;
+pub mod test_hydra;
+
+pub mod prelude {
+    pub use crate::builder::HydraBuilder;
+    pub use crate::test_hydra::TestHydra;
+
+    // Re-export the most commonly needed types from downstream crates
+    pub use hydra_core::prelude::*;
+    pub use hydra_engine::prelude::*;
+    pub use hydra_storage::prelude::*;
+}

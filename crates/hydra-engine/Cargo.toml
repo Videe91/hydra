@@ -1,0 +1,13 @@
+[package]
+name = "hydra-engine"
+description = "Cascade engine, projection, and subscription registry for Hydra"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hydra-core = { path = "../hydra-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
