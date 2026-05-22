@@ -1,8 +1,10 @@
 use crate::action::{Action, Outcome};
 use crate::epistemic::{Claim, Evidence};
 use crate::id::{
-    ActionId, ActorId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId, TenantId,
+    ActionId, ActorId, ApprovalId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId,
+    PolicyId, TenantId,
 };
+use crate::policy::{ApprovalRequest, Policy, PolicyDecision};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -174,6 +176,36 @@ pub enum EventKind {
     OutcomeObserved {
         outcome: Outcome,
     },
+
+    // Policy / approval lifecycle — policies govern whether actions can proceed.
+    PolicyRegistered {
+        policy: Policy,
+    },
+    PolicyDisabled {
+        policy_id: PolicyId,
+        disabled_by: ActorId,
+        reason: Option<String>,
+    },
+    PolicyDecisionRecorded {
+        decision: PolicyDecision,
+    },
+    ApprovalRequested {
+        request: ApprovalRequest,
+    },
+    ApprovalGranted {
+        approval_id: ApprovalId,
+        approved_by: ActorId,
+    },
+    ApprovalRejected {
+        approval_id: ApprovalId,
+        rejected_by: ActorId,
+        reason: String,
+    },
+    ApprovalCancelled {
+        approval_id: ApprovalId,
+        cancelled_by: ActorId,
+        reason: Option<String>,
+    },
 }
 
 impl EventKind {
@@ -207,7 +239,14 @@ impl EventKind {
             | EventKind::ActionExecuted { .. }
             | EventKind::ActionFailed { .. }
             | EventKind::ActionCancelled { .. }
-            | EventKind::OutcomeObserved { .. } => None,
+            | EventKind::OutcomeObserved { .. }
+            | EventKind::PolicyRegistered { .. }
+            | EventKind::PolicyDisabled { .. }
+            | EventKind::PolicyDecisionRecorded { .. }
+            | EventKind::ApprovalRequested { .. }
+            | EventKind::ApprovalGranted { .. }
+            | EventKind::ApprovalRejected { .. }
+            | EventKind::ApprovalCancelled { .. } => None,
         }
     }
 
@@ -238,6 +277,13 @@ impl EventKind {
             EventKind::ActionFailed { .. } => "action_failed",
             EventKind::ActionCancelled { .. } => "action_cancelled",
             EventKind::OutcomeObserved { .. } => "outcome_observed",
+            EventKind::PolicyRegistered { .. } => "policy_registered",
+            EventKind::PolicyDisabled { .. } => "policy_disabled",
+            EventKind::PolicyDecisionRecorded { .. } => "policy_decision_recorded",
+            EventKind::ApprovalRequested { .. } => "approval_requested",
+            EventKind::ApprovalGranted { .. } => "approval_granted",
+            EventKind::ApprovalRejected { .. } => "approval_rejected",
+            EventKind::ApprovalCancelled { .. } => "approval_cancelled",
         }
     }
 }
@@ -678,6 +724,78 @@ mod tests {
         assert_eq!(
             EventKind::OutcomeObserved { outcome }.kind_name(),
             "outcome_observed"
+        );
+    }
+
+    #[test]
+    fn policy_event_kind_names() {
+        use crate::id::{ActionId, ActorId, PolicyDecisionId, PolicyId};
+        use crate::policy::{
+            ApprovalRequest, ApprovalStatus, Policy, PolicyDecision, PolicyDecisionKind,
+            PolicyKind, PolicyScope, PolicyStatus,
+        };
+        use chrono::Utc;
+        use std::collections::HashMap;
+
+        let now = Utc::now();
+        let actor = ActorId::from_str("actor_policy");
+
+        let policy = Policy {
+            id: PolicyId::new(),
+            tenant_id: None,
+            name: "Require approval for payroll runs".to_string(),
+            kind: PolicyKind::HumanApproval,
+            status: PolicyStatus::Active,
+            scope: PolicyScope::ActionKind("RunPayroll".to_string()),
+            condition: HashMap::new(),
+            metadata: HashMap::new(),
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        assert_eq!(
+            EventKind::PolicyRegistered { policy }.kind_name(),
+            "policy_registered"
+        );
+
+        let decision = PolicyDecision {
+            id: PolicyDecisionId::new(),
+            tenant_id: None,
+            policy_id: Some(PolicyId::new()),
+            action_id: ActionId::new(),
+            kind: PolicyDecisionKind::RequireApproval,
+            reason: "payroll runs require approval".to_string(),
+            evidence: vec![],
+            related_claims: vec![],
+            decided_by: actor.clone(),
+            decided_at: now,
+            caused_by: None,
+            details: HashMap::new(),
+        };
+        assert_eq!(
+            EventKind::PolicyDecisionRecorded { decision }.kind_name(),
+            "policy_decision_recorded"
+        );
+
+        let request = ApprovalRequest {
+            id: crate::id::ApprovalId::new(),
+            tenant_id: None,
+            action_id: ActionId::new(),
+            policy_decision_id: Some(PolicyDecisionId::new()),
+            status: ApprovalStatus::Requested,
+            requested_by: actor.clone(),
+            requested_from: vec![ActorId::from_str("actor_accountant")],
+            reason: "accountant approval required".to_string(),
+            requested_at: now,
+            resolved_at: None,
+            resolved_by: None,
+            caused_by: None,
+            metadata: HashMap::new(),
+        };
+        assert_eq!(
+            EventKind::ApprovalRequested { request }.kind_name(),
+            "approval_requested"
         );
     }
 }

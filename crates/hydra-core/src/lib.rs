@@ -3,14 +3,15 @@ pub mod error;
 pub mod event;
 pub mod epistemic;
 pub mod action;
+pub mod policy;
 pub mod node;
 pub mod edge;
 pub mod graph;
 pub mod subscription;
 
 pub use id::{
-    ActionId, ActorId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId, OutcomeId,
-    PolicyId, SnapshotId, SubscriptionId, TenantId,
+    ActionId, ActorId, ApprovalId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId,
+    OutcomeId, PolicyDecisionId, PolicyId, SnapshotId, SubscriptionId, TenantId,
 };
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
@@ -32,12 +33,22 @@ pub use action::{
     Outcome,
     OutcomeKind,
 };
+pub use policy::{
+    ApprovalRequest,
+    ApprovalStatus,
+    Policy,
+    PolicyDecision,
+    PolicyDecisionKind,
+    PolicyKind,
+    PolicyScope,
+    PolicyStatus,
+};
 
 /// Convenience re-exports for common types
 pub mod prelude {
     pub use crate::id::{
-        ActionId, ActorId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId, OutcomeId,
-        PolicyId, SnapshotId, SubscriptionId, TenantId,
+        ActionId, ActorId, ApprovalId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId,
+        OutcomeId, PolicyDecisionId, PolicyId, SnapshotId, SubscriptionId, TenantId,
     };
     pub use crate::error::{HydraError, Result};
     pub use crate::event::{Event, EventKind, Value};
@@ -47,6 +58,10 @@ pub mod prelude {
     };
     pub use crate::action::{
         Action, ActionKind, ActionStatus, ActionTarget, Outcome, OutcomeKind,
+    };
+    pub use crate::policy::{
+        ApprovalRequest, ApprovalStatus, Policy, PolicyDecision, PolicyDecisionKind, PolicyKind,
+        PolicyScope, PolicyStatus,
     };
     pub use crate::node::{Node, NodeMeta, NodeValidator};
     pub use crate::edge::{Edge, EdgeMeta};

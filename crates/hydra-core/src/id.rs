@@ -176,6 +176,8 @@ define_id!(ClaimId, "claim");
 define_id!(EvidenceId, "evd");
 define_id!(ActorId, "actor");
 define_id!(PolicyId, "pol");
+define_id!(PolicyDecisionId, "pdec");
+define_id!(ApprovalId, "appr");
 // Agentic action loop IDs
 define_id!(ActionId, "act");
 define_id!(OutcomeId, "out");

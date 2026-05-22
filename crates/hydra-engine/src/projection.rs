@@ -263,7 +263,14 @@ impl Projection {
             | EventKind::ActionExecuted { .. }
             | EventKind::ActionFailed { .. }
             | EventKind::ActionCancelled { .. }
-            | EventKind::OutcomeObserved { .. } => Ok(false),
+            | EventKind::OutcomeObserved { .. }
+            | EventKind::PolicyRegistered { .. }
+            | EventKind::PolicyDisabled { .. }
+            | EventKind::PolicyDecisionRecorded { .. }
+            | EventKind::ApprovalRequested { .. }
+            | EventKind::ApprovalGranted { .. }
+            | EventKind::ApprovalRejected { .. }
+            | EventKind::ApprovalCancelled { .. } => Ok(false),
         }
     }
 
