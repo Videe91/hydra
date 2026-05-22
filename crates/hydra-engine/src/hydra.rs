@@ -9,6 +9,7 @@ use crate::projection::Projection;
 use crate::registry::SubscriptionRegistry;
 use crate::temporal::TemporalIndex;
 use crate::outcome_agent::OutcomeAgent;
+use crate::policy_engine::PolicyEngine;
 use crate::policy_store::PolicyStore;
 use crate::reflex::ReflexRegistry;
 use crate::remediation_agent::RemediationAgent;
@@ -52,6 +53,7 @@ pub struct Hydra {
     action_store: ActionStore,
     outcome_agent: OutcomeAgent,
     policy_store: PolicyStore,
+    policy_engine: PolicyEngine,
     reflex_registry: ReflexRegistry,
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
@@ -117,6 +119,7 @@ impl Hydra {
             action_store: ActionStore::new(),
             outcome_agent: OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel")),
             policy_store: PolicyStore::new(),
+            policy_engine: PolicyEngine::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -140,6 +143,7 @@ impl Hydra {
             action_store: ActionStore::new(),
             outcome_agent: OutcomeAgent::new(ActorId::from_str("actor_hydra_sentinel")),
             policy_store: PolicyStore::new(),
+            policy_engine: PolicyEngine::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -759,6 +763,27 @@ impl Hydra {
         actor_id: &hydra_core::ActorId,
     ) -> Vec<&hydra_core::ApprovalRequest> {
         self.policy_store.approvals_requested_from(actor_id)
+    }
+
+    // === Policy evaluation ===
+
+    /// Read access to the policy evaluation engine.
+    pub fn policy_engine(&self) -> &PolicyEngine {
+        &self.policy_engine
+    }
+
+    /// Evaluate the policy store against a known proposed action.
+    ///
+    /// Returns `None` if the action is not in the action store. Otherwise
+    /// returns a deterministic `PolicyEvaluationReport` — no state mutated,
+    /// no events emitted. The later PolicyAgent translates these reports
+    /// into event-sourced transitions.
+    pub fn evaluate_action_policy(
+        &self,
+        action_id: &hydra_core::ActionId,
+    ) -> Option<crate::policy_engine::PolicyEvaluationReport> {
+        let action = self.action_store.action(action_id)?;
+        Some(self.policy_engine.evaluate_action(&self.policy_store, action))
     }
 }
 
@@ -1653,6 +1678,66 @@ mod sprint1_tests {
         }
         assert_eq!(result.events[1].caused_by, vec![result.events[0].id.clone()]);
         assert_eq!(result.events[1].cascade_id, result.events[0].cascade_id);
+    }
+
+    #[test]
+    fn hydra_evaluates_policy_for_action() {
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionStatus, ActionTarget, ActorId, EventKind, Policy,
+            PolicyId, PolicyKind, PolicyScope, PolicyStatus,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = ActorId::from_str("actor_policy_test");
+
+        let policy = Policy {
+            id: PolicyId::new(),
+            tenant_id: None,
+            name: "Require approval for payroll runs".to_string(),
+            kind: PolicyKind::HumanApproval,
+            status: PolicyStatus::Active,
+            scope: PolicyScope::ActionKind("RunPayroll".to_string()),
+            condition: HashMap::new(),
+            metadata: HashMap::new(),
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(EventKind::PolicyRegistered { policy })
+            .unwrap();
+
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: None,
+            kind: ActionKind::RunPayroll,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("payroll".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor,
+            approved_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        let action_id = action.id.clone();
+        hydra
+            .ingest(EventKind::ActionProposed { action })
+            .unwrap();
+
+        let report = hydra.evaluate_action_policy(&action_id).unwrap();
+        assert_eq!(
+            report.decision,
+            crate::policy_engine::PolicyEvaluationDecision::RequireApproval
+        );
     }
 
     #[test]

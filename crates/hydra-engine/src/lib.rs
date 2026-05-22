@@ -12,6 +12,7 @@ pub mod verification;
 pub mod verification_agent;
 pub mod action_store;
 pub mod policy_store;
+pub mod policy_engine;
 pub mod remediation_agent;
 pub mod outcome_agent;
 pub mod reflex;
@@ -52,6 +53,9 @@ pub mod prelude {
     pub use crate::verification_agent::VerificationAgent;
     pub use crate::action_store::{ActionStore, ActionTargetKey};
     pub use crate::policy_store::{PolicyScopeKey, PolicyStore};
+    pub use crate::policy_engine::{
+        PolicyEngine, PolicyEvaluationDecision, PolicyEvaluationReport,
+    };
     pub use crate::remediation_agent::RemediationAgent;
     pub use crate::outcome_agent::OutcomeAgent;
     pub use crate::reflex::{Reflex, ReflexContext, ReflexRegistry};
