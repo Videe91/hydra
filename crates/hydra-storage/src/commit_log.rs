@@ -342,6 +342,52 @@ mod tests {
     }
 
     #[test]
+    fn commit_log_persists_sensor_observation_helper_commits() {
+        use hydra_core::{EventKind, NodeId, SensorId, SourceCursor};
+        use hydra_engine::hydra::Hydra;
+        use std::collections::HashMap;
+
+        let path = temp_path("sensor_observation_helper");
+        let log = CommitLog::open(&path).unwrap();
+        let mut hydra = Hydra::new();
+        hydra.set_commit_writer(log.clone());
+
+        let checkpoint = hydra
+            .record_sensor_observation(
+                SensorId::from_str("sensor_commit_log"),
+                "test",
+                SourceCursor::Custom {
+                    source: "test".to_string(),
+                    value: "cursor-1".to_string(),
+                },
+                EventKind::Signal {
+                    source: NodeId::from_str("test.sensor"),
+                    name: "observation".to_string(),
+                    payload: HashMap::new(),
+                },
+            )
+            .unwrap();
+
+        let batches = log.load_all().unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].id, checkpoint.commit_id);
+        assert_eq!(batches[1].events.len(), 1);
+
+        let mut recovered = Hydra::new();
+        recovered.recover_from_commits(batches).unwrap();
+        assert_eq!(
+            recovered
+                .checkpoint_for_idempotency_key(&checkpoint.idempotency_key)
+                .unwrap()
+                .id,
+            checkpoint.id
+        );
+        recovered.verify_commit_chain().unwrap();
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn open_creates_parent_directory() {
         let mut path = std::env::temp_dir();
         path.push(format!(

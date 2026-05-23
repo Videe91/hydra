@@ -970,6 +970,94 @@ impl Hydra {
             .checkpoint_for_commit(commit_id)
     }
 
+    /// Record one external sensor observation safely.
+    ///
+    /// This is the high-level reliable-ingestion helper:
+    ///
+    /// 1. Derive a stable IdempotencyKey from the SourceCursor.
+    /// 2. If a checkpoint already exists for that key, return it without ingesting.
+    /// 3. Ingest the business event with that idempotency key.
+    /// 4. Find the committed batch associated with that key.
+    /// 5. Record a SensorCheckpoint that links cursor → idempotency key → commit.
+    /// 6. Return the recorded checkpoint.
+    ///
+    /// This method makes at-least-once external sources effectively safe:
+    /// duplicate sensor reads reuse the same key and short-circuit.
+    pub fn record_sensor_observation(
+        &mut self,
+        sensor_id: hydra_core::SensorId,
+        source_system: impl Into<String>,
+        cursor: hydra_core::SourceCursor,
+        business_event: hydra_core::EventKind,
+    ) -> hydra_core::error::Result<hydra_core::SensorCheckpoint> {
+        self.record_sensor_observation_for_run(
+            None,
+            sensor_id,
+            source_system,
+            cursor,
+            business_event,
+        )
+    }
+
+    /// Record one external sensor observation associated with a SensorRun.
+    pub fn record_sensor_observation_for_run(
+        &mut self,
+        run_id: Option<hydra_core::SensorRunId>,
+        sensor_id: hydra_core::SensorId,
+        source_system: impl Into<String>,
+        cursor: hydra_core::SourceCursor,
+        business_event: hydra_core::EventKind,
+    ) -> hydra_core::error::Result<hydra_core::SensorCheckpoint> {
+        let source_system = source_system.into();
+        let key = hydra_core::IdempotencyKey::new(cursor.stable_key_material());
+
+        if let Some(existing) = self.checkpoint_for_idempotency_key(&key) {
+            return Ok(existing.clone());
+        }
+
+        let result = self.ingest_with_idempotency_key(business_event, key.clone())?;
+
+        let commit = self
+            .commit_ledger
+            .commit_for_idempotency_key(&key)
+            .ok_or_else(|| {
+                hydra_core::error::HydraError::StorageError(format!(
+                    "missing commit for sensor observation idempotency key {}",
+                    key.value()
+                ))
+            })?
+            .clone();
+
+        let event_id = result
+            .events
+            .first()
+            .map(|event| event.id.clone())
+            .or_else(|| commit.first_event_id().cloned());
+
+        let now = chrono::Utc::now();
+        let checkpoint = hydra_core::SensorCheckpoint {
+            id: hydra_core::SensorCheckpointId::new(),
+            tenant_id: commit.tenant_id.clone(),
+            sensor_id,
+            run_id,
+            status: hydra_core::SensorCheckpointStatus::Recorded,
+            source_system,
+            cursor,
+            idempotency_key: key,
+            commit_id: commit.id.clone(),
+            event_id,
+            observed_at: now,
+            recorded_at: now,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        self.ingest(hydra_core::EventKind::SensorCheckpointRecorded {
+            checkpoint: checkpoint.clone(),
+        })?;
+
+        Ok(checkpoint)
+    }
+
     // === Commit ledger ===
 
     /// Read access to the in-memory commit ledger.
@@ -2200,6 +2288,194 @@ mod sprint1_tests {
             hydra.sensor_run(&run_id).unwrap().status,
             SensorRunStatus::Completed
         );
+    }
+
+    #[test]
+    fn hydra_records_sensor_observation_and_checkpoint() {
+        use hydra_core::{
+            EventKind, IdempotencyKey, NodeId, SensorCheckpointStatus, SensorId, SourceCursor,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let sensor_id = SensorId::from_str("sensor_bank_feed");
+        let cursor = SourceCursor::Offset {
+            stream: "bank.transactions".to_string(),
+            partition: Some("acct-9001".to_string()),
+            offset: "42".to_string(),
+        };
+        let key = IdempotencyKey::new(cursor.stable_key_material());
+
+        let checkpoint = hydra
+            .record_sensor_observation(
+                sensor_id.clone(),
+                "bank",
+                cursor.clone(),
+                EventKind::Signal {
+                    source: NodeId::from_str("bank.feed"),
+                    name: "bank_transaction_observed".to_string(),
+                    payload: HashMap::new(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(checkpoint.sensor_id, sensor_id);
+        assert_eq!(checkpoint.cursor, cursor);
+        assert_eq!(checkpoint.idempotency_key, key);
+        assert_eq!(checkpoint.status, SensorCheckpointStatus::Recorded);
+        assert!(checkpoint.event_id.is_some());
+
+        // Commit 1 = business event. Commit 2 = checkpoint event.
+        assert_eq!(hydra.commit_count(), 2);
+        assert!(hydra.commit_ledger().batch(&checkpoint.commit_id).is_some());
+        assert_eq!(
+            hydra
+                .checkpoint_for_idempotency_key(&checkpoint.idempotency_key)
+                .unwrap()
+                .id,
+            checkpoint.id
+        );
+        assert_eq!(
+            hydra.checkpoint_for_cursor(&checkpoint.cursor).unwrap().id,
+            checkpoint.id
+        );
+        assert_eq!(
+            hydra
+                .latest_sensor_checkpoint(&checkpoint.sensor_id, "bank.transactions")
+                .unwrap()
+                .id,
+            checkpoint.id
+        );
+        hydra.verify_commit_chain().unwrap();
+    }
+
+    #[test]
+    fn hydra_record_sensor_observation_is_idempotent() {
+        use hydra_core::{EventKind, NodeId, SensorId, SourceCursor};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let sensor_id = SensorId::from_str("sensor_bank_feed");
+        let cursor = SourceCursor::DeliveryId {
+            source: "stripe".to_string(),
+            delivery_id: "evt_123".to_string(),
+        };
+
+        let first = hydra
+            .record_sensor_observation(
+                sensor_id.clone(),
+                "stripe",
+                cursor.clone(),
+                EventKind::Signal {
+                    source: NodeId::from_str("stripe.webhook"),
+                    name: "stripe_event_observed".to_string(),
+                    payload: HashMap::new(),
+                },
+            )
+            .unwrap();
+        let commit_count_after_first = hydra.commit_count();
+        let event_count_after_first = hydra.total_events();
+
+        let second = hydra
+            .record_sensor_observation(
+                sensor_id,
+                "stripe",
+                cursor,
+                EventKind::Signal {
+                    source: NodeId::from_str("stripe.webhook"),
+                    name: "duplicate_should_not_run".to_string(),
+                    payload: HashMap::new(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(hydra.commit_count(), commit_count_after_first);
+        assert_eq!(hydra.total_events(), event_count_after_first);
+        hydra.verify_commit_chain().unwrap();
+    }
+
+    #[test]
+    fn hydra_records_sensor_observation_for_run() {
+        use hydra_core::{
+            EventKind, NodeId, SensorId, SensorRun, SensorRunId, SensorRunStatus, SourceCursor,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let sensor_id = SensorId::from_str("sensor_github");
+        let run_id = SensorRunId::new();
+        let run = SensorRun {
+            id: run_id.clone(),
+            tenant_id: None,
+            sensor_id: sensor_id.clone(),
+            status: SensorRunStatus::Started,
+            source_system: "github".to_string(),
+            stream: Some("webhooks".to_string()),
+            started_at: now,
+            completed_at: None,
+            failed_at: None,
+            error: None,
+            actor_id: None,
+            metadata: HashMap::new(),
+        };
+        hydra.ingest(EventKind::SensorRunStarted { run }).unwrap();
+
+        let checkpoint = hydra
+            .record_sensor_observation_for_run(
+                Some(run_id.clone()),
+                sensor_id,
+                "github",
+                SourceCursor::DeliveryId {
+                    source: "github".to_string(),
+                    delivery_id: "delivery-1".to_string(),
+                },
+                EventKind::Signal {
+                    source: NodeId::from_str("github.webhook"),
+                    name: "github_delivery_observed".to_string(),
+                    payload: HashMap::new(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(checkpoint.run_id, Some(run_id.clone()));
+        assert_eq!(
+            hydra.sensor_run(&run_id).unwrap().status,
+            SensorRunStatus::Started
+        );
+        hydra.verify_commit_chain().unwrap();
+    }
+
+    #[test]
+    fn hydra_sensor_observation_helper_writes_to_commit_writer() {
+        use hydra_core::{EventKind, NodeId, SensorId, SourceCursor};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let writer = TestCommitWriter::new();
+        let commits = writer.commits();
+        hydra.set_commit_writer(writer);
+
+        hydra
+            .record_sensor_observation(
+                SensorId::from_str("sensor_writer"),
+                "test",
+                SourceCursor::Custom {
+                    source: "test".to_string(),
+                    value: "cursor-1".to_string(),
+                },
+                EventKind::Signal {
+                    source: NodeId::from_str("test.sensor"),
+                    name: "observation".to_string(),
+                    payload: HashMap::new(),
+                },
+            )
+            .unwrap();
+
+        // One commit for business event, one commit for SensorCheckpointRecorded.
+        assert_eq!(hydra.commit_count(), 2);
+        assert_eq!(commits.lock().unwrap().len(), 2);
     }
 
     #[test]
