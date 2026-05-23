@@ -7,7 +7,7 @@ use crate::state::AppState;
 use axum::http::{header, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
-use hydra_net::http::{ingest_router, schema_router};
+use hydra_net::http::{ingest_router, schema_router, sensor_router};
 use hydra_net::runtime::RuntimeHandle;
 use tower_http::cors::CorsLayer;
 
@@ -52,7 +52,8 @@ pub fn build_router(runtime: RuntimeHandle) -> Router {
     let state = AppState::new(runtime.clone());
     legacy_routes(state)
         .merge(schema_router(runtime.clone()))
-        .merge(ingest_router(runtime))
+        .merge(ingest_router(runtime.clone()))
+        .merge(sensor_router(runtime))
         .layer(cors_layer())
 }
 
@@ -636,5 +637,63 @@ mod tests {
             runtime.hydra().read().await.commit_count(),
             commit_count_after_schema
         );
+    }
+
+    #[tokio::test]
+    async fn api_sensor_observation_route_is_mounted_and_idempotent() {
+        use hydra_core::{EventKind, NodeId, SensorId, SourceCursor};
+        use hydra_net::http::sensor::{SensorObservationRequest, SensorObservationResponse};
+        use std::collections::HashMap;
+
+        let runtime = test_runtime();
+        let app = build_router(runtime.clone());
+
+        let request = SensorObservationRequest {
+            sensor_id: SensorId::from_str("sensor_api"),
+            source_system: "api-test".to_string(),
+            source_cursor: SourceCursor::DeliveryId {
+                source: "api-test".to_string(),
+                delivery_id: "delivery-1".to_string(),
+            },
+            event_kind: EventKind::Signal {
+                source: NodeId::from_str("api.sensor"),
+                name: "observation".to_string(),
+                payload: HashMap::new(),
+            },
+            run_id: None,
+        };
+        let body = serde_json::to_vec(&request).unwrap();
+
+        let http_request = Request::builder()
+            .method("POST")
+            .uri("/sensor/observation")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let response = app.clone().oneshot(http_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first: SensorObservationResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(!first.idempotent_hit);
+
+        let duplicate = Request::builder()
+            .method("POST")
+            .uri("/sensor/observation")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.oneshot(duplicate).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second: SensorObservationResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(second.idempotent_hit);
+        assert_eq!(second.checkpoint_id, first.checkpoint_id);
+
+        // Business event commit + checkpoint commit. Duplicate adds nothing.
+        assert_eq!(runtime.hydra().read().await.commit_count(), 2);
     }
 }
