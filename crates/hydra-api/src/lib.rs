@@ -37,9 +37,21 @@
 //!
 //! For a schema-only deployment without the legacy surface, use
 //! [`server::serve_schema`] instead.
+//!
+//! ## Authentication
+//!
+//! Authentication is opt-in in v0. Use [`server::build_router_with_auth`]
+//! or [`server::serve_with_auth`] with
+//! [`AuthConfig::require_for_mutations`] before exposing destructive
+//! routes (`POST /ingest`, `POST /schemas/*`, `POST /snapshots`,
+//! `POST /snapshots/:id/restore`, etc.) to untrusted clients. The
+//! default [`AuthConfig::off`] preserves existing behavior.
 
+pub mod auth;
 pub mod responses;
 pub mod routes;
 pub mod server;
 pub mod state;
 pub mod transport;
+
+pub use auth::{AuthConfig, AuthMode};

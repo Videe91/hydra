@@ -2,9 +2,11 @@
 //!
 //! Axum server with all routes, CORS, security middleware.
 
+use crate::auth::{auth_middleware, AuthConfig, AuthState};
 use crate::routes;
 use crate::state::AppState;
 use axum::http::{header, HeaderValue, Method};
+use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
 use hydra_net::http::{
@@ -51,23 +53,53 @@ fn legacy_routes(state: AppState) -> Router {
 /// CloudTrail ingestion writes are immediately visible to schema reads
 /// and vice versa.
 pub fn build_router(runtime: RuntimeHandle) -> Router {
+    build_router_with_auth(runtime, AuthConfig::off())
+}
+
+/// Build the unified Axum router with optional bearer-token authentication.
+///
+/// `AuthConfig::off()` preserves the existing public-by-default behavior.
+/// `AuthConfig::require_for_mutations(tokens)` gates POST/PUT/PATCH/DELETE.
+/// `AuthConfig::require_for_all(tokens)` gates everything except OPTIONS.
+///
+/// Auth is layered AFTER CORS so the auth check runs first on inbound
+/// requests; rejected requests never reach the route handlers.
+pub fn build_router_with_auth(runtime: RuntimeHandle, auth: AuthConfig) -> Router {
     let state = AppState::new(runtime.clone());
-    legacy_routes(state)
+    let app = legacy_routes(state)
         .merge(schema_router(runtime.clone()))
         .merge(ingest_router(runtime.clone()))
         .merge(sensor_router(runtime.clone()))
         .merge(commits_router(runtime.clone()))
         .merge(events_router(runtime.clone()))
         .merge(snapshots_router(runtime))
-        .layer(cors_layer())
+        .layer(cors_layer());
+    if auth.is_enabled() {
+        app.layer(middleware::from_fn_with_state(
+            AuthState::new(auth),
+            auth_middleware,
+        ))
+    } else {
+        app
+    }
 }
 
-/// Start the HTTP server on the given address.
+/// Start the HTTP server on the given address (no auth).
 pub async fn serve(
     runtime: RuntimeHandle,
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let router = build_router(runtime);
+    serve_with_auth(runtime, addr, AuthConfig::off()).await
+}
+
+/// Start the HTTP server on the given address with the supplied auth
+/// configuration.
+pub async fn serve_with_auth(
+    runtime: RuntimeHandle,
+    addr: &str,
+    auth: AuthConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let router = build_router_with_auth(runtime, auth);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
     Ok(())
@@ -908,5 +940,155 @@ mod tests {
         assert_eq!(body.manifest.id, created.manifest.id);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // === Auth middleware ===
+
+    fn empty_request(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn json_request<T: serde::Serialize>(method: &str, uri: &str, body: &T) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    fn with_bearer(mut request: Request<Body>, token: &str) -> Request<Body> {
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        request
+    }
+
+    #[tokio::test]
+    async fn auth_default_off_does_not_block_routes() {
+        let runtime = test_runtime();
+        let app = build_router(runtime);
+        let response = app
+            .oneshot(empty_request("GET", "/health"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_require_for_mutations_allows_get_without_token() {
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_mutations(["secret-token"]),
+        );
+        let response = app
+            .oneshot(empty_request("GET", "/health"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_require_for_mutations_rejects_post_without_token() {
+        use hydra_core::ActorId;
+        use hydra_net::http::snapshots::CreateSnapshotRequest;
+
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_mutations(["secret-token"]),
+        );
+        let request = json_request(
+            "POST",
+            "/snapshots",
+            &CreateSnapshotRequest {
+                created_by: ActorId::from_str("actor_auth_test"),
+            },
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_valid_bearer_token_allows_post() {
+        use hydra_core::ActorId;
+        use hydra_net::http::snapshots::CreateSnapshotRequest;
+
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_mutations(["secret-token"]),
+        );
+        let request = json_request(
+            "POST",
+            "/snapshots",
+            &CreateSnapshotRequest {
+                created_by: ActorId::from_str("actor_auth_test"),
+            },
+        );
+        let response = app
+            .oneshot(with_bearer(request, "secret-token"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn auth_invalid_bearer_token_rejects_post() {
+        use hydra_core::ActorId;
+        use hydra_net::http::snapshots::CreateSnapshotRequest;
+
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_mutations(["secret-token"]),
+        );
+        let request = json_request(
+            "POST",
+            "/snapshots",
+            &CreateSnapshotRequest {
+                created_by: ActorId::from_str("actor_auth_test"),
+            },
+        );
+        let response = app
+            .oneshot(with_bearer(request, "wrong-token"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_require_for_all_rejects_get_without_token() {
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_all(["secret-token"]),
+        );
+        let response = app
+            .oneshot(empty_request("GET", "/health"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_require_for_all_allows_options_for_cors_preflight() {
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_all(["secret-token"]),
+        );
+        let response = app
+            .oneshot(empty_request("OPTIONS", "/health"))
+            .await
+            .unwrap();
+        // OPTIONS must NOT be 401 — the CORS layer below auth handles it.
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
