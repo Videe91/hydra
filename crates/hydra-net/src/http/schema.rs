@@ -7,10 +7,12 @@ use axum::{
     Json, Router,
 };
 use hydra_core::{
-    Action, FieldSchema, SchemaDefinition, SchemaId,
+    Action, Claim, Evidence, FieldSchema, Policy, SchemaDefinition, SchemaId, TypeId, Value,
+    ValueType,
 };
 use hydra_engine::schema_validator::{SchemaValidationError, SchemaValidationReport};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Shared HTTP state for schema routes.
 #[derive(Clone)]
@@ -26,18 +28,96 @@ impl SchemaHttpState {
 
 /// Build the schema HTTP router.
 ///
-/// Mounted route shape:
+/// Mounted route shape (full schema HTTP surface):
+///
+/// Read:
 /// - GET  /schemas/active
+/// - GET  /schemas/disabled
+/// - GET  /schemas/archived
+/// - GET  /schemas/entity/:type_id
+/// - GET  /schemas/evidence/:kind
+/// - GET  /schemas/claim/:predicate
+/// - GET  /schemas/action/:action_kind
+/// - GET  /schemas/policy/:policy_kind
+///
+/// Register:
+/// - POST /schemas/entity
+/// - POST /schemas/evidence
+/// - POST /schemas/claim-predicate
 /// - POST /schemas/action
-/// - POST /schemas/validate/action
+/// - POST /schemas/policy-condition
+///
+/// Lifecycle:
 /// - POST /schemas/:schema_id/disable
+/// - POST /schemas/:schema_id/archive
+///
+/// Validate:
+/// - POST /schemas/validate/action
+/// - POST /schemas/validate/evidence
+/// - POST /schemas/validate/claim
+/// - POST /schemas/validate/policy
+/// - POST /schemas/validate/node-create
+/// - POST /schemas/validate/node-update
 pub fn schema_router(runtime: RuntimeHandle) -> Router {
     Router::new()
+        // Read
         .route("/schemas/active", get(active_schemas))
+        .route("/schemas/disabled", get(disabled_schemas))
+        .route("/schemas/archived", get(archived_schemas))
+        .route("/schemas/entity/:type_id", get(get_entity_schema))
+        .route("/schemas/evidence/:kind", get(get_evidence_schema))
+        .route("/schemas/claim/:predicate", get(get_claim_predicate_schema))
+        .route("/schemas/action/:action_kind", get(get_action_payload_schema))
+        .route(
+            "/schemas/policy/:policy_kind",
+            get(get_policy_condition_schema),
+        )
+        // Register
+        .route("/schemas/entity", post(register_entity_schema))
+        .route("/schemas/evidence", post(register_evidence_schema))
+        .route(
+            "/schemas/claim-predicate",
+            post(register_claim_predicate_schema),
+        )
         .route("/schemas/action", post(register_action_schema))
-        .route("/schemas/validate/action", post(validate_action))
+        .route(
+            "/schemas/policy-condition",
+            post(register_policy_condition_schema),
+        )
+        // Lifecycle
         .route("/schemas/:schema_id/disable", post(disable_schema))
+        .route("/schemas/:schema_id/archive", post(archive_schema))
+        // Validate
+        .route("/schemas/validate/action", post(validate_action))
+        .route("/schemas/validate/evidence", post(validate_evidence))
+        .route("/schemas/validate/claim", post(validate_claim))
+        .route("/schemas/validate/policy", post(validate_policy))
+        .route("/schemas/validate/node-create", post(validate_node_create))
+        .route("/schemas/validate/node-update", post(validate_node_update))
         .with_state(SchemaHttpState::new(runtime))
+}
+
+// === Register request DTOs (one per SchemaDefinition variant) ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterEntitySchemaRequest {
+    pub type_id: TypeId,
+    pub name: String,
+    pub fields: Vec<FieldSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterEvidenceSchemaRequest {
+    pub kind: String,
+    pub fields: Vec<FieldSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterClaimPredicateSchemaRequest {
+    pub predicate: String,
+    pub subject_type: Option<TypeId>,
+    pub object_type: ValueType,
+    pub allowed_claim_kinds: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,9 +127,19 @@ pub struct RegisterActionSchemaRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DisableSchemaRequest {
+pub struct RegisterPolicyConditionSchemaRequest {
+    pub policy_kind: String,
+    pub fields: Vec<FieldSchema>,
+}
+
+// === Lifecycle request DTO (shared by disable + archive) ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaLifecycleRequest {
     pub reason: Option<String>,
 }
+
+// === Validate request DTOs (one per typed write surface) ===
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidateActionRequest {
@@ -57,12 +147,43 @@ pub struct ValidateActionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateEvidenceRequest {
+    pub evidence: Evidence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateClaimRequest {
+    pub claim: Claim,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatePolicyRequest {
+    pub policy: Policy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateNodeCreateRequest {
+    pub type_id: TypeId,
+    pub properties: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateNodeUpdateRequest {
+    pub type_id: TypeId,
+    pub changes: HashMap<String, Value>,
+}
+
+// === Response DTOs ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaIdResponse {
     pub schema_id: SchemaId,
 }
 
+/// Shared response shape for any list-of-schemas endpoint
+/// (active / disabled / archived).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActiveSchemasResponse {
+pub struct SchemasResponse {
     pub schemas: Vec<SchemaDefinition>,
 }
 
@@ -119,9 +240,145 @@ fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
         .into_response()
 }
 
+// === Read handlers ===
+
 async fn active_schemas(State(state): State<SchemaHttpState>) -> Response {
-    let schemas = state.runtime.schema().active_schemas().await;
-    Json(ActiveSchemasResponse { schemas }).into_response()
+    Json(SchemasResponse {
+        schemas: state.runtime.schema().active_schemas().await,
+    })
+    .into_response()
+}
+
+async fn disabled_schemas(State(state): State<SchemaHttpState>) -> Response {
+    Json(SchemasResponse {
+        schemas: state.runtime.schema().disabled_schemas().await,
+    })
+    .into_response()
+}
+
+async fn archived_schemas(State(state): State<SchemaHttpState>) -> Response {
+    Json(SchemasResponse {
+        schemas: state.runtime.schema().archived_schemas().await,
+    })
+    .into_response()
+}
+
+async fn get_entity_schema(
+    State(state): State<SchemaHttpState>,
+    Path(type_id): Path<String>,
+) -> Response {
+    let type_id = TypeId::from_str(&type_id);
+    match state.runtime.schema().entity_schema(&type_id).await {
+        Some(schema) => Json(schema).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "entity schema not found"),
+    }
+}
+
+async fn get_evidence_schema(
+    State(state): State<SchemaHttpState>,
+    Path(kind): Path<String>,
+) -> Response {
+    match state.runtime.schema().evidence_schema(&kind).await {
+        Some(schema) => Json(schema).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "evidence schema not found"),
+    }
+}
+
+async fn get_claim_predicate_schema(
+    State(state): State<SchemaHttpState>,
+    Path(predicate): Path<String>,
+) -> Response {
+    match state.runtime.schema().claim_predicate_schema(&predicate).await {
+        Some(schema) => Json(schema).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "claim predicate schema not found"),
+    }
+}
+
+async fn get_action_payload_schema(
+    State(state): State<SchemaHttpState>,
+    Path(action_kind): Path<String>,
+) -> Response {
+    match state.runtime.schema().action_payload_schema(&action_kind).await {
+        Some(schema) => Json(schema).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "action payload schema not found"),
+    }
+}
+
+async fn get_policy_condition_schema(
+    State(state): State<SchemaHttpState>,
+    Path(policy_kind): Path<String>,
+) -> Response {
+    match state.runtime.schema().policy_condition_schema(&policy_kind).await {
+        Some(schema) => Json(schema).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "policy condition schema not found"),
+    }
+}
+
+// === Register handlers ===
+
+async fn register_entity_schema(
+    State(state): State<SchemaHttpState>,
+    Json(request): Json<RegisterEntitySchemaRequest>,
+) -> Response {
+    match state
+        .runtime
+        .schema_admin()
+        .register_entity_schema(request.type_id, request.name, request.fields)
+        .await
+    {
+        Ok(schema_id) => {
+            (StatusCode::CREATED, Json(SchemaIdResponse { schema_id })).into_response()
+        }
+        Err(error) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("failed to register entity schema: {error}"),
+        ),
+    }
+}
+
+async fn register_evidence_schema(
+    State(state): State<SchemaHttpState>,
+    Json(request): Json<RegisterEvidenceSchemaRequest>,
+) -> Response {
+    match state
+        .runtime
+        .schema_admin()
+        .register_evidence_schema(request.kind, request.fields)
+        .await
+    {
+        Ok(schema_id) => {
+            (StatusCode::CREATED, Json(SchemaIdResponse { schema_id })).into_response()
+        }
+        Err(error) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("failed to register evidence schema: {error}"),
+        ),
+    }
+}
+
+async fn register_claim_predicate_schema(
+    State(state): State<SchemaHttpState>,
+    Json(request): Json<RegisterClaimPredicateSchemaRequest>,
+) -> Response {
+    match state
+        .runtime
+        .schema_admin()
+        .register_claim_predicate_schema(
+            request.predicate,
+            request.subject_type,
+            request.object_type,
+            request.allowed_claim_kinds,
+        )
+        .await
+    {
+        Ok(schema_id) => {
+            (StatusCode::CREATED, Json(SchemaIdResponse { schema_id })).into_response()
+        }
+        Err(error) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("failed to register claim predicate schema: {error}"),
+        ),
+    }
 }
 
 async fn register_action_schema(
@@ -144,22 +401,32 @@ async fn register_action_schema(
     }
 }
 
-async fn validate_action(
+async fn register_policy_condition_schema(
     State(state): State<SchemaHttpState>,
-    Json(request): Json<ValidateActionRequest>,
+    Json(request): Json<RegisterPolicyConditionSchemaRequest>,
 ) -> Response {
-    let report = state
+    match state
         .runtime
-        .schema()
-        .validate_action_payload(&request.action)
-        .await;
-    Json(ValidationResponse::from(report)).into_response()
+        .schema_admin()
+        .register_policy_condition_schema(request.policy_kind, request.fields)
+        .await
+    {
+        Ok(schema_id) => {
+            (StatusCode::CREATED, Json(SchemaIdResponse { schema_id })).into_response()
+        }
+        Err(error) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("failed to register policy condition schema: {error}"),
+        ),
+    }
 }
+
+// === Lifecycle handlers ===
 
 async fn disable_schema(
     State(state): State<SchemaHttpState>,
     Path(schema_id): Path<String>,
-    Json(request): Json<DisableSchemaRequest>,
+    Json(request): Json<SchemaLifecycleRequest>,
 ) -> Response {
     let schema_id = SchemaId::from_str(&schema_id);
     match state
@@ -174,6 +441,96 @@ async fn disable_schema(
             format!("failed to disable schema: {error}"),
         ),
     }
+}
+
+async fn archive_schema(
+    State(state): State<SchemaHttpState>,
+    Path(schema_id): Path<String>,
+    Json(request): Json<SchemaLifecycleRequest>,
+) -> Response {
+    let schema_id = SchemaId::from_str(&schema_id);
+    match state
+        .runtime
+        .schema_admin()
+        .archive_schema(schema_id, request.reason)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("failed to archive schema: {error}"),
+        ),
+    }
+}
+
+// === Validate handlers ===
+
+async fn validate_action(
+    State(state): State<SchemaHttpState>,
+    Json(request): Json<ValidateActionRequest>,
+) -> Response {
+    let report = state
+        .runtime
+        .schema()
+        .validate_action_payload(&request.action)
+        .await;
+    Json(ValidationResponse::from(report)).into_response()
+}
+
+async fn validate_evidence(
+    State(state): State<SchemaHttpState>,
+    Json(request): Json<ValidateEvidenceRequest>,
+) -> Response {
+    let report = state
+        .runtime
+        .schema()
+        .validate_evidence(&request.evidence)
+        .await;
+    Json(ValidationResponse::from(report)).into_response()
+}
+
+async fn validate_claim(
+    State(state): State<SchemaHttpState>,
+    Json(request): Json<ValidateClaimRequest>,
+) -> Response {
+    let report = state.runtime.schema().validate_claim(&request.claim).await;
+    Json(ValidationResponse::from(report)).into_response()
+}
+
+async fn validate_policy(
+    State(state): State<SchemaHttpState>,
+    Json(request): Json<ValidatePolicyRequest>,
+) -> Response {
+    let report = state
+        .runtime
+        .schema()
+        .validate_policy_condition(&request.policy)
+        .await;
+    Json(ValidationResponse::from(report)).into_response()
+}
+
+async fn validate_node_create(
+    State(state): State<SchemaHttpState>,
+    Json(request): Json<ValidateNodeCreateRequest>,
+) -> Response {
+    let report = state
+        .runtime
+        .schema()
+        .validate_node_create(&request.type_id, &request.properties)
+        .await;
+    Json(ValidationResponse::from(report)).into_response()
+}
+
+async fn validate_node_update(
+    State(state): State<SchemaHttpState>,
+    Json(request): Json<ValidateNodeUpdateRequest>,
+) -> Response {
+    let report = state
+        .runtime
+        .schema()
+        .validate_node_update(&request.type_id, &request.changes)
+        .await;
+    Json(ValidationResponse::from(report)).into_response()
 }
 
 #[cfg(test)]
@@ -250,7 +607,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = read_body_bytes(response).await;
-        let decoded: ActiveSchemasResponse = serde_json::from_slice(&body).unwrap();
+        let decoded: SchemasResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(decoded.schemas.len(), 0);
 
         runtime
@@ -277,7 +634,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = read_body_bytes(response).await;
-        let decoded: ActiveSchemasResponse = serde_json::from_slice(&body).unwrap();
+        let decoded: SchemasResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(decoded.schemas.len(), 1);
     }
 
@@ -390,7 +747,7 @@ mod tests {
             .await
             .unwrap();
         let app = schema_router(runtime.clone());
-        let request = DisableSchemaRequest {
+        let request = SchemaLifecycleRequest {
             reason: Some("deprecated".to_string()),
         };
         let response = app
@@ -410,5 +767,361 @@ mod tests {
             }
             other => panic!("expected action payload schema, got {other:?}"),
         }
+    }
+
+    // === Read-route tests ===
+
+    #[tokio::test]
+    async fn get_disabled_schemas_returns_one_after_disable() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let schema_id = runtime
+            .schema_admin()
+            .register_action_payload_schema(
+                "PostLedgerEntry",
+                vec![FieldSchema::required("amount", ValueType::Float)],
+            )
+            .await
+            .unwrap();
+        runtime
+            .schema_admin()
+            .disable_schema(schema_id, None)
+            .await
+            .unwrap();
+        let app = schema_router(runtime);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/schemas/disabled")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_body_bytes(response).await;
+        let decoded: SchemasResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded.schemas.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_action_schema_by_kind_returns_schema() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        runtime
+            .schema_admin()
+            .register_action_payload_schema(
+                "PostLedgerEntry",
+                vec![FieldSchema::required("amount", ValueType::Float)],
+            )
+            .await
+            .unwrap();
+        let app = schema_router(runtime);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/schemas/action/PostLedgerEntry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_entity_schema_returns_schema() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        runtime
+            .schema_admin()
+            .register_entity_schema(
+                TypeId::from_str("type_invoice"),
+                "Invoice",
+                vec![
+                    FieldSchema::required("invoice_number", ValueType::String),
+                    FieldSchema::required("amount", ValueType::Float),
+                ],
+            )
+            .await
+            .unwrap();
+        let app = schema_router(runtime);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/schemas/entity/type_invoice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_missing_schema_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = schema_router(runtime);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/schemas/entity/type_does_not_exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // === Register-route tests ===
+
+    #[tokio::test]
+    async fn post_entity_schema_registers_schema() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = schema_router(runtime.clone());
+        let request = RegisterEntitySchemaRequest {
+            type_id: TypeId::from_str("type_invoice"),
+            name: "Invoice".to_string(),
+            fields: vec![FieldSchema::required("invoice_number", ValueType::String)],
+        };
+        let response = app
+            .oneshot(request_json(Method::POST, "/schemas/entity", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(runtime
+            .schema()
+            .entity_schema(&TypeId::from_str("type_invoice"))
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn post_evidence_schema_registers_schema() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = schema_router(runtime.clone());
+        let request = RegisterEvidenceSchemaRequest {
+            kind: "bank_transaction".to_string(),
+            fields: vec![
+                FieldSchema::required("amount", ValueType::Float),
+                FieldSchema::required("currency", ValueType::String),
+            ],
+        };
+        let response = app
+            .oneshot(request_json(Method::POST, "/schemas/evidence", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(runtime
+            .schema()
+            .evidence_schema("bank_transaction")
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn post_claim_predicate_schema_registers_schema() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = schema_router(runtime.clone());
+        let request = RegisterClaimPredicateSchemaRequest {
+            predicate: "is_stale".to_string(),
+            subject_type: Some(TypeId::from_str("type_dataset")),
+            object_type: ValueType::Bool,
+            allowed_claim_kinds: vec!["AnomalyFinding".to_string()],
+        };
+        let response = app
+            .oneshot(request_json(
+                Method::POST,
+                "/schemas/claim-predicate",
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(runtime
+            .schema()
+            .claim_predicate_schema("is_stale")
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn post_policy_condition_schema_registers_schema() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = schema_router(runtime.clone());
+        let request = RegisterPolicyConditionSchemaRequest {
+            policy_kind: "AutoApproval".to_string(),
+            fields: vec![FieldSchema::required("max_amount", ValueType::Float)],
+        };
+        let response = app
+            .oneshot(request_json(
+                Method::POST,
+                "/schemas/policy-condition",
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(runtime
+            .schema()
+            .policy_condition_schema("AutoApproval")
+            .await
+            .is_some());
+    }
+
+    // === Validate-route tests ===
+
+    #[tokio::test]
+    async fn validate_node_create_returns_valid_for_good_payload() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        runtime
+            .schema_admin()
+            .register_entity_schema(
+                TypeId::from_str("type_invoice"),
+                "Invoice",
+                vec![
+                    FieldSchema::required("invoice_number", ValueType::String),
+                    FieldSchema::required("amount", ValueType::Float),
+                ],
+            )
+            .await
+            .unwrap();
+        let app = schema_router(runtime);
+        let mut properties = HashMap::new();
+        properties.insert(
+            "invoice_number".to_string(),
+            Value::String("INV-001".to_string()),
+        );
+        properties.insert("amount".to_string(), Value::Float(100.0));
+        let request = ValidateNodeCreateRequest {
+            type_id: TypeId::from_str("type_invoice"),
+            properties,
+        };
+        let response = app
+            .oneshot(request_json(
+                Method::POST,
+                "/schemas/validate/node-create",
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_body_bytes(response).await;
+        let decoded: ValidationResponse = serde_json::from_slice(&body).unwrap();
+        assert!(decoded.valid);
+        assert!(decoded.schema_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn validate_node_update_reports_unknown_field() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        runtime
+            .schema_admin()
+            .register_entity_schema(
+                TypeId::from_str("type_invoice"),
+                "Invoice",
+                vec![
+                    FieldSchema::required("invoice_number", ValueType::String),
+                    FieldSchema::required("amount", ValueType::Float),
+                ],
+            )
+            .await
+            .unwrap();
+        let app = schema_router(runtime);
+        let mut changes = HashMap::new();
+        changes.insert("unknown".to_string(), Value::String("x".to_string()));
+        let request = ValidateNodeUpdateRequest {
+            type_id: TypeId::from_str("type_invoice"),
+            changes,
+        };
+        let response = app
+            .oneshot(request_json(
+                Method::POST,
+                "/schemas/validate/node-update",
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_body_bytes(response).await;
+        let decoded: ValidationResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!decoded.valid);
+        assert_eq!(decoded.errors[0].path, "unknown");
+    }
+
+    #[tokio::test]
+    async fn validate_policy_reports_missing_max_amount() {
+        use hydra_core::{PolicyId, PolicyKind, PolicyScope, PolicyStatus};
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        runtime
+            .schema_admin()
+            .register_policy_condition_schema(
+                "AutoApproval",
+                vec![FieldSchema::required("max_amount", ValueType::Float)],
+            )
+            .await
+            .unwrap();
+        let app = schema_router(runtime);
+        let now = chrono::Utc::now();
+        let policy = Policy {
+            id: PolicyId::new(),
+            tenant_id: None,
+            name: "missing condition".to_string(),
+            kind: PolicyKind::AutoApproval,
+            status: PolicyStatus::Active,
+            scope: PolicyScope::AnyAction,
+            condition: HashMap::new(),
+            metadata: HashMap::new(),
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        let request = ValidatePolicyRequest { policy };
+        let response = app
+            .oneshot(request_json(
+                Method::POST,
+                "/schemas/validate/policy",
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_body_bytes(response).await;
+        let decoded: ValidationResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!decoded.valid);
+        assert_eq!(decoded.errors[0].path, "max_amount");
+    }
+
+    // === Lifecycle-route tests ===
+
+    #[tokio::test]
+    async fn post_archive_schema_moves_schema_to_archived() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let schema_id = runtime
+            .schema_admin()
+            .register_action_payload_schema(
+                "PostLedgerEntry",
+                vec![FieldSchema::required("amount", ValueType::Float)],
+            )
+            .await
+            .unwrap();
+        let app = schema_router(runtime.clone());
+        let request = SchemaLifecycleRequest {
+            reason: Some("end of life".to_string()),
+        };
+        let response = app
+            .oneshot(request_json(
+                Method::POST,
+                &format!("/schemas/{schema_id}/archive"),
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(runtime.schema().active_schemas().await.len(), 0);
+        assert_eq!(runtime.schema().archived_schemas().await.len(), 1);
     }
 }
