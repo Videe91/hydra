@@ -18,6 +18,7 @@ pub mod commit_ledger;
 pub mod sensor_checkpoint_store;
 pub mod schema_registry_store;
 pub mod schema_validator;
+pub mod schema_gate;
 pub mod remediation_agent;
 pub mod outcome_agent;
 pub mod reflex;
@@ -69,6 +70,9 @@ pub mod prelude {
     pub use crate::schema_registry_store::SchemaRegistryStore;
     pub use crate::schema_validator::{
         SchemaValidationError, SchemaValidationReport, SchemaValidator,
+    };
+    pub use crate::schema_gate::{
+        SchemaGate, SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy,
     };
     pub use crate::remediation_agent::RemediationAgent;
     pub use crate::outcome_agent::OutcomeAgent;

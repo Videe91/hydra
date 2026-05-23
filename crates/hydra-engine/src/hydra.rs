@@ -2,6 +2,7 @@ use crate::anomaly::{Anomaly, AnomalyEngine};
 use crate::cascade::{CascadeConfig, CascadeEngine, CascadeResult};
 use crate::commit_ledger::CommitLedger;
 use crate::coverage::{CoverageEngine, CoverageReport};
+use crate::schema_gate::{SchemaGate, SchemaGateConfig};
 use crate::schema_registry_store::SchemaRegistryStore;
 use crate::schema_validator::SchemaValidator;
 use crate::sensor_checkpoint_store::SensorCheckpointStore;
@@ -65,6 +66,7 @@ pub struct Hydra {
     sensor_checkpoint_store: SensorCheckpointStore,
     schema_registry_store: SchemaRegistryStore,
     schema_validator: SchemaValidator,
+    schema_gate: SchemaGate,
     reflex_registry: ReflexRegistry,
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
@@ -140,6 +142,7 @@ impl Hydra {
             sensor_checkpoint_store: SensorCheckpointStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
             schema_validator: SchemaValidator::new(),
+            schema_gate: SchemaGate::disabled(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -173,6 +176,7 @@ impl Hydra {
             sensor_checkpoint_store: SensorCheckpointStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
             schema_validator: SchemaValidator::new(),
+            schema_gate: SchemaGate::disabled(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -301,6 +305,16 @@ impl Hydra {
                 return Ok(CascadeResult::from_committed_events(batch.events.clone()));
             }
         }
+
+        // Schema gate runs AFTER idempotency short-circuit and BEFORE cascade.
+        // In Strict mode, invalid writes are rejected here — no cascade, no
+        // commit, no writer, no WAL. Permissive and Off modes always allow
+        // through.
+        self.schema_gate.validate_event(
+            &self.schema_registry_store,
+            &self.schema_validator,
+            &event,
+        )?;
 
         // The cascade engine drives both topology projection AND the epistemic
         // store, so verification / remediation / policy / outcome reflexes
@@ -1074,6 +1088,20 @@ impl Hydra {
     ) -> crate::schema_validator::SchemaValidationReport {
         self.schema_validator
             .validate_evidence_payload(&self.schema_registry_store, evidence_kind, payload)
+    }
+
+    // === Schema gate (pre-cascade enforcement) ===
+
+    pub fn schema_gate(&self) -> &SchemaGate {
+        &self.schema_gate
+    }
+
+    pub fn schema_gate_mut(&mut self) -> &mut SchemaGate {
+        &mut self.schema_gate
+    }
+
+    pub fn set_schema_gate_config(&mut self, config: SchemaGateConfig) {
+        self.schema_gate.set_config(config);
     }
 
     /// Record one external sensor observation safely.
@@ -3443,5 +3471,245 @@ mod sprint1_tests {
         assert!(report.is_invalid());
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].path, "amount");
+    }
+
+    #[test]
+    fn hydra_schema_gate_default_off_does_not_block_invalid_action() {
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionStatus, ActionTarget, ActorId, EventKind, Value,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let mut payload = HashMap::new();
+        payload.insert("amount".to_string(), Value::String("bad".to_string()));
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: None,
+            kind: ActionKind::PostLedgerEntry,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("ledger".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_bookkeeper"),
+            approved_by: None,
+            policy_id: None,
+            payload,
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        let result = hydra.ingest(EventKind::ActionProposed { action });
+        assert!(result.is_ok());
+        assert_eq!(hydra.commit_count(), 1);
+    }
+
+    #[test]
+    fn hydra_schema_gate_strict_rejects_invalid_action_before_commit() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionPayloadSchema, ActionStatus, ActionTarget, ActorId,
+            EventKind, FieldSchema, SchemaDefinition, SchemaId, SchemaStatus, Value, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let schema = ActionPayloadSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            action_kind: "PostLedgerEntry".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("account", ValueType::String),
+                FieldSchema::required("amount", ValueType::Float),
+            ],
+            created_by: ActorId::from_str("actor_schema"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        hydra
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::ActionPayload(schema),
+            })
+            .unwrap();
+        assert_eq!(hydra.commit_count(), 1);
+
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Allow,
+        });
+
+        let mut payload = HashMap::new();
+        payload.insert("account".to_string(), Value::String("Cash".to_string()));
+        payload.insert("amount".to_string(), Value::String("bad".to_string()));
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: None,
+            kind: ActionKind::PostLedgerEntry,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("ledger".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_bookkeeper"),
+            approved_by: None,
+            policy_id: None,
+            payload,
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        let events_before = hydra.total_events();
+        let result = hydra.ingest(EventKind::ActionProposed { action });
+        assert!(result.is_err());
+        // No new commit, no new event.
+        assert_eq!(hydra.commit_count(), 1);
+        assert_eq!(hydra.total_events(), events_before);
+    }
+
+    #[test]
+    fn hydra_schema_gate_strict_allows_valid_action() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionPayloadSchema, ActionStatus, ActionTarget, ActorId,
+            EventKind, FieldSchema, SchemaDefinition, SchemaId, SchemaStatus, Value, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let schema = ActionPayloadSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            action_kind: "PostLedgerEntry".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("account", ValueType::String),
+                FieldSchema::required("amount", ValueType::Float),
+            ],
+            created_by: ActorId::from_str("actor_schema"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        hydra
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::ActionPayload(schema),
+            })
+            .unwrap();
+
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Allow,
+        });
+
+        let mut payload = HashMap::new();
+        payload.insert("account".to_string(), Value::String("Cash".to_string()));
+        payload.insert("amount".to_string(), Value::Float(100.0));
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: None,
+            kind: ActionKind::PostLedgerEntry,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("ledger".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_bookkeeper"),
+            approved_by: None,
+            policy_id: None,
+            payload,
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        let result = hydra.ingest(EventKind::ActionProposed { action });
+        assert!(result.is_ok());
+        assert_eq!(hydra.commit_count(), 2);
+    }
+
+    #[test]
+    fn hydra_schema_gate_strict_reject_unknown_schema() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionStatus, ActionTarget, ActorId, EventKind,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Reject,
+        });
+
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: None,
+            kind: ActionKind::PostLedgerEntry,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("ledger".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_bookkeeper"),
+            approved_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        let result = hydra.ingest(EventKind::ActionProposed { action });
+        assert!(result.is_err());
+        assert_eq!(hydra.commit_count(), 0);
+        assert_eq!(hydra.total_events(), 0);
+    }
+
+    #[test]
+    fn idempotent_retry_short_circuits_before_schema_gate() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{EventKind, IdempotencyKey, NodeId};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let key = IdempotencyKey::new("schema-gate-retry");
+        let first = hydra
+            .ingest_with_idempotency_key(
+                EventKind::Signal {
+                    source: NodeId::from_str("test"),
+                    name: "first".to_string(),
+                    payload: HashMap::new(),
+                },
+                key.clone(),
+            )
+            .unwrap();
+        assert_eq!(hydra.commit_count(), 1);
+
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Reject,
+        });
+
+        let second = hydra
+            .ingest_with_idempotency_key(
+                EventKind::Signal {
+                    source: NodeId::from_str("test"),
+                    name: "second_should_not_run".to_string(),
+                    payload: HashMap::new(),
+                },
+                key,
+            )
+            .unwrap();
+        assert_eq!(hydra.commit_count(), 1);
+        assert_eq!(second.events[0].id, first.events[0].id);
     }
 }
