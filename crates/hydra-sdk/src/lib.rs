@@ -1,8 +1,10 @@
 pub mod builder;
+pub mod schema;
 pub mod test_hydra;
 
 pub mod prelude {
     pub use crate::builder::HydraBuilder;
+    pub use crate::schema::SchemaApi;
     pub use crate::test_hydra::TestHydra;
 
     // Re-export the most commonly needed types from downstream crates

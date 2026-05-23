@@ -249,6 +249,15 @@ impl TestHydra {
         );
     }
 
+    /// Schema introspection + preflight validation handle.
+    ///
+    /// Returns the same SchemaValidationReport that strict SchemaGate
+    /// would produce at ingestion time, so callers can preflight payloads
+    /// before attempting writes.
+    pub fn schema(&self) -> crate::schema::SchemaApi<'_> {
+        crate::schema::SchemaApi::new(&self.hydra)
+    }
+
     /// Access the underlying Hydra for advanced operations
     pub fn hydra(&self) -> &Hydra {
         &self.hydra
