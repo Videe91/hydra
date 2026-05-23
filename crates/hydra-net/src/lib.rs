@@ -12,7 +12,7 @@ pub mod prelude {
         PollSensor, PollSensorHandle, SensorBatch, SensorEmitter, SensorError, SensorResult,
     };
     pub use crate::bus::{BusConfig, BusMetrics, CascadeNotification};
-    pub use crate::http::{schema_router, SchemaHttpState};
+    pub use crate::http::{ingest_router, schema_router, IngestHttpState, SchemaHttpState};
     pub use crate::query::{QueryService, QueryStats};
     pub use crate::schema_admin_service::{SchemaAdminService, SchemaFields};
     pub use crate::schema_service::SchemaService;

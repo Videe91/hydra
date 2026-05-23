@@ -7,7 +7,7 @@ use crate::state::AppState;
 use axum::http::{header, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
-use hydra_net::http::schema_router;
+use hydra_net::http::{ingest_router, schema_router};
 use hydra_net::runtime::RuntimeHandle;
 use tower_http::cors::CorsLayer;
 
@@ -51,7 +51,8 @@ fn legacy_routes(state: AppState) -> Router {
 pub fn build_router(runtime: RuntimeHandle) -> Router {
     let state = AppState::new(runtime.clone());
     legacy_routes(state)
-        .merge(schema_router(runtime))
+        .merge(schema_router(runtime.clone()))
+        .merge(ingest_router(runtime))
         .layer(cors_layer())
 }
 
@@ -486,5 +487,154 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_ingest_route_is_mounted_and_idempotent() {
+        use hydra_core::{EventKind, NodeId};
+        use hydra_net::http::ingest::{IngestRequest, IngestResponse};
+        use std::collections::HashMap;
+
+        let runtime = test_runtime();
+        let app = build_router(runtime.clone());
+
+        let request = IngestRequest {
+            event_kind: EventKind::Signal {
+                source: NodeId::from_str("test.api"),
+                name: "api_ingest".to_string(),
+                payload: HashMap::new(),
+            },
+        };
+
+        let http_request = Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header("content-type", "application/json")
+            .header("Idempotency-Key", "api-ingest-1")
+            .body(Body::from(serde_json::to_vec(&request).unwrap()))
+            .unwrap();
+        let response = app.clone().oneshot(http_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first: IngestResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!first.idempotent_hit);
+        assert_eq!(runtime.hydra().read().await.commit_count(), 1);
+
+        let duplicate = Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header("content-type", "application/json")
+            .header("Idempotency-Key", "api-ingest-1")
+            .body(Body::from(serde_json::to_vec(&request).unwrap()))
+            .unwrap();
+        let response = app.oneshot(duplicate).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second: IngestResponse = serde_json::from_slice(&body).unwrap();
+        assert!(second.idempotent_hit);
+        assert_eq!(runtime.hydra().read().await.commit_count(), 1);
+        assert_eq!(second.event_ids, first.event_ids);
+    }
+
+    /// Schema gate failures surface over the public /ingest route — proves
+    /// schema preflight (POST /schemas/validate/*) and ingest enforcement
+    /// (POST /ingest) talk to the same engine and use the same gate.
+    #[tokio::test]
+    async fn api_ingest_strict_schema_gate_rejection_returns_400() {
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionPayloadSchema, ActionStatus, ActionTarget,
+            ActorId, EventKind, FieldSchema, SchemaDefinition, SchemaId, SchemaStatus, Value,
+            ValueType,
+        };
+        use hydra_engine::schema_gate::{
+            SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy,
+        };
+        use hydra_net::http::ingest::IngestRequest;
+        use std::collections::HashMap;
+
+        let runtime = test_runtime();
+
+        // Register an action schema and flip strict mode on, all via the
+        // RuntimeHandle so the test doesn't depend on POST /schemas/action
+        // working in this test.
+        {
+            let hydra_arc = runtime.hydra();
+            let mut hydra = hydra_arc.write().await;
+            let now = chrono::Utc::now();
+            let schema = ActionPayloadSchema {
+                id: SchemaId::new(),
+                tenant_id: None,
+                action_kind: "PostLedgerEntry".to_string(),
+                status: SchemaStatus::Active,
+                fields: vec![
+                    FieldSchema::required("account", ValueType::String),
+                    FieldSchema::required("amount", ValueType::Float),
+                ],
+                created_by: ActorId::from_str("actor_schema_gate_api_test"),
+                created_at: now,
+                updated_at: now,
+                metadata: HashMap::new(),
+            };
+            hydra
+                .ingest(EventKind::SchemaRegistered {
+                    schema: SchemaDefinition::ActionPayload(schema),
+                })
+                .unwrap();
+            hydra.set_schema_gate_config(SchemaGateConfig {
+                mode: SchemaGateMode::Strict,
+                unknown_schema_policy: UnknownSchemaPolicy::Allow,
+            });
+        }
+        let commit_count_after_schema = runtime.hydra().read().await.commit_count();
+
+        let app = build_router(runtime.clone());
+
+        // Build an ActionProposed event whose payload fails the schema:
+        // amount is a String, not a Float.
+        let now = chrono::Utc::now();
+        let mut payload = HashMap::new();
+        payload.insert("account".to_string(), Value::String("Cash".to_string()));
+        payload.insert("amount".to_string(), Value::String("bad".to_string()));
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: None,
+            kind: ActionKind::PostLedgerEntry,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("ledger".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_ingest_api_test"),
+            approved_by: None,
+            policy_id: None,
+            payload,
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        let request = IngestRequest {
+            event_kind: EventKind::ActionProposed { action },
+        };
+
+        let http_request = Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&request).unwrap()))
+            .unwrap();
+        let response = app.oneshot(http_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // No new commit — strict gate rejected before commit_ledger was
+        // touched.
+        assert_eq!(
+            runtime.hydra().read().await.commit_count(),
+            commit_count_after_schema
+        );
     }
 }
