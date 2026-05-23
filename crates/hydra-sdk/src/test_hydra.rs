@@ -258,6 +258,18 @@ impl TestHydra {
         crate::schema::SchemaApi::new(&self.hydra)
     }
 
+    /// Schema administration handle for registering / disabling / archiving
+    /// schemas through the normal event-sourced path.
+    ///
+    /// Uses a default actor id for the test harness; for production callers,
+    /// construct `SchemaAdmin` directly with a meaningful `ActorId`.
+    pub fn schema_admin(&mut self) -> crate::schema_admin::SchemaAdmin<'_> {
+        crate::schema_admin::SchemaAdmin::new(
+            &mut self.hydra,
+            hydra_core::ActorId::from_str("actor_sdk_schema_admin"),
+        )
+    }
+
     /// Access the underlying Hydra for advanced operations
     pub fn hydra(&self) -> &Hydra {
         &self.hydra
