@@ -16,6 +16,7 @@ pub mod policy_engine;
 pub mod policy_agent;
 pub mod commit_ledger;
 pub mod sensor_checkpoint_store;
+pub mod schema_registry_store;
 pub mod remediation_agent;
 pub mod outcome_agent;
 pub mod reflex;
@@ -64,6 +65,7 @@ pub mod prelude {
     pub use crate::sensor_checkpoint_store::{
         SensorCheckpointStore, SensorSourceKey, SourceCursorKey,
     };
+    pub use crate::schema_registry_store::SchemaRegistryStore;
     pub use crate::remediation_agent::RemediationAgent;
     pub use crate::outcome_agent::OutcomeAgent;
     pub use crate::reflex::{Reflex, ReflexContext, ReflexRegistry};

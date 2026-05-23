@@ -2,6 +2,7 @@ use crate::anomaly::{Anomaly, AnomalyEngine};
 use crate::cascade::{CascadeConfig, CascadeEngine, CascadeResult};
 use crate::commit_ledger::CommitLedger;
 use crate::coverage::{CoverageEngine, CoverageReport};
+use crate::schema_registry_store::SchemaRegistryStore;
 use crate::sensor_checkpoint_store::SensorCheckpointStore;
 use crate::action_store::ActionStore;
 use crate::epistemic_store::EpistemicStore;
@@ -61,6 +62,7 @@ pub struct Hydra {
     commit_ledger: CommitLedger,
     commit_writer: Option<Box<dyn crate::commit_ledger::CommitBatchWriter>>,
     sensor_checkpoint_store: SensorCheckpointStore,
+    schema_registry_store: SchemaRegistryStore,
     reflex_registry: ReflexRegistry,
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
@@ -134,6 +136,7 @@ impl Hydra {
             commit_ledger: CommitLedger::new(),
             commit_writer: None,
             sensor_checkpoint_store: SensorCheckpointStore::new(),
+            schema_registry_store: SchemaRegistryStore::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -165,6 +168,7 @@ impl Hydra {
             commit_ledger: CommitLedger::new(),
             commit_writer: None,
             sensor_checkpoint_store: SensorCheckpointStore::new(),
+            schema_registry_store: SchemaRegistryStore::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -320,6 +324,7 @@ impl Hydra {
             self.event_log.append(event.clone());
             self.temporal.record(event);
             self.sensor_checkpoint_store.apply_event(event)?;
+            self.schema_registry_store.apply_event(event)?;
         }
 
         // Record an atomic commit batch for this cascade. v0 ledger is
@@ -434,6 +439,7 @@ impl Hydra {
             self.action_store.apply_event(&event)?;
             self.policy_store.apply_event(&event)?;
             self.sensor_checkpoint_store.apply_event(&event)?;
+            self.schema_registry_store.apply_event(&event)?;
             count += 1;
         }
         Ok(count)
@@ -485,6 +491,7 @@ impl Hydra {
         self.action_store = ActionStore::new();
         self.policy_store = PolicyStore::new();
         self.sensor_checkpoint_store = SensorCheckpointStore::new();
+        self.schema_registry_store = SchemaRegistryStore::new();
     }
 
     // === Anomaly Detection (cont.) ===
@@ -968,6 +975,70 @@ impl Hydra {
     ) -> Option<&hydra_core::SensorCheckpoint> {
         self.sensor_checkpoint_store
             .checkpoint_for_commit(commit_id)
+    }
+
+    // === Schema registry ===
+
+    /// Read access to the schema registry store.
+    pub fn schema_registry_store(&self) -> &SchemaRegistryStore {
+        &self.schema_registry_store
+    }
+
+    pub fn schema(
+        &self,
+        id: &hydra_core::SchemaId,
+    ) -> Option<&hydra_core::SchemaDefinition> {
+        self.schema_registry_store.schema(id)
+    }
+
+    pub fn active_schemas(&self) -> Vec<&hydra_core::SchemaDefinition> {
+        self.schema_registry_store.active_schemas()
+    }
+
+    pub fn disabled_schemas(&self) -> Vec<&hydra_core::SchemaDefinition> {
+        self.schema_registry_store.disabled_schemas()
+    }
+
+    pub fn archived_schemas(&self) -> Vec<&hydra_core::SchemaDefinition> {
+        self.schema_registry_store.archived_schemas()
+    }
+
+    pub fn entity_schema(
+        &self,
+        type_id: &hydra_core::TypeId,
+    ) -> Option<&hydra_core::EntityTypeSchema> {
+        self.schema_registry_store.entity_schema(type_id)
+    }
+
+    pub fn evidence_schema(
+        &self,
+        kind: &str,
+    ) -> Option<&hydra_core::EvidencePayloadSchema> {
+        self.schema_registry_store.evidence_schema(kind)
+    }
+
+    pub fn claim_predicate_schema(
+        &self,
+        predicate: &str,
+    ) -> Option<&hydra_core::ClaimPredicateSchema> {
+        self.schema_registry_store
+            .claim_predicate_schema(predicate)
+    }
+
+    pub fn action_payload_schema(
+        &self,
+        action_kind: &str,
+    ) -> Option<&hydra_core::ActionPayloadSchema> {
+        self.schema_registry_store
+            .action_payload_schema(action_kind)
+    }
+
+    pub fn policy_condition_schema(
+        &self,
+        policy_kind: &str,
+    ) -> Option<&hydra_core::PolicyConditionSchema> {
+        self.schema_registry_store
+            .policy_condition_schema(policy_kind)
     }
 
     /// Record one external sensor observation safely.
@@ -3003,5 +3074,221 @@ mod sprint1_tests {
         let outcomes = hydra.outcomes_for_action(&action_id);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].kind, OutcomeKind::Unknown);
+    }
+
+    #[test]
+    fn hydra_materializes_schema_registry_state() {
+        use hydra_core::{
+            ActorId, EntityTypeSchema, EventKind, EvidencePayloadSchema, FieldSchema,
+            SchemaDefinition, SchemaId, SchemaStatus, TypeId, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = ActorId::from_str("actor_schema_admin");
+        let type_id = TypeId::from_str("type_dataset");
+        let entity = SchemaDefinition::EntityType(EntityTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            type_id: type_id.clone(),
+            name: "Dataset".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![FieldSchema::required("name", ValueType::String)],
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        });
+        let entity_schema_id = entity.id().clone();
+
+        let evidence = SchemaDefinition::EvidencePayload(EvidencePayloadSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            kind: "bank_transaction".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![FieldSchema::required("amount", ValueType::Float)],
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        });
+        let evidence_schema_id = evidence.id().clone();
+
+        hydra
+            .ingest(EventKind::SchemaRegistered { schema: entity })
+            .unwrap();
+        hydra
+            .ingest(EventKind::SchemaRegistered { schema: evidence })
+            .unwrap();
+
+        assert_eq!(hydra.schema_registry_store().schema_count(), 2);
+        assert_eq!(hydra.active_schemas().len(), 2);
+        assert_eq!(
+            hydra.entity_schema(&type_id).unwrap().name,
+            "Dataset"
+        );
+        assert!(hydra.evidence_schema("bank_transaction").is_some());
+
+        hydra
+            .ingest(EventKind::SchemaDisabled {
+                schema_id: evidence_schema_id.clone(),
+                disabled_by: actor.clone(),
+                reason: Some("deprecated".to_string()),
+            })
+            .unwrap();
+
+        assert_eq!(hydra.active_schemas().len(), 1);
+        assert_eq!(hydra.disabled_schemas().len(), 1);
+        assert_eq!(
+            hydra.schema(&evidence_schema_id).unwrap().status(),
+            &SchemaStatus::Disabled
+        );
+
+        hydra
+            .ingest(EventKind::SchemaArchived {
+                schema_id: entity_schema_id.clone(),
+                archived_by: actor,
+                reason: None,
+            })
+            .unwrap();
+
+        assert_eq!(hydra.active_schemas().len(), 0);
+        assert_eq!(hydra.archived_schemas().len(), 1);
+        assert_eq!(
+            hydra.schema(&entity_schema_id).unwrap().status(),
+            &SchemaStatus::Archived
+        );
+    }
+
+    #[test]
+    fn hydra_recovers_schema_registry_state_from_commits() {
+        use hydra_core::{
+            ActionPayloadSchema, ActorId, ClaimPredicateSchema, EntityTypeSchema, EventKind,
+            EvidencePayloadSchema, FieldSchema, PolicyConditionSchema, SchemaDefinition, SchemaId,
+            SchemaStatus, TypeId, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut original = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = ActorId::from_str("actor_recovery_schema");
+        let type_id = TypeId::from_str("type_invoice");
+
+        let entity = SchemaDefinition::EntityType(EntityTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            type_id: type_id.clone(),
+            name: "Invoice".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![FieldSchema::required("amount", ValueType::Float)],
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        });
+        let evidence = SchemaDefinition::EvidencePayload(EvidencePayloadSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            kind: "bank_transaction".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![FieldSchema::required("amount", ValueType::Float)],
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        });
+        let claim = SchemaDefinition::ClaimPredicate(ClaimPredicateSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            predicate: "is_stale".to_string(),
+            status: SchemaStatus::Active,
+            subject_type: Some(type_id.clone()),
+            object_type: ValueType::Bool,
+            allowed_claim_kinds: vec!["AnomalyFinding".to_string()],
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        });
+        let action = SchemaDefinition::ActionPayload(ActionPayloadSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            action_kind: "Backfill".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![FieldSchema::required("dataset", ValueType::String)],
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        });
+        let policy = SchemaDefinition::PolicyCondition(PolicyConditionSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            policy_kind: "AutoApproval".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![FieldSchema::required("max_amount", ValueType::Float)],
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        });
+
+        let evidence_schema_id = evidence.id().clone();
+
+        original
+            .ingest(EventKind::SchemaRegistered { schema: entity })
+            .unwrap();
+        original
+            .ingest(EventKind::SchemaRegistered { schema: evidence })
+            .unwrap();
+        original
+            .ingest(EventKind::SchemaRegistered { schema: claim })
+            .unwrap();
+        original
+            .ingest(EventKind::SchemaRegistered { schema: action })
+            .unwrap();
+        original
+            .ingest(EventKind::SchemaRegistered { schema: policy })
+            .unwrap();
+        original
+            .ingest(EventKind::SchemaDisabled {
+                schema_id: evidence_schema_id.clone(),
+                disabled_by: actor,
+                reason: Some("rotated".to_string()),
+            })
+            .unwrap();
+
+        let batches: Vec<hydra_core::CommitBatch> = original
+            .commit_ledger()
+            .batches_in_sequence()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let mut recovered = Hydra::new();
+        recovered.recover_from_commits(batches).unwrap();
+
+        assert_eq!(
+            recovered.schema_registry_store().schema_count(),
+            original.schema_registry_store().schema_count()
+        );
+        assert_eq!(recovered.active_schemas().len(), 4);
+        assert_eq!(recovered.disabled_schemas().len(), 1);
+        assert_eq!(
+            recovered.entity_schema(&type_id).unwrap().name,
+            "Invoice"
+        );
+        assert_eq!(
+            recovered
+                .schema(&evidence_schema_id)
+                .unwrap()
+                .status(),
+            &SchemaStatus::Disabled
+        );
+        assert!(recovered.claim_predicate_schema("is_stale").is_some());
+        assert!(recovered.action_payload_schema("Backfill").is_some());
+        assert!(recovered.policy_condition_schema("AutoApproval").is_some());
+        recovered.verify_commit_chain().unwrap();
     }
 }
