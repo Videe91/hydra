@@ -408,7 +408,10 @@ impl TemporalIndex {
             | EventKind::SensorRunCompleted { .. }
             | EventKind::SensorRunFailed { .. }
             | EventKind::SensorCheckpointRecorded { .. }
-            | EventKind::SensorCheckpointSuperseded { .. } => false,
+            | EventKind::SensorCheckpointSuperseded { .. }
+            | EventKind::SchemaRegistered { .. }
+            | EventKind::SchemaDisabled { .. }
+            | EventKind::SchemaArchived { .. } => false,
         }
     }
 

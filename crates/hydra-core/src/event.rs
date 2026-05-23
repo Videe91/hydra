@@ -2,9 +2,10 @@ use crate::action::{Action, Outcome};
 use crate::epistemic::{Claim, Evidence};
 use crate::id::{
     ActionId, ActorId, ApprovalId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId,
-    PolicyId, SensorCheckpointId, SensorRunId, TenantId,
+    PolicyId, SchemaId, SensorCheckpointId, SensorRunId, TenantId,
 };
 use crate::policy::{ApprovalRequest, Policy, PolicyDecision};
+use crate::schema::SchemaDefinition;
 use crate::sensor::{SensorCheckpoint, SensorRun};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -227,6 +228,21 @@ pub enum EventKind {
         superseded_by: Option<SensorCheckpointId>,
         reason: Option<String>,
     },
+
+    // Schema/type registry lifecycle — database validation vocabulary.
+    SchemaRegistered {
+        schema: SchemaDefinition,
+    },
+    SchemaDisabled {
+        schema_id: SchemaId,
+        disabled_by: ActorId,
+        reason: Option<String>,
+    },
+    SchemaArchived {
+        schema_id: SchemaId,
+        archived_by: ActorId,
+        reason: Option<String>,
+    },
 }
 
 impl EventKind {
@@ -272,7 +288,10 @@ impl EventKind {
             | EventKind::SensorRunCompleted { .. }
             | EventKind::SensorRunFailed { .. }
             | EventKind::SensorCheckpointRecorded { .. }
-            | EventKind::SensorCheckpointSuperseded { .. } => None,
+            | EventKind::SensorCheckpointSuperseded { .. }
+            | EventKind::SchemaRegistered { .. }
+            | EventKind::SchemaDisabled { .. }
+            | EventKind::SchemaArchived { .. } => None,
         }
     }
 
@@ -315,6 +334,9 @@ impl EventKind {
             EventKind::SensorRunFailed { .. } => "sensor_run_failed",
             EventKind::SensorCheckpointRecorded { .. } => "sensor_checkpoint_recorded",
             EventKind::SensorCheckpointSuperseded { .. } => "sensor_checkpoint_superseded",
+            EventKind::SchemaRegistered { .. } => "schema_registered",
+            EventKind::SchemaDisabled { .. } => "schema_disabled",
+            EventKind::SchemaArchived { .. } => "schema_archived",
         }
     }
 }
@@ -908,6 +930,61 @@ mod tests {
             }
             .kind_name(),
             "sensor_checkpoint_superseded"
+        );
+    }
+
+    #[test]
+    fn schema_event_kind_names() {
+        use crate::id::{ActorId, SchemaId, TypeId};
+        use crate::schema::{
+            EntityTypeSchema, FieldSchema, SchemaDefinition, SchemaStatus, ValueType,
+        };
+        use chrono::Utc;
+        use std::collections::HashMap;
+
+        let now = Utc::now();
+        let actor = ActorId::from_str("actor_schema");
+        let schema = EntityTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            type_id: TypeId::from_str("type_invoice"),
+            name: "Invoice".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("invoice_number", ValueType::String),
+                FieldSchema::required("amount", ValueType::Float),
+            ],
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        assert_eq!(
+            EventKind::SchemaRegistered {
+                schema: SchemaDefinition::EntityType(schema)
+            }
+            .kind_name(),
+            "schema_registered"
+        );
+
+        assert_eq!(
+            EventKind::SchemaDisabled {
+                schema_id: SchemaId::new(),
+                disabled_by: actor.clone(),
+                reason: Some("test".to_string())
+            }
+            .kind_name(),
+            "schema_disabled"
+        );
+
+        assert_eq!(
+            EventKind::SchemaArchived {
+                schema_id: SchemaId::new(),
+                archived_by: actor,
+                reason: None
+            }
+            .kind_name(),
+            "schema_archived"
         );
     }
 }

@@ -172,6 +172,8 @@ define_id!(CommitId, "commit");
 define_id!(SensorId, "sensor");
 define_id!(SensorRunId, "srun");
 define_id!(SensorCheckpointId, "sckpt");
+define_id!(SchemaId, "schema");
+define_id!(TypeId, "type");
 define_id!(TenantId, "ten");
 define_id!(SubscriptionId, "sub");
 define_id!(SnapshotId, "snap");

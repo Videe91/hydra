@@ -275,7 +275,10 @@ impl Projection {
             | EventKind::SensorRunCompleted { .. }
             | EventKind::SensorRunFailed { .. }
             | EventKind::SensorCheckpointRecorded { .. }
-            | EventKind::SensorCheckpointSuperseded { .. } => Ok(false),
+            | EventKind::SensorCheckpointSuperseded { .. }
+            | EventKind::SchemaRegistered { .. }
+            | EventKind::SchemaDisabled { .. }
+            | EventKind::SchemaArchived { .. } => Ok(false),
         }
     }
 

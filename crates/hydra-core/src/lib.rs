@@ -6,6 +6,7 @@ pub mod action;
 pub mod policy;
 pub mod commit;
 pub mod sensor;
+pub mod schema;
 pub mod node;
 pub mod edge;
 pub mod graph;
@@ -13,8 +14,8 @@ pub mod subscription;
 
 pub use id::{
     ActionId, ActorId, ApprovalId, CascadeId, ClaimId, CommitId, EdgeId, EventId, EvidenceId,
-    NodeId, OutcomeId, PolicyDecisionId, PolicyId, SensorCheckpointId, SensorId, SensorRunId,
-    SnapshotId, SubscriptionId, TenantId,
+    NodeId, OutcomeId, PolicyDecisionId, PolicyId, SchemaId, SensorCheckpointId, SensorId,
+    SensorRunId, SnapshotId, SubscriptionId, TenantId, TypeId,
 };
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
@@ -62,13 +63,24 @@ pub use sensor::{
     SensorRunStatus,
     SourceCursor,
 };
+pub use schema::{
+    ActionPayloadSchema,
+    ClaimPredicateSchema,
+    EntityTypeSchema,
+    EvidencePayloadSchema,
+    FieldSchema,
+    PolicyConditionSchema,
+    SchemaDefinition,
+    SchemaStatus,
+    ValueType,
+};
 
 /// Convenience re-exports for common types
 pub mod prelude {
     pub use crate::id::{
         ActionId, ActorId, ApprovalId, CascadeId, ClaimId, CommitId, EdgeId, EventId, EvidenceId,
-        NodeId, OutcomeId, PolicyDecisionId, PolicyId, SensorCheckpointId, SensorId, SensorRunId,
-        SnapshotId, SubscriptionId, TenantId,
+        NodeId, OutcomeId, PolicyDecisionId, PolicyId, SchemaId, SensorCheckpointId, SensorId,
+        SensorRunId, SnapshotId, SubscriptionId, TenantId, TypeId,
     };
     pub use crate::error::{HydraError, Result};
     pub use crate::event::{Event, EventKind, Value};
@@ -89,6 +101,10 @@ pub mod prelude {
     };
     pub use crate::sensor::{
         SensorCheckpoint, SensorCheckpointStatus, SensorRun, SensorRunStatus, SourceCursor,
+    };
+    pub use crate::schema::{
+        ActionPayloadSchema, ClaimPredicateSchema, EntityTypeSchema, EvidencePayloadSchema,
+        FieldSchema, PolicyConditionSchema, SchemaDefinition, SchemaStatus, ValueType,
     };
     pub use crate::node::{Node, NodeMeta, NodeValidator};
     pub use crate::edge::{Edge, EdgeMeta};
