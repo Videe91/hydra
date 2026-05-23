@@ -572,6 +572,30 @@ impl Hydra {
         &self.event_log
     }
 
+    /// All events in the log, in insertion order. Thin wrapper over the
+    /// log's iterator — useful for audit views and HTTP listing routes.
+    pub fn events(&self) -> Vec<&hydra_core::Event> {
+        self.event_log.iter().collect()
+    }
+
+    /// Look up a single event by id. Linear scan — fine for audit
+    /// surfaces; not intended for hot-path lookups.
+    pub fn event(&self, event_id: &hydra_core::EventId) -> Option<&hydra_core::Event> {
+        self.event_log.iter().find(|event| &event.id == event_id)
+    }
+
+    /// All events that share a given cascade id, in insertion order.
+    /// Empty if the cascade is unknown.
+    pub fn events_for_cascade(
+        &self,
+        cascade_id: &hydra_core::CascadeId,
+    ) -> Vec<&hydra_core::Event> {
+        self.event_log
+            .iter()
+            .filter(|event| &event.cascade_id == cascade_id)
+            .collect()
+    }
+
     /// Mutable access to the event log (for configuring retention policy).
     pub fn event_log_mut(&mut self) -> &mut EventLog {
         &mut self.event_log
