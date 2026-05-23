@@ -5,6 +5,7 @@ pub mod epistemic;
 pub mod action;
 pub mod policy;
 pub mod commit;
+pub mod sensor;
 pub mod node;
 pub mod edge;
 pub mod graph;
@@ -12,7 +13,8 @@ pub mod subscription;
 
 pub use id::{
     ActionId, ActorId, ApprovalId, CascadeId, ClaimId, CommitId, EdgeId, EventId, EvidenceId,
-    NodeId, OutcomeId, PolicyDecisionId, PolicyId, SnapshotId, SubscriptionId, TenantId,
+    NodeId, OutcomeId, PolicyDecisionId, PolicyId, SensorCheckpointId, SensorId, SensorRunId,
+    SnapshotId, SubscriptionId, TenantId,
 };
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
@@ -53,12 +55,20 @@ pub use commit::{
     EventHash,
     IdempotencyKey,
 };
+pub use sensor::{
+    SensorCheckpoint,
+    SensorCheckpointStatus,
+    SensorRun,
+    SensorRunStatus,
+    SourceCursor,
+};
 
 /// Convenience re-exports for common types
 pub mod prelude {
     pub use crate::id::{
         ActionId, ActorId, ApprovalId, CascadeId, ClaimId, CommitId, EdgeId, EventId, EvidenceId,
-        NodeId, OutcomeId, PolicyDecisionId, PolicyId, SnapshotId, SubscriptionId, TenantId,
+        NodeId, OutcomeId, PolicyDecisionId, PolicyId, SensorCheckpointId, SensorId, SensorRunId,
+        SnapshotId, SubscriptionId, TenantId,
     };
     pub use crate::error::{HydraError, Result};
     pub use crate::event::{Event, EventKind, Value};
@@ -76,6 +86,9 @@ pub mod prelude {
     pub use crate::commit::{
         CommitBatch, CommitHash, CommitRecord, CommitStatus, EventCommitRecord, EventHash,
         IdempotencyKey,
+    };
+    pub use crate::sensor::{
+        SensorCheckpoint, SensorCheckpointStatus, SensorRun, SensorRunStatus, SourceCursor,
     };
     pub use crate::node::{Node, NodeMeta, NodeValidator};
     pub use crate::edge::{Edge, EdgeMeta};

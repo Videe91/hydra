@@ -2,9 +2,10 @@ use crate::action::{Action, Outcome};
 use crate::epistemic::{Claim, Evidence};
 use crate::id::{
     ActionId, ActorId, ApprovalId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId,
-    PolicyId, TenantId,
+    PolicyId, SensorCheckpointId, SensorRunId, TenantId,
 };
 use crate::policy::{ApprovalRequest, Policy, PolicyDecision};
+use crate::sensor::{SensorCheckpoint, SensorRun};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -206,6 +207,26 @@ pub enum EventKind {
         cancelled_by: ActorId,
         reason: Option<String>,
     },
+
+    // Sensor ingestion lifecycle — reliable external observation checkpoints.
+    SensorRunStarted {
+        run: SensorRun,
+    },
+    SensorRunCompleted {
+        run_id: SensorRunId,
+    },
+    SensorRunFailed {
+        run_id: SensorRunId,
+        error: String,
+    },
+    SensorCheckpointRecorded {
+        checkpoint: SensorCheckpoint,
+    },
+    SensorCheckpointSuperseded {
+        checkpoint_id: SensorCheckpointId,
+        superseded_by: Option<SensorCheckpointId>,
+        reason: Option<String>,
+    },
 }
 
 impl EventKind {
@@ -246,7 +267,12 @@ impl EventKind {
             | EventKind::ApprovalRequested { .. }
             | EventKind::ApprovalGranted { .. }
             | EventKind::ApprovalRejected { .. }
-            | EventKind::ApprovalCancelled { .. } => None,
+            | EventKind::ApprovalCancelled { .. }
+            | EventKind::SensorRunStarted { .. }
+            | EventKind::SensorRunCompleted { .. }
+            | EventKind::SensorRunFailed { .. }
+            | EventKind::SensorCheckpointRecorded { .. }
+            | EventKind::SensorCheckpointSuperseded { .. } => None,
         }
     }
 
@@ -284,6 +310,11 @@ impl EventKind {
             EventKind::ApprovalGranted { .. } => "approval_granted",
             EventKind::ApprovalRejected { .. } => "approval_rejected",
             EventKind::ApprovalCancelled { .. } => "approval_cancelled",
+            EventKind::SensorRunStarted { .. } => "sensor_run_started",
+            EventKind::SensorRunCompleted { .. } => "sensor_run_completed",
+            EventKind::SensorRunFailed { .. } => "sensor_run_failed",
+            EventKind::SensorCheckpointRecorded { .. } => "sensor_checkpoint_recorded",
+            EventKind::SensorCheckpointSuperseded { .. } => "sensor_checkpoint_superseded",
         }
     }
 }
@@ -796,6 +827,87 @@ mod tests {
         assert_eq!(
             EventKind::ApprovalRequested { request }.kind_name(),
             "approval_requested"
+        );
+    }
+
+    #[test]
+    fn sensor_event_kind_names() {
+        use crate::commit::IdempotencyKey;
+        use crate::id::{CommitId, SensorCheckpointId, SensorId, SensorRunId};
+        use crate::sensor::{
+            SensorCheckpoint, SensorCheckpointStatus, SensorRun, SensorRunStatus, SourceCursor,
+        };
+        use chrono::Utc;
+        use std::collections::HashMap;
+
+        let now = Utc::now();
+        let run = SensorRun {
+            id: SensorRunId::new(),
+            tenant_id: None,
+            sensor_id: SensorId::from_str("sensor_github"),
+            status: SensorRunStatus::Started,
+            source_system: "github".to_string(),
+            stream: Some("webhooks".to_string()),
+            started_at: now,
+            completed_at: None,
+            failed_at: None,
+            error: None,
+            actor_id: None,
+            metadata: HashMap::new(),
+        };
+        assert_eq!(
+            EventKind::SensorRunStarted { run }.kind_name(),
+            "sensor_run_started"
+        );
+
+        assert_eq!(
+            EventKind::SensorRunCompleted {
+                run_id: SensorRunId::new()
+            }
+            .kind_name(),
+            "sensor_run_completed"
+        );
+
+        assert_eq!(
+            EventKind::SensorRunFailed {
+                run_id: SensorRunId::new(),
+                error: "boom".to_string()
+            }
+            .kind_name(),
+            "sensor_run_failed"
+        );
+
+        let checkpoint = SensorCheckpoint {
+            id: SensorCheckpointId::new(),
+            tenant_id: None,
+            sensor_id: SensorId::from_str("sensor_github"),
+            run_id: None,
+            status: SensorCheckpointStatus::Recorded,
+            source_system: "github".to_string(),
+            cursor: SourceCursor::DeliveryId {
+                source: "github".to_string(),
+                delivery_id: "delivery-1".to_string(),
+            },
+            idempotency_key: IdempotencyKey::new("github-delivery-1"),
+            commit_id: CommitId::new(),
+            event_id: None,
+            observed_at: now,
+            recorded_at: now,
+            metadata: HashMap::new(),
+        };
+        assert_eq!(
+            EventKind::SensorCheckpointRecorded { checkpoint }.kind_name(),
+            "sensor_checkpoint_recorded"
+        );
+
+        assert_eq!(
+            EventKind::SensorCheckpointSuperseded {
+                checkpoint_id: SensorCheckpointId::new(),
+                superseded_by: None,
+                reason: Some("compacted".to_string())
+            }
+            .kind_name(),
+            "sensor_checkpoint_superseded"
         );
     }
 }

@@ -270,7 +270,12 @@ impl Projection {
             | EventKind::ApprovalRequested { .. }
             | EventKind::ApprovalGranted { .. }
             | EventKind::ApprovalRejected { .. }
-            | EventKind::ApprovalCancelled { .. } => Ok(false),
+            | EventKind::ApprovalCancelled { .. }
+            | EventKind::SensorRunStarted { .. }
+            | EventKind::SensorRunCompleted { .. }
+            | EventKind::SensorRunFailed { .. }
+            | EventKind::SensorCheckpointRecorded { .. }
+            | EventKind::SensorCheckpointSuperseded { .. } => Ok(false),
         }
     }
 
