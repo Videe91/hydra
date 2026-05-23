@@ -69,6 +69,7 @@ pub struct Hydra {
     schema_validator: SchemaValidator,
     schema_gate: SchemaGate,
     snapshot_store: SnapshotStore,
+    snapshot_backend: Option<Box<dyn crate::snapshot_store::SnapshotBackend>>,
     reflex_registry: ReflexRegistry,
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
@@ -146,6 +147,7 @@ impl Hydra {
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
             snapshot_store: SnapshotStore::new(),
+            snapshot_backend: None,
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -181,6 +183,7 @@ impl Hydra {
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
             snapshot_store: SnapshotStore::new(),
+            snapshot_backend: None,
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -1471,11 +1474,37 @@ impl Hydra {
             schemas,
             metadata: std::collections::HashMap::new(),
         };
+        // Persist to the backend FIRST so a backend failure aborts the
+        // snapshot before any in-memory mutation or audit event commit.
+        if let Some(backend) = &self.snapshot_backend {
+            backend.write_snapshot(&body)?;
+        }
         self.snapshot_store.insert(body);
         self.ingest(hydra_core::EventKind::SnapshotTaken {
             manifest: manifest.clone(),
         })?;
         Ok(manifest)
+    }
+
+    /// Attach a durable snapshot backend.
+    ///
+    /// When set, `snapshot()` calls `backend.write_snapshot(&body)?` BEFORE
+    /// inserting the body into the in-memory store and committing the
+    /// `SnapshotTaken` audit event — backend failures cleanly abort the
+    /// whole snapshot.
+    pub fn set_snapshot_backend<B>(&mut self, backend: B)
+    where
+        B: crate::snapshot_store::SnapshotBackend + 'static,
+    {
+        self.snapshot_backend = Some(Box::new(backend));
+    }
+
+    pub fn clear_snapshot_backend(&mut self) {
+        self.snapshot_backend = None;
+    }
+
+    pub fn has_snapshot_backend(&self) -> bool {
+        self.snapshot_backend.is_some()
     }
 
     /// Restore the runtime from a previously captured snapshot.
@@ -4587,5 +4616,111 @@ mod sprint1_tests {
         assert_eq!(hydra.latest_snapshot_manifest().unwrap().id, second.id);
         assert!(second.sequence > first.sequence);
         assert_eq!(hydra.snapshot_manifests().len(), 2);
+    }
+
+    #[derive(Clone, Default)]
+    struct TestSnapshotBackend {
+        bodies: std::sync::Arc<std::sync::Mutex<Vec<hydra_core::SnapshotBody>>>,
+    }
+
+    impl crate::snapshot_store::SnapshotBackend for TestSnapshotBackend {
+        fn write_snapshot(
+            &self,
+            body: &hydra_core::SnapshotBody,
+        ) -> hydra_core::error::Result<()> {
+            self.bodies.lock().unwrap().push(body.clone());
+            Ok(())
+        }
+
+        fn read_snapshot(
+            &self,
+            id: &hydra_core::SnapshotId,
+        ) -> hydra_core::error::Result<hydra_core::SnapshotBody> {
+            self.bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|body| &body.manifest.id == id)
+                .cloned()
+                .ok_or_else(|| {
+                    hydra_core::error::HydraError::QueryError(format!("unknown snapshot: {id}"))
+                })
+        }
+
+        fn list_snapshot_manifests(
+            &self,
+        ) -> hydra_core::error::Result<Vec<hydra_core::SnapshotManifest>> {
+            Ok(self
+                .bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|body| body.manifest.clone())
+                .collect())
+        }
+
+        fn delete_snapshot(
+            &self,
+            _id: &hydra_core::SnapshotId,
+        ) -> hydra_core::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn hydra_snapshot_writes_to_attached_backend_before_audit_event() {
+        use hydra_core::{ActorId, EventKind, NodeId};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        hydra
+            .ingest(EventKind::Signal {
+                source: NodeId::from_str("snapshot.backend"),
+                name: "one".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+
+        let backend = TestSnapshotBackend::default();
+        let observed = backend.bodies.clone();
+        hydra.set_snapshot_backend(backend);
+        assert!(hydra.has_snapshot_backend());
+
+        let manifest = hydra
+            .snapshot(ActorId::from_str("actor_snapshot_backend"))
+            .unwrap();
+        let bodies = observed.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].manifest.id, manifest.id);
+        assert_eq!(bodies[0].events.len(), 1);
+        // SnapshotTaken commits AFTER the backend write succeeds.
+        assert_eq!(hydra.commit_count(), 2);
+    }
+
+    #[test]
+    fn hydra_clear_snapshot_backend_stops_writes() {
+        use hydra_core::{ActorId, EventKind, NodeId};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let backend = TestSnapshotBackend::default();
+        let observed = backend.bodies.clone();
+        hydra.set_snapshot_backend(backend);
+        hydra.clear_snapshot_backend();
+        assert!(!hydra.has_snapshot_backend());
+
+        hydra
+            .ingest(EventKind::Signal {
+                source: NodeId::from_str("snapshot.backend"),
+                name: "one".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+        hydra
+            .snapshot(ActorId::from_str("actor_no_backend"))
+            .unwrap();
+
+        // Backend cleared before snapshot — nothing should have reached it.
+        assert_eq!(observed.lock().unwrap().len(), 0);
     }
 }

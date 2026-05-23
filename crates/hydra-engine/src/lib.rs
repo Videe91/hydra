@@ -75,7 +75,7 @@ pub mod prelude {
     pub use crate::schema_gate::{
         SchemaGate, SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy,
     };
-    pub use crate::snapshot_store::SnapshotStore;
+    pub use crate::snapshot_store::{SnapshotBackend, SnapshotStore};
     pub use crate::remediation_agent::RemediationAgent;
     pub use crate::outcome_agent::OutcomeAgent;
     pub use crate::reflex::{Reflex, ReflexContext, ReflexRegistry};

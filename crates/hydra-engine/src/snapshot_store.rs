@@ -2,6 +2,22 @@ use hydra_core::error::{HydraError, Result};
 use hydra_core::{SnapshotBody, SnapshotId, SnapshotManifest};
 use std::collections::{BTreeMap, HashMap};
 
+/// Pluggable durable backend for snapshot persistence.
+///
+/// `Hydra::snapshot()` calls `write_snapshot` *before* committing the
+/// `SnapshotTaken` audit event, so if the backend fails the in-memory
+/// snapshot is never inserted and no audit event is emitted — the engine
+/// stays consistent.
+///
+/// Implemented in `hydra-storage::FileSnapshotStore` for the on-disk
+/// case. The engine is backend-agnostic.
+pub trait SnapshotBackend: Send + Sync {
+    fn write_snapshot(&self, body: &SnapshotBody) -> Result<()>;
+    fn read_snapshot(&self, id: &SnapshotId) -> Result<SnapshotBody>;
+    fn list_snapshot_manifests(&self) -> Result<Vec<SnapshotManifest>>;
+    fn delete_snapshot(&self, id: &SnapshotId) -> Result<()>;
+}
+
 /// In-memory store of snapshot bodies.
 ///
 /// Snapshots are indexed two ways:
