@@ -7,7 +7,17 @@ use crate::state::AppState;
 use axum::http::{header, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
+use hydra_net::http::schema_router;
+use hydra_net::runtime::RuntimeHandle;
 use tower_http::cors::CorsLayer;
+
+fn schema_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        .allow_origin("*".parse::<HeaderValue>().unwrap())
+        .max_age(std::time::Duration::from_secs(3600))
+}
 
 /// Build the Axum router with all endpoints.
 pub fn build_router(state: AppState) -> Router {
@@ -41,6 +51,38 @@ pub fn build_router(state: AppState) -> Router {
 /// Start the HTTP server on the given address.
 pub async fn serve(state: AppState, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let router = build_router(state);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+/// Build a router that exposes the schema HTTP surface
+/// (introspection + preflight validation + register/disable/archive).
+///
+/// Mounts the full `/schemas/*` route tree from `hydra-net` behind the same
+/// CORS policy as the legacy CloudTrail server.
+///
+/// **Note on engine ownership.** The legacy [`AppState`]-backed server uses
+/// `Arc<std::sync::Mutex<Hydra>>`; this entrypoint uses
+/// [`RuntimeHandle`], which holds `Arc<tokio::sync::RwLock<Hydra>>`. They
+/// cannot share a single `Hydra` instance today. Unifying the two ownership
+/// models so legacy routes and schema routes hit the same engine is a
+/// dedicated follow-up patch.
+pub fn build_schema_router(runtime: RuntimeHandle) -> Router {
+    Router::new()
+        .merge(schema_router(runtime))
+        .layer(schema_cors_layer())
+}
+
+/// Start an HTTP server exposing only the schema routes.
+///
+/// Convenience for a clean "schema database" deployment that does not also
+/// want the Sentinel/CloudTrail surface.
+pub async fn serve_schema(
+    runtime: RuntimeHandle,
+    addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let router = build_schema_router(runtime);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
     Ok(())
@@ -122,6 +164,151 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // === Schema HTTP route mounting ===
+    //
+    // These tests prove `/schemas/*` is reachable through hydra-api's
+    // server scaffold. The schema router is built from a hydra-net
+    // RuntimeHandle, so it owns a different engine than the legacy
+    // AppState path — see build_schema_router doc.
+
+    fn schema_test_app() -> (Router, hydra_net::runtime::RuntimeHandle) {
+        use hydra_net::runtime::RuntimeBuilder;
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = build_schema_router(runtime.clone());
+        (app, runtime)
+    }
+
+    #[tokio::test]
+    async fn schema_active_endpoint_is_empty_initially() {
+        use hydra_net::http::schema::SchemasResponse;
+        let (app, _runtime) = schema_test_app();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/schemas/active")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoded: SchemasResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded.schemas.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn schema_register_action_then_list() {
+        use hydra_core::{FieldSchema, ValueType};
+        use hydra_net::http::schema::{
+            RegisterActionSchemaRequest, SchemaIdResponse, SchemasResponse,
+        };
+        let (app, _runtime) = schema_test_app();
+
+        let register = RegisterActionSchemaRequest {
+            action_kind: "PostLedgerEntry".to_string(),
+            fields: vec![
+                FieldSchema::required("account", ValueType::String),
+                FieldSchema::required("amount", ValueType::Float),
+            ],
+        };
+        let register_req = Request::builder()
+            .method("POST")
+            .uri("/schemas/action")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&register).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(register_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let registered: SchemaIdResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!registered.schema_id.to_string().is_empty());
+
+        let list_req = Request::builder()
+            .method("GET")
+            .uri("/schemas/active")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(list_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: SchemasResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed.schemas.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn schema_validate_action_route_is_mounted() {
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionStatus, ActionTarget, ActorId, FieldSchema,
+            Value, ValueType,
+        };
+        use hydra_net::http::schema::{
+            RegisterActionSchemaRequest, ValidateActionRequest, ValidationResponse,
+        };
+        let (app, _runtime) = schema_test_app();
+
+        // Register the schema first.
+        let register = RegisterActionSchemaRequest {
+            action_kind: "PostLedgerEntry".to_string(),
+            fields: vec![
+                FieldSchema::required("account", ValueType::String),
+                FieldSchema::required("amount", ValueType::Float),
+            ],
+        };
+        let req = Request::builder()
+            .method("POST")
+            .uri("/schemas/action")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&register).unwrap()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+
+        // Build a bad action and POST to validate route.
+        let now = chrono::Utc::now();
+        let mut payload = std::collections::HashMap::new();
+        payload.insert("account".to_string(), Value::String("Cash".to_string()));
+        payload.insert("amount".to_string(), Value::String("bad".to_string()));
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: None,
+            kind: ActionKind::PostLedgerEntry,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("ledger".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_api_schema_test"),
+            approved_by: None,
+            policy_id: None,
+            payload,
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        let validate = ValidateActionRequest { action };
+        let req = Request::builder()
+            .method("POST")
+            .uri("/schemas/validate/action")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&validate).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoded: ValidationResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!decoded.valid);
+        assert_eq!(decoded.errors[0].path, "amount");
     }
 
     #[tokio::test]
