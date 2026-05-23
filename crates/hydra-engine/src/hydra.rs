@@ -310,10 +310,21 @@ impl Hydra {
         // In Strict mode, invalid writes are rejected here — no cascade, no
         // commit, no writer, no WAL. Permissive and Off modes always allow
         // through.
-        self.schema_gate.validate_event(
+        //
+        // NodeUpdated needs a NodeId → TypeId lookup to know which entity
+        // schema to validate against, so we hand the gate a projection-
+        // backed resolver closure.
+        let projection = &self.projection;
+        let node_type_resolver = |node_id: &hydra_core::NodeId| -> Option<hydra_core::TypeId> {
+            projection
+                .node(node_id)
+                .map(|node| hydra_core::TypeId::from_str(&node.meta.type_id))
+        };
+        self.schema_gate.validate_event_with_node_resolver(
             &self.schema_registry_store,
             &self.schema_validator,
             &event,
+            Some(&node_type_resolver),
         )?;
 
         // The cascade engine drives both topology projection AND the epistemic
@@ -1104,6 +1115,37 @@ impl Hydra {
     ) -> crate::schema_validator::SchemaValidationReport {
         self.schema_validator
             .validate_claim(&self.schema_registry_store, claim)
+    }
+
+    pub fn validate_node_create(
+        &self,
+        type_id: &hydra_core::TypeId,
+        properties: &std::collections::HashMap<String, hydra_core::Value>,
+    ) -> crate::schema_validator::SchemaValidationReport {
+        self.schema_validator
+            .validate_node_create(&self.schema_registry_store, type_id, properties)
+    }
+
+    pub fn validate_node_update(
+        &self,
+        type_id: &hydra_core::TypeId,
+        changes: &std::collections::HashMap<String, hydra_core::Value>,
+    ) -> crate::schema_validator::SchemaValidationReport {
+        match self.entity_schema(type_id) {
+            Some(schema) => self.schema_validator.validate_node_update(schema, changes),
+            None => crate::schema_validator::SchemaValidationReport::valid(None),
+        }
+    }
+
+    /// Look up the current TypeId for a node by reading the projection.
+    /// Returns None for unknown / deleted nodes.
+    pub fn resolve_node_type_id(
+        &self,
+        node_id: &hydra_core::NodeId,
+    ) -> Option<hydra_core::TypeId> {
+        self.projection
+            .node(node_id)
+            .map(|node| hydra_core::TypeId::from_str(&node.meta.type_id))
     }
 
     // === Schema gate (pre-cascade enforcement) ===
@@ -3987,6 +4029,170 @@ mod sprint1_tests {
         let report = hydra.validate_claim(&claim);
         assert!(report.is_valid());
         assert!(report.schema_id.is_some());
+    }
+
+    fn register_invoice_entity_schema(hydra: &mut Hydra) {
+        use hydra_core::{
+            ActorId, EntityTypeSchema, EventKind, FieldSchema, SchemaDefinition, SchemaId,
+            SchemaStatus, TypeId, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let now = chrono::Utc::now();
+        let schema = EntityTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            type_id: TypeId::from_str("type_invoice"),
+            name: "Invoice".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("invoice_number", ValueType::String),
+                FieldSchema::required("amount", ValueType::Float),
+                FieldSchema::optional("memo", ValueType::String),
+            ],
+            created_by: ActorId::from_str("actor_schema"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        hydra
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::EntityType(schema),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn hydra_schema_gate_strict_rejects_invalid_node_create_before_commit() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{EventKind, NodeId, Value};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        register_invoice_entity_schema(&mut hydra);
+        assert_eq!(hydra.commit_count(), 1);
+
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Allow,
+        });
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "invoice_number".to_string(),
+            Value::String("INV-001".to_string()),
+        );
+        properties.insert("amount".to_string(), Value::String("bad".to_string()));
+        let result = hydra.ingest(EventKind::NodeCreated {
+            node_id: NodeId::new(),
+            type_id: "type_invoice".to_string(),
+            properties,
+        });
+        assert!(result.is_err());
+        assert_eq!(hydra.commit_count(), 1);
+    }
+
+    #[test]
+    fn hydra_schema_gate_strict_allows_valid_node_create() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{EventKind, NodeId, Value};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        register_invoice_entity_schema(&mut hydra);
+
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Allow,
+        });
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "invoice_number".to_string(),
+            Value::String("INV-001".to_string()),
+        );
+        properties.insert("amount".to_string(), Value::Float(100.0));
+        let node_id = NodeId::new();
+        let result = hydra.ingest(EventKind::NodeCreated {
+            node_id: node_id.clone(),
+            type_id: "type_invoice".to_string(),
+            properties,
+        });
+        assert!(result.is_ok());
+        assert_eq!(hydra.commit_count(), 2);
+        assert!(hydra.resolve_node_type_id(&node_id).is_some());
+    }
+
+    #[test]
+    fn hydra_schema_gate_strict_rejects_invalid_node_update_before_commit() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{EventKind, NodeId, Value};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        register_invoice_entity_schema(&mut hydra);
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "invoice_number".to_string(),
+            Value::String("INV-001".to_string()),
+        );
+        properties.insert("amount".to_string(), Value::Float(100.0));
+        let node_id = NodeId::new();
+        hydra
+            .ingest(EventKind::NodeCreated {
+                node_id: node_id.clone(),
+                type_id: "type_invoice".to_string(),
+                properties,
+            })
+            .unwrap();
+        let commit_count_before_update = hydra.commit_count();
+
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Allow,
+        });
+
+        let mut changes = HashMap::new();
+        changes.insert("amount".to_string(), Value::String("bad".to_string()));
+        let result = hydra.ingest(EventKind::NodeUpdated { node_id, changes });
+        assert!(result.is_err());
+        assert_eq!(hydra.commit_count(), commit_count_before_update);
+    }
+
+    #[test]
+    fn hydra_schema_gate_strict_allows_valid_node_update() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{EventKind, NodeId, Value};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        register_invoice_entity_schema(&mut hydra);
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "invoice_number".to_string(),
+            Value::String("INV-001".to_string()),
+        );
+        properties.insert("amount".to_string(), Value::Float(100.0));
+        let node_id = NodeId::new();
+        hydra
+            .ingest(EventKind::NodeCreated {
+                node_id: node_id.clone(),
+                type_id: "type_invoice".to_string(),
+                properties,
+            })
+            .unwrap();
+
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Allow,
+        });
+
+        let mut changes = HashMap::new();
+        changes.insert("amount".to_string(), Value::Float(125.0));
+        let result = hydra.ingest(EventKind::NodeUpdated { node_id, changes });
+        assert!(result.is_ok());
     }
 
     #[test]

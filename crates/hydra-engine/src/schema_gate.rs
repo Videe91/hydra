@@ -6,6 +6,11 @@ use hydra_core::error::Result;
 use hydra_core::{EventKind, Value};
 use std::collections::HashMap;
 
+/// Closure type used to resolve a NodeId to its current TypeId during
+/// NodeUpdated validation. SchemaGate is projection-agnostic; callers
+/// (typically Hydra::ingest_event_internal) supply this to bridge in.
+pub type NodeTypeResolver<'a> = dyn Fn(&hydra_core::NodeId) -> Option<hydra_core::TypeId> + 'a;
+
 /// How aggressively Hydra should enforce schema validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaGateMode {
@@ -99,7 +104,9 @@ impl SchemaGate {
         self.config.mode != SchemaGateMode::Off
     }
 
-    /// Validate one incoming event before it enters the cascade.
+    /// Validate one incoming event before it enters the cascade. No node
+    /// resolver — NodeUpdated is treated as valid because the gate cannot
+    /// look up the node's TypeId on its own.
     pub fn validate_event(
         &self,
         store: &SchemaRegistryStore,
@@ -109,12 +116,44 @@ impl SchemaGate {
         self.validate_event_kind(store, validator, &event.kind)
     }
 
-    /// Validate one incoming EventKind before it enters the cascade.
+    /// Validate one incoming event with a projection-backed node type
+    /// resolver. Required for NodeUpdated, which only carries node_id +
+    /// changes — the gate needs the resolver to recover the TypeId.
+    pub fn validate_event_with_node_resolver(
+        &self,
+        store: &SchemaRegistryStore,
+        validator: &SchemaValidator,
+        event: &hydra_core::Event,
+        node_type_resolver: Option<&NodeTypeResolver<'_>>,
+    ) -> Result<()> {
+        self.validate_event_kind_with_node_resolver(
+            store,
+            validator,
+            &event.kind,
+            node_type_resolver,
+        )
+    }
+
+    /// Validate one incoming EventKind before it enters the cascade. No node
+    /// resolver supplied — NodeUpdated passes through. For full coverage,
+    /// use validate_event_kind_with_node_resolver.
     pub fn validate_event_kind(
         &self,
         store: &SchemaRegistryStore,
         validator: &SchemaValidator,
         kind: &EventKind,
+    ) -> Result<()> {
+        self.validate_event_kind_with_node_resolver(store, validator, kind, None)
+    }
+
+    /// Validate one incoming EventKind before it enters the cascade with an
+    /// optional NodeId → TypeId resolver for NodeUpdated.
+    pub fn validate_event_kind_with_node_resolver(
+        &self,
+        store: &SchemaRegistryStore,
+        validator: &SchemaValidator,
+        kind: &EventKind,
+        node_type_resolver: Option<&NodeTypeResolver<'_>>,
     ) -> Result<()> {
         if self.config.mode == SchemaGateMode::Off {
             return Ok(());
@@ -188,9 +227,36 @@ impl SchemaGate {
                     report
                 }
             }
+            EventKind::NodeCreated {
+                type_id, properties, ..
+            } => {
+                let type_id = hydra_core::TypeId::from_str(type_id);
+                let report = validator.validate_node_create(store, &type_id, properties);
+                if report.schema_id.is_none()
+                    && self.config.unknown_schema_policy == UnknownSchemaPolicy::Reject
+                {
+                    SchemaValidationReport::invalid(
+                        None,
+                        vec![SchemaValidationError::new(
+                            None,
+                            format!("node.{}", type_id),
+                            "no registered entity type schema",
+                        )],
+                    )
+                } else {
+                    report
+                }
+            }
+            EventKind::NodeUpdated { node_id, changes } => self.evaluate_node_update(
+                store,
+                validator,
+                node_id,
+                changes,
+                node_type_resolver,
+            ),
             // v0 only gates shapes that the validator can unambiguously check.
-            // Evidence/claim/node validation can be added once their shape
-            // mapping is finalized.
+            // EdgeCreated/EdgeUpdated can be added once their shape mapping
+            // is finalized — they need a parallel edge type schema.
             _ => SchemaValidationReport::valid(None),
         };
         match self.config.mode {
@@ -201,6 +267,71 @@ impl SchemaGate {
             }
             SchemaGateMode::Strict => report.into_result(),
         }
+    }
+
+    /// Resolve TypeId for NodeUpdated and validate the changes. Factored
+    /// out to avoid nested let-else chains in the main match.
+    fn evaluate_node_update(
+        &self,
+        store: &SchemaRegistryStore,
+        validator: &SchemaValidator,
+        node_id: &hydra_core::NodeId,
+        changes: &HashMap<String, Value>,
+        node_type_resolver: Option<&NodeTypeResolver<'_>>,
+    ) -> SchemaValidationReport {
+        let reject_unknown = self.config.unknown_schema_policy == UnknownSchemaPolicy::Reject;
+        let resolver = match node_type_resolver {
+            Some(resolver) => resolver,
+            None => {
+                return if reject_unknown {
+                    SchemaValidationReport::invalid(
+                        None,
+                        vec![SchemaValidationError::new(
+                            None,
+                            format!("node.{}", node_id),
+                            "node update gating requires a node type resolver",
+                        )],
+                    )
+                } else {
+                    SchemaValidationReport::valid(None)
+                };
+            }
+        };
+        let type_id = match resolver(node_id) {
+            Some(type_id) => type_id,
+            None => {
+                return if reject_unknown {
+                    SchemaValidationReport::invalid(
+                        None,
+                        vec![SchemaValidationError::new(
+                            None,
+                            format!("node.{}", node_id),
+                            "cannot resolve node type for update",
+                        )],
+                    )
+                } else {
+                    SchemaValidationReport::valid(None)
+                };
+            }
+        };
+        let schema = match store.entity_schema(&type_id) {
+            Some(schema) => schema,
+            None => {
+                return if reject_unknown {
+                    SchemaValidationReport::invalid(
+                        None,
+                        vec![SchemaValidationError::new(
+                            None,
+                            format!("node.{}", type_id),
+                            "no registered entity type schema",
+                        )],
+                    )
+                } else {
+                    SchemaValidationReport::valid(None)
+                };
+            }
+        };
+        validator.validate_node_update(schema, changes)
     }
 
     /// Build a diagnostic Signal for permissive-mode future wiring.
@@ -303,11 +434,10 @@ mod tests {
     use hydra_core::{
         Action, ActionId, ActionKind, ActionPayloadSchema, ActionStatus, ActionTarget, ActorId,
         Claim, ClaimId, ClaimKind, ClaimObject, ClaimPredicateSchema, ClaimStatus, ClaimSubject,
-        Confidence,
-        Event, EventId, EventKind, Evidence, EvidenceId, EvidencePayload, EvidencePayloadSchema,
-        EvidenceSource, FieldSchema, Policy, PolicyConditionSchema, PolicyId, PolicyKind,
-        PolicyScope, PolicyStatus, SchemaDefinition, SchemaId, SchemaStatus, TypeId, Value,
-        ValueType,
+        Confidence, EntityTypeSchema, Event, EventId, EventKind, Evidence, EvidenceId,
+        EvidencePayload, EvidencePayloadSchema, EvidenceSource, FieldSchema, NodeId, Policy,
+        PolicyConditionSchema, PolicyId, PolicyKind, PolicyScope, PolicyStatus, SchemaDefinition,
+        SchemaId, SchemaStatus, TypeId, Value, ValueType,
     };
     use std::collections::HashMap;
 
@@ -764,6 +894,157 @@ mod tests {
             &EventKind::ClaimProposed {
                 claim: claim(ClaimObject::Value(Value::Bool(true))),
             },
+        );
+        assert!(result.is_ok());
+    }
+
+    fn store_with_entity_schema() -> SchemaRegistryStore {
+        let mut store = SchemaRegistryStore::new();
+        let now = chrono::Utc::now();
+        let schema = EntityTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            type_id: TypeId::from_str("type_invoice"),
+            name: "Invoice".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("invoice_number", ValueType::String),
+                FieldSchema::required("amount", ValueType::Float),
+                FieldSchema::optional("memo", ValueType::String),
+            ],
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        store
+            .apply_event(&event(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::EntityType(schema),
+            }))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn strict_gate_allows_valid_node_create() {
+        let store = store_with_entity_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "invoice_number".to_string(),
+            Value::String("INV-001".to_string()),
+        );
+        properties.insert("amount".to_string(), Value::Float(100.0));
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::NodeCreated {
+                node_id: NodeId::new(),
+                type_id: "type_invoice".to_string(),
+                properties,
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn strict_gate_rejects_invalid_node_create() {
+        let store = store_with_entity_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "invoice_number".to_string(),
+            Value::String("INV-001".to_string()),
+        );
+        properties.insert("amount".to_string(), Value::String("bad".to_string()));
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::NodeCreated {
+                node_id: NodeId::new(),
+                type_id: "type_invoice".to_string(),
+                properties,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_reject_unknown_rejects_unknown_node_type_schema() {
+        let store = SchemaRegistryStore::new();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_reject_unknown();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "invoice_number".to_string(),
+            Value::String("INV-001".to_string()),
+        );
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::NodeCreated {
+                node_id: NodeId::new(),
+                type_id: "type_invoice".to_string(),
+                properties,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_gate_rejects_invalid_node_update_with_resolver() {
+        let store = store_with_entity_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let node_id = NodeId::new();
+        let target_id = node_id.clone();
+        let resolver = move |id: &NodeId| {
+            if id == &target_id {
+                Some(TypeId::from_str("type_invoice"))
+            } else {
+                None
+            }
+        };
+        let mut changes = HashMap::new();
+        changes.insert("amount".to_string(), Value::String("bad".to_string()));
+        let result = gate.validate_event_kind_with_node_resolver(
+            &store,
+            &validator,
+            &EventKind::NodeUpdated {
+                node_id: node_id.clone(),
+                changes,
+            },
+            Some(&resolver),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_gate_allows_valid_node_update_with_resolver() {
+        let store = store_with_entity_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let node_id = NodeId::new();
+        let target_id = node_id.clone();
+        let resolver = move |id: &NodeId| {
+            if id == &target_id {
+                Some(TypeId::from_str("type_invoice"))
+            } else {
+                None
+            }
+        };
+        let mut changes = HashMap::new();
+        changes.insert("amount".to_string(), Value::Float(125.0));
+        let result = gate.validate_event_kind_with_node_resolver(
+            &store,
+            &validator,
+            &EventKind::NodeUpdated {
+                node_id: node_id.clone(),
+                changes,
+            },
+            Some(&resolver),
         );
         assert!(result.is_ok());
     }

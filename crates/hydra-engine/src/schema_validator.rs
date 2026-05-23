@@ -1,8 +1,8 @@
 use crate::schema_registry_store::SchemaRegistryStore;
 use hydra_core::error::{HydraError, Result};
 use hydra_core::{
-    Action, ActionKind, Claim, ClaimObject, FieldSchema, Policy, PolicyKind, SchemaId,
-    SchemaStatus, Value, ValueType,
+    Action, ActionKind, Claim, ClaimObject, EntityTypeSchema, FieldSchema, Policy, PolicyKind,
+    SchemaId, SchemaStatus, TypeId, Value, ValueType,
 };
 use std::collections::HashMap;
 
@@ -287,6 +287,91 @@ impl SchemaValidator {
             );
         }
         self.validate_fields(Some(schema.id.clone()), &schema.fields, payload)
+    }
+
+    /// Validate a full entity/node payload against an EntityTypeSchema.
+    ///
+    /// Used for NodeCreated. Required fields are enforced.
+    pub fn validate_entity_payload(
+        &self,
+        schema: &EntityTypeSchema,
+        payload: &HashMap<String, Value>,
+    ) -> SchemaValidationReport {
+        if schema.status != SchemaStatus::Active {
+            return SchemaValidationReport::invalid(
+                Some(schema.id.clone()),
+                vec![SchemaValidationError::new(
+                    Some(schema.id.clone()),
+                    schema.type_id.to_string(),
+                    "entity type schema is not active",
+                )],
+            );
+        }
+        self.validate_fields(Some(schema.id.clone()), &schema.fields, payload)
+    }
+
+    /// Validate a node create by TypeId.
+    ///
+    /// Unknown schema returns valid(None) in read-only v0; strict
+    /// unknown-schema behavior belongs to SchemaGate.
+    pub fn validate_node_create(
+        &self,
+        store: &SchemaRegistryStore,
+        type_id: &TypeId,
+        properties: &HashMap<String, Value>,
+    ) -> SchemaValidationReport {
+        let Some(schema) = store.entity_schema(type_id) else {
+            return SchemaValidationReport::valid(None);
+        };
+        self.validate_entity_payload(schema, properties)
+    }
+
+    /// Validate a partial node update against an EntityTypeSchema.
+    ///
+    /// Used for NodeUpdated. Required fields are NOT enforced because updates
+    /// usually contain only changed fields. v0 rejects changed fields that
+    /// are not declared in the schema — typed entities are meaningful in
+    /// strict mode.
+    pub fn validate_node_update(
+        &self,
+        schema: &EntityTypeSchema,
+        changes: &HashMap<String, Value>,
+    ) -> SchemaValidationReport {
+        let schema_id = Some(schema.id.clone());
+        if schema.status != SchemaStatus::Active {
+            return SchemaValidationReport::invalid(
+                schema_id.clone(),
+                vec![SchemaValidationError::new(
+                    schema_id.clone(),
+                    schema.type_id.to_string(),
+                    "entity type schema is not active",
+                )],
+            );
+        }
+        let mut errors = Vec::new();
+        for (field_name, value) in changes {
+            let Some(field) = schema.fields.iter().find(|field| &field.name == field_name)
+            else {
+                errors.push(SchemaValidationError::new(
+                    schema_id.clone(),
+                    field_name.clone(),
+                    "unknown field for entity type",
+                ));
+                continue;
+            };
+            if let Err(message) = value_matches_type(value, &field.value_type) {
+                errors.push(SchemaValidationError::new(
+                    schema_id.clone(),
+                    field_name.clone(),
+                    message,
+                ));
+            }
+        }
+        if errors.is_empty() {
+            SchemaValidationReport::valid(schema_id)
+        } else {
+            SchemaValidationReport::invalid(schema_id, errors)
+        }
     }
 }
 
@@ -684,6 +769,111 @@ mod tests {
         assert!(report.is_invalid());
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].path, "max_amount");
+    }
+
+    fn store_with_entity_schema(status: SchemaStatus) -> SchemaRegistryStore {
+        let now = chrono::Utc::now();
+        let mut store = SchemaRegistryStore::new();
+        let schema = EntityTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            type_id: TypeId::from_str("type_invoice"),
+            name: "Invoice".to_string(),
+            status,
+            fields: vec![
+                FieldSchema::required("invoice_number", ValueType::String),
+                FieldSchema::required("amount", ValueType::Float),
+                FieldSchema::optional("memo", ValueType::String),
+            ],
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        store
+            .apply_event(&event(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::EntityType(schema),
+            }))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn validates_node_create_against_entity_schema() {
+        let store = store_with_entity_schema(SchemaStatus::Active);
+        let validator = SchemaValidator::new();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "invoice_number".to_string(),
+            Value::String("INV-001".to_string()),
+        );
+        properties.insert("amount".to_string(), Value::Float(100.0));
+        let report = validator.validate_node_create(
+            &store,
+            &TypeId::from_str("type_invoice"),
+            &properties,
+        );
+        assert!(report.is_valid());
+        assert!(report.schema_id.is_some());
+    }
+
+    #[test]
+    fn node_create_missing_required_field_is_invalid() {
+        let store = store_with_entity_schema(SchemaStatus::Active);
+        let validator = SchemaValidator::new();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "invoice_number".to_string(),
+            Value::String("INV-001".to_string()),
+        );
+        let report = validator.validate_node_create(
+            &store,
+            &TypeId::from_str("type_invoice"),
+            &properties,
+        );
+        assert!(report.is_invalid());
+        assert_eq!(report.errors[0].path, "amount");
+    }
+
+    #[test]
+    fn node_update_validates_only_changed_fields() {
+        let store = store_with_entity_schema(SchemaStatus::Active);
+        let validator = SchemaValidator::new();
+        let schema = store
+            .entity_schema(&TypeId::from_str("type_invoice"))
+            .unwrap();
+        let mut changes = HashMap::new();
+        changes.insert("amount".to_string(), Value::Float(125.0));
+        let report = validator.validate_node_update(schema, &changes);
+        assert!(report.is_valid());
+    }
+
+    #[test]
+    fn node_update_wrong_field_type_is_invalid() {
+        let store = store_with_entity_schema(SchemaStatus::Active);
+        let validator = SchemaValidator::new();
+        let schema = store
+            .entity_schema(&TypeId::from_str("type_invoice"))
+            .unwrap();
+        let mut changes = HashMap::new();
+        changes.insert("amount".to_string(), Value::String("bad".to_string()));
+        let report = validator.validate_node_update(schema, &changes);
+        assert!(report.is_invalid());
+        assert_eq!(report.errors[0].path, "amount");
+    }
+
+    #[test]
+    fn node_update_unknown_field_is_invalid() {
+        let store = store_with_entity_schema(SchemaStatus::Active);
+        let validator = SchemaValidator::new();
+        let schema = store
+            .entity_schema(&TypeId::from_str("type_invoice"))
+            .unwrap();
+        let mut changes = HashMap::new();
+        changes.insert("unknown".to_string(), Value::String("x".to_string()));
+        let report = validator.validate_node_update(schema, &changes);
+        assert!(report.is_invalid());
+        assert_eq!(report.errors[0].path, "unknown");
     }
 
     fn store_with_claim_schema(
