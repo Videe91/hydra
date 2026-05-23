@@ -6,6 +6,16 @@ use hydra_core::{
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+/// Pluggable sink for durable commit batch persistence.
+///
+/// HydraEngine owns commit creation and sequencing.
+/// Storage backends implement this trait to persist committed batches.
+///
+/// This keeps hydra-engine independent from hydra-storage.
+pub trait CommitBatchWriter: Send + Sync {
+    fn append_commit(&self, batch: &CommitBatch) -> Result<()>;
+}
+
 /// In-memory commit ledger for committed cascade batches.
 ///
 /// v0 intentionally uses deterministic std hashing over serialized event/batch

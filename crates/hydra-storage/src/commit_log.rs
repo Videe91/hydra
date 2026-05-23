@@ -1,5 +1,6 @@
 use hydra_core::commit::CommitBatch;
 use hydra_core::error::{HydraError, Result};
+use hydra_engine::commit_ledger::CommitBatchWriter;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -141,6 +142,16 @@ impl CommitLog {
     }
 }
 
+/// Persist committed batches via the engine's pluggable writer trait.
+///
+/// This is the seam that lets `Hydra::set_commit_writer(commit_log)` attach a
+/// disk-backed journal without hydra-engine depending on hydra-storage.
+impl CommitBatchWriter for CommitLog {
+    fn append_commit(&self, batch: &CommitBatch) -> Result<()> {
+        self.append(batch)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +256,20 @@ mod tests {
         let log = CommitLog::open(&path).unwrap();
         let result = log.load_all();
         assert!(result.is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn commit_log_implements_commit_batch_writer() {
+        use hydra_engine::commit_ledger::CommitBatchWriter;
+        let path = temp_path("writer_trait");
+        let log = CommitLog::open(&path).unwrap();
+        let batch = commit_batch("first", 1);
+        let batch_id = batch.id.clone();
+        log.append_commit(&batch).unwrap();
+        let loaded = log.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, batch_id);
         let _ = fs::remove_file(path);
     }
 

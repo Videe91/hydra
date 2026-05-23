@@ -58,6 +58,7 @@ pub struct Hydra {
     policy_engine: PolicyEngine,
     policy_agent: PolicyAgent,
     commit_ledger: CommitLedger,
+    commit_writer: Option<Box<dyn crate::commit_ledger::CommitBatchWriter>>,
     reflex_registry: ReflexRegistry,
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
@@ -129,6 +130,7 @@ impl Hydra {
                 ActorId::from_str("actor_hydra_approver"),
             ),
             commit_ledger: CommitLedger::new(),
+            commit_writer: None,
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -158,6 +160,7 @@ impl Hydra {
                 ActorId::from_str("actor_hydra_approver"),
             ),
             commit_ledger: CommitLedger::new(),
+            commit_writer: None,
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -266,10 +269,14 @@ impl Hydra {
         }
 
         // Record an atomic commit batch for this cascade. v0 ledger is
-        // in-memory only; storage will persist these later.
-        let _commit = self
+        // in-memory; if a CommitBatchWriter is attached, the batch is also
+        // appended durably.
+        let commit = self
             .commit_ledger
             .commit_events(result.events.clone(), None)?;
+        if let Some(writer) = &self.commit_writer {
+            writer.append_commit(&commit)?;
+        }
 
         // I8: Persist cascade events to WAL (if configured)
         if let Some(ref mut wal) = self.wal {
@@ -346,9 +353,12 @@ impl Hydra {
             self.temporal.record(event);
         }
 
-        let _commit = self
+        let commit = self
             .commit_ledger
             .commit_events(result.events.clone(), None)?;
+        if let Some(writer) = &self.commit_writer {
+            writer.append_commit(&commit)?;
+        }
 
         // Persist to WAL (if configured)
         if let Some(ref mut wal) = self.wal {
@@ -839,6 +849,28 @@ impl Hydra {
     /// Verify the in-memory commit hash chain.
     pub fn verify_commit_chain(&self) -> hydra_core::error::Result<()> {
         self.commit_ledger.verify_chain()
+    }
+
+    /// Attach a durable commit writer.
+    ///
+    /// The writer receives every committed cascade batch after the in-memory
+    /// CommitLedger accepts it.
+    pub fn set_commit_writer<W>(&mut self, writer: W)
+    where
+        W: crate::commit_ledger::CommitBatchWriter + 'static,
+    {
+        self.commit_writer = Some(Box::new(writer));
+    }
+
+    /// Remove the durable commit writer.
+    ///
+    /// Hydra will continue maintaining its in-memory CommitLedger.
+    pub fn clear_commit_writer(&mut self) {
+        self.commit_writer = None;
+    }
+
+    pub fn has_commit_writer(&self) -> bool {
+        self.commit_writer.is_some()
     }
 }
 
@@ -1750,6 +1782,73 @@ mod sprint1_tests {
         }
         assert_eq!(result.events[1].caused_by, vec![result.events[0].id.clone()]);
         assert_eq!(result.events[1].cascade_id, result.events[0].cascade_id);
+    }
+
+    #[derive(Debug, Default)]
+    struct TestCommitWriter {
+        commits: std::sync::Arc<std::sync::Mutex<Vec<hydra_core::CommitBatch>>>,
+    }
+
+    impl TestCommitWriter {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn commits(&self) -> std::sync::Arc<std::sync::Mutex<Vec<hydra_core::CommitBatch>>> {
+            self.commits.clone()
+        }
+    }
+
+    impl crate::commit_ledger::CommitBatchWriter for TestCommitWriter {
+        fn append_commit(
+            &self,
+            batch: &hydra_core::CommitBatch,
+        ) -> hydra_core::error::Result<()> {
+            self.commits.lock().unwrap().push(batch.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn hydra_writes_commit_to_attached_writer() {
+        use hydra_core::EventKind;
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let writer = TestCommitWriter::new();
+        let commits = writer.commits();
+        assert!(!hydra.has_commit_writer());
+        hydra.set_commit_writer(writer);
+        assert!(hydra.has_commit_writer());
+
+        let result = hydra
+            .ingest(EventKind::Signal {
+                source: hydra_core::NodeId::from_str("test"),
+                name: "commit_writer_test".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+
+        assert_eq!(hydra.commit_count(), 1);
+        let written = commits.lock().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].sequence, 1);
+        assert_eq!(written[0].event_count(), result.events.len());
+        assert_eq!(
+            written[0].commit_hash,
+            Some(hydra.latest_commit().unwrap().commit_hash.clone())
+        );
+        hydra.verify_commit_chain().unwrap();
+    }
+
+    #[test]
+    fn hydra_can_clear_commit_writer() {
+        let mut hydra = Hydra::new();
+        let writer = TestCommitWriter::new();
+        hydra.set_commit_writer(writer);
+        assert!(hydra.has_commit_writer());
+        hydra.clear_commit_writer();
+        assert!(!hydra.has_commit_writer());
     }
 
     #[test]
