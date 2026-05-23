@@ -428,6 +428,53 @@ impl Hydra {
         Ok(count)
     }
 
+    /// Recover Hydra state from committed batches.
+    ///
+    /// This is database recovery:
+    /// - rebuild the in-memory CommitLedger from supplied committed batches
+    /// - verify the hash chain
+    /// - replay committed events in sequence
+    /// - rebuild graph, temporal, epistemic, action, and policy stores
+    ///
+    /// It does not:
+    /// - run cascades
+    /// - run agents/reflexes
+    /// - append new commits
+    /// - write to the commit writer
+    pub fn recover_from_commits(
+        &mut self,
+        batches: Vec<hydra_core::CommitBatch>,
+    ) -> hydra_core::error::Result<()> {
+        // First validate/rebuild a fresh ledger. Do this before mutating
+        // runtime state so an invalid commit log does not partially recover.
+        let mut recovered_ledger = CommitLedger::new();
+        recovered_ledger.load_committed_batches(batches)?;
+
+        let mut events = Vec::new();
+        for batch in recovered_ledger.batches_in_sequence() {
+            events.extend(batch.events.iter().cloned());
+        }
+
+        self.reset_runtime_state_preserving_config();
+        self.commit_ledger = recovered_ledger;
+        self.recover_from_events(events)?;
+        Ok(())
+    }
+
+    /// Reset runtime-derived state while preserving configuration and pluggable hooks.
+    ///
+    /// This is used before recovery so replay starts from a clean projection.
+    /// Engines, agents, reflex registry, commit writer, WAL, and resource
+    /// limits are all preserved.
+    fn reset_runtime_state_preserving_config(&mut self) {
+        self.projection = Projection::new();
+        self.event_log = EventLog::with_config(self.event_log.config().clone());
+        self.temporal = TemporalIndex::new();
+        self.epistemic_store = EpistemicStore::new();
+        self.action_store = ActionStore::new();
+        self.policy_store = PolicyStore::new();
+    }
+
     // === Anomaly Detection (cont.) ===
 
     /// Mutable access to the anomaly engine for adding rules
@@ -1849,6 +1896,139 @@ mod sprint1_tests {
         assert!(hydra.has_commit_writer());
         hydra.clear_commit_writer();
         assert!(!hydra.has_commit_writer());
+    }
+
+    #[test]
+    fn hydra_recovers_state_from_commit_batches() {
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionStatus, ActionTarget, ActorId, EventKind,
+        };
+        use std::collections::HashMap;
+
+        let mut original = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = ActorId::from_str("actor_recovery_test");
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: None,
+            kind: ActionKind::Backfill,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::Dataset(
+                "analytics.public.revenue_daily".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor,
+            approved_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        let action_id = action.id.clone();
+        original
+            .ingest(EventKind::ActionProposed { action })
+            .unwrap();
+        // PolicyAgent auto-approves when no policy matches.
+        assert_eq!(
+            original.action(&action_id).unwrap().status,
+            ActionStatus::Approved
+        );
+
+        let batches: Vec<hydra_core::CommitBatch> = original
+            .commit_ledger()
+            .batches_in_sequence()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let mut recovered = Hydra::new();
+        recovered.recover_from_commits(batches).unwrap();
+
+        assert_eq!(recovered.commit_count(), original.commit_count());
+        assert_eq!(
+            recovered.latest_commit().unwrap().commit_hash,
+            original.latest_commit().unwrap().commit_hash
+        );
+        assert_eq!(
+            recovered.action(&action_id).unwrap().status,
+            ActionStatus::Approved
+        );
+        assert_eq!(
+            recovered.decisions_for_action(&action_id).len(),
+            original.decisions_for_action(&action_id).len()
+        );
+        recovered.verify_commit_chain().unwrap();
+    }
+
+    #[test]
+    fn hydra_recovery_from_commits_does_not_append_to_writer() {
+        use hydra_core::EventKind;
+        use std::collections::HashMap;
+
+        let mut original = Hydra::new();
+        original
+            .ingest(EventKind::Signal {
+                source: hydra_core::NodeId::from_str("test"),
+                name: "recovery_writer_test".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+
+        let batches: Vec<hydra_core::CommitBatch> = original
+            .commit_ledger()
+            .batches_in_sequence()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let writer = TestCommitWriter::new();
+        let commits = writer.commits();
+        let mut recovered = Hydra::new();
+        recovered.set_commit_writer(writer);
+        recovered.recover_from_commits(batches).unwrap();
+
+        assert_eq!(recovered.commit_count(), 1);
+        assert_eq!(commits.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn hydra_rejects_invalid_commit_chain_during_recovery() {
+        use hydra_core::EventKind;
+        use std::collections::HashMap;
+
+        let mut original = Hydra::new();
+        original
+            .ingest(EventKind::Signal {
+                source: hydra_core::NodeId::from_str("test"),
+                name: "first".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+        original
+            .ingest(EventKind::Signal {
+                source: hydra_core::NodeId::from_str("test"),
+                name: "second".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+
+        let mut batches: Vec<hydra_core::CommitBatch> = original
+            .commit_ledger()
+            .batches_in_sequence()
+            .into_iter()
+            .cloned()
+            .collect();
+        // Break the chain.
+        batches[1].previous_hash = None;
+
+        let mut recovered = Hydra::new();
+        let result = recovered.recover_from_commits(batches);
+        assert!(result.is_err());
+        assert_eq!(recovered.commit_count(), 0);
     }
 
     #[test]

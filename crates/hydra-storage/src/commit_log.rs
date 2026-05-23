@@ -274,6 +274,34 @@ mod tests {
     }
 
     #[test]
+    fn commit_log_batches_can_recover_hydra_state() {
+        use hydra_core::{EventKind, NodeId};
+        use hydra_engine::hydra::Hydra;
+        use std::collections::HashMap;
+
+        let path = temp_path("recover_hydra");
+        let log = CommitLog::open(&path).unwrap();
+        let mut hydra = Hydra::new();
+        hydra.set_commit_writer(log.clone());
+
+        hydra
+            .ingest(EventKind::Signal {
+                source: NodeId::from_str("test"),
+                name: "persisted".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+
+        let batches = log.load_all().unwrap();
+        let mut recovered = Hydra::new();
+        recovered.recover_from_commits(batches).unwrap();
+        assert_eq!(recovered.commit_count(), 1);
+        recovered.verify_commit_chain().unwrap();
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn open_creates_parent_directory() {
         let mut path = std::env::temp_dir();
         path.push(format!(

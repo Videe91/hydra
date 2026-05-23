@@ -133,6 +133,69 @@ impl CommitLedger {
         Ok(batch)
     }
 
+    /// Load an already-committed batch into the in-memory ledger.
+    ///
+    /// This is used during recovery from durable storage. It does not
+    /// recompute a new commit. It trusts the supplied CommitBatch shape,
+    /// indexes it, then verify_chain() can recompute hashes and validate
+    /// the chain.
+    pub fn load_committed_batch(&mut self, batch: CommitBatch) -> Result<()> {
+        if batch.status != CommitStatus::Committed {
+            return Err(HydraError::QueryError(format!(
+                "cannot load non-committed batch {} with status {:?}",
+                batch.id, batch.status
+            )));
+        }
+        if batch.commit_hash.is_none() {
+            return Err(HydraError::QueryError(format!(
+                "cannot load committed batch {} without commit_hash",
+                batch.id
+            )));
+        }
+        if self.batches_by_id.contains_key(&batch.id) {
+            return Err(HydraError::QueryError(format!(
+                "duplicate commit id during recovery: {}",
+                batch.id
+            )));
+        }
+        if let Some(key) = &batch.idempotency_key {
+            if self.idempotency_index.contains_key(key) {
+                return Err(HydraError::QueryError(format!(
+                    "duplicate idempotency key during recovery: {}",
+                    key.value()
+                )));
+            }
+        }
+        let record = CommitRecord::try_from(&batch)
+            .map_err(|err| HydraError::QueryError(err.to_string()))?;
+        if let Some(key) = batch.idempotency_key.clone() {
+            self.idempotency_index.insert(key, batch.id.clone());
+        }
+        self.next_sequence = self.next_sequence.max(batch.sequence);
+        self.head_hash = batch.commit_hash.clone();
+        self.records.push(record);
+        self.batches_by_id.insert(batch.id.clone(), batch);
+        Ok(())
+    }
+
+    /// Load committed batches in order, then verify the resulting chain.
+    pub fn load_committed_batches<I>(&mut self, batches: I) -> Result<()>
+    where
+        I: IntoIterator<Item = CommitBatch>,
+    {
+        for batch in batches {
+            self.load_committed_batch(batch)?;
+        }
+        self.verify_chain()
+    }
+
+    /// Return all loaded batches ordered by commit sequence.
+    pub fn batches_in_sequence(&self) -> Vec<&CommitBatch> {
+        let mut batches: Vec<&CommitBatch> = self.batches_by_id.values().collect();
+        batches.sort_by_key(|batch| batch.sequence);
+        batches
+    }
+
     /// Verify the in-memory hash chain and record/batch consistency.
     pub fn verify_chain(&self) -> Result<()> {
         let mut previous_hash: Option<CommitHash> = None;
@@ -383,5 +446,97 @@ mod tests {
     #[test]
     fn unused_import_guard() {
         let _ = Value::Bool(true);
+    }
+
+    #[test]
+    fn loads_committed_batches_and_verifies_chain() {
+        let mut original = CommitLedger::new();
+        let first = original
+            .commit_events(
+                vec![signal_event("first")],
+                Some(IdempotencyKey::new("first-key")),
+            )
+            .unwrap();
+        let second = original
+            .commit_events(
+                vec![signal_event("second")],
+                Some(IdempotencyKey::new("second-key")),
+            )
+            .unwrap();
+
+        let mut recovered = CommitLedger::new();
+        recovered
+            .load_committed_batches(vec![first.clone(), second.clone()])
+            .unwrap();
+
+        assert_eq!(recovered.commit_count(), 2);
+        assert_eq!(recovered.latest_record().unwrap().sequence, 2);
+        assert_eq!(recovered.head_hash(), second.commit_hash.as_ref());
+        assert_eq!(
+            recovered
+                .commit_for_idempotency_key(&IdempotencyKey::new("first-key"))
+                .unwrap()
+                .id,
+            first.id
+        );
+        recovered.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn rejects_pending_batch_during_recovery() {
+        let event = signal_event("pending");
+        let batch = CommitBatch::new(vec![event]);
+        let mut ledger = CommitLedger::new();
+        let result = ledger.load_committed_batch(batch);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_commit_id_during_recovery() {
+        let mut original = CommitLedger::new();
+        let batch = original
+            .commit_events(vec![signal_event("first")], None)
+            .unwrap();
+        let mut recovered = CommitLedger::new();
+        recovered.load_committed_batch(batch.clone()).unwrap();
+        let result = recovered.load_committed_batch(batch);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_idempotency_key_during_recovery() {
+        let mut original = CommitLedger::new();
+        let first = original
+            .commit_events(
+                vec![signal_event("first")],
+                Some(IdempotencyKey::new("same-key")),
+            )
+            .unwrap();
+        let mut second = original
+            .commit_events(
+                vec![signal_event("second")],
+                Some(IdempotencyKey::new("other-key")),
+            )
+            .unwrap();
+        second.idempotency_key = Some(IdempotencyKey::new("same-key"));
+        let mut recovered = CommitLedger::new();
+        recovered.load_committed_batch(first).unwrap();
+        let result = recovered.load_committed_batch(second);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn batches_in_sequence_returns_ordered_batches() {
+        let mut ledger = CommitLedger::new();
+        let first = ledger
+            .commit_events(vec![signal_event("first")], None)
+            .unwrap();
+        let second = ledger
+            .commit_events(vec![signal_event("second")], None)
+            .unwrap();
+        let batches = ledger.batches_in_sequence();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].id, first.id);
+        assert_eq!(batches[1].id, second.id);
     }
 }

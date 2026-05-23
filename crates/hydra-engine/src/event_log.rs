@@ -70,6 +70,11 @@ impl EventLog {
         }
     }
 
+    /// Read the current retention/compaction config.
+    pub fn config(&self) -> &EventLogConfig {
+        &self.config
+    }
+
     /// Set the config (can be changed at runtime).
     pub fn set_config(&mut self, config: EventLogConfig) {
         self.config = config;
