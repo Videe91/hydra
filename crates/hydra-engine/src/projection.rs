@@ -278,7 +278,9 @@ impl Projection {
             | EventKind::SensorCheckpointSuperseded { .. }
             | EventKind::SchemaRegistered { .. }
             | EventKind::SchemaDisabled { .. }
-            | EventKind::SchemaArchived { .. } => Ok(false),
+            | EventKind::SchemaArchived { .. }
+            | EventKind::SnapshotTaken { .. }
+            | EventKind::SnapshotRestored { .. } => Ok(false),
         }
     }
 

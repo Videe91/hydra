@@ -243,6 +243,15 @@ pub enum EventKind {
         archived_by: ActorId,
         reason: Option<String>,
     },
+
+    // Snapshots — point-in-time captures of the full runtime state
+    SnapshotTaken {
+        manifest: crate::snapshot::SnapshotManifest,
+    },
+    SnapshotRestored {
+        manifest: crate::snapshot::SnapshotManifest,
+        replayed_commit_count: usize,
+    },
 }
 
 impl EventKind {
@@ -291,7 +300,9 @@ impl EventKind {
             | EventKind::SensorCheckpointSuperseded { .. }
             | EventKind::SchemaRegistered { .. }
             | EventKind::SchemaDisabled { .. }
-            | EventKind::SchemaArchived { .. } => None,
+            | EventKind::SchemaArchived { .. }
+            | EventKind::SnapshotTaken { .. }
+            | EventKind::SnapshotRestored { .. } => None,
         }
     }
 
@@ -337,6 +348,8 @@ impl EventKind {
             EventKind::SchemaRegistered { .. } => "schema_registered",
             EventKind::SchemaDisabled { .. } => "schema_disabled",
             EventKind::SchemaArchived { .. } => "schema_archived",
+            EventKind::SnapshotTaken { .. } => "snapshot_taken",
+            EventKind::SnapshotRestored { .. } => "snapshot_restored",
         }
     }
 }
@@ -985,6 +998,38 @@ mod tests {
             }
             .kind_name(),
             "schema_archived"
+        );
+    }
+
+    #[test]
+    fn snapshot_event_kind_names() {
+        use crate::snapshot::SnapshotManifest;
+        use crate::{ActorId, CommitHash, CommitId, SnapshotId};
+
+        let manifest = SnapshotManifest::committed(
+            SnapshotId::new(),
+            None,
+            1,
+            Some(CommitId::from_str("commit_1")),
+            Some(CommitHash("engine-v0:hash".to_string())),
+            ActorId::from_str("actor_snapshot"),
+            Utc::now(),
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        assert_eq!(
+            EventKind::SnapshotTaken {
+                manifest: manifest.clone()
+            }
+            .kind_name(),
+            "snapshot_taken"
+        );
+        assert_eq!(
+            EventKind::SnapshotRestored {
+                manifest,
+                replayed_commit_count: 3
+            }
+            .kind_name(),
+            "snapshot_restored"
         );
     }
 }

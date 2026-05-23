@@ -411,7 +411,9 @@ impl TemporalIndex {
             | EventKind::SensorCheckpointSuperseded { .. }
             | EventKind::SchemaRegistered { .. }
             | EventKind::SchemaDisabled { .. }
-            | EventKind::SchemaArchived { .. } => false,
+            | EventKind::SchemaArchived { .. }
+            | EventKind::SnapshotTaken { .. }
+            | EventKind::SnapshotRestored { .. } => false,
         }
     }
 

@@ -10,6 +10,7 @@ pub mod schema;
 pub mod node;
 pub mod edge;
 pub mod graph;
+pub mod snapshot;
 pub mod subscription;
 
 pub use id::{
@@ -74,6 +75,7 @@ pub use schema::{
     SchemaStatus,
     ValueType,
 };
+pub use snapshot::{SnapshotBody, SnapshotManifest, SnapshotStatus};
 
 /// Convenience re-exports for common types
 pub mod prelude {
@@ -106,6 +108,7 @@ pub mod prelude {
         ActionPayloadSchema, ClaimPredicateSchema, EntityTypeSchema, EvidencePayloadSchema,
         FieldSchema, PolicyConditionSchema, SchemaDefinition, SchemaStatus, ValueType,
     };
+    pub use crate::snapshot::{SnapshotBody, SnapshotManifest, SnapshotStatus};
     pub use crate::node::{Node, NodeMeta, NodeValidator};
     pub use crate::edge::{Edge, EdgeMeta};
     pub use crate::graph::{GraphReader, TraversalDirection, bfs, bfs_dyn, topological_sort};

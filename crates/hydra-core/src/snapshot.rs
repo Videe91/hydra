@@ -1,0 +1,242 @@
+use crate::edge::Edge;
+use crate::epistemic::{Claim, Evidence};
+use crate::event::Value;
+use crate::id::{ActorId, SnapshotId, TenantId};
+use crate::node::Node;
+use crate::{
+    Action, CommitHash, CommitId, CommitRecord, Event, Policy, SchemaDefinition, SensorCheckpoint,
+    SensorRun,
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Snapshot lifecycle.
+///
+/// - `Pending`  — snapshot is being built.
+/// - `Committed` — snapshot is complete and restorable.
+/// - `Stale`    — snapshot is obsolete because a newer snapshot superseded it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SnapshotStatus {
+    Pending,
+    Committed,
+    Stale,
+}
+
+/// Lightweight summary of a snapshot.
+///
+/// Storage backends and HTTP list endpoints should read this first — it
+/// avoids loading the full body when callers only need inventory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotManifest {
+    pub id: SnapshotId,
+    pub tenant_id: Option<TenantId>,
+    /// Commit sequence covered by this snapshot.
+    pub sequence: u64,
+    /// Head commit included in this snapshot.
+    pub head_commit_id: Option<CommitId>,
+    pub head_commit_hash: Option<CommitHash>,
+    pub status: SnapshotStatus,
+    pub created_by: ActorId,
+    pub created_at: DateTime<Utc>,
+    /// Summary counts for quick auditing.
+    pub total_events: usize,
+    pub total_commits: usize,
+    pub total_nodes: usize,
+    pub total_edges: usize,
+    pub total_claims: usize,
+    pub total_evidence: usize,
+    pub total_actions: usize,
+    pub total_policies: usize,
+    pub total_sensor_checkpoints: usize,
+    pub total_schemas: usize,
+    pub metadata: HashMap<String, Value>,
+}
+
+/// Owned materialized state captured in a snapshot.
+///
+/// Patch 1 intentionally keeps this type simple and store-agnostic. The
+/// engine patch will decide exactly how each runtime store maps into these
+/// vectors.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotBody {
+    pub manifest: SnapshotManifest,
+    /// Graph projection.
+    pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+    /// Event / audit state.
+    pub events: Vec<Event>,
+    pub commit_records: Vec<CommitRecord>,
+    /// Epistemic state.
+    pub claims: Vec<Claim>,
+    pub evidence: Vec<Evidence>,
+    /// Action / policy state.
+    pub actions: Vec<Action>,
+    pub policies: Vec<Policy>,
+    /// Sensor / checkpoint state.
+    pub sensor_runs: Vec<SensorRun>,
+    pub sensor_checkpoints: Vec<SensorCheckpoint>,
+    /// Schema registry state.
+    pub schemas: Vec<SchemaDefinition>,
+    pub metadata: HashMap<String, Value>,
+}
+
+impl SnapshotManifest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn committed(
+        id: SnapshotId,
+        tenant_id: Option<TenantId>,
+        sequence: u64,
+        head_commit_id: Option<CommitId>,
+        head_commit_hash: Option<CommitHash>,
+        created_by: ActorId,
+        created_at: DateTime<Utc>,
+        total_events: usize,
+        total_commits: usize,
+        total_nodes: usize,
+        total_edges: usize,
+        total_claims: usize,
+        total_evidence: usize,
+        total_actions: usize,
+        total_policies: usize,
+        total_sensor_checkpoints: usize,
+        total_schemas: usize,
+    ) -> Self {
+        Self {
+            id,
+            tenant_id,
+            sequence,
+            head_commit_id,
+            head_commit_hash,
+            status: SnapshotStatus::Committed,
+            created_by,
+            created_at,
+            total_events,
+            total_commits,
+            total_nodes,
+            total_edges,
+            total_claims,
+            total_evidence,
+            total_actions,
+            total_policies,
+            total_sensor_checkpoints,
+            total_schemas,
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn is_committed(&self) -> bool {
+        self.status == SnapshotStatus::Committed
+    }
+}
+
+impl SnapshotBody {
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn commit_count(&self) -> usize {
+        self.commit_records.len()
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    pub fn schema_count(&self) -> usize {
+        self.schemas.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn actor() -> ActorId {
+        ActorId::from_str("actor_snapshot_test")
+    }
+
+    #[test]
+    fn snapshot_manifest_committed_builder_sets_counts() {
+        let manifest = SnapshotManifest::committed(
+            SnapshotId::new(),
+            None,
+            42,
+            Some(CommitId::from_str("commit_42")),
+            Some(CommitHash("engine-v0:abc".to_string())),
+            actor(),
+            Utc::now(),
+            10, 4, 3, 2, 5, 6, 7, 8, 9, 11,
+        );
+        assert!(manifest.is_committed());
+        assert_eq!(manifest.sequence, 42);
+        assert_eq!(manifest.total_events, 10);
+        assert_eq!(manifest.total_commits, 4);
+        assert_eq!(manifest.total_nodes, 3);
+        assert_eq!(manifest.total_edges, 2);
+        assert_eq!(manifest.total_claims, 5);
+        assert_eq!(manifest.total_evidence, 6);
+        assert_eq!(manifest.total_actions, 7);
+        assert_eq!(manifest.total_policies, 8);
+        assert_eq!(manifest.total_sensor_checkpoints, 9);
+        assert_eq!(manifest.total_schemas, 11);
+    }
+
+    #[test]
+    fn snapshot_manifest_serde_roundtrip() {
+        let manifest = SnapshotManifest::committed(
+            SnapshotId::new(),
+            None,
+            1,
+            Some(CommitId::from_str("commit_1")),
+            Some(CommitHash("engine-v0:hash".to_string())),
+            actor(),
+            Utc::now(),
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        let json = serde_json::to_string(&manifest).unwrap();
+        let restored: SnapshotManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(manifest, restored);
+    }
+
+    #[test]
+    fn snapshot_body_serde_roundtrip_empty() {
+        let manifest = SnapshotManifest::committed(
+            SnapshotId::new(),
+            None,
+            0,
+            None,
+            None,
+            actor(),
+            Utc::now(),
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        let body = SnapshotBody {
+            manifest,
+            nodes: vec![],
+            edges: vec![],
+            events: vec![],
+            commit_records: vec![],
+            claims: vec![],
+            evidence: vec![],
+            actions: vec![],
+            policies: vec![],
+            sensor_runs: vec![],
+            sensor_checkpoints: vec![],
+            schemas: vec![],
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let restored: SnapshotBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(body, restored);
+        assert_eq!(restored.event_count(), 0);
+        assert_eq!(restored.commit_count(), 0);
+        assert_eq!(restored.node_count(), 0);
+        assert_eq!(restored.edge_count(), 0);
+        assert_eq!(restored.schema_count(), 0);
+    }
+}
