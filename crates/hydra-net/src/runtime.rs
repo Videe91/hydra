@@ -101,6 +101,7 @@ impl RuntimeBuilder {
         let outbound = Arc::new(outbound);
 
         let handle = RuntimeHandle {
+            hydra: Arc::clone(&hydra),
             inbound_sender: in_tx,
             query: query_service,
             schema: schema_service,
@@ -130,6 +131,7 @@ impl Default for RuntimeBuilder {
 /// The external API for interacting with a running Hydra runtime.
 /// Cheaply cloneable — share across tasks.
 pub struct RuntimeHandle {
+    hydra: Arc<RwLock<Hydra>>,
     inbound_sender: mpsc::Sender<SensorBatch>,
     query: QueryService,
     schema: SchemaService,
@@ -138,6 +140,16 @@ pub struct RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    /// Direct access to the shared `Arc<RwLock<Hydra>>`.
+    ///
+    /// Useful for callers that need to compose their own routes or services
+    /// against the same engine instance. Most callers should prefer the
+    /// typed service accessors (`query()`, `schema()`, `schema_admin()`)
+    /// which acquire the lock automatically and return cloned data.
+    pub fn hydra(&self) -> Arc<RwLock<Hydra>> {
+        self.hydra.clone()
+    }
+
     /// Get the query service for reading the graph
     pub fn query(&self) -> &QueryService {
         &self.query
@@ -169,6 +181,7 @@ impl RuntimeHandle {
 impl Clone for RuntimeHandle {
     fn clone(&self) -> Self {
         Self {
+            hydra: Arc::clone(&self.hydra),
             inbound_sender: self.inbound_sender.clone(),
             query: self.query.clone(),
             schema: self.schema.clone(),

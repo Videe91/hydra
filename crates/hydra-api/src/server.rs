@@ -11,7 +11,8 @@ use hydra_net::http::schema_router;
 use hydra_net::runtime::RuntimeHandle;
 use tower_http::cors::CorsLayer;
 
-fn schema_cors_layer() -> CorsLayer {
+/// Shared CORS policy used by every hydra-api router build.
+fn cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
@@ -19,14 +20,10 @@ fn schema_cors_layer() -> CorsLayer {
         .max_age(std::time::Duration::from_secs(3600))
 }
 
-/// Build the Axum router with all endpoints.
-pub fn build_router(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
-        .allow_origin("*".parse::<HeaderValue>().unwrap())
-        .max_age(std::time::Duration::from_secs(3600));
-
+/// Legacy CloudTrail/Sentinel routes, parameterised by the shared
+/// `AppState`. Kept as a separate builder so the unified `build_router`
+/// can `.merge(...)` it alongside the schema routes.
+fn legacy_routes(state: AppState) -> Router {
     Router::new()
         // Health & Stats
         .route("/health", get(routes::health))
@@ -43,41 +40,44 @@ pub fn build_router(state: AppState) -> Router {
         .route("/recovery-plan/:node_id", get(routes::recovery_plan))
         // Ingestion
         .route("/sensor/cloudtrail", post(routes::ingest_cloudtrail))
-        // Middleware
-        .layer(cors)
         .with_state(state)
 }
 
+/// Build the unified Axum router exposing every hydra-api endpoint:
+/// legacy CloudTrail/Sentinel routes **and** the `/schemas/*` surface from
+/// `hydra-net`. Both layers share the same [`RuntimeHandle`], which means
+/// CloudTrail ingestion writes are immediately visible to schema reads
+/// and vice versa.
+pub fn build_router(runtime: RuntimeHandle) -> Router {
+    let state = AppState::new(runtime.clone());
+    legacy_routes(state)
+        .merge(schema_router(runtime))
+        .layer(cors_layer())
+}
+
 /// Start the HTTP server on the given address.
-pub async fn serve(state: AppState, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let router = build_router(state);
+pub async fn serve(
+    runtime: RuntimeHandle,
+    addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let router = build_router(runtime);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
     Ok(())
 }
 
-/// Build a router that exposes the schema HTTP surface
+/// Build a router exposing only the schema HTTP surface
 /// (introspection + preflight validation + register/disable/archive).
 ///
-/// Mounts the full `/schemas/*` route tree from `hydra-net` behind the same
-/// CORS policy as the legacy CloudTrail server.
-///
-/// **Note on engine ownership.** The legacy [`AppState`]-backed server uses
-/// `Arc<std::sync::Mutex<Hydra>>`; this entrypoint uses
-/// [`RuntimeHandle`], which holds `Arc<tokio::sync::RwLock<Hydra>>`. They
-/// cannot share a single `Hydra` instance today. Unifying the two ownership
-/// models so legacy routes and schema routes hit the same engine is a
-/// dedicated follow-up patch.
+/// Convenience for schema-only deployments that don't want the legacy
+/// CloudTrail/Sentinel routes mounted.
 pub fn build_schema_router(runtime: RuntimeHandle) -> Router {
     Router::new()
         .merge(schema_router(runtime))
-        .layer(schema_cors_layer())
+        .layer(cors_layer())
 }
 
 /// Start an HTTP server exposing only the schema routes.
-///
-/// Convenience for a clean "schema database" deployment that does not also
-/// want the Sentinel/CloudTrail surface.
 pub async fn serve_schema(
     runtime: RuntimeHandle,
     addr: &str,
@@ -96,13 +96,14 @@ mod tests {
     use hydra_engine::prelude::*;
     use tower::ServiceExt;
 
-    fn test_state() -> AppState {
-        AppState::new(Hydra::new())
+    fn test_runtime() -> hydra_net::runtime::RuntimeHandle {
+        let (runtime, _processor) = hydra_net::runtime::RuntimeBuilder::new().build();
+        runtime
     }
 
     #[tokio::test]
     async fn health_endpoint() {
-        let app = build_router(test_state());
+        let app = build_router(test_runtime());
         let req = Request::builder()
             .uri("/health")
             .body(Body::empty())
@@ -113,7 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn stats_endpoint() {
-        let app = build_router(test_state());
+        let app = build_router(test_runtime());
         let req = Request::builder()
             .uri("/stats")
             .body(Body::empty())
@@ -124,7 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_not_found() {
-        let app = build_router(test_state());
+        let app = build_router(test_runtime());
         let req = Request::builder()
             .uri("/nodes/nonexistent")
             .body(Body::empty())
@@ -135,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_nodes_empty() {
-        let app = build_router(test_state());
+        let app = build_router(test_runtime());
         let req = Request::builder()
             .uri("/nodes")
             .body(Body::empty())
@@ -146,7 +147,7 @@ mod tests {
 
     #[tokio::test]
     async fn protection_status_empty() {
-        let app = build_router(test_state());
+        let app = build_router(test_runtime());
         let req = Request::builder()
             .uri("/protection-status")
             .body(Body::empty())
@@ -157,7 +158,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_endpoint() {
-        let app = build_router(test_state());
+        let app = build_router(test_runtime());
         let req = Request::builder()
             .uri("/metrics")
             .body(Body::empty())
@@ -313,37 +314,63 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_cloudtrail_and_query() {
-        use hydra_core::subscription::{Subscription, EventFilter};
+        use hydra_core::subscription::{EventFilter, Subscription};
+        use hydra_net::runtime::RuntimeBuilder;
         use hydra_sentinel::arms::*;
 
-        // Build Hydra with Arms
-        let mut hydra = Hydra::with_config(CascadeConfig {
-            max_depth: 15,
-            max_events: 200,
-        });
-        hydra.register(Subscription::new("discovery", EventFilter::Or(vec![
-            EventFilter::SignalName("resource_discovered".into()),
-            EventFilter::SignalName("resource_deleted".into()),
-        ]), 200, Box::new(DiscoveryArm::new())));
-        hydra.register(Subscription::new("classification", EventFilter::Or(vec![
-            EventFilter::NodeCreated,
-        ]), 190, Box::new(ClassificationArm::with_defaults())));
-        hydra.register(Subscription::new("policy", EventFilter::NodeUpdated,
-            180, Box::new(PolicyArm::new())));
-        hydra.register(Subscription::new("execution", EventFilter::Or(vec![
-            EventFilter::SignalName("policy_computed".into()),
-        ]), 170, Box::new(ExecutionArm::new())));
-        hydra.register(Subscription::new("verification",
-            EventFilter::SignalName("backup_completed".into()),
-            160, Box::new(VerificationArm::new())));
-        hydra.register(Subscription::new("trust", EventFilter::Or(vec![
-            EventFilter::SignalName("trust_penalty".into()),
-            EventFilter::NodeUpdated,
-            EventFilter::EdgeCreated,
-        ]), 100, Box::new(TrustArm::new())));
+        // Build a runtime with the full Sentinel arm pipeline registered as
+        // subscriptions. RuntimeBuilder owns Hydra construction now.
+        let (runtime, _processor) = RuntimeBuilder::new()
+            .cascade_config(CascadeConfig {
+                max_depth: 15,
+                max_events: 200,
+            })
+            .subscription(Subscription::new(
+                "discovery",
+                EventFilter::Or(vec![
+                    EventFilter::SignalName("resource_discovered".into()),
+                    EventFilter::SignalName("resource_deleted".into()),
+                ]),
+                200,
+                Box::new(DiscoveryArm::new()),
+            ))
+            .subscription(Subscription::new(
+                "classification",
+                EventFilter::Or(vec![EventFilter::NodeCreated]),
+                190,
+                Box::new(ClassificationArm::with_defaults()),
+            ))
+            .subscription(Subscription::new(
+                "policy",
+                EventFilter::NodeUpdated,
+                180,
+                Box::new(PolicyArm::new()),
+            ))
+            .subscription(Subscription::new(
+                "execution",
+                EventFilter::Or(vec![EventFilter::SignalName("policy_computed".into())]),
+                170,
+                Box::new(ExecutionArm::new()),
+            ))
+            .subscription(Subscription::new(
+                "verification",
+                EventFilter::SignalName("backup_completed".into()),
+                160,
+                Box::new(VerificationArm::new()),
+            ))
+            .subscription(Subscription::new(
+                "trust",
+                EventFilter::Or(vec![
+                    EventFilter::SignalName("trust_penalty".into()),
+                    EventFilter::NodeUpdated,
+                    EventFilter::EdgeCreated,
+                ]),
+                100,
+                Box::new(TrustArm::new()),
+            ))
+            .build();
 
-        let state = AppState::new(hydra);
-        let app = build_router(state.clone());
+        let app = build_router(runtime.clone());
 
         // POST CloudTrail event
         let cloudtrail = r#"{"Records": [{
@@ -368,7 +395,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         // GET the node
-        let app = build_router(state.clone());
+        let app = build_router(runtime.clone());
         let req = Request::builder()
             .uri("/nodes/api-test-db")
             .body(Body::empty())
@@ -377,7 +404,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         // GET protection status
-        let app = build_router(state.clone());
+        let app = build_router(runtime.clone());
         let req = Request::builder()
             .uri("/protection-status")
             .body(Body::empty())
@@ -386,9 +413,75 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         // GET blast radius
-        let app = build_router(state.clone());
+        let app = build_router(runtime.clone());
         let req = Request::builder()
             .uri("/blast-radius/api-test-db")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Unification test: the legacy `/stats` endpoint and the new
+    /// `/schemas/active` endpoint share a single `Hydra` instance via the
+    /// same `RuntimeHandle`. A schema registered through `/schemas/action`
+    /// is visible to the legacy route's `state.runtime.hydra().read().await`
+    /// path because both sides hold the same `Arc<RwLock<Hydra>>`.
+    #[tokio::test]
+    async fn legacy_and_schema_routes_share_one_runtime() {
+        use hydra_core::{FieldSchema, ValueType};
+        use hydra_net::http::schema::{
+            RegisterActionSchemaRequest, SchemasResponse,
+        };
+
+        let runtime = test_runtime();
+        let app = build_router(runtime.clone());
+
+        // Register a schema via /schemas/action
+        let register = RegisterActionSchemaRequest {
+            action_kind: "PostLedgerEntry".to_string(),
+            fields: vec![
+                FieldSchema::required("account", ValueType::String),
+                FieldSchema::required("amount", ValueType::Float),
+            ],
+        };
+        let req = Request::builder()
+            .method("POST")
+            .uri("/schemas/action")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&register).unwrap()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+
+        // The same RuntimeHandle that backs every legacy route sees it
+        // immediately.
+        assert!(runtime
+            .schema()
+            .action_payload_schema("PostLedgerEntry")
+            .await
+            .is_some());
+
+        // /schemas/active over the unified router sees it.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/schemas/active")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoded: SchemasResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded.schemas.len(), 1);
+
+        // Legacy route still works against the same runtime.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/stats")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

@@ -19,7 +19,8 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 }
 
 pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
-    let hydra = state.hydra.lock().unwrap();
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
     let (sensor_processed, sensor_signals) = state.transport.stats();
     Json(StatsResponse {
         node_count: hydra.node_count(),
@@ -35,7 +36,8 @@ pub async fn get_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<NodeResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let hydra = state.hydra.lock().unwrap();
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
     let node_id = NodeId::from_str(&id);
     match hydra.graph().node(&node_id) {
         Some(node) => {
@@ -93,7 +95,8 @@ pub async fn list_nodes(
     State(state): State<AppState>,
     Query(params): Query<NodeListParams>,
 ) -> Json<NodeListResponse> {
-    let hydra = state.hydra.lock().unwrap();
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
     let limit = params.limit.unwrap_or(100).min(1000);
 
     let nodes: Vec<NodeSummary> = match &params.type_filter {
@@ -134,7 +137,8 @@ pub async fn blast_radius(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
 ) -> Result<Json<BlastRadiusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let hydra = state.hydra.lock().unwrap();
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
     let id = NodeId::from_str(&node_id);
     if hydra.graph().node(&id).is_none() {
         return Err((StatusCode::NOT_FOUND,
@@ -160,7 +164,8 @@ pub async fn blast_radius(
 }
 
 pub async fn protection_status(State(state): State<AppState>) -> Json<ProtectionStatusResponse> {
-    let hydra = state.hydra.lock().unwrap();
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
     let summary = hydra_sentinel::queries::protection_status::protection_summary(hydra.graph());
 
     // Aggregate by type
@@ -191,7 +196,8 @@ pub async fn protection_status(State(state): State<AppState>) -> Json<Protection
 }
 
 pub async fn compliance_gaps(State(state): State<AppState>) -> Json<ComplianceGapsResponse> {
-    let hydra = state.hydra.lock().unwrap();
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
     // Use the same rules as ComplianceArm
     let rules = vec![]; // Use empty rules for now — compliance checks run via ComplianceArm
     let report = hydra_sentinel::queries::compliance_gaps::compliance_gaps(hydra.graph(), &rules);
@@ -216,7 +222,8 @@ pub async fn compliance_gaps(State(state): State<AppState>) -> Json<ComplianceGa
 }
 
 pub async fn confidence_report(State(state): State<AppState>) -> Json<ConfidenceReportResponse> {
-    let hydra = state.hydra.lock().unwrap();
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
     let report = hydra_sentinel::queries::confidence_report::confidence_report(hydra.graph(), 10);
 
     let weak_links: Vec<WeakLink> = report.weakest_links.iter().map(|wl| WeakLink {
@@ -237,7 +244,8 @@ pub async fn recovery_plan(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
 ) -> Result<Json<RecoveryPlanResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let hydra = state.hydra.lock().unwrap();
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
     let id = NodeId::from_str(&node_id);
     match hydra_sentinel::queries::recovery_plan::recovery_plan(hydra.graph(), &id) {
         Some(plan) => {
@@ -278,7 +286,8 @@ pub async fn ingest_cloudtrail(
 
     let mut cascade_events = 0;
     {
-        let mut hydra = state.hydra.lock().unwrap();
+        let hydra = state.runtime.hydra();
+        let mut hydra = hydra.write().await;
         for signal in transport_result.signals {
             match hydra.ingest(signal) {
                 Ok(result) => cascade_events += result.events.len(),
@@ -298,7 +307,8 @@ pub async fn ingest_cloudtrail(
 }
 
 pub async fn metrics(State(state): State<AppState>) -> String {
-    let hydra = state.hydra.lock().unwrap();
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
     let (sensor_processed, sensor_signals) = state.transport.stats();
     format!(
         "# HELP hydra_nodes_total Total graph nodes\n# TYPE hydra_nodes_total gauge\nhydra_nodes_total {}\n\

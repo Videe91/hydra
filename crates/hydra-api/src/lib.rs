@@ -10,30 +10,17 @@
 //! - Prometheus-compatible metrics
 //! - CORS and security headers
 //!
-//! ## Two engine ownership models (transitional)
+//! ## Engine ownership
 //!
-//! The legacy [`state::AppState`]-backed server uses
-//! `Arc<std::sync::Mutex<Hydra>>` (sync). The schema HTTP surface mounts a
-//! [`hydra_net::runtime::RuntimeHandle`], which owns
-//! `Arc<tokio::sync::RwLock<Hydra>>` (async). They cannot share a single
-//! `Hydra` instance today. Unifying them is a dedicated follow-up patch.
+//! Every router exposed by hydra-api is built from a single
+//! [`hydra_net::runtime::RuntimeHandle`], which holds
+//! `Arc<tokio::sync::RwLock<Hydra>>`. Legacy CloudTrail/Sentinel routes and
+//! the `/schemas/*` surface share the same `Hydra` instance through this
+//! handle — schema writes are immediately visible to legacy queries, and
+//! CloudTrail ingestion is immediately visible to `/schemas/*`. There is
+//! no split-brain.
 //!
-//! ## Quick Start (legacy AppState-backed server)
-//!
-//! ```rust,ignore
-//! use hydra_api::{server, state::AppState};
-//! use hydra_engine::prelude::*;
-//!
-//! #[tokio::main]
-//! async fn main() {
-//!     let hydra = Hydra::new();
-//!     // ... register Arms ...
-//!     let state = AppState::new(hydra);
-//!     server::serve(state, "0.0.0.0:3000").await.unwrap();
-//! }
-//! ```
-//!
-//! ## Quick Start (schema HTTP server)
+//! ## Quick Start
 //!
 //! ```rust,ignore
 //! use hydra_api::server;
@@ -41,10 +28,15 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let (runtime, _processor) = RuntimeBuilder::new().build();
-//!     server::serve_schema(runtime, "0.0.0.0:3000").await.unwrap();
+//!     let (runtime, _processor) = RuntimeBuilder::new()
+//!         // ... .subscription(...) to register Sentinel Arms ...
+//!         .build();
+//!     server::serve(runtime, "0.0.0.0:3000").await.unwrap();
 //! }
 //! ```
+//!
+//! For a schema-only deployment without the legacy surface, use
+//! [`server::serve_schema`] instead.
 
 pub mod responses;
 pub mod routes;
