@@ -1267,6 +1267,22 @@ impl Hydra {
         self.commit_ledger.commit_count()
     }
 
+    /// All committed records, in sequence. Useful for audit views and HTTP
+    /// listing routes that need lightweight commit metadata without loading
+    /// full event bodies.
+    pub fn commit_records(&self) -> &[hydra_core::CommitRecord] {
+        self.commit_ledger.records()
+    }
+
+    /// Full commit batch (including events) for a specific commit id.
+    /// Returns `None` if the id is unknown.
+    pub fn commit_batch(
+        &self,
+        id: &hydra_core::CommitId,
+    ) -> Option<&hydra_core::CommitBatch> {
+        self.commit_ledger.batch(id)
+    }
+
     /// Verify the in-memory commit hash chain.
     pub fn verify_commit_chain(&self) -> hydra_core::error::Result<()> {
         self.commit_ledger.verify_chain()

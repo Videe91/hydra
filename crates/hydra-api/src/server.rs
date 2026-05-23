@@ -7,7 +7,7 @@ use crate::state::AppState;
 use axum::http::{header, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
-use hydra_net::http::{ingest_router, schema_router, sensor_router};
+use hydra_net::http::{commits_router, ingest_router, schema_router, sensor_router};
 use hydra_net::runtime::RuntimeHandle;
 use tower_http::cors::CorsLayer;
 
@@ -53,7 +53,8 @@ pub fn build_router(runtime: RuntimeHandle) -> Router {
     legacy_routes(state)
         .merge(schema_router(runtime.clone()))
         .merge(ingest_router(runtime.clone()))
-        .merge(sensor_router(runtime))
+        .merge(sensor_router(runtime.clone()))
+        .merge(commits_router(runtime))
         .layer(cors_layer())
 }
 
@@ -695,5 +696,63 @@ mod tests {
 
         // Business event commit + checkpoint commit. Duplicate adds nothing.
         assert_eq!(runtime.hydra().read().await.commit_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn api_commits_routes_are_mounted_and_verify_clean_chain() {
+        use hydra_core::{EventKind, NodeId};
+        use hydra_net::http::commits::{CommitListResponse, VerifyCommitsResponse};
+        use std::collections::HashMap;
+
+        let runtime = test_runtime();
+        {
+            let hydra_arc = runtime.hydra();
+            let mut hydra = hydra_arc.write().await;
+            hydra
+                .ingest(EventKind::Signal {
+                    source: NodeId::from_str("api.commits"),
+                    name: "commit_test".to_string(),
+                    payload: HashMap::new(),
+                })
+                .unwrap();
+        }
+        let app = build_router(runtime.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/commits")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: CommitListResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(list.commits.len(), 1);
+        assert!(!list.commits[0].commit_hash.0.is_empty());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/commits/verify")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let verify: VerifyCommitsResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(verify.valid);
+        assert_eq!(verify.total_commits, 1);
     }
 }
