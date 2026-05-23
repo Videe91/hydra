@@ -8,7 +8,7 @@ use axum::http::{header, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use hydra_net::http::{
-    commits_router, events_router, ingest_router, schema_router, sensor_router,
+    commits_router, events_router, ingest_router, schema_router, sensor_router, snapshots_router,
 };
 use hydra_net::runtime::RuntimeHandle;
 use tower_http::cors::CorsLayer;
@@ -57,7 +57,8 @@ pub fn build_router(runtime: RuntimeHandle) -> Router {
         .merge(ingest_router(runtime.clone()))
         .merge(sensor_router(runtime.clone()))
         .merge(commits_router(runtime.clone()))
-        .merge(events_router(runtime))
+        .merge(events_router(runtime.clone()))
+        .merge(snapshots_router(runtime))
         .layer(cors_layer())
 }
 
@@ -796,5 +797,116 @@ mod tests {
         let list: EventListResponse = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(list.events.len(), 1);
         assert_eq!(list.events[0].kind, "signal");
+    }
+
+    #[tokio::test]
+    async fn api_snapshots_routes_are_mounted() {
+        use hydra_core::ActorId;
+        use hydra_net::http::snapshots::{
+            CreateSnapshotRequest, SnapshotManifestResponse, SnapshotsListResponse,
+        };
+
+        let runtime = test_runtime();
+        let app = build_router(runtime.clone());
+
+        let create = CreateSnapshotRequest {
+            created_by: ActorId::from_str("actor_api_snapshot"),
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/snapshots")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&create).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: SnapshotManifestResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(runtime
+            .hydra()
+            .read()
+            .await
+            .snapshot_body(&created.manifest.id)
+            .is_some());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/snapshots")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: SnapshotsListResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(list.snapshots.len(), 1);
+    }
+
+    /// End-to-end pipeline test: HTTP POST /snapshots → engine snapshot
+    /// → FileSnapshotStore backend → disk. Reopen the same backend at the
+    /// same root and confirm the manifest + body survive process restart.
+    #[tokio::test]
+    async fn api_snapshot_route_writes_to_file_backend() {
+        use hydra_core::ActorId;
+        use hydra_net::http::snapshots::{CreateSnapshotRequest, SnapshotManifestResponse};
+        use hydra_storage::snapshot::FileSnapshotStore;
+
+        let root = std::env::temp_dir().join(format!(
+            "hydra_api_snapshot_route_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        let runtime = test_runtime();
+        {
+            let hydra_arc = runtime.hydra();
+            let mut hydra = hydra_arc.write().await;
+            hydra.set_snapshot_backend(FileSnapshotStore::open(&root).unwrap());
+        }
+
+        let app = build_router(runtime.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/snapshots")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&CreateSnapshotRequest {
+                            created_by: ActorId::from_str("actor_api_snapshot"),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: SnapshotManifestResponse = serde_json::from_slice(&bytes).unwrap();
+
+        // Reopen the backend at the same root — simulates process restart.
+        let reopened = FileSnapshotStore::open(&root).unwrap();
+        let manifests = reopened.list_snapshot_manifests().unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].id, created.manifest.id);
+        let body = reopened.read_snapshot(&created.manifest.id).unwrap();
+        assert_eq!(body.manifest.id, created.manifest.id);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
