@@ -3,6 +3,7 @@ use crate::cascade::{CascadeConfig, CascadeEngine, CascadeResult};
 use crate::commit_ledger::CommitLedger;
 use crate::coverage::{CoverageEngine, CoverageReport};
 use crate::schema_registry_store::SchemaRegistryStore;
+use crate::schema_validator::SchemaValidator;
 use crate::sensor_checkpoint_store::SensorCheckpointStore;
 use crate::action_store::ActionStore;
 use crate::epistemic_store::EpistemicStore;
@@ -63,6 +64,7 @@ pub struct Hydra {
     commit_writer: Option<Box<dyn crate::commit_ledger::CommitBatchWriter>>,
     sensor_checkpoint_store: SensorCheckpointStore,
     schema_registry_store: SchemaRegistryStore,
+    schema_validator: SchemaValidator,
     reflex_registry: ReflexRegistry,
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
@@ -137,6 +139,7 @@ impl Hydra {
             commit_writer: None,
             sensor_checkpoint_store: SensorCheckpointStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
+            schema_validator: SchemaValidator::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -169,6 +172,7 @@ impl Hydra {
             commit_writer: None,
             sensor_checkpoint_store: SensorCheckpointStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
+            schema_validator: SchemaValidator::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -1039,6 +1043,37 @@ impl Hydra {
     ) -> Option<&hydra_core::PolicyConditionSchema> {
         self.schema_registry_store
             .policy_condition_schema(policy_kind)
+    }
+
+    // === Schema validator (read-only) ===
+
+    pub fn schema_validator(&self) -> &SchemaValidator {
+        &self.schema_validator
+    }
+
+    pub fn validate_action_payload(
+        &self,
+        action: &hydra_core::Action,
+    ) -> crate::schema_validator::SchemaValidationReport {
+        self.schema_validator
+            .validate_action_payload(&self.schema_registry_store, action)
+    }
+
+    pub fn validate_policy_condition(
+        &self,
+        policy: &hydra_core::Policy,
+    ) -> crate::schema_validator::SchemaValidationReport {
+        self.schema_validator
+            .validate_policy_condition(&self.schema_registry_store, policy)
+    }
+
+    pub fn validate_evidence_payload(
+        &self,
+        evidence_kind: &str,
+        payload: &std::collections::HashMap<String, hydra_core::Value>,
+    ) -> crate::schema_validator::SchemaValidationReport {
+        self.schema_validator
+            .validate_evidence_payload(&self.schema_registry_store, evidence_kind, payload)
     }
 
     /// Record one external sensor observation safely.
@@ -3290,5 +3325,123 @@ mod sprint1_tests {
         assert!(recovered.action_payload_schema("Backfill").is_some());
         assert!(recovered.policy_condition_schema("AutoApproval").is_some());
         recovered.verify_commit_chain().unwrap();
+    }
+
+    #[test]
+    fn hydra_validates_action_payload_against_registered_schema() {
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionPayloadSchema, ActionStatus, ActionTarget, ActorId,
+            EventKind, FieldSchema, SchemaDefinition, SchemaId, SchemaStatus, Value, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let schema = ActionPayloadSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            action_kind: "PostLedgerEntry".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("account", ValueType::String),
+                FieldSchema::required("amount", ValueType::Float),
+            ],
+            created_by: ActorId::from_str("actor_schema"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        hydra
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::ActionPayload(schema),
+            })
+            .unwrap();
+
+        let mut payload = HashMap::new();
+        payload.insert("account".to_string(), Value::String("Cash".to_string()));
+        payload.insert("amount".to_string(), Value::Float(100.0));
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: None,
+            kind: ActionKind::PostLedgerEntry,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("ledger".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_bookkeeper"),
+            approved_by: None,
+            policy_id: None,
+            payload,
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+
+        let report = hydra.validate_action_payload(&action);
+        assert!(report.is_valid());
+        assert!(report.schema_id.is_some());
+    }
+
+    #[test]
+    fn hydra_reports_invalid_action_payload() {
+        use hydra_core::{
+            Action, ActionId, ActionKind, ActionPayloadSchema, ActionStatus, ActionTarget, ActorId,
+            EventKind, FieldSchema, SchemaDefinition, SchemaId, SchemaStatus, Value, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let schema = ActionPayloadSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            action_kind: "PostLedgerEntry".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("account", ValueType::String),
+                FieldSchema::required("amount", ValueType::Float),
+            ],
+            created_by: ActorId::from_str("actor_schema"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        hydra
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::ActionPayload(schema),
+            })
+            .unwrap();
+
+        let mut payload = HashMap::new();
+        payload.insert("account".to_string(), Value::String("Cash".to_string()));
+        payload.insert(
+            "amount".to_string(),
+            Value::String("not-a-number".to_string()),
+        );
+        let action = Action {
+            id: ActionId::new(),
+            tenant_id: None,
+            kind: ActionKind::PostLedgerEntry,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("ledger".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_bookkeeper"),
+            approved_by: None,
+            policy_id: None,
+            payload,
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+
+        let report = hydra.validate_action_payload(&action);
+        assert!(report.is_invalid());
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].path, "amount");
     }
 }
