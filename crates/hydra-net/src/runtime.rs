@@ -1,5 +1,6 @@
 use crate::bus::{BusConfig, BusMetrics, BusOutbound, CascadeNotification, create_bus};
 use crate::query::QueryService;
+use crate::schema_service::SchemaService;
 use crate::sensor::{SensorBatch, SensorEmitter};
 use hydra_core::id::TenantId;
 use hydra_core::subscription::Subscription;
@@ -91,11 +92,13 @@ impl RuntimeBuilder {
         let (in_tx, in_rx, outbound) = create_bus(&self.config.bus);
 
         let query_service = QueryService::new(Arc::clone(&hydra));
+        let schema_service = SchemaService::new(Arc::clone(&hydra));
         let outbound = Arc::new(outbound);
 
         let handle = RuntimeHandle {
             inbound_sender: in_tx,
             query: query_service,
+            schema: schema_service,
             outbound: Arc::clone(&outbound),
         };
 
@@ -123,6 +126,7 @@ impl Default for RuntimeBuilder {
 pub struct RuntimeHandle {
     inbound_sender: mpsc::Sender<SensorBatch>,
     query: QueryService,
+    schema: SchemaService,
     outbound: Arc<BusOutbound>,
 }
 
@@ -130,6 +134,12 @@ impl RuntimeHandle {
     /// Get the query service for reading the graph
     pub fn query(&self) -> &QueryService {
         &self.query
+    }
+
+    /// Get the schema service for introspecting schemas and preflighting
+    /// payloads before attempting writes.
+    pub fn schema(&self) -> &SchemaService {
+        &self.schema
     }
 
     /// Create a sensor emitter for a named sensor
@@ -148,6 +158,7 @@ impl Clone for RuntimeHandle {
         Self {
             inbound_sender: self.inbound_sender.clone(),
             query: self.query.clone(),
+            schema: self.schema.clone(),
             outbound: Arc::clone(&self.outbound),
         }
     }
