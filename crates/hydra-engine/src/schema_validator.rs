@@ -1,7 +1,8 @@
 use crate::schema_registry_store::SchemaRegistryStore;
 use hydra_core::error::{HydraError, Result};
 use hydra_core::{
-    Action, ActionKind, FieldSchema, Policy, PolicyKind, SchemaId, SchemaStatus, Value, ValueType,
+    Action, ActionKind, Claim, ClaimObject, FieldSchema, Policy, PolicyKind, SchemaId,
+    SchemaStatus, Value, ValueType,
 };
 use std::collections::HashMap;
 
@@ -199,6 +200,69 @@ impl SchemaValidator {
         self.validate_evidence_payload(store, &evidence.payload.kind, &evidence.payload.data)
     }
 
+    /// Validate a Claim against the registered ClaimPredicateSchema.
+    ///
+    /// v0 checks:
+    /// - predicate exists if a schema is registered
+    /// - schema is Active
+    /// - claim kind is allowed when allowed_claim_kinds is non-empty
+    /// - ClaimObject::Value matches schema.object_type
+    ///
+    /// v0 deliberately does not enforce subject_type yet. That requires
+    /// resolving ClaimSubject against entity TypeId through projection/node
+    /// schema state.
+    pub fn validate_claim(
+        &self,
+        store: &SchemaRegistryStore,
+        claim: &Claim,
+    ) -> SchemaValidationReport {
+        let Some(schema) = store.claim_predicate_schema(&claim.predicate) else {
+            return SchemaValidationReport::valid(None);
+        };
+        let schema_id = Some(schema.id.clone());
+        let mut errors = Vec::new();
+        if schema.status != SchemaStatus::Active {
+            errors.push(SchemaValidationError::new(
+                schema_id.clone(),
+                claim.predicate.clone(),
+                "claim predicate schema is not active",
+            ));
+        }
+        if !schema.allowed_claim_kinds.is_empty() {
+            let claim_kind = format!("{:?}", claim.kind);
+            if !schema
+                .allowed_claim_kinds
+                .iter()
+                .any(|kind| kind == &claim_kind)
+            {
+                errors.push(SchemaValidationError::new(
+                    schema_id.clone(),
+                    "kind",
+                    format!(
+                        "claim kind {claim_kind} is not allowed for predicate {}",
+                        claim.predicate
+                    ),
+                ));
+            }
+        }
+        if let ClaimObject::Value(value) = &claim.object {
+            if let Err(message) = value_matches_type(value, &schema.object_type) {
+                errors.push(SchemaValidationError::new(
+                    schema_id.clone(),
+                    "object",
+                    message,
+                ));
+            }
+        }
+        // v0: non-value ClaimObject variants (Node/Edge/ExternalRef) pass.
+        // TypeId-based object checks land with the entity/node gate.
+        if errors.is_empty() {
+            SchemaValidationReport::valid(schema_id)
+        } else {
+            SchemaValidationReport::invalid(schema_id, errors)
+        }
+    }
+
     /// Validate an evidence payload by evidence kind.
     ///
     /// This is intentionally generic because evidence payload shape may be
@@ -338,8 +402,9 @@ mod tests {
     use crate::schema_registry_store::SchemaRegistryStore;
     use hydra_core::{
         Action, ActionId, ActionKind, ActionPayloadSchema, ActionStatus, ActionTarget, ActorId,
-        Event, EventId, EventKind, FieldSchema, Policy, PolicyConditionSchema, PolicyId,
-        PolicyKind, PolicyScope, PolicyStatus, SchemaDefinition, SchemaId, ValueType,
+        ClaimId, ClaimKind, ClaimPredicateSchema, ClaimStatus, ClaimSubject, Confidence, Event,
+        EventId, EventKind, FieldSchema, Policy, PolicyConditionSchema, PolicyId, PolicyKind,
+        PolicyScope, PolicyStatus, SchemaDefinition, SchemaId, TypeId, ValueType,
     };
     use std::collections::HashMap;
 
@@ -619,6 +684,143 @@ mod tests {
         assert!(report.is_invalid());
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].path, "max_amount");
+    }
+
+    fn store_with_claim_schema(
+        status: SchemaStatus,
+        allowed_claim_kinds: Vec<String>,
+        object_type: ValueType,
+    ) -> SchemaRegistryStore {
+        let now = chrono::Utc::now();
+        let mut store = SchemaRegistryStore::new();
+        let schema = ClaimPredicateSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            predicate: "is_stale".to_string(),
+            status,
+            subject_type: Some(TypeId::from_str("type_dataset")),
+            object_type,
+            allowed_claim_kinds,
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        store
+            .apply_event(&event(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::ClaimPredicate(schema),
+            }))
+            .unwrap();
+        store
+    }
+
+    fn claim(predicate: &str, kind: ClaimKind, object: ClaimObject) -> Claim {
+        let now = chrono::Utc::now();
+        Claim {
+            id: ClaimId::new(),
+            tenant_id: None,
+            kind,
+            subject: ClaimSubject::Dataset("analytics.public.revenue_daily".to_string()),
+            predicate: predicate.to_string(),
+            object,
+            confidence: Confidence::default(),
+            status: ClaimStatus::Proposed,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: now,
+            valid_until: None,
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        }
+    }
+
+    #[test]
+    fn validates_claim_against_registered_predicate_schema() {
+        let store = store_with_claim_schema(
+            SchemaStatus::Active,
+            vec!["AnomalyFinding".to_string()],
+            ValueType::Bool,
+        );
+        let validator = SchemaValidator::new();
+        let claim = claim(
+            "is_stale",
+            ClaimKind::AnomalyFinding,
+            ClaimObject::Value(Value::Bool(true)),
+        );
+        let report = validator.validate_claim(&store, &claim);
+        assert!(report.is_valid());
+        assert!(report.schema_id.is_some());
+    }
+
+    #[test]
+    fn unknown_claim_predicate_schema_is_valid_in_read_only_v0() {
+        let store = SchemaRegistryStore::new();
+        let validator = SchemaValidator::new();
+        let claim = claim(
+            "unknown_predicate",
+            ClaimKind::AnomalyFinding,
+            ClaimObject::Value(Value::Bool(true)),
+        );
+        let report = validator.validate_claim(&store, &claim);
+        assert!(report.is_valid());
+        assert_eq!(report.schema_id, None);
+    }
+
+    #[test]
+    fn disabled_claim_predicate_schema_is_invalid() {
+        let store = store_with_claim_schema(
+            SchemaStatus::Disabled,
+            vec!["AnomalyFinding".to_string()],
+            ValueType::Bool,
+        );
+        let validator = SchemaValidator::new();
+        let claim = claim(
+            "is_stale",
+            ClaimKind::AnomalyFinding,
+            ClaimObject::Value(Value::Bool(true)),
+        );
+        let report = validator.validate_claim(&store, &claim);
+        assert!(report.is_invalid());
+        assert!(report.errors[0].message.contains("not active"));
+    }
+
+    #[test]
+    fn disallowed_claim_kind_is_invalid() {
+        let store = store_with_claim_schema(
+            SchemaStatus::Active,
+            vec!["Fact".to_string()],
+            ValueType::Bool,
+        );
+        let validator = SchemaValidator::new();
+        let claim = claim(
+            "is_stale",
+            ClaimKind::AnomalyFinding,
+            ClaimObject::Value(Value::Bool(true)),
+        );
+        let report = validator.validate_claim(&store, &claim);
+        assert!(report.is_invalid());
+        assert_eq!(report.errors[0].path, "kind");
+    }
+
+    #[test]
+    fn wrong_claim_object_value_type_is_invalid() {
+        let store = store_with_claim_schema(
+            SchemaStatus::Active,
+            vec!["AnomalyFinding".to_string()],
+            ValueType::Bool,
+        );
+        let validator = SchemaValidator::new();
+        let claim = claim(
+            "is_stale",
+            ClaimKind::AnomalyFinding,
+            ClaimObject::Value(Value::String("yes".to_string())),
+        );
+        let report = validator.validate_claim(&store, &claim);
+        assert!(report.is_invalid());
+        assert_eq!(report.errors[0].path, "object");
+        assert!(report.errors[0].message.contains("expected Bool"));
     }
 
     #[test]

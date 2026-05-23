@@ -137,6 +137,23 @@ impl SchemaGate {
                     report
                 }
             }
+            EventKind::ClaimProposed { claim } => {
+                let report = validator.validate_claim(store, claim);
+                if report.schema_id.is_none()
+                    && self.config.unknown_schema_policy == UnknownSchemaPolicy::Reject
+                {
+                    SchemaValidationReport::invalid(
+                        None,
+                        vec![SchemaValidationError::new(
+                            None,
+                            claim_predicate_path(claim),
+                            "no registered claim predicate schema",
+                        )],
+                    )
+                } else {
+                    report
+                }
+            }
             EventKind::ActionProposed { action } => {
                 let report = validator.validate_action_payload(store, action);
                 if report.schema_id.is_none()
@@ -241,6 +258,10 @@ fn evidence_kind_path(evidence: &hydra_core::Evidence) -> String {
     format!("evidence.{}", evidence.payload.kind)
 }
 
+fn claim_predicate_path(claim: &hydra_core::Claim) -> String {
+    format!("claim.{}", claim.predicate)
+}
+
 fn action_kind_key(kind: &hydra_core::ActionKind) -> String {
     match kind {
         hydra_core::ActionKind::Notify => "Notify".to_string(),
@@ -281,10 +302,12 @@ mod tests {
     use crate::schema_validator::SchemaValidator;
     use hydra_core::{
         Action, ActionId, ActionKind, ActionPayloadSchema, ActionStatus, ActionTarget, ActorId,
-        Confidence, Event, EventId, EventKind, Evidence, EvidenceId, EvidencePayload,
-        EvidencePayloadSchema, EvidenceSource, FieldSchema, Policy, PolicyConditionSchema,
-        PolicyId, PolicyKind, PolicyScope, PolicyStatus, SchemaDefinition, SchemaId, SchemaStatus,
-        Value, ValueType,
+        Claim, ClaimId, ClaimKind, ClaimObject, ClaimPredicateSchema, ClaimStatus, ClaimSubject,
+        Confidence,
+        Event, EventId, EventKind, Evidence, EvidenceId, EvidencePayload, EvidencePayloadSchema,
+        EvidenceSource, FieldSchema, Policy, PolicyConditionSchema, PolicyId, PolicyKind,
+        PolicyScope, PolicyStatus, SchemaDefinition, SchemaId, SchemaStatus, TypeId, Value,
+        ValueType,
     };
     use std::collections::HashMap;
 
@@ -410,6 +433,52 @@ mod tests {
             reliability: Confidence::default(),
             observed_at: now,
             recorded_at: now,
+            caused_by: None,
+        }
+    }
+
+    fn store_with_claim_schema() -> SchemaRegistryStore {
+        let mut store = SchemaRegistryStore::new();
+        let now = chrono::Utc::now();
+        let schema = ClaimPredicateSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            predicate: "is_stale".to_string(),
+            status: SchemaStatus::Active,
+            subject_type: Some(TypeId::from_str("type_dataset")),
+            object_type: ValueType::Bool,
+            allowed_claim_kinds: vec!["AnomalyFinding".to_string()],
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        store
+            .apply_event(&event(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::ClaimPredicate(schema),
+            }))
+            .unwrap();
+        store
+    }
+
+    fn claim(object: ClaimObject) -> Claim {
+        let now = chrono::Utc::now();
+        Claim {
+            id: ClaimId::new(),
+            tenant_id: None,
+            kind: ClaimKind::AnomalyFinding,
+            subject: ClaimSubject::Dataset("analytics.public.revenue_daily".to_string()),
+            predicate: "is_stale".to_string(),
+            object,
+            confidence: Confidence::default(),
+            status: ClaimStatus::Proposed,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: now,
+            valid_until: None,
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
             caused_by: None,
         }
     }
@@ -634,6 +703,66 @@ mod tests {
             &validator,
             &EventKind::EvidenceAdded {
                 evidence: evidence("bank_transaction", payload),
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn strict_gate_rejects_invalid_claim_object() {
+        let store = store_with_claim_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::ClaimProposed {
+                claim: claim(ClaimObject::Value(Value::String("yes".to_string()))),
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_gate_allows_valid_claim() {
+        let store = store_with_claim_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::ClaimProposed {
+                claim: claim(ClaimObject::Value(Value::Bool(true))),
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn strict_reject_unknown_rejects_unknown_claim_predicate_schema() {
+        let store = SchemaRegistryStore::new();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_reject_unknown();
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::ClaimProposed {
+                claim: claim(ClaimObject::Value(Value::Bool(true))),
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_allow_unknown_allows_unknown_claim_predicate_schema() {
+        let store = SchemaRegistryStore::new();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::ClaimProposed {
+                claim: claim(ClaimObject::Value(Value::Bool(true))),
             },
         );
         assert!(result.is_ok());

@@ -1098,6 +1098,14 @@ impl Hydra {
             .validate_evidence(&self.schema_registry_store, evidence)
     }
 
+    pub fn validate_claim(
+        &self,
+        claim: &hydra_core::Claim,
+    ) -> crate::schema_validator::SchemaValidationReport {
+        self.schema_validator
+            .validate_claim(&self.schema_registry_store, claim)
+    }
+
     // === Schema gate (pre-cascade enforcement) ===
 
     pub fn schema_gate(&self) -> &SchemaGate {
@@ -3682,6 +3690,30 @@ mod sprint1_tests {
         assert_eq!(hydra.total_events(), 0);
     }
 
+    fn test_claim(object: hydra_core::ClaimObject) -> hydra_core::Claim {
+        let now = chrono::Utc::now();
+        hydra_core::Claim {
+            id: hydra_core::ClaimId::new(),
+            tenant_id: None,
+            kind: hydra_core::ClaimKind::AnomalyFinding,
+            subject: hydra_core::ClaimSubject::Dataset(
+                "analytics.public.revenue_daily".to_string(),
+            ),
+            predicate: "is_stale".to_string(),
+            object,
+            confidence: hydra_core::Confidence::default(),
+            status: hydra_core::ClaimStatus::Proposed,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: now,
+            valid_until: None,
+            created_by: hydra_core::ActorId::from_str("actor_schema_test"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        }
+    }
+
     fn test_evidence(
         kind: &str,
         data: std::collections::HashMap<String, hydra_core::Value>,
@@ -3833,6 +3865,126 @@ mod sprint1_tests {
         payload.insert("currency".to_string(), Value::String("USD".to_string()));
         let evidence = test_evidence("bank_transaction", payload);
         let report = hydra.validate_evidence(&evidence);
+        assert!(report.is_valid());
+        assert!(report.schema_id.is_some());
+    }
+
+    #[test]
+    fn hydra_schema_gate_strict_rejects_invalid_claim_before_commit() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{
+            ActorId, ClaimObject, ClaimPredicateSchema, EventKind, SchemaDefinition, SchemaId,
+            SchemaStatus, TypeId, Value, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let schema = ClaimPredicateSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            predicate: "is_stale".to_string(),
+            status: SchemaStatus::Active,
+            subject_type: Some(TypeId::from_str("type_dataset")),
+            object_type: ValueType::Bool,
+            allowed_claim_kinds: vec!["AnomalyFinding".to_string()],
+            created_by: ActorId::from_str("actor_schema"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        hydra
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::ClaimPredicate(schema),
+            })
+            .unwrap();
+        assert_eq!(hydra.commit_count(), 1);
+
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Allow,
+        });
+
+        let result = hydra.ingest(EventKind::ClaimProposed {
+            claim: test_claim(ClaimObject::Value(Value::String("yes".to_string()))),
+        });
+        assert!(result.is_err());
+        assert_eq!(hydra.commit_count(), 1);
+    }
+
+    #[test]
+    fn hydra_schema_gate_strict_allows_valid_claim() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{
+            ActorId, ClaimObject, ClaimPredicateSchema, EventKind, SchemaDefinition, SchemaId,
+            SchemaStatus, TypeId, Value, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let schema = ClaimPredicateSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            predicate: "is_stale".to_string(),
+            status: SchemaStatus::Active,
+            subject_type: Some(TypeId::from_str("type_dataset")),
+            object_type: ValueType::Bool,
+            allowed_claim_kinds: vec!["AnomalyFinding".to_string()],
+            created_by: ActorId::from_str("actor_schema"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        hydra
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::ClaimPredicate(schema),
+            })
+            .unwrap();
+
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Allow,
+        });
+
+        let result = hydra.ingest(EventKind::ClaimProposed {
+            claim: test_claim(ClaimObject::Value(Value::Bool(true))),
+        });
+        assert!(result.is_ok());
+        assert_eq!(hydra.commit_count(), 2);
+    }
+
+    #[test]
+    fn hydra_validates_claim_against_registered_schema() {
+        use hydra_core::{
+            ActorId, ClaimObject, ClaimPredicateSchema, EventKind, SchemaDefinition, SchemaId,
+            SchemaStatus, TypeId, Value, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let schema = ClaimPredicateSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            predicate: "is_stale".to_string(),
+            status: SchemaStatus::Active,
+            subject_type: Some(TypeId::from_str("type_dataset")),
+            object_type: ValueType::Bool,
+            allowed_claim_kinds: vec!["AnomalyFinding".to_string()],
+            created_by: ActorId::from_str("actor_schema"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        hydra
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::ClaimPredicate(schema),
+            })
+            .unwrap();
+
+        let claim = test_claim(ClaimObject::Value(Value::Bool(true)));
+        let report = hydra.validate_claim(&claim);
         assert!(report.is_valid());
         assert!(report.schema_id.is_some());
     }
