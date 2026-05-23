@@ -232,16 +232,67 @@ impl Hydra {
         tenant: Option<TenantId>,
     ) -> hydra_core::error::Result<CascadeResult> {
         self.check_limits()?;
-
         let event = match tenant {
             Some(t) => Event::trigger_for_tenant(kind, t),
             None => Event::trigger(kind),
         };
+        self.ingest_event_internal(event, None)
+    }
+
+    /// Ingest a pre-built Event (useful for replay)
+    pub fn ingest_event(&mut self, event: Event) -> hydra_core::error::Result<CascadeResult> {
+        self.ingest_event_internal(event, None)
+    }
+
+    /// Ingest an EventKind with an idempotency key.
+    ///
+    /// If the key has already been committed, Hydra returns the original
+    /// committed cascade events and does NOT rerun the cascade. This makes
+    /// external retries safe — no duplicate state mutations, no duplicate
+    /// commit batches, no duplicate writer appends.
+    pub fn ingest_with_idempotency_key(
+        &mut self,
+        kind: EventKind,
+        key: hydra_core::IdempotencyKey,
+    ) -> hydra_core::error::Result<CascadeResult> {
+        self.check_limits()?;
+        let event = Event::trigger(kind);
+        self.ingest_event_internal(event, Some(key))
+    }
+
+    /// Ingest a pre-built Event with an idempotency key.
+    ///
+    /// Duplicate keys short-circuit before cascade processing.
+    pub fn ingest_event_with_idempotency_key(
+        &mut self,
+        event: Event,
+        key: hydra_core::IdempotencyKey,
+    ) -> hydra_core::error::Result<CascadeResult> {
+        self.ingest_event_internal(event, Some(key))
+    }
+
+    /// Shared cascade + commit + writer + WAL body.
+    ///
+    /// When `idempotency_key` is `Some`, looks up the key in the commit ledger
+    /// first. If it's already been committed, returns the original events as a
+    /// `CascadeResult` without running the cascade, mutating state, appending
+    /// a commit, or writing to the durable sink.
+    fn ingest_event_internal(
+        &mut self,
+        event: Event,
+        idempotency_key: Option<hydra_core::IdempotencyKey>,
+    ) -> hydra_core::error::Result<CascadeResult> {
+        // Idempotent short-circuit BEFORE cascade — duplicate retries return
+        // the original committed events.
+        if let Some(key) = &idempotency_key {
+            if let Some(batch) = self.commit_ledger.commit_for_idempotency_key(key) {
+                return Ok(CascadeResult::from_committed_events(batch.events.clone()));
+            }
+        }
 
         // The cascade engine drives both topology projection AND the epistemic
-        // store now, so verification reflexes fire inside the cascade with full
-        // causal links. Post-cascade `epistemic_store.apply_event` is therefore
-        // intentionally omitted — it would double-apply.
+        // store, so verification / remediation / policy / outcome reflexes
+        // see fresh state inline.
         let result = self.engine.process_with_epistemics(
             event,
             &mut self.projection,
@@ -259,10 +310,6 @@ impl Hydra {
         )?;
 
         // Record all events in the log AND the temporal index.
-        // EpistemicStore, ActionStore, and PolicyStore are all driven inline
-        // by `process_with_epistemics` so the verification / remediation /
-        // policy / outcome agents see fresh state. Re-applying here would
-        // double-update.
         for event in &result.events {
             self.event_log.append(event.clone());
             self.temporal.record(event);
@@ -273,7 +320,7 @@ impl Hydra {
         // appended durably.
         let commit = self
             .commit_ledger
-            .commit_events(result.events.clone(), None)?;
+            .commit_events(result.events.clone(), idempotency_key)?;
         if let Some(writer) = &self.commit_writer {
             writer.append_commit(&commit)?;
         }
@@ -323,50 +370,6 @@ impl Hydra {
             self.event_log.append(alarm_event.clone());
             self.temporal.record(&alarm_event);
         }
-
-        Ok(result)
-    }
-
-    /// Ingest a pre-built Event (useful for replay)
-    pub fn ingest_event(&mut self, event: Event) -> hydra_core::error::Result<CascadeResult> {
-        // Drives the epistemic cascade for the same reason as ingest_internal:
-        // verification reflexes fire inline, so the post-cascade loop must not
-        // re-apply to the epistemic store.
-        let result = self.engine.process_with_epistemics(
-            event,
-            &mut self.projection,
-            &self.registry,
-            &mut self.epistemic_store,
-            &self.verification_engine,
-            &self.verification_agent,
-            &self.remediation_agent,
-            &mut self.action_store,
-            &self.outcome_agent,
-            &mut self.policy_store,
-            &self.policy_engine,
-            &self.policy_agent,
-            &self.reflex_registry,
-        )?;
-
-        for event in &result.events {
-            self.event_log.append(event.clone());
-            self.temporal.record(event);
-        }
-
-        let commit = self
-            .commit_ledger
-            .commit_events(result.events.clone(), None)?;
-        if let Some(writer) = &self.commit_writer {
-            writer.append_commit(&commit)?;
-        }
-
-        // Persist to WAL (if configured)
-        if let Some(ref mut wal) = self.wal {
-            wal.persist_cascade(&result.events)?;
-        }
-
-        self.event_log.auto_compact();
-        self.tracker.record_cascade(&result, &self.registry);
 
         Ok(result)
     }
@@ -1896,6 +1899,121 @@ mod sprint1_tests {
         assert!(hydra.has_commit_writer());
         hydra.clear_commit_writer();
         assert!(!hydra.has_commit_writer());
+    }
+
+    #[test]
+    fn ingest_with_idempotency_key_short_circuits_duplicate_without_new_commit() {
+        use hydra_core::{EventKind, IdempotencyKey};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let key = IdempotencyKey::new("request-123");
+        let first = hydra
+            .ingest_with_idempotency_key(
+                EventKind::Signal {
+                    source: hydra_core::NodeId::from_str("test"),
+                    name: "first".to_string(),
+                    payload: HashMap::new(),
+                },
+                key.clone(),
+            )
+            .unwrap();
+        assert_eq!(hydra.commit_count(), 1);
+        assert_eq!(hydra.total_events(), first.events.len());
+        let total_events_after_first = hydra.total_events();
+
+        let second = hydra
+            .ingest_with_idempotency_key(
+                EventKind::Signal {
+                    source: hydra_core::NodeId::from_str("test"),
+                    name: "duplicate_should_not_run".to_string(),
+                    payload: HashMap::new(),
+                },
+                key.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(hydra.commit_count(), 1);
+        assert_eq!(hydra.total_events(), total_events_after_first);
+        assert_eq!(second.events.len(), first.events.len());
+        assert_eq!(second.events[0].id, first.events[0].id);
+        match &second.events[0].kind {
+            EventKind::Signal { name, .. } => {
+                assert_eq!(name, "first");
+            }
+            other => panic!("expected original Signal event, got {other:?}"),
+        }
+        hydra.verify_commit_chain().unwrap();
+    }
+
+    #[test]
+    fn different_idempotency_keys_create_distinct_commits() {
+        use hydra_core::{EventKind, IdempotencyKey};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        hydra
+            .ingest_with_idempotency_key(
+                EventKind::Signal {
+                    source: hydra_core::NodeId::from_str("test"),
+                    name: "first".to_string(),
+                    payload: HashMap::new(),
+                },
+                IdempotencyKey::new("request-1"),
+            )
+            .unwrap();
+        hydra
+            .ingest_with_idempotency_key(
+                EventKind::Signal {
+                    source: hydra_core::NodeId::from_str("test"),
+                    name: "second".to_string(),
+                    payload: HashMap::new(),
+                },
+                IdempotencyKey::new("request-2"),
+            )
+            .unwrap();
+
+        assert_eq!(hydra.commit_count(), 2);
+        assert_eq!(hydra.total_events(), 2);
+        let latest = hydra.latest_commit().unwrap();
+        assert_eq!(latest.sequence, 2);
+        hydra.verify_commit_chain().unwrap();
+    }
+
+    #[test]
+    fn duplicate_idempotency_key_does_not_append_to_writer_twice() {
+        use hydra_core::{EventKind, IdempotencyKey};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let writer = TestCommitWriter::new();
+        let commits = writer.commits();
+        hydra.set_commit_writer(writer);
+
+        let key = IdempotencyKey::new("request-writer");
+        hydra
+            .ingest_with_idempotency_key(
+                EventKind::Signal {
+                    source: hydra_core::NodeId::from_str("test"),
+                    name: "first".to_string(),
+                    payload: HashMap::new(),
+                },
+                key.clone(),
+            )
+            .unwrap();
+        hydra
+            .ingest_with_idempotency_key(
+                EventKind::Signal {
+                    source: hydra_core::NodeId::from_str("test"),
+                    name: "duplicate".to_string(),
+                    payload: HashMap::new(),
+                },
+                key,
+            )
+            .unwrap();
+
+        assert_eq!(hydra.commit_count(), 1);
+        assert_eq!(commits.lock().unwrap().len(), 1);
     }
 
     #[test]

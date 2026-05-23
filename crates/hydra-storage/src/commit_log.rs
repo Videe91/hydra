@@ -302,6 +302,46 @@ mod tests {
     }
 
     #[test]
+    fn commit_log_persists_only_one_commit_for_duplicate_idempotency_key() {
+        use hydra_core::{EventKind, IdempotencyKey, NodeId};
+        use hydra_engine::hydra::Hydra;
+        use std::collections::HashMap;
+
+        let path = temp_path("idempotency_one_commit");
+        let log = CommitLog::open(&path).unwrap();
+        let mut hydra = Hydra::new();
+        hydra.set_commit_writer(log.clone());
+
+        let key = IdempotencyKey::new("external-request-1");
+        hydra
+            .ingest_with_idempotency_key(
+                EventKind::Signal {
+                    source: NodeId::from_str("test"),
+                    name: "first".to_string(),
+                    payload: HashMap::new(),
+                },
+                key.clone(),
+            )
+            .unwrap();
+        hydra
+            .ingest_with_idempotency_key(
+                EventKind::Signal {
+                    source: NodeId::from_str("test"),
+                    name: "duplicate".to_string(),
+                    payload: HashMap::new(),
+                },
+                key,
+            )
+            .unwrap();
+
+        let batches = log.load_all().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].sequence, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn open_creates_parent_directory() {
         let mut path = std::env::temp_dir();
         path.push(format!(

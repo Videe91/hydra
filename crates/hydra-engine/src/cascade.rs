@@ -44,6 +44,30 @@ pub struct CascadeResult {
     pub truncated: bool,
 }
 
+impl CascadeResult {
+    /// Reconstruct a CascadeResult from already-committed events.
+    ///
+    /// Used for idempotent replay responses: when an IdempotencyKey already
+    /// maps to a committed batch, Hydra must not rerun the cascade. It returns
+    /// the original events as a response envelope instead.
+    ///
+    /// Mutation count is not persisted in CommitBatch v0, so this returns 0.
+    /// Later we can store cascade summary metadata in CommitBatch.
+    pub fn from_committed_events(events: Vec<Event>) -> Self {
+        let max_depth_reached = events
+            .iter()
+            .map(|event| event.cascade_depth)
+            .max()
+            .unwrap_or(0);
+        Self {
+            events,
+            mutations: 0,
+            max_depth_reached,
+            truncated: false,
+        }
+    }
+}
+
 /// The cascade engine. Processes events breadth-first through subscriptions.
 ///
 /// Processing model:
