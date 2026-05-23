@@ -2,6 +2,7 @@ use crate::anomaly::{Anomaly, AnomalyEngine};
 use crate::cascade::{CascadeConfig, CascadeEngine, CascadeResult};
 use crate::commit_ledger::CommitLedger;
 use crate::coverage::{CoverageEngine, CoverageReport};
+use crate::sensor_checkpoint_store::SensorCheckpointStore;
 use crate::action_store::ActionStore;
 use crate::epistemic_store::EpistemicStore;
 use crate::event_log::EventLog;
@@ -59,6 +60,7 @@ pub struct Hydra {
     policy_agent: PolicyAgent,
     commit_ledger: CommitLedger,
     commit_writer: Option<Box<dyn crate::commit_ledger::CommitBatchWriter>>,
+    sensor_checkpoint_store: SensorCheckpointStore,
     reflex_registry: ReflexRegistry,
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
@@ -131,6 +133,7 @@ impl Hydra {
             ),
             commit_ledger: CommitLedger::new(),
             commit_writer: None,
+            sensor_checkpoint_store: SensorCheckpointStore::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -161,6 +164,7 @@ impl Hydra {
             ),
             commit_ledger: CommitLedger::new(),
             commit_writer: None,
+            sensor_checkpoint_store: SensorCheckpointStore::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -310,9 +314,12 @@ impl Hydra {
         )?;
 
         // Record all events in the log AND the temporal index.
+        // The sensor checkpoint store is post-cascade for now — no sensor
+        // agent runs inline yet. When one is wired, move into the cascade.
         for event in &result.events {
             self.event_log.append(event.clone());
             self.temporal.record(event);
+            self.sensor_checkpoint_store.apply_event(event)?;
         }
 
         // Record an atomic commit batch for this cascade. v0 ledger is
@@ -426,6 +433,7 @@ impl Hydra {
             self.epistemic_store.apply_event(&event)?;
             self.action_store.apply_event(&event)?;
             self.policy_store.apply_event(&event)?;
+            self.sensor_checkpoint_store.apply_event(&event)?;
             count += 1;
         }
         Ok(count)
@@ -476,6 +484,7 @@ impl Hydra {
         self.epistemic_store = EpistemicStore::new();
         self.action_store = ActionStore::new();
         self.policy_store = PolicyStore::new();
+        self.sensor_checkpoint_store = SensorCheckpointStore::new();
     }
 
     // === Anomaly Detection (cont.) ===
@@ -877,6 +886,88 @@ impl Hydra {
     /// invokes on `ActionProposed`.
     pub fn policy_agent(&self) -> &PolicyAgent {
         &self.policy_agent
+    }
+
+    // === Sensor checkpoints ===
+
+    /// Read access to the sensor checkpoint store.
+    pub fn sensor_checkpoint_store(&self) -> &SensorCheckpointStore {
+        &self.sensor_checkpoint_store
+    }
+
+    pub fn sensor_run(
+        &self,
+        id: &hydra_core::SensorRunId,
+    ) -> Option<&hydra_core::SensorRun> {
+        self.sensor_checkpoint_store.run(id)
+    }
+
+    pub fn sensor_checkpoint(
+        &self,
+        id: &hydra_core::SensorCheckpointId,
+    ) -> Option<&hydra_core::SensorCheckpoint> {
+        self.sensor_checkpoint_store.checkpoint(id)
+    }
+
+    pub fn runs_for_sensor(
+        &self,
+        sensor_id: &hydra_core::SensorId,
+    ) -> Vec<&hydra_core::SensorRun> {
+        self.sensor_checkpoint_store.runs_for_sensor(sensor_id)
+    }
+
+    pub fn runs_with_status(
+        &self,
+        status: hydra_core::SensorRunStatus,
+    ) -> Vec<&hydra_core::SensorRun> {
+        self.sensor_checkpoint_store.runs_with_status(status)
+    }
+
+    pub fn checkpoints_for_sensor(
+        &self,
+        sensor_id: &hydra_core::SensorId,
+    ) -> Vec<&hydra_core::SensorCheckpoint> {
+        self.sensor_checkpoint_store
+            .checkpoints_for_sensor(sensor_id)
+    }
+
+    pub fn checkpoints_for_source(
+        &self,
+        source: &str,
+    ) -> Vec<&hydra_core::SensorCheckpoint> {
+        self.sensor_checkpoint_store.checkpoints_for_source(source)
+    }
+
+    pub fn checkpoint_for_cursor(
+        &self,
+        cursor: &hydra_core::SourceCursor,
+    ) -> Option<&hydra_core::SensorCheckpoint> {
+        self.sensor_checkpoint_store.checkpoint_for_cursor(cursor)
+    }
+
+    pub fn latest_sensor_checkpoint(
+        &self,
+        sensor_id: &hydra_core::SensorId,
+        source: &str,
+    ) -> Option<&hydra_core::SensorCheckpoint> {
+        self.sensor_checkpoint_store
+            .latest_checkpoint(sensor_id, source)
+    }
+
+    pub fn checkpoint_for_idempotency_key(
+        &self,
+        key: &hydra_core::IdempotencyKey,
+    ) -> Option<&hydra_core::SensorCheckpoint> {
+        self.sensor_checkpoint_store
+            .checkpoint_for_idempotency_key(key)
+    }
+
+    pub fn checkpoint_for_commit(
+        &self,
+        commit_id: &hydra_core::CommitId,
+    ) -> Option<&hydra_core::SensorCheckpoint> {
+        self.sensor_checkpoint_store
+            .checkpoint_for_commit(commit_id)
     }
 
     // === Commit ledger ===
@@ -2014,6 +2105,163 @@ mod sprint1_tests {
 
         assert_eq!(hydra.commit_count(), 1);
         assert_eq!(commits.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hydra_materializes_sensor_runs_and_checkpoints() {
+        use hydra_core::{
+            CommitId, EventKind, IdempotencyKey, SensorCheckpoint, SensorCheckpointId,
+            SensorCheckpointStatus, SensorId, SensorRun, SensorRunId, SensorRunStatus,
+            SourceCursor,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let sensor_id = SensorId::from_str("sensor_bank_feed");
+
+        let run = SensorRun {
+            id: SensorRunId::new(),
+            tenant_id: None,
+            sensor_id: sensor_id.clone(),
+            status: SensorRunStatus::Started,
+            source_system: "bank".to_string(),
+            stream: Some("transactions".to_string()),
+            started_at: now,
+            completed_at: None,
+            failed_at: None,
+            error: None,
+            actor_id: None,
+            metadata: HashMap::new(),
+        };
+        let run_id = run.id.clone();
+        hydra.ingest(EventKind::SensorRunStarted { run }).unwrap();
+        assert_eq!(hydra.runs_for_sensor(&sensor_id).len(), 1);
+        assert_eq!(
+            hydra.sensor_run(&run_id).unwrap().status,
+            SensorRunStatus::Started
+        );
+
+        let cursor = SourceCursor::Offset {
+            stream: "bank.transactions".to_string(),
+            partition: Some("acct-9001".to_string()),
+            offset: "42".to_string(),
+        };
+        let key = IdempotencyKey::new(cursor.stable_key_material());
+        let commit_id = CommitId::new();
+        let checkpoint = SensorCheckpoint {
+            id: SensorCheckpointId::new(),
+            tenant_id: None,
+            sensor_id: sensor_id.clone(),
+            run_id: Some(run_id.clone()),
+            status: SensorCheckpointStatus::Recorded,
+            source_system: "bank".to_string(),
+            cursor: cursor.clone(),
+            idempotency_key: key.clone(),
+            commit_id: commit_id.clone(),
+            event_id: None,
+            observed_at: now,
+            recorded_at: now,
+            metadata: HashMap::new(),
+        };
+        let checkpoint_id = checkpoint.id.clone();
+        hydra
+            .ingest(EventKind::SensorCheckpointRecorded { checkpoint })
+            .unwrap();
+
+        assert_eq!(hydra.checkpoints_for_sensor(&sensor_id).len(), 1);
+        assert_eq!(hydra.checkpoints_for_source("bank.transactions").len(), 1);
+        assert_eq!(
+            hydra.checkpoint_for_cursor(&cursor).unwrap().id,
+            checkpoint_id
+        );
+        assert_eq!(
+            hydra.checkpoint_for_idempotency_key(&key).unwrap().id,
+            checkpoint_id
+        );
+        assert_eq!(
+            hydra.checkpoint_for_commit(&commit_id).unwrap().id,
+            checkpoint_id
+        );
+        assert_eq!(
+            hydra
+                .latest_sensor_checkpoint(&sensor_id, "bank.transactions")
+                .unwrap()
+                .id,
+            checkpoint_id
+        );
+
+        hydra
+            .ingest(EventKind::SensorRunCompleted {
+                run_id: run_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            hydra.sensor_run(&run_id).unwrap().status,
+            SensorRunStatus::Completed
+        );
+    }
+
+    #[test]
+    fn hydra_recovers_sensor_checkpoint_state_from_commits() {
+        use hydra_core::{
+            CommitId, EventKind, IdempotencyKey, SensorCheckpoint, SensorCheckpointId,
+            SensorCheckpointStatus, SensorId, SourceCursor,
+        };
+        use std::collections::HashMap;
+
+        let mut original = Hydra::new();
+        let now = chrono::Utc::now();
+        let sensor_id = SensorId::from_str("sensor_bank_feed");
+        let cursor = SourceCursor::DeliveryId {
+            source: "stripe".to_string(),
+            delivery_id: "evt_123".to_string(),
+        };
+        let key = IdempotencyKey::new(cursor.stable_key_material());
+        let commit_id = CommitId::new();
+        let checkpoint = SensorCheckpoint {
+            id: SensorCheckpointId::new(),
+            tenant_id: None,
+            sensor_id: sensor_id.clone(),
+            run_id: None,
+            status: SensorCheckpointStatus::Recorded,
+            source_system: "stripe".to_string(),
+            cursor: cursor.clone(),
+            idempotency_key: key.clone(),
+            commit_id: commit_id.clone(),
+            event_id: None,
+            observed_at: now,
+            recorded_at: now,
+            metadata: HashMap::new(),
+        };
+        let checkpoint_id = checkpoint.id.clone();
+        original
+            .ingest(EventKind::SensorCheckpointRecorded { checkpoint })
+            .unwrap();
+
+        let batches: Vec<hydra_core::CommitBatch> = original
+            .commit_ledger()
+            .batches_in_sequence()
+            .into_iter()
+            .cloned()
+            .collect();
+
+        let mut recovered = Hydra::new();
+        recovered.recover_from_commits(batches).unwrap();
+
+        assert_eq!(
+            recovered.checkpoint_for_cursor(&cursor).unwrap().id,
+            checkpoint_id
+        );
+        assert_eq!(
+            recovered.checkpoint_for_idempotency_key(&key).unwrap().id,
+            checkpoint_id
+        );
+        assert_eq!(
+            recovered.checkpoint_for_commit(&commit_id).unwrap().id,
+            checkpoint_id
+        );
+        recovered.verify_commit_chain().unwrap();
     }
 
     #[test]
