@@ -186,6 +186,19 @@ impl SchemaValidator {
         self.validate_fields(Some(schema.id.clone()), &schema.fields, &policy.condition)
     }
 
+    /// Validate an Evidence object against the registered EvidencePayloadSchema.
+    ///
+    /// Adapter over validate_evidence_payload that reads the kind + data out
+    /// of the nested EvidencePayload struct. hydra-core stores them as
+    /// evidence.payload.kind and evidence.payload.data.
+    pub fn validate_evidence(
+        &self,
+        store: &SchemaRegistryStore,
+        evidence: &hydra_core::Evidence,
+    ) -> SchemaValidationReport {
+        self.validate_evidence_payload(store, &evidence.payload.kind, &evidence.payload.data)
+    }
+
     /// Validate an evidence payload by evidence kind.
     ///
     /// This is intentionally generic because evidence payload shape may be

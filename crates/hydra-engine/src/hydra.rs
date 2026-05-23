@@ -1090,6 +1090,14 @@ impl Hydra {
             .validate_evidence_payload(&self.schema_registry_store, evidence_kind, payload)
     }
 
+    pub fn validate_evidence(
+        &self,
+        evidence: &hydra_core::Evidence,
+    ) -> crate::schema_validator::SchemaValidationReport {
+        self.schema_validator
+            .validate_evidence(&self.schema_registry_store, evidence)
+    }
+
     // === Schema gate (pre-cascade enforcement) ===
 
     pub fn schema_gate(&self) -> &SchemaGate {
@@ -3672,6 +3680,161 @@ mod sprint1_tests {
         assert!(result.is_err());
         assert_eq!(hydra.commit_count(), 0);
         assert_eq!(hydra.total_events(), 0);
+    }
+
+    fn test_evidence(
+        kind: &str,
+        data: std::collections::HashMap<String, hydra_core::Value>,
+    ) -> hydra_core::Evidence {
+        let now = chrono::Utc::now();
+        hydra_core::Evidence {
+            id: hydra_core::EvidenceId::new(),
+            tenant_id: None,
+            source: hydra_core::EvidenceSource::System {
+                name: "test".to_string(),
+            },
+            payload: hydra_core::EvidencePayload {
+                kind: kind.to_string(),
+                data,
+            },
+            reliability: hydra_core::Confidence::default(),
+            observed_at: now,
+            recorded_at: now,
+            caused_by: None,
+        }
+    }
+
+    #[test]
+    fn hydra_schema_gate_strict_rejects_invalid_evidence_before_commit() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{
+            ActorId, EventKind, EvidencePayloadSchema, FieldSchema, SchemaDefinition, SchemaId,
+            SchemaStatus, Value, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let schema = EvidencePayloadSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            kind: "bank_transaction".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("amount", ValueType::Float),
+                FieldSchema::required("currency", ValueType::String),
+            ],
+            created_by: ActorId::from_str("actor_schema"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        hydra
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::EvidencePayload(schema),
+            })
+            .unwrap();
+        assert_eq!(hydra.commit_count(), 1);
+
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Allow,
+        });
+
+        let mut payload = HashMap::new();
+        payload.insert("amount".to_string(), Value::String("bad".to_string()));
+        payload.insert("currency".to_string(), Value::String("USD".to_string()));
+        let result = hydra.ingest(EventKind::EvidenceAdded {
+            evidence: test_evidence("bank_transaction", payload),
+        });
+        assert!(result.is_err());
+        // Only the schema registration commit exists.
+        assert_eq!(hydra.commit_count(), 1);
+    }
+
+    #[test]
+    fn hydra_schema_gate_strict_allows_valid_evidence() {
+        use crate::schema_gate::{SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy};
+        use hydra_core::{
+            ActorId, EventKind, EvidencePayloadSchema, FieldSchema, SchemaDefinition, SchemaId,
+            SchemaStatus, Value, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let schema = EvidencePayloadSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            kind: "bank_transaction".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("amount", ValueType::Float),
+                FieldSchema::required("currency", ValueType::String),
+            ],
+            created_by: ActorId::from_str("actor_schema"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        hydra
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::EvidencePayload(schema),
+            })
+            .unwrap();
+
+        hydra.set_schema_gate_config(SchemaGateConfig {
+            mode: SchemaGateMode::Strict,
+            unknown_schema_policy: UnknownSchemaPolicy::Allow,
+        });
+
+        let mut payload = HashMap::new();
+        payload.insert("amount".to_string(), Value::Float(42.0));
+        payload.insert("currency".to_string(), Value::String("USD".to_string()));
+        let result = hydra.ingest(EventKind::EvidenceAdded {
+            evidence: test_evidence("bank_transaction", payload),
+        });
+        assert!(result.is_ok());
+        assert_eq!(hydra.commit_count(), 2);
+    }
+
+    #[test]
+    fn hydra_validates_evidence_against_registered_schema() {
+        use hydra_core::{
+            ActorId, EventKind, EvidencePayloadSchema, FieldSchema, SchemaDefinition, SchemaId,
+            SchemaStatus, Value, ValueType,
+        };
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let schema = EvidencePayloadSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            kind: "bank_transaction".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("amount", ValueType::Float),
+                FieldSchema::required("currency", ValueType::String),
+            ],
+            created_by: ActorId::from_str("actor_schema"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        hydra
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::EvidencePayload(schema),
+            })
+            .unwrap();
+
+        let mut payload = HashMap::new();
+        payload.insert("amount".to_string(), Value::Float(42.0));
+        payload.insert("currency".to_string(), Value::String("USD".to_string()));
+        let evidence = test_evidence("bank_transaction", payload);
+        let report = hydra.validate_evidence(&evidence);
+        assert!(report.is_valid());
+        assert!(report.schema_id.is_some());
     }
 
     #[test]

@@ -120,6 +120,23 @@ impl SchemaGate {
             return Ok(());
         }
         let report = match kind {
+            EventKind::EvidenceAdded { evidence } => {
+                let report = validator.validate_evidence(store, evidence);
+                if report.schema_id.is_none()
+                    && self.config.unknown_schema_policy == UnknownSchemaPolicy::Reject
+                {
+                    SchemaValidationReport::invalid(
+                        None,
+                        vec![SchemaValidationError::new(
+                            None,
+                            evidence_kind_path(evidence),
+                            "no registered evidence payload schema",
+                        )],
+                    )
+                } else {
+                    report
+                }
+            }
             EventKind::ActionProposed { action } => {
                 let report = validator.validate_action_payload(store, action);
                 if report.schema_id.is_none()
@@ -220,6 +237,10 @@ fn policy_kind_path(kind: &hydra_core::PolicyKind) -> String {
     format!("policy.{}", policy_kind_key(kind))
 }
 
+fn evidence_kind_path(evidence: &hydra_core::Evidence) -> String {
+    format!("evidence.{}", evidence.payload.kind)
+}
+
 fn action_kind_key(kind: &hydra_core::ActionKind) -> String {
     match kind {
         hydra_core::ActionKind::Notify => "Notify".to_string(),
@@ -260,9 +281,10 @@ mod tests {
     use crate::schema_validator::SchemaValidator;
     use hydra_core::{
         Action, ActionId, ActionKind, ActionPayloadSchema, ActionStatus, ActionTarget, ActorId,
-        Event, EventId, EventKind, FieldSchema, Policy, PolicyConditionSchema, PolicyId,
-        PolicyKind, PolicyScope, PolicyStatus, SchemaDefinition, SchemaId, SchemaStatus, Value,
-        ValueType,
+        Confidence, Event, EventId, EventKind, Evidence, EvidenceId, EvidencePayload,
+        EvidencePayloadSchema, EvidenceSource, FieldSchema, Policy, PolicyConditionSchema,
+        PolicyId, PolicyKind, PolicyScope, PolicyStatus, SchemaDefinition, SchemaId, SchemaStatus,
+        Value, ValueType,
     };
     use std::collections::HashMap;
 
@@ -346,6 +368,50 @@ mod tests {
             }))
             .unwrap();
         store
+    }
+
+    fn store_with_evidence_schema() -> SchemaRegistryStore {
+        let mut store = SchemaRegistryStore::new();
+        let now = chrono::Utc::now();
+        let schema = EvidencePayloadSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            kind: "bank_transaction".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("amount", ValueType::Float),
+                FieldSchema::required("currency", ValueType::String),
+            ],
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        store
+            .apply_event(&event(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::EvidencePayload(schema),
+            }))
+            .unwrap();
+        store
+    }
+
+    fn evidence(kind: &str, data: HashMap<String, Value>) -> Evidence {
+        let now = chrono::Utc::now();
+        Evidence {
+            id: EvidenceId::new(),
+            tenant_id: None,
+            source: EvidenceSource::System {
+                name: "test".to_string(),
+            },
+            payload: EvidencePayload {
+                kind: kind.to_string(),
+                data,
+            },
+            reliability: Confidence::default(),
+            observed_at: now,
+            recorded_at: now,
+            caused_by: None,
+        }
     }
 
     fn store_with_policy_schema() -> SchemaRegistryStore {
@@ -498,6 +564,76 @@ mod tests {
             &validator,
             &EventKind::ActionProposed {
                 action: action(HashMap::new()),
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn strict_gate_rejects_invalid_evidence_payload() {
+        let store = store_with_evidence_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let mut payload = HashMap::new();
+        payload.insert("amount".to_string(), Value::String("bad".to_string()));
+        payload.insert("currency".to_string(), Value::String("USD".to_string()));
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::EvidenceAdded {
+                evidence: evidence("bank_transaction", payload),
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_gate_allows_valid_evidence_payload() {
+        let store = store_with_evidence_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let mut payload = HashMap::new();
+        payload.insert("amount".to_string(), Value::Float(42.0));
+        payload.insert("currency".to_string(), Value::String("USD".to_string()));
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::EvidenceAdded {
+                evidence: evidence("bank_transaction", payload),
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn strict_reject_unknown_rejects_unknown_evidence_schema() {
+        let store = SchemaRegistryStore::new();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_reject_unknown();
+        let mut payload = HashMap::new();
+        payload.insert("amount".to_string(), Value::Float(42.0));
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::EvidenceAdded {
+                evidence: evidence("bank_transaction", payload),
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_allow_unknown_allows_unknown_evidence_schema() {
+        let store = SchemaRegistryStore::new();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let mut payload = HashMap::new();
+        payload.insert("amount".to_string(), Value::Float(42.0));
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::EvidenceAdded {
+                evidence: evidence("bank_transaction", payload),
             },
         );
         assert!(result.is_ok());
