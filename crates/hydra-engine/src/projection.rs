@@ -300,6 +300,18 @@ impl Projection {
         self.edges.keys().cloned().collect()
     }
 
+    /// All stored nodes (including dead ones). Used by snapshotting to
+    /// capture the full projection state.
+    pub fn all_nodes(&self) -> Vec<&Node> {
+        self.nodes.values().collect()
+    }
+
+    /// All stored edges (including dead ones). Used by snapshotting to
+    /// capture the full projection state.
+    pub fn all_edges(&self) -> Vec<&Edge> {
+        self.edges.values().collect()
+    }
+
 }
 
 impl Default for Projection {

@@ -1014,7 +1014,7 @@ mod tests {
             Some(CommitHash("engine-v0:hash".to_string())),
             ActorId::from_str("actor_snapshot"),
             Utc::now(),
-            1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         );
         assert_eq!(
             EventKind::SnapshotTaken {

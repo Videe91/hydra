@@ -4,6 +4,7 @@ use crate::commit_ledger::CommitLedger;
 use crate::coverage::{CoverageEngine, CoverageReport};
 use crate::schema_gate::{SchemaGate, SchemaGateConfig};
 use crate::schema_registry_store::SchemaRegistryStore;
+use crate::snapshot_store::SnapshotStore;
 use crate::schema_validator::SchemaValidator;
 use crate::sensor_checkpoint_store::SensorCheckpointStore;
 use crate::action_store::ActionStore;
@@ -67,6 +68,7 @@ pub struct Hydra {
     schema_registry_store: SchemaRegistryStore,
     schema_validator: SchemaValidator,
     schema_gate: SchemaGate,
+    snapshot_store: SnapshotStore,
     reflex_registry: ReflexRegistry,
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
@@ -143,6 +145,7 @@ impl Hydra {
             schema_registry_store: SchemaRegistryStore::new(),
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
+            snapshot_store: SnapshotStore::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -177,6 +180,7 @@ impl Hydra {
             schema_registry_store: SchemaRegistryStore::new(),
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
+            snapshot_store: SnapshotStore::new(),
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
@@ -1310,6 +1314,199 @@ impl Hydra {
     /// Verify the in-memory commit hash chain.
     pub fn verify_commit_chain(&self) -> hydra_core::error::Result<()> {
         self.commit_ledger.verify_chain()
+    }
+
+    // === Snapshots ===
+
+    /// Read access to the snapshot store.
+    pub fn snapshot_store(&self) -> &SnapshotStore {
+        &self.snapshot_store
+    }
+
+    pub fn snapshot_manifest(
+        &self,
+        id: &hydra_core::SnapshotId,
+    ) -> Option<&hydra_core::SnapshotManifest> {
+        self.snapshot_store.manifest(id)
+    }
+
+    pub fn snapshot_body(
+        &self,
+        id: &hydra_core::SnapshotId,
+    ) -> Option<&hydra_core::SnapshotBody> {
+        self.snapshot_store.body(id)
+    }
+
+    pub fn snapshot_manifests(&self) -> Vec<&hydra_core::SnapshotManifest> {
+        self.snapshot_store.manifests()
+    }
+
+    pub fn latest_snapshot_manifest(&self) -> Option<&hydra_core::SnapshotManifest> {
+        self.snapshot_store.latest_manifest()
+    }
+
+    /// Capture the current materialized state as a snapshot.
+    ///
+    /// Walks every store, clones its visible state into a `SnapshotBody`,
+    /// inserts the body into `snapshot_store`, and emits a
+    /// `SnapshotTaken` audit event. The returned manifest's `sequence`
+    /// reflects the last commit included in the body; the `SnapshotTaken`
+    /// audit event is committed as a separate (later) commit.
+    pub fn snapshot(
+        &mut self,
+        created_by: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::SnapshotManifest> {
+        let latest_commit = self.latest_commit().cloned();
+        let sequence = latest_commit
+            .as_ref()
+            .map(|commit| commit.sequence)
+            .unwrap_or(0);
+        let head_commit_id = latest_commit.as_ref().map(|commit| commit.id.clone());
+        let head_commit_hash = latest_commit
+            .as_ref()
+            .map(|commit| commit.commit_hash.clone());
+
+        let nodes = self
+            .projection
+            .all_nodes()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let edges = self
+            .projection
+            .all_edges()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let events = self.events().into_iter().cloned().collect::<Vec<_>>();
+        let commit_records = self.commit_records().to_vec();
+        let claims = self
+            .epistemic_store
+            .all_claims()
+            .cloned()
+            .collect::<Vec<_>>();
+        let evidence = self
+            .epistemic_store
+            .all_evidence()
+            .cloned()
+            .collect::<Vec<_>>();
+        let actions = self
+            .action_store
+            .all_actions()
+            .cloned()
+            .collect::<Vec<_>>();
+        let outcomes = self
+            .action_store
+            .all_outcomes()
+            .cloned()
+            .collect::<Vec<_>>();
+        let policies = self
+            .policy_store
+            .all_policies()
+            .cloned()
+            .collect::<Vec<_>>();
+        let policy_decisions = self
+            .policy_store
+            .all_decisions()
+            .cloned()
+            .collect::<Vec<_>>();
+        let approval_requests = self
+            .policy_store
+            .all_approvals()
+            .cloned()
+            .collect::<Vec<_>>();
+        let sensor_runs = self
+            .sensor_checkpoint_store
+            .all_runs()
+            .cloned()
+            .collect::<Vec<_>>();
+        let sensor_checkpoints = self
+            .sensor_checkpoint_store
+            .all_checkpoints()
+            .cloned()
+            .collect::<Vec<_>>();
+        let schemas = self
+            .schema_registry_store
+            .all_schemas()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let manifest = hydra_core::SnapshotManifest::committed(
+            hydra_core::SnapshotId::new(),
+            None,
+            sequence,
+            head_commit_id,
+            head_commit_hash,
+            created_by,
+            chrono::Utc::now(),
+            events.len(),
+            commit_records.len(),
+            nodes.len(),
+            edges.len(),
+            claims.len(),
+            evidence.len(),
+            actions.len(),
+            outcomes.len(),
+            policies.len(),
+            policy_decisions.len(),
+            approval_requests.len(),
+            sensor_checkpoints.len(),
+            schemas.len(),
+        );
+        let body = hydra_core::SnapshotBody {
+            manifest: manifest.clone(),
+            nodes,
+            edges,
+            events,
+            commit_records,
+            claims,
+            evidence,
+            actions,
+            outcomes,
+            policies,
+            policy_decisions,
+            approval_requests,
+            sensor_runs,
+            sensor_checkpoints,
+            schemas,
+            metadata: std::collections::HashMap::new(),
+        };
+        self.snapshot_store.insert(body);
+        self.ingest(hydra_core::EventKind::SnapshotTaken {
+            manifest: manifest.clone(),
+        })?;
+        Ok(manifest)
+    }
+
+    /// Restore the runtime from a previously captured snapshot.
+    ///
+    /// Patch 2 restores by replaying the events captured in the snapshot
+    /// body — slightly slower than direct state injection but avoids
+    /// adding per-store "replace entire map" APIs. Patch 3+ may optimize.
+    /// After restore, a `SnapshotRestored` audit event is committed.
+    /// `replayed_commit_count` is 0 in Patch 2; "snapshot + replay newer
+    /// commits" lands in Patch 3.
+    pub fn restore_from_snapshot(
+        &mut self,
+        snapshot_id: &hydra_core::SnapshotId,
+        restored_by: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::SnapshotManifest> {
+        let body = self.snapshot_store.require_body(snapshot_id)?.clone();
+        let manifest = body.manifest.clone();
+        self.reset_runtime_state_preserving_config();
+        self.recover_from_events(body.events.clone())?;
+        // Re-insert is a no-op when reset_runtime_state_preserving_config
+        // doesn't touch the snapshot store, but keeps the intent explicit
+        // and protects against future reset behavior changes.
+        self.snapshot_store.insert(body);
+        // restored_by is captured for future audit metadata; the current
+        // SnapshotRestored event variant doesn't yet carry an actor field.
+        let _ = restored_by;
+        self.ingest(hydra_core::EventKind::SnapshotRestored {
+            manifest: manifest.clone(),
+            replayed_commit_count: 0,
+        })?;
+        Ok(manifest)
     }
 
     /// Attach a durable commit writer.
@@ -4272,5 +4469,123 @@ mod sprint1_tests {
             .unwrap();
         assert_eq!(hydra.commit_count(), 1);
         assert_eq!(second.events[0].id, first.events[0].id);
+    }
+
+    #[test]
+    fn hydra_snapshot_captures_current_state() {
+        use hydra_core::{ActorId, EventKind, NodeId};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        hydra
+            .ingest(EventKind::Signal {
+                source: NodeId::from_str("snapshot.test"),
+                name: "one".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+        hydra
+            .ingest(EventKind::Signal {
+                source: NodeId::from_str("snapshot.test"),
+                name: "two".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+
+        let manifest = hydra
+            .snapshot(ActorId::from_str("actor_snapshot"))
+            .unwrap();
+        assert_eq!(manifest.total_events, 2);
+        assert_eq!(manifest.total_commits, 2);
+        assert!(manifest.is_committed());
+
+        let body = hydra.snapshot_body(&manifest.id).unwrap();
+        assert_eq!(body.events.len(), 2);
+        assert_eq!(body.commit_records.len(), 2);
+
+        // SnapshotTaken itself is audited after the snapshot body is captured.
+        assert_eq!(hydra.commit_count(), 3);
+    }
+
+    #[test]
+    fn hydra_restore_from_snapshot_resets_to_snapshot_state() {
+        use hydra_core::{ActorId, EventKind, NodeId};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        hydra
+            .ingest(EventKind::Signal {
+                source: NodeId::from_str("snapshot.test"),
+                name: "before".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+
+        let manifest = hydra
+            .snapshot(ActorId::from_str("actor_snapshot"))
+            .unwrap();
+        let commits_at_snapshot = hydra.commit_count();
+
+        hydra
+            .ingest(EventKind::Signal {
+                source: NodeId::from_str("snapshot.test"),
+                name: "after".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+        assert!(hydra.commit_count() > commits_at_snapshot);
+
+        hydra
+            .restore_from_snapshot(&manifest.id, ActorId::from_str("actor_restore"))
+            .unwrap();
+
+        // After restore, the event log contains:
+        // - 1 original signal recovered from the snapshot body
+        // - 1 SnapshotRestored audit event committed after restore
+        let names: Vec<String> = hydra
+            .events()
+            .into_iter()
+            .map(|event| event.kind.kind_name().to_string())
+            .collect();
+        assert!(names.contains(&"signal".to_string()));
+        assert!(names.contains(&"snapshot_restored".to_string()));
+        // The "after" signal that came in post-snapshot is gone.
+        assert!(!hydra.events().iter().any(|event| matches!(
+            &event.kind,
+            EventKind::Signal { name, .. } if name == "after"
+        )));
+    }
+
+    #[test]
+    fn hydra_latest_snapshot_manifest_tracks_highest_sequence() {
+        use hydra_core::{ActorId, EventKind, NodeId};
+        use std::collections::HashMap;
+
+        let mut hydra = Hydra::new();
+        hydra
+            .ingest(EventKind::Signal {
+                source: NodeId::from_str("snapshot.test"),
+                name: "one".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+        let first = hydra
+            .snapshot(ActorId::from_str("actor_snapshot"))
+            .unwrap();
+
+        hydra
+            .ingest(EventKind::Signal {
+                source: NodeId::from_str("snapshot.test"),
+                name: "two".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+        let second = hydra
+            .snapshot(ActorId::from_str("actor_snapshot"))
+            .unwrap();
+
+        assert_eq!(hydra.latest_snapshot_manifest().unwrap().id, second.id);
+        assert!(second.sequence > first.sequence);
+        assert_eq!(hydra.snapshot_manifests().len(), 2);
     }
 }

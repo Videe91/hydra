@@ -1,8 +1,10 @@
+use crate::action::Outcome;
 use crate::edge::Edge;
 use crate::epistemic::{Claim, Evidence};
 use crate::event::Value;
 use crate::id::{ActorId, SnapshotId, TenantId};
 use crate::node::Node;
+use crate::policy::{ApprovalRequest, PolicyDecision};
 use crate::{
     Action, CommitHash, CommitId, CommitRecord, Event, Policy, SchemaDefinition, SensorCheckpoint,
     SensorRun,
@@ -47,7 +49,10 @@ pub struct SnapshotManifest {
     pub total_claims: usize,
     pub total_evidence: usize,
     pub total_actions: usize,
+    pub total_outcomes: usize,
     pub total_policies: usize,
+    pub total_policy_decisions: usize,
+    pub total_approval_requests: usize,
     pub total_sensor_checkpoints: usize,
     pub total_schemas: usize,
     pub metadata: HashMap<String, Value>,
@@ -70,9 +75,13 @@ pub struct SnapshotBody {
     /// Epistemic state.
     pub claims: Vec<Claim>,
     pub evidence: Vec<Evidence>,
-    /// Action / policy state.
+    /// Action / outcome state.
     pub actions: Vec<Action>,
+    pub outcomes: Vec<Outcome>,
+    /// Policy / decision / approval state.
     pub policies: Vec<Policy>,
+    pub policy_decisions: Vec<PolicyDecision>,
+    pub approval_requests: Vec<ApprovalRequest>,
     /// Sensor / checkpoint state.
     pub sensor_runs: Vec<SensorRun>,
     pub sensor_checkpoints: Vec<SensorCheckpoint>,
@@ -98,7 +107,10 @@ impl SnapshotManifest {
         total_claims: usize,
         total_evidence: usize,
         total_actions: usize,
+        total_outcomes: usize,
         total_policies: usize,
+        total_policy_decisions: usize,
+        total_approval_requests: usize,
         total_sensor_checkpoints: usize,
         total_schemas: usize,
     ) -> Self {
@@ -118,7 +130,10 @@ impl SnapshotManifest {
             total_claims,
             total_evidence,
             total_actions,
+            total_outcomes,
             total_policies,
+            total_policy_decisions,
+            total_approval_requests,
             total_sensor_checkpoints,
             total_schemas,
             metadata: HashMap::new(),
@@ -162,6 +177,8 @@ mod tests {
 
     #[test]
     fn snapshot_manifest_committed_builder_sets_counts() {
+        // events, commits, nodes, edges, claims, evidence, actions, outcomes,
+        // policies, policy_decisions, approval_requests, sensor_checkpoints, schemas
         let manifest = SnapshotManifest::committed(
             SnapshotId::new(),
             None,
@@ -170,7 +187,7 @@ mod tests {
             Some(CommitHash("engine-v0:abc".to_string())),
             actor(),
             Utc::now(),
-            10, 4, 3, 2, 5, 6, 7, 8, 9, 11,
+            10, 4, 3, 2, 5, 6, 7, 12, 8, 13, 14, 9, 11,
         );
         assert!(manifest.is_committed());
         assert_eq!(manifest.sequence, 42);
@@ -181,7 +198,10 @@ mod tests {
         assert_eq!(manifest.total_claims, 5);
         assert_eq!(manifest.total_evidence, 6);
         assert_eq!(manifest.total_actions, 7);
+        assert_eq!(manifest.total_outcomes, 12);
         assert_eq!(manifest.total_policies, 8);
+        assert_eq!(manifest.total_policy_decisions, 13);
+        assert_eq!(manifest.total_approval_requests, 14);
         assert_eq!(manifest.total_sensor_checkpoints, 9);
         assert_eq!(manifest.total_schemas, 11);
     }
@@ -196,7 +216,7 @@ mod tests {
             Some(CommitHash("engine-v0:hash".to_string())),
             actor(),
             Utc::now(),
-            1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         );
         let json = serde_json::to_string(&manifest).unwrap();
         let restored: SnapshotManifest = serde_json::from_str(&json).unwrap();
@@ -213,7 +233,7 @@ mod tests {
             None,
             actor(),
             Utc::now(),
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         );
         let body = SnapshotBody {
             manifest,
@@ -224,7 +244,10 @@ mod tests {
             claims: vec![],
             evidence: vec![],
             actions: vec![],
+            outcomes: vec![],
             policies: vec![],
+            policy_decisions: vec![],
+            approval_requests: vec![],
             sensor_runs: vec![],
             sensor_checkpoints: vec![],
             schemas: vec![],

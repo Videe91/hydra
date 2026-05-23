@@ -19,6 +19,7 @@ pub mod sensor_checkpoint_store;
 pub mod schema_registry_store;
 pub mod schema_validator;
 pub mod schema_gate;
+pub mod snapshot_store;
 pub mod remediation_agent;
 pub mod outcome_agent;
 pub mod reflex;
@@ -74,6 +75,7 @@ pub mod prelude {
     pub use crate::schema_gate::{
         SchemaGate, SchemaGateConfig, SchemaGateMode, UnknownSchemaPolicy,
     };
+    pub use crate::snapshot_store::SnapshotStore;
     pub use crate::remediation_agent::RemediationAgent;
     pub use crate::outcome_agent::OutcomeAgent;
     pub use crate::reflex::{Reflex, ReflexContext, ReflexRegistry};
