@@ -75,6 +75,12 @@ impl QueryService {
         guard.graph().edge(id).cloned()
     }
 
+    /// All alive edges (unfiltered). Read-side query API entry point.
+    pub async fn edges(&self) -> Vec<Edge> {
+        let guard = self.hydra.read().await;
+        guard.all_edges().into_iter().cloned().collect()
+    }
+
     /// Get outgoing edges from a node
     pub async fn outgoing_edges(&self, node_id: &NodeId) -> Vec<Edge> {
         let guard = self.hydra.read().await;
@@ -196,6 +202,13 @@ impl QueryService {
     pub async fn evidence(&self, id: &EvidenceId) -> Option<Evidence> {
         let hydra = self.hydra.read().await;
         hydra.evidence(id).cloned()
+    }
+
+    /// All evidence (unfiltered). Read-side query API entry point.
+    /// Named `evidence_items` to avoid collision with [`Self::evidence`].
+    pub async fn evidence_items(&self) -> Vec<Evidence> {
+        let hydra = self.hydra.read().await;
+        hydra.all_evidence().into_iter().cloned().collect()
     }
 
     /// Get claim by ID.
@@ -510,6 +523,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edges_returns_all_alive_edges() {
+        let hydra = make_hydra();
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let edge_id = EdgeId::new();
+        {
+            let mut h = hydra.write().await;
+            h.ingest(EventKind::NodeCreated {
+                node_id: a.clone(),
+                type_id: "ec2".to_string(),
+                properties: HashMap::new(),
+            })
+            .unwrap();
+            h.ingest(EventKind::NodeCreated {
+                node_id: b.clone(),
+                type_id: "vpc".to_string(),
+                properties: HashMap::new(),
+            })
+            .unwrap();
+            h.ingest(EventKind::EdgeCreated {
+                edge_id: edge_id.clone(),
+                source: a.clone(),
+                target: b.clone(),
+                type_id: "in_vpc".to_string(),
+                properties: HashMap::new(),
+            })
+            .unwrap();
+        }
+        let qs = QueryService::new(hydra);
+        let all = qs.edges().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id(), &edge_id);
+    }
+
+    #[tokio::test]
     async fn nodes_returns_all_alive_nodes() {
         let hydra = make_hydra();
         let a = NodeId::new();
@@ -733,6 +781,31 @@ mod epistemic_query_tests {
         assert_eq!(disputed.len(), 1);
         assert_eq!(disputed[0].id, claim_id);
         assert_eq!(disputed[0].status, ClaimStatus::Disputed);
+    }
+
+    #[tokio::test]
+    async fn evidence_items_returns_all_evidence() {
+        let mut hydra = Hydra::new();
+        let ev_one = evidence();
+        let ev_two = Evidence {
+            id: EvidenceId::new(),
+            ..evidence()
+        };
+        let id_one = ev_one.id.clone();
+        let id_two = ev_two.id.clone();
+        hydra
+            .ingest_event(event(EventKind::EvidenceAdded { evidence: ev_one }))
+            .unwrap();
+        hydra
+            .ingest_event(event(EventKind::EvidenceAdded { evidence: ev_two }))
+            .unwrap();
+
+        let service = QueryService::new(Arc::new(RwLock::new(hydra)));
+        let all = service.evidence_items().await;
+        assert_eq!(all.len(), 2);
+        let ids: Vec<_> = all.iter().map(|e| e.id.clone()).collect();
+        assert!(ids.contains(&id_one));
+        assert!(ids.contains(&id_two));
     }
 
     #[tokio::test]

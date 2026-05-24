@@ -10,9 +10,15 @@
 //! Routes (registered specific-before-generic so axum picks the right
 //! handler for paths like `/query/claims/status/Verified`):
 //!
+//! - `GET /query/nodes/:node_id/outgoing-edges`    — edges with this node as source
+//! - `GET /query/nodes/:node_id/incoming-edges`    — edges with this node as target
 //! - `GET /query/nodes/:node_id/neighbors`         — undirected neighbors of a node
 //! - `GET /query/nodes/:node_id`                   — single node lookup
 //! - `GET /query/nodes`                            — list all alive nodes
+//! - `GET /query/edges/:edge_id`                   — single edge lookup
+//! - `GET /query/edges`                            — list all alive edges
+//! - `GET /query/evidence/:evidence_id`            — single evidence lookup
+//! - `GET /query/evidence`                         — list all evidence
 //! - `GET /query/claims/status/:status`            — claims filtered by lifecycle status
 //! - `GET /query/claims/:claim_id`                 — single claim lookup
 //! - `GET /query/claims`                           — list all claims
@@ -36,8 +42,10 @@ use axum::{
     Json, Router,
 };
 use hydra_core::{
-    Action, ActionId, ActionStatus, Claim, ClaimId, ClaimStatus, NodeId, Outcome,
+    Action, ActionId, ActionStatus, Claim, ClaimId, ClaimStatus, EdgeId, Evidence, EvidenceId,
+    NodeId, Outcome,
 };
+use hydra_core::edge::Edge;
 use hydra_core::node::Node;
 use serde::{Deserialize, Serialize};
 
@@ -61,9 +69,23 @@ impl QueryHttpState {
 /// specific-before-generic registration order.
 pub fn query_router(runtime: RuntimeHandle) -> Router {
     Router::new()
+        // Node sub-paths first — these are 4-segment URIs but axum still
+        // benefits from explicit-before-generic ordering for clarity.
+        .route(
+            "/query/nodes/:node_id/outgoing-edges",
+            get(node_outgoing_edges),
+        )
+        .route(
+            "/query/nodes/:node_id/incoming-edges",
+            get(node_incoming_edges),
+        )
         .route("/query/nodes/:node_id/neighbors", get(node_neighbors))
         .route("/query/nodes/:node_id", get(get_node))
         .route("/query/nodes", get(list_nodes))
+        .route("/query/edges/:edge_id", get(get_edge))
+        .route("/query/edges", get(list_edges))
+        .route("/query/evidence/:evidence_id", get(get_evidence))
+        .route("/query/evidence", get(list_evidence))
         .route("/query/claims/status/:status", get(claims_by_status))
         .route("/query/claims/:claim_id", get(get_claim))
         .route("/query/claims", get(list_claims))
@@ -109,6 +131,29 @@ pub struct ActionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutcomesResponse {
     pub outcomes: Vec<Outcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgesResponse {
+    pub edges: Vec<Edge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeResponse {
+    pub edge: Edge,
+}
+
+/// List view of evidence. The JSON key is `evidence` (singular) because
+/// "evidence" is an uncountable noun — same shape as the wrapped single
+/// response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceListResponse {
+    pub evidence: Vec<Evidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceResponse {
+    pub evidence: Evidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +228,69 @@ async fn node_neighbors(
     }
     let nodes = state.service.neighbors(&id).await;
     Json(NodesResponse { nodes }).into_response()
+}
+
+async fn node_outgoing_edges(
+    State(state): State<QueryHttpState>,
+    Path(node_id): Path<String>,
+) -> Response {
+    let id = NodeId::from_str(&node_id);
+    if state.service.node(&id).await.is_none() {
+        return error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}"));
+    }
+    let edges = state.service.outgoing_edges(&id).await;
+    Json(EdgesResponse { edges }).into_response()
+}
+
+async fn node_incoming_edges(
+    State(state): State<QueryHttpState>,
+    Path(node_id): Path<String>,
+) -> Response {
+    let id = NodeId::from_str(&node_id);
+    if state.service.node(&id).await.is_none() {
+        return error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}"));
+    }
+    let edges = state.service.incoming_edges(&id).await;
+    Json(EdgesResponse { edges }).into_response()
+}
+
+// === Edge handlers ===
+
+async fn list_edges(State(state): State<QueryHttpState>) -> Response {
+    let edges = state.service.edges().await;
+    Json(EdgesResponse { edges }).into_response()
+}
+
+async fn get_edge(
+    State(state): State<QueryHttpState>,
+    Path(edge_id): Path<String>,
+) -> Response {
+    let id = EdgeId::from_str(&edge_id);
+    match state.service.edge(&id).await {
+        Some(edge) => Json(EdgeResponse { edge }).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, format!("edge not found: {edge_id}")),
+    }
+}
+
+// === Evidence handlers ===
+
+async fn list_evidence(State(state): State<QueryHttpState>) -> Response {
+    let evidence = state.service.evidence_items().await;
+    Json(EvidenceListResponse { evidence }).into_response()
+}
+
+async fn get_evidence(
+    State(state): State<QueryHttpState>,
+    Path(evidence_id): Path<String>,
+) -> Response {
+    let id = EvidenceId::from_str(&evidence_id);
+    match state.service.evidence(&id).await {
+        Some(evidence) => Json(EvidenceResponse { evidence }).into_response(),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            format!("evidence not found: {evidence_id}"),
+        ),
+    }
 }
 
 // === Claim handlers ===
@@ -753,6 +861,235 @@ mod tests {
         let app = query_router(runtime);
         let response = app
             .oneshot(empty_get("/query/actions/act_missing/outcomes"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // === Edges ===
+
+    #[tokio::test]
+    async fn list_edges_returns_empty_when_no_edges() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app.oneshot(empty_get("/query/edges")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EdgesResponse = read_json(response).await;
+        assert_eq!(decoded.edges.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_and_get_edge_round_trip() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let edge_id = hydra_core::EdgeId::new();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: a.clone(),
+                    type_id: "ec2".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+            hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: b.clone(),
+                    type_id: "vpc".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+            hydra
+                .ingest(EventKind::EdgeCreated {
+                    edge_id: edge_id.clone(),
+                    source: a.clone(),
+                    target: b.clone(),
+                    type_id: "in_vpc".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+        }
+        let app = query_router(runtime);
+
+        let response = app
+            .clone()
+            .oneshot(empty_get("/query/edges"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EdgesResponse = read_json(response).await;
+        assert_eq!(decoded.edges.len(), 1);
+        assert_eq!(decoded.edges[0].id(), &edge_id);
+
+        let response = app
+            .oneshot(empty_get(&format!("/query/edges/{edge_id}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EdgeResponse = read_json(response).await;
+        assert_eq!(decoded.edge.id(), &edge_id);
+        assert_eq!(decoded.edge.source(), &a);
+        assert_eq!(decoded.edge.target(), &b);
+    }
+
+    #[tokio::test]
+    async fn get_edge_returns_404_when_missing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/edges/edg_missing"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn node_outgoing_and_incoming_edges() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let edge_id = hydra_core::EdgeId::new();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: a.clone(),
+                    type_id: "ec2".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+            hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: b.clone(),
+                    type_id: "vpc".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+            hydra
+                .ingest(EventKind::EdgeCreated {
+                    edge_id: edge_id.clone(),
+                    source: a.clone(),
+                    target: b.clone(),
+                    type_id: "in_vpc".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+        }
+        let app = query_router(runtime);
+
+        let response = app
+            .clone()
+            .oneshot(empty_get(&format!("/query/nodes/{a}/outgoing-edges")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EdgesResponse = read_json(response).await;
+        assert_eq!(decoded.edges.len(), 1);
+        assert_eq!(decoded.edges[0].id(), &edge_id);
+
+        let response = app
+            .clone()
+            .oneshot(empty_get(&format!("/query/nodes/{b}/incoming-edges")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EdgesResponse = read_json(response).await;
+        assert_eq!(decoded.edges.len(), 1);
+        assert_eq!(decoded.edges[0].id(), &edge_id);
+
+        // Source has no incoming, target has no outgoing.
+        let response = app
+            .clone()
+            .oneshot(empty_get(&format!("/query/nodes/{a}/incoming-edges")))
+            .await
+            .unwrap();
+        let decoded: EdgesResponse = read_json(response).await;
+        assert_eq!(decoded.edges.len(), 0);
+
+        let response = app
+            .oneshot(empty_get(&format!("/query/nodes/{b}/outgoing-edges")))
+            .await
+            .unwrap();
+        let decoded: EdgesResponse = read_json(response).await;
+        assert_eq!(decoded.edges.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn node_outgoing_edges_returns_404_when_node_missing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/nodes/node_missing/outgoing-edges"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn node_incoming_edges_returns_404_when_node_missing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/nodes/node_missing/incoming-edges"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // === Evidence ===
+
+    #[tokio::test]
+    async fn list_evidence_returns_empty_when_none() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app.oneshot(empty_get("/query/evidence")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EvidenceListResponse = read_json(response).await;
+        assert_eq!(decoded.evidence.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_and_get_evidence_round_trip() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let ev = evidence();
+        let evidence_id = ev.id.clone();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest_event(event(EventKind::EvidenceAdded { evidence: ev }))
+                .unwrap();
+        }
+        let app = query_router(runtime);
+
+        let response = app
+            .clone()
+            .oneshot(empty_get("/query/evidence"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EvidenceListResponse = read_json(response).await;
+        assert_eq!(decoded.evidence.len(), 1);
+        assert_eq!(decoded.evidence[0].id, evidence_id);
+
+        let response = app
+            .oneshot(empty_get(&format!("/query/evidence/{evidence_id}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EvidenceResponse = read_json(response).await;
+        assert_eq!(decoded.evidence.id, evidence_id);
+    }
+
+    #[tokio::test]
+    async fn get_evidence_returns_404_when_missing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/evidence/evd_missing"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);

@@ -830,6 +830,19 @@ impl Hydra {
         self.projection.all_nodes()
     }
 
+    /// All alive edges in the projection (unfiltered). Pair to
+    /// [`Self::all_nodes`] for the read-side query API.
+    pub fn all_edges(&self) -> Vec<&hydra_core::edge::Edge> {
+        self.projection.all_edges()
+    }
+
+    /// All evidence currently held by the epistemic store. Pair to
+    /// [`EpistemicStore::all_claims`] / [`Self::all_nodes`] for the
+    /// read-side query API.
+    pub fn all_evidence(&self) -> Vec<&hydra_core::Evidence> {
+        self.epistemic_store.all_evidence().collect()
+    }
+
     /// Edge count in the graph
     pub fn edge_count(&self) -> usize {
         self.projection.edge_count()
