@@ -4,11 +4,11 @@ pub mod schema;
 pub mod schema_admin;
 pub mod test_hydra;
 
-pub use persistent::{HydraRuntime, InspectReport};
+pub use persistent::{HydraRuntime, InspectReport, VerifyReport};
 
 pub mod prelude {
     pub use crate::builder::HydraBuilder;
-    pub use crate::persistent::{HydraRuntime, InspectReport};
+    pub use crate::persistent::{HydraRuntime, InspectReport, VerifyReport};
     pub use crate::schema::SchemaApi;
     pub use crate::schema_admin::{SchemaAdmin, SchemaFields};
     pub use crate::test_hydra::TestHydra;

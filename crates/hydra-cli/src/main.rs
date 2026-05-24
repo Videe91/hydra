@@ -58,6 +58,16 @@ enum Command {
         #[arg(long)]
         actor: String,
     },
+    /// Verify the durable commit chain.
+    ///
+    /// Loads every commit from `<root>/commits.jsonl`, replays through
+    /// the engine, and runs `verify_commit_chain`. Prints `valid: true |
+    /// false`, the commit count, and a `message:` line on failure. Safe
+    /// to run on a live root.
+    Verify {
+        /// Hydra data root directory.
+        root: PathBuf,
+    },
 }
 
 fn main() {
@@ -73,6 +83,7 @@ fn run() -> hydra_core::error::Result<()> {
         Command::Compact { root } => compact(root),
         Command::Inspect { root } => inspect(root),
         Command::Snapshot { root, actor } => snapshot(root, actor),
+        Command::Verify { root } => verify(root),
     }
 }
 
@@ -110,5 +121,15 @@ fn snapshot(root: PathBuf, actor: String) -> hydra_core::error::Result<()> {
         "snapshot: id={} sequence={} events={} commits={}",
         manifest.id, manifest.sequence, manifest.total_events, manifest.total_commits
     );
+    Ok(())
+}
+
+fn verify(root: PathBuf) -> hydra_core::error::Result<()> {
+    let report = HydraRuntime::verify_persistent_state(&root)?;
+    println!("valid: {}", report.valid);
+    println!("commits: {}", report.commits);
+    if let Some(message) = report.message {
+        println!("message: {message}");
+    }
     Ok(())
 }

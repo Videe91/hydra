@@ -23,6 +23,17 @@ pub struct InspectReport {
     pub recommended_recovery: RecoveryMode,
 }
 
+/// Result of [`HydraRuntime::verify_persistent_state`].
+///
+/// `valid == true` means the durable commit log is a self-consistent
+/// hash chain. `message` carries the engine's error string when invalid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport {
+    pub valid: bool,
+    pub commits: usize,
+    pub message: Option<String>,
+}
+
 /// SDK-facing persistent runtime bootstrap.
 ///
 /// The "open a real on-disk Hydra" convenience layer:
@@ -165,6 +176,53 @@ impl HydraRuntime {
             latest_snapshot_sequence,
             recommended_recovery,
         })
+    }
+
+    /// Verify the persistent commit chain from the full commit log.
+    ///
+    /// Intentionally bypasses snapshot fast-recovery: verification is a
+    /// full-chain operation that validates the durable commit log itself,
+    /// not just the materialized state restored from the latest snapshot.
+    /// The helper opens the log, loads every batch, rebuilds an in-memory
+    /// `Hydra` via `recover_from_commits`, then runs `verify_commit_chain`.
+    ///
+    /// On success returns `valid: true, message: None`. Any engine error
+    /// during recovery or verification is captured as `valid: false` with
+    /// the error's `Display` form in `message`.
+    ///
+    /// **Limitation**: this verifies the current commit log file as a
+    /// standalone genesis chain. If the log has been compacted past a
+    /// snapshot, the retained tail does not start at sequence 1 and
+    /// `recover_from_commits` may reject it as non-contiguous. A future
+    /// snapshot-aware verifier (`verify_recoverability`) will validate
+    /// compacted roots by combining snapshot + tail.
+    pub fn verify_persistent_state(
+        root: impl AsRef<Path>,
+    ) -> Result<VerifyReport> {
+        let root = root.as_ref();
+        let commit_log = CommitLog::open(commit_log_path(root))?;
+        let commits = commit_log.load_all()?;
+        let commit_count = commits.len();
+        let mut hydra = Hydra::new();
+        match hydra.recover_from_commits(commits) {
+            Ok(()) => match hydra.verify_commit_chain() {
+                Ok(()) => Ok(VerifyReport {
+                    valid: true,
+                    commits: commit_count,
+                    message: None,
+                }),
+                Err(error) => Ok(VerifyReport {
+                    valid: false,
+                    commits: commit_count,
+                    message: Some(error.to_string()),
+                }),
+            },
+            Err(error) => Ok(VerifyReport {
+                valid: false,
+                commits: commit_count,
+                message: Some(error.to_string()),
+            }),
+        }
     }
 
     pub fn compact_commit_log_through_latest_snapshot(
@@ -434,6 +492,32 @@ mod tests {
         assert_eq!(report.snapshot_count, 1);
         assert!(report.commit_count >= 3);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_persistent_state_empty_root_is_valid() {
+        let root = temp_root("verify_empty");
+        let report = HydraRuntime::verify_persistent_state(&root).unwrap();
+        assert!(report.valid);
+        assert_eq!(report.commits, 0);
+        assert_eq!(report.message, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_persistent_state_reports_valid_chain() {
+        let root = temp_root("verify_valid");
+        {
+            let (mut hydra, _) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            hydra.ingest(signal("one")).unwrap();
+            hydra.ingest(signal("two")).unwrap();
+        }
+        let report = HydraRuntime::verify_persistent_state(&root).unwrap();
+        assert!(report.valid, "message: {:?}", report.message);
+        assert_eq!(report.commits, 2);
+        assert_eq!(report.message, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
