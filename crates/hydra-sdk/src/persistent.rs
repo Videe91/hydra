@@ -34,6 +34,22 @@ pub struct VerifyReport {
     pub message: Option<String>,
 }
 
+/// Result of [`HydraRuntime::verify_recoverability`].
+///
+/// Snapshot-aware integrity check. On non-snapshotted roots, falls back
+/// to standalone commit-log verification and reports
+/// `snapshot_id: None`. On snapshotted (and possibly compacted) roots,
+/// `valid == true` means the latest snapshot loaded and the retained
+/// tail successfully replayed on top of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverabilityReport {
+    pub valid: bool,
+    pub snapshot_id: Option<hydra_core::SnapshotId>,
+    pub snapshot_sequence: Option<u64>,
+    pub tail_commits: usize,
+    pub message: Option<String>,
+}
+
 /// SDK-facing persistent runtime bootstrap.
 ///
 /// The "open a real on-disk Hydra" convenience layer:
@@ -220,6 +236,104 @@ impl HydraRuntime {
             Err(error) => Ok(VerifyReport {
                 valid: false,
                 commits: commit_count,
+                message: Some(error.to_string()),
+            }),
+        }
+    }
+
+    /// Verify that a persistent root is recoverable end-to-end.
+    ///
+    /// Snapshot-aware: this is the correct verifier for compacted roots.
+    ///
+    /// - **No snapshots present**: falls back to standalone commit-log
+    ///   verification ([`verify_persistent_state`](Self::verify_persistent_state))
+    ///   and tags the report with a "no snapshots found" message so
+    ///   operators can tell the two paths apart.
+    /// - **Snapshots present**: loads the latest manifest, reads its body,
+    ///   loads every commit batch, and exercises
+    ///   [`Hydra::recover_from_snapshot_body_and_replay`]. The engine's
+    ///   replay-tail validator catches sequence gaps; engine errors are
+    ///   captured as `valid: false` with the error string in `message`.
+    ///
+    /// Returns `tail_commits = count of batches with sequence >
+    /// snapshot.sequence`, so operators can see how much replay work
+    /// recovery would do on the next restart.
+    pub fn verify_recoverability(
+        root: impl AsRef<Path>,
+    ) -> Result<RecoverabilityReport> {
+        let root = root.as_ref();
+        let commit_log = CommitLog::open(commit_log_path(root))?;
+        let snapshot_store = FileSnapshotStore::open(root)?;
+        let manifests = snapshot_store.list_snapshot_manifests()?;
+        let latest = manifests
+            .into_iter()
+            .max_by_key(|manifest| manifest.sequence);
+
+        let Some(manifest) = latest else {
+            // No snapshots — full commit-chain verification is the
+            // correct integrity check for this root.
+            let verify = Self::verify_persistent_state(root)?;
+            return Ok(RecoverabilityReport {
+                valid: verify.valid,
+                snapshot_id: None,
+                snapshot_sequence: None,
+                tail_commits: 0,
+                message: verify.message.or_else(|| {
+                    Some(
+                        "full commit-log verification used; no snapshots found"
+                            .to_string(),
+                    )
+                }),
+            });
+        };
+
+        let body = match snapshot_store.read_snapshot(&manifest.id) {
+            Ok(body) => body,
+            Err(error) => {
+                return Ok(RecoverabilityReport {
+                    valid: false,
+                    snapshot_id: Some(manifest.id),
+                    snapshot_sequence: Some(manifest.sequence),
+                    tail_commits: 0,
+                    message: Some(error.to_string()),
+                });
+            }
+        };
+        let commits = match commit_log.load_all() {
+            Ok(commits) => commits,
+            Err(error) => {
+                return Ok(RecoverabilityReport {
+                    valid: false,
+                    snapshot_id: Some(manifest.id),
+                    snapshot_sequence: Some(manifest.sequence),
+                    tail_commits: 0,
+                    message: Some(error.to_string()),
+                });
+            }
+        };
+        let tail_commits = commits
+            .iter()
+            .filter(|batch| batch.sequence > manifest.sequence)
+            .count();
+
+        let mut hydra = Hydra::new();
+        match hydra.recover_from_snapshot_body_and_replay(
+            body,
+            commits,
+            ActorId::from_str("actor_hydra_recoverability_check"),
+        ) {
+            Ok(_) => Ok(RecoverabilityReport {
+                valid: true,
+                snapshot_id: Some(manifest.id),
+                snapshot_sequence: Some(manifest.sequence),
+                tail_commits,
+                message: None,
+            }),
+            Err(error) => Ok(RecoverabilityReport {
+                valid: false,
+                snapshot_id: Some(manifest.id),
+                snapshot_sequence: Some(manifest.sequence),
+                tail_commits,
                 message: Some(error.to_string()),
             }),
         }
@@ -518,6 +632,91 @@ mod tests {
         assert!(report.valid, "message: {:?}", report.message);
         assert_eq!(report.commits, 2);
         assert_eq!(report.message, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_recoverability_falls_back_without_snapshot() {
+        let root = temp_root("recoverability_no_snapshot");
+        {
+            let (mut hydra, _) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            hydra.ingest(signal("one")).unwrap();
+            hydra.ingest(signal("two")).unwrap();
+        }
+        let report = HydraRuntime::verify_recoverability(&root).unwrap();
+        assert!(report.valid, "message: {:?}", report.message);
+        assert_eq!(report.snapshot_id, None);
+        assert_eq!(report.snapshot_sequence, None);
+        assert_eq!(report.tail_commits, 0);
+        assert!(
+            report
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("no snapshots"),
+            "expected fallback marker in message, got {:?}",
+            report.message
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_recoverability_succeeds_after_compaction() {
+        let root = temp_root("recoverability_compacted");
+        {
+            let (mut hydra, _) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            hydra.ingest(signal("before")).unwrap();
+            let manifest = hydra.snapshot(actor()).unwrap();
+            hydra.ingest(signal("after_one")).unwrap();
+            hydra.ingest(signal("after_two")).unwrap();
+            assert_eq!(manifest.sequence, 1);
+        }
+        let compact =
+            HydraRuntime::compact_commit_log_through_latest_snapshot(&root)
+                .unwrap()
+                .unwrap();
+        assert_eq!(compact.cutoff_sequence, 1);
+
+        // Plain verify fails on the compacted tail because it's no longer
+        // a standalone genesis chain — this is the exact gap
+        // verify_recoverability fixes.
+        let plain = HydraRuntime::verify_persistent_state(&root).unwrap();
+        assert!(!plain.valid);
+
+        let report = HydraRuntime::verify_recoverability(&root).unwrap();
+        assert!(report.valid, "message: {:?}", report.message);
+        assert_eq!(report.snapshot_sequence, Some(1));
+        // Tail: SnapshotTaken (N+1), after_one (N+2), after_two (N+3).
+        assert_eq!(report.tail_commits, 3);
+        assert_eq!(report.message, None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_recoverability_reports_missing_snapshot_body() {
+        let root = temp_root("recoverability_missing_body");
+        let manifest = {
+            let (mut hydra, _) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            hydra.ingest(signal("before")).unwrap();
+            hydra.snapshot(actor()).unwrap()
+        };
+
+        // Delete the body file but leave the index.jsonl manifest behind.
+        // verify_recoverability must report this as a failed read, not panic.
+        let body_path = root
+            .join("snapshots")
+            .join(format!("{}.json", manifest.id));
+        std::fs::remove_file(&body_path).unwrap();
+
+        let report = HydraRuntime::verify_recoverability(&root).unwrap();
+        assert!(!report.valid);
+        assert_eq!(report.snapshot_id, Some(manifest.id));
+        assert!(report.message.is_some());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -68,6 +68,17 @@ enum Command {
         /// Hydra data root directory.
         root: PathBuf,
     },
+    /// Verify snapshot-aware recoverability of a persistent root.
+    ///
+    /// This is the right check for compacted roots: it loads the latest
+    /// snapshot body and runs the full snapshot + replay-tail recovery
+    /// path. Falls back to standalone commit-log verification when no
+    /// snapshots exist (with a message marker). Safe to run on a live
+    /// root.
+    VerifyRecoverability {
+        /// Hydra data root directory.
+        root: PathBuf,
+    },
 }
 
 fn main() {
@@ -84,6 +95,7 @@ fn run() -> hydra_core::error::Result<()> {
         Command::Inspect { root } => inspect(root),
         Command::Snapshot { root, actor } => snapshot(root, actor),
         Command::Verify { root } => verify(root),
+        Command::VerifyRecoverability { root } => verify_recoverability(root),
     }
 }
 
@@ -128,6 +140,24 @@ fn verify(root: PathBuf) -> hydra_core::error::Result<()> {
     let report = HydraRuntime::verify_persistent_state(&root)?;
     println!("valid: {}", report.valid);
     println!("commits: {}", report.commits);
+    if let Some(message) = report.message {
+        println!("message: {message}");
+    }
+    Ok(())
+}
+
+fn verify_recoverability(root: PathBuf) -> hydra_core::error::Result<()> {
+    let report = HydraRuntime::verify_recoverability(&root)?;
+    println!("valid: {}", report.valid);
+    match report.snapshot_id {
+        Some(id) => println!("snapshot_id: {id}"),
+        None => println!("snapshot_id: none"),
+    }
+    match report.snapshot_sequence {
+        Some(sequence) => println!("snapshot_sequence: {sequence}"),
+        None => println!("snapshot_sequence: none"),
+    }
+    println!("tail_commits: {}", report.tail_commits);
     if let Some(message) = report.message {
         println!("message: {message}");
     }
