@@ -2,7 +2,8 @@ use hydra_core::error::Result;
 use hydra_core::ActorId;
 use hydra_engine::cascade::CascadeConfig;
 use hydra_engine::hydra::Hydra;
-use hydra_storage::commit_log::CommitLog;
+use hydra_engine::snapshot_store::SnapshotBackend;
+use hydra_storage::commit_log::{CommitLog, CommitLogCompactionReport};
 use hydra_storage::recovery::{recover_from_latest_snapshot_or_commit_log, RecoveryReport};
 use hydra_storage::snapshot::FileSnapshotStore;
 use std::path::{Path, PathBuf};
@@ -80,6 +81,43 @@ impl HydraRuntime {
         hydra.set_snapshot_backend(snapshot_store);
 
         Ok((hydra, report))
+    }
+
+    /// Compact the persistent commit log through the latest durable snapshot.
+    ///
+    /// Opens both backends at `root`, finds the latest snapshot manifest,
+    /// and drops every commit batch with `sequence <= manifest.sequence`.
+    /// On restart, recovery loads the snapshot body and replays the
+    /// retained tail — identical post-state to a never-compacted log.
+    ///
+    /// Returns:
+    /// - `Ok(None)` when no snapshots exist (nothing safe to drop yet).
+    /// - `Ok(Some(report))` when compaction ran.
+    ///
+    /// Safe by construction: always compacts through a snapshot's
+    /// sequence, never past one. Callers can run this on a live root
+    /// while another process holds the runtime; the compaction is an
+    /// atomic file rewrite (tempfile + rename) so the worst case is
+    /// the running process sees its log replaced under it on next
+    /// `load_all` — recovery on that process's next restart still works.
+    /// Concurrent-writer hardening (file locking) is a future patch.
+    pub fn compact_commit_log_through_latest_snapshot(
+        root: impl AsRef<Path>,
+    ) -> Result<Option<CommitLogCompactionReport>> {
+        let root = root.as_ref();
+        let commit_log = CommitLog::open(commit_log_path(root))?;
+        let snapshot_store = FileSnapshotStore::open(root)?;
+        let latest = snapshot_store
+            .list_snapshot_manifests()?
+            .into_iter()
+            .max_by_key(|manifest| manifest.sequence);
+        match latest {
+            Some(manifest) => {
+                let report = commit_log.compact_through(manifest.sequence)?;
+                Ok(Some(report))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -205,6 +243,109 @@ mod tests {
         assert_eq!(hydra.commit_count(), 0);
         assert!(hydra.has_commit_writer());
         assert!(hydra.has_snapshot_backend());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compact_commit_log_through_latest_snapshot_returns_none_without_snapshots() {
+        let root = temp_root("compact_none");
+        // Open + drop just to materialize the directory and an empty log file.
+        {
+            let (_, _) = HydraRuntime::open_persistent(&root, actor()).unwrap();
+        }
+        let result =
+            HydraRuntime::compact_commit_log_through_latest_snapshot(&root).unwrap();
+        assert!(result.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compact_commit_log_through_latest_snapshot_compacts_and_recovery_still_works() {
+        let root = temp_root("compact_latest");
+
+        // Phase 1: open, ingest, snapshot, ingest more.
+        let snapshot_sequence;
+        {
+            let (mut hydra, report) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            assert_eq!(report.mode, RecoveryMode::Empty);
+            hydra.ingest(signal("before")).unwrap();
+            let manifest = hydra.snapshot(actor()).unwrap();
+            hydra.ingest(signal("after_one")).unwrap();
+            hydra.ingest(signal("after_two")).unwrap();
+            snapshot_sequence = manifest.sequence;
+            assert_eq!(snapshot_sequence, 1);
+        }
+
+        // Phase 2: compact through the snapshot.
+        let report =
+            HydraRuntime::compact_commit_log_through_latest_snapshot(&root)
+                .unwrap()
+                .unwrap();
+        assert_eq!(report.cutoff_sequence, snapshot_sequence);
+        assert_eq!(report.removed_count, 1);
+        // Retained: SnapshotTaken (N+1), after_one (N+2), after_two (N+3).
+        assert_eq!(report.retained_count, 3);
+
+        // Phase 3: recovery still works using snapshot + compacted tail.
+        {
+            let (hydra, recovery) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            assert_eq!(recovery.mode, RecoveryMode::SnapshotAndReplay);
+            assert_eq!(recovery.replayed_commit_count, 3);
+            let names = hydra
+                .events()
+                .into_iter()
+                .map(|event| event.kind.kind_name().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names.iter().filter(|name| *name == "signal").count(),
+                3
+            );
+            assert!(names.contains(&"snapshot_taken".to_string()));
+            assert!(names.contains(&"snapshot_restored".to_string()));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compact_commit_log_through_latest_snapshot_uses_highest_sequence() {
+        let root = temp_root("compact_latest_sequence");
+
+        // Two snapshots — the helper must use the later one as the cutoff.
+        let (first_sequence, second_sequence);
+        {
+            let (mut hydra, _) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            hydra.ingest(signal("one")).unwrap();
+            let first = hydra.snapshot(actor()).unwrap();
+            hydra.ingest(signal("two")).unwrap();
+            let second = hydra.snapshot(actor()).unwrap();
+            assert!(second.sequence > first.sequence);
+            first_sequence = first.sequence;
+            second_sequence = second.sequence;
+        }
+
+        let report =
+            HydraRuntime::compact_commit_log_through_latest_snapshot(&root)
+                .unwrap()
+                .unwrap();
+        assert_eq!(report.cutoff_sequence, second_sequence);
+        assert!(report.cutoff_sequence > first_sequence);
+
+        // Recovery loads the second (latest) snapshot.
+        let (hydra, recovery) =
+            HydraRuntime::open_persistent(&root, actor()).unwrap();
+        assert_eq!(recovery.mode, RecoveryMode::SnapshotAndReplay);
+        assert_eq!(recovery.snapshot_sequence, Some(second_sequence));
+        let names = hydra
+            .events()
+            .into_iter()
+            .map(|event| event.kind.kind_name().to_string())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"snapshot_restored".to_string()));
 
         let _ = std::fs::remove_dir_all(&root);
     }
