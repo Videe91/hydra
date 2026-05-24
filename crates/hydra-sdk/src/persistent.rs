@@ -4,9 +4,24 @@ use hydra_engine::cascade::CascadeConfig;
 use hydra_engine::hydra::Hydra;
 use hydra_engine::snapshot_store::SnapshotBackend;
 use hydra_storage::commit_log::{CommitLog, CommitLogCompactionReport};
-use hydra_storage::recovery::{recover_from_latest_snapshot_or_commit_log, RecoveryReport};
+use hydra_storage::recovery::{
+    recover_from_latest_snapshot_or_commit_log, RecoveryMode, RecoveryReport,
+};
 use hydra_storage::snapshot::FileSnapshotStore;
 use std::path::{Path, PathBuf};
+
+/// Read-only summary of a persistent Hydra root.
+///
+/// Returned by [`HydraRuntime::inspect_persistent_state`]. Lets operators
+/// see what `open_persistent` would do without actually opening the engine
+/// or mutating anything on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectReport {
+    pub commit_count: usize,
+    pub snapshot_count: usize,
+    pub latest_snapshot_sequence: Option<u64>,
+    pub recommended_recovery: RecoveryMode,
+}
 
 /// SDK-facing persistent runtime bootstrap.
 ///
@@ -101,6 +116,41 @@ impl HydraRuntime {
     /// the running process sees its log replaced under it on next
     /// `load_all` — recovery on that process's next restart still works.
     /// Concurrent-writer hardening (file locking) is a future patch.
+    /// Inspect persistent Hydra state without performing recovery or
+    /// mutating anything on disk.
+    ///
+    /// Opens the commit log + snapshot store read-only, counts durable
+    /// records, and computes the recovery path that a subsequent
+    /// [`open_persistent`](Self::open_persistent) call would take. Useful
+    /// as a pre-flight check before running [`compact_commit_log_through_latest_snapshot`](Self::compact_commit_log_through_latest_snapshot)
+    /// or before promoting a directory to a hot Hydra instance.
+    pub fn inspect_persistent_state(
+        root: impl AsRef<Path>,
+    ) -> Result<InspectReport> {
+        let root = root.as_ref();
+        let commit_log = CommitLog::open(commit_log_path(root))?;
+        let snapshot_store = FileSnapshotStore::open(root)?;
+        let commits = commit_log.load_all()?;
+        let manifests = snapshot_store.list_snapshot_manifests()?;
+
+        let latest_snapshot_sequence =
+            manifests.iter().map(|manifest| manifest.sequence).max();
+        let recommended_recovery = if manifests.is_empty() && commits.is_empty() {
+            RecoveryMode::Empty
+        } else if manifests.is_empty() {
+            RecoveryMode::CommitLog
+        } else {
+            RecoveryMode::SnapshotAndReplay
+        };
+
+        Ok(InspectReport {
+            commit_count: commits.len(),
+            snapshot_count: manifests.len(),
+            latest_snapshot_sequence,
+            recommended_recovery,
+        })
+    }
+
     pub fn compact_commit_log_through_latest_snapshot(
         root: impl AsRef<Path>,
     ) -> Result<Option<CommitLogCompactionReport>> {
@@ -307,6 +357,57 @@ mod tests {
             assert!(names.contains(&"snapshot_restored".to_string()));
         }
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inspect_persistent_state_reports_empty_root() {
+        let root = temp_root("inspect_empty");
+        let report = HydraRuntime::inspect_persistent_state(&root).unwrap();
+        assert_eq!(report.commit_count, 0);
+        assert_eq!(report.snapshot_count, 0);
+        assert_eq!(report.latest_snapshot_sequence, None);
+        assert_eq!(report.recommended_recovery, RecoveryMode::Empty);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inspect_persistent_state_reports_commit_log_recovery() {
+        let root = temp_root("inspect_commit_log");
+        {
+            let (mut hydra, _) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            hydra.ingest(signal("one")).unwrap();
+            hydra.ingest(signal("two")).unwrap();
+        }
+        let report = HydraRuntime::inspect_persistent_state(&root).unwrap();
+        assert_eq!(report.commit_count, 2);
+        assert_eq!(report.snapshot_count, 0);
+        assert_eq!(report.latest_snapshot_sequence, None);
+        assert_eq!(report.recommended_recovery, RecoveryMode::CommitLog);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inspect_persistent_state_reports_snapshot_and_replay_recovery() {
+        let root = temp_root("inspect_snapshot");
+        {
+            let (mut hydra, _) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            hydra.ingest(signal("before")).unwrap();
+            let manifest = hydra.snapshot(actor()).unwrap();
+            hydra.ingest(signal("after")).unwrap();
+            assert_eq!(manifest.sequence, 1);
+        }
+        let report = HydraRuntime::inspect_persistent_state(&root).unwrap();
+        // 1 "before" + SnapshotTaken + 1 "after" = 3 commits durable on disk.
+        assert_eq!(report.commit_count, 3);
+        assert_eq!(report.snapshot_count, 1);
+        assert_eq!(report.latest_snapshot_sequence, Some(1));
+        assert_eq!(
+            report.recommended_recovery,
+            RecoveryMode::SnapshotAndReplay
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

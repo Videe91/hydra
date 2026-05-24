@@ -36,6 +36,15 @@ enum Command {
         /// Hydra data root directory.
         root: PathBuf,
     },
+    /// Inspect persistent Hydra state without mutating it.
+    ///
+    /// Prints commit count, snapshot count, latest snapshot sequence
+    /// (if any), and the recovery path a subsequent `open_persistent`
+    /// would take. Safe to run on a live root.
+    Inspect {
+        /// Hydra data root directory.
+        root: PathBuf,
+    },
 }
 
 fn main() {
@@ -49,6 +58,7 @@ fn run() -> hydra_core::error::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Compact { root } => compact(root),
+        Command::Inspect { root } => inspect(root),
     }
 }
 
@@ -64,5 +74,17 @@ fn compact(root: PathBuf) -> hydra_core::error::Result<()> {
             println!("no snapshots - nothing to compact");
         }
     }
+    Ok(())
+}
+
+fn inspect(root: PathBuf) -> hydra_core::error::Result<()> {
+    let report = HydraRuntime::inspect_persistent_state(&root)?;
+    println!("commits: {}", report.commit_count);
+    println!("snapshots: {}", report.snapshot_count);
+    match report.latest_snapshot_sequence {
+        Some(sequence) => println!("latest_snapshot_sequence: {sequence}"),
+        None => println!("latest_snapshot_sequence: none"),
+    }
+    println!("recommended_recovery: {:?}", report.recommended_recovery);
     Ok(())
 }
