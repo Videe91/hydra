@@ -9,6 +9,7 @@ members = [
     "crates/hydra-sentinel",
     "crates/hydra-sensor",
     "crates/hydra-api",
+    "crates/hydra-cli",
 ]
 
 [workspace.package]

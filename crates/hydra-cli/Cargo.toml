@@ -1,0 +1,17 @@
+[package]
+name = "hydra-cli"
+description = "Hydra database operator CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hydra-sdk = { path = "../hydra-sdk" }
+hydra-core = { path = "../hydra-core" }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+hydra-engine = { path = "../hydra-engine" }
+hydra-storage = { path = "../hydra-storage" }
+chrono = { workspace = true }
