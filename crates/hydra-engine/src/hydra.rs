@@ -481,6 +481,135 @@ impl Hydra {
         Ok(count)
     }
 
+    /// Validate that a sequence of commit batches forms a contiguous tail
+    /// starting at `snapshot_sequence + 1`. Each batch must also be
+    /// committed (`is_committed`) — uncommitted batches in the replay tail
+    /// indicate a corrupt or in-flight commit stream.
+    ///
+    /// This is intentionally separate from `CommitLedger::verify_chain`,
+    /// which expects a full chain from sequence 1. Snapshot replay starts
+    /// at `snapshot.sequence + 1`, so it needs its own validator.
+    fn validate_snapshot_replay_tail(
+        snapshot_sequence: u64,
+        batches: &[hydra_core::CommitBatch],
+    ) -> hydra_core::error::Result<()> {
+        let mut expected_sequence = snapshot_sequence + 1;
+        for batch in batches {
+            if batch.sequence != expected_sequence {
+                return Err(hydra_core::error::HydraError::StorageError(format!(
+                    "snapshot replay expected commit sequence {expected_sequence}, got {}",
+                    batch.sequence
+                )));
+            }
+            if !batch.is_committed() {
+                return Err(hydra_core::error::HydraError::StorageError(format!(
+                    "snapshot replay encountered uncommitted batch {}",
+                    batch.id
+                )));
+            }
+            expected_sequence += 1;
+        }
+        Ok(())
+    }
+
+    /// Fast-restart recovery: restore materialized state from a stored
+    /// snapshot, then replay every commit whose sequence is greater than
+    /// the snapshot's sequence.
+    ///
+    /// Looks up the snapshot body in `snapshot_store` and delegates to
+    /// [`Hydra::recover_from_snapshot_body_and_replay`].
+    ///
+    /// v0 semantics:
+    /// - Replays ALL commits with `sequence > snapshot.sequence`,
+    ///   including `SnapshotTaken` control-plane commits — the commit log
+    ///   replay is faithful to what happened after the snapshot, with no
+    ///   filtering. This is the cleanest model; "business-only" replay
+    ///   can be a future option.
+    /// - The validate-then-mutate pattern: replay-tail validation happens
+    ///   before any state reset, so a sequence gap leaves the runtime
+    ///   untouched.
+    ///
+    /// v0 limitation:
+    /// - The in-memory `commit_ledger` is NOT reconstructed from
+    ///   historical commits. `SnapshotBody` stores `CommitRecord`
+    ///   summaries (no event bodies for ledger replay) and the snapshot
+    ///   replay tail covers only post-snapshot batches. After this call,
+    ///   `commit_ledger` reflects the post-restore commits only (e.g.
+    ///   the audit `SnapshotRestored` batch). Full ledger reconstruction
+    ///   is `recover_from_commits` territory.
+    pub fn recover_from_snapshot_and_replay(
+        &mut self,
+        snapshot_id: &hydra_core::SnapshotId,
+        commits: Vec<hydra_core::CommitBatch>,
+        restored_by: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::SnapshotManifest> {
+        let body = self.snapshot_store.require_body(snapshot_id)?.clone();
+        self.recover_from_snapshot_body_and_replay(body, commits, restored_by)
+    }
+
+    /// Same as [`Hydra::recover_from_snapshot_and_replay`] but takes a
+    /// `SnapshotBody` directly. Useful for restart flows that loaded the
+    /// snapshot from disk before constructing a fresh `Hydra`.
+    pub fn recover_from_snapshot_body_and_replay(
+        &mut self,
+        body: hydra_core::SnapshotBody,
+        commits: Vec<hydra_core::CommitBatch>,
+        restored_by: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::SnapshotManifest> {
+        let manifest = body.manifest.clone();
+        let snapshot_sequence = manifest.sequence;
+
+        // Filter to post-snapshot batches and sort by sequence BEFORE
+        // validating, so callers can pass batches in any order.
+        let mut replay_batches: Vec<hydra_core::CommitBatch> = commits
+            .into_iter()
+            .filter(|batch| batch.sequence > snapshot_sequence)
+            .collect();
+        replay_batches.sort_by_key(|batch| batch.sequence);
+
+        // Validate the replay tail BEFORE any mutation. A gap or
+        // uncommitted batch errors out without touching runtime state.
+        Self::validate_snapshot_replay_tail(snapshot_sequence, &replay_batches)?;
+        let replayed_commit_count = replay_batches.len();
+
+        // Assemble the full event sequence: snapshot body's captured
+        // events, followed by every event from the replay tail in order.
+        let mut all_events = body.events.clone();
+        all_events.extend(
+            replay_batches
+                .iter()
+                .flat_map(|batch| batch.events.clone()),
+        );
+
+        // Mutation phase. recover_from_events is the pure replay path:
+        // it applies events to projection / event_log / temporal /
+        // epistemic / action / policy / sensor_checkpoint /
+        // schema_registry stores, without running cascades, agents,
+        // reflexes, commit writers, or WAL writes.
+        //
+        // reset_runtime_state_preserving_config() clears materialized
+        // stores but deliberately leaves snapshot_store alone — so the
+        // restored snapshot survives.
+        self.reset_runtime_state_preserving_config();
+        self.recover_from_events(all_events)?;
+
+        // Re-insert the body so callers can later list / inspect /
+        // re-restore this snapshot. Idempotent on the same id.
+        self.snapshot_store.insert(body);
+
+        // Audit the restore. The SnapshotRestored event commits on top
+        // of the now-fresh commit_ledger.
+        self.ingest(hydra_core::EventKind::SnapshotRestored {
+            manifest: manifest.clone(),
+            replayed_commit_count,
+        })?;
+
+        // restored_by is captured for future SnapshotRestored audit
+        // metadata; the current variant doesn't yet carry an actor field.
+        let _ = restored_by;
+        Ok(manifest)
+    }
+
     /// Recover Hydra state from committed batches.
     ///
     /// This is database recovery:
@@ -4722,5 +4851,175 @@ mod sprint1_tests {
 
         // Backend cleared before snapshot — nothing should have reached it.
         assert_eq!(observed.lock().unwrap().len(), 0);
+    }
+
+    fn snapshot_replay_signal(name: &str) -> hydra_core::EventKind {
+        hydra_core::EventKind::Signal {
+            source: hydra_core::NodeId::from_str("snapshot.replay"),
+            name: name.to_string(),
+            payload: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn hydra_recover_from_snapshot_and_replay_applies_post_snapshot_commits() {
+        use hydra_core::ActorId;
+
+        let mut source = Hydra::new();
+        source.ingest(snapshot_replay_signal("before")).unwrap();
+        let manifest = source
+            .snapshot(ActorId::from_str("actor_snapshot"))
+            .unwrap();
+        source.ingest(snapshot_replay_signal("after")).unwrap();
+        let commits = source
+            .commit_ledger()
+            .batches_in_sequence()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let body = source.snapshot_body(&manifest.id).unwrap().clone();
+
+        let mut target = Hydra::new();
+        target
+            .recover_from_snapshot_body_and_replay(
+                body,
+                commits,
+                ActorId::from_str("actor_restore"),
+            )
+            .unwrap();
+
+        let names = target
+            .events()
+            .into_iter()
+            .map(|event| event.kind.kind_name().to_string())
+            .collect::<Vec<_>>();
+        // 2 signals: "before" (from body) + "after" (from replay tail).
+        assert_eq!(
+            names.iter().filter(|name| *name == "signal").count(),
+            2
+        );
+        assert!(names.contains(&"snapshot_restored".to_string()));
+        // SnapshotTaken is replayed faithfully from the post-snapshot
+        // commit at sequence N+1 (Option A semantics).
+        assert!(names.contains(&"snapshot_taken".to_string()));
+    }
+
+    #[test]
+    fn hydra_recover_from_snapshot_and_replay_records_replayed_commit_count() {
+        use hydra_core::{ActorId, EventKind};
+
+        let mut source = Hydra::new();
+        source.ingest(snapshot_replay_signal("before")).unwrap();
+        let manifest = source
+            .snapshot(ActorId::from_str("actor_snapshot"))
+            .unwrap();
+        source.ingest(snapshot_replay_signal("after_one")).unwrap();
+        source.ingest(snapshot_replay_signal("after_two")).unwrap();
+        let commits = source
+            .commit_ledger()
+            .batches_in_sequence()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let body = source.snapshot_body(&manifest.id).unwrap().clone();
+
+        let mut target = Hydra::new();
+        target
+            .recover_from_snapshot_body_and_replay(
+                body,
+                commits,
+                ActorId::from_str("actor_restore"),
+            )
+            .unwrap();
+
+        let restored_event = target
+            .events()
+            .into_iter()
+            .find(|event| event.kind.kind_name() == "snapshot_restored")
+            .unwrap();
+        match &restored_event.kind {
+            EventKind::SnapshotRestored {
+                replayed_commit_count,
+                ..
+            } => {
+                // 3 commits after snapshot.sequence: SnapshotTaken (N+1),
+                // after_one (N+2), after_two (N+3). Option A semantics.
+                assert_eq!(*replayed_commit_count, 3);
+            }
+            other => panic!("expected SnapshotRestored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hydra_recover_from_snapshot_and_replay_rejects_sequence_gap_before_mutation() {
+        use hydra_core::ActorId;
+
+        let mut source = Hydra::new();
+        source.ingest(snapshot_replay_signal("before")).unwrap();
+        let manifest = source
+            .snapshot(ActorId::from_str("actor_snapshot"))
+            .unwrap();
+        source.ingest(snapshot_replay_signal("after")).unwrap();
+        let mut commits = source
+            .commit_ledger()
+            .batches_in_sequence()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        // Drop the SnapshotTaken commit (sequence = manifest.sequence + 1)
+        // to create a gap in the replay tail.
+        commits.retain(|batch| batch.sequence != manifest.sequence + 1);
+        let body = source.snapshot_body(&manifest.id).unwrap().clone();
+
+        let mut target = Hydra::new();
+        let result = target.recover_from_snapshot_body_and_replay(
+            body,
+            commits,
+            ActorId::from_str("actor_restore"),
+        );
+        assert!(result.is_err());
+        // No partial mutation — validation runs before reset/replay.
+        assert_eq!(target.events().len(), 0);
+        assert_eq!(target.commit_count(), 0);
+    }
+
+    #[test]
+    fn hydra_recover_from_snapshot_and_replay_by_id_works() {
+        use hydra_core::ActorId;
+
+        let mut source = Hydra::new();
+        source.ingest(snapshot_replay_signal("before")).unwrap();
+        let manifest = source
+            .snapshot(ActorId::from_str("actor_snapshot"))
+            .unwrap();
+        source.ingest(snapshot_replay_signal("after")).unwrap();
+        let commits = source
+            .commit_ledger()
+            .batches_in_sequence()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let body = source.snapshot_body(&manifest.id).unwrap().clone();
+
+        let mut target = Hydra::new();
+        target.snapshot_store.insert(body);
+        target
+            .recover_from_snapshot_and_replay(
+                &manifest.id,
+                commits,
+                ActorId::from_str("actor_restore"),
+            )
+            .unwrap();
+
+        let names = target
+            .events()
+            .into_iter()
+            .map(|event| event.kind.kind_name().to_string())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"snapshot_restored".to_string()));
+        assert_eq!(
+            names.iter().filter(|name| *name == "signal").count(),
+            2
+        );
     }
 }
