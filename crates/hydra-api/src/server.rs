@@ -9,10 +9,13 @@ use axum::http::{header, HeaderValue, Method};
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::Router;
+use hydra_core::ActorId;
 use hydra_net::http::{
     commits_router, events_router, ingest_router, schema_router, sensor_router, snapshots_router,
 };
-use hydra_net::runtime::RuntimeHandle;
+use hydra_net::runtime::{RuntimeBuilder, RuntimeHandle};
+use hydra_sdk::HydraRuntime;
+use std::path::Path;
 use tower_http::cors::CorsLayer;
 
 /// Shared CORS policy used by every hydra-api router build.
@@ -122,6 +125,73 @@ pub async fn serve_schema(
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let router = build_schema_router(runtime);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+/// Build a fully persistent router: recovers `Hydra` from disk at `root`,
+/// wraps it in a `RuntimeHandle`, and composes the unified router. Both
+/// the commit log and snapshot backend are attached so subsequent writes
+/// and snapshots persist automatically.
+///
+/// No auth (matches `build_router`). Use
+/// [`build_persistent_router_with_auth`] for gated deployments.
+pub fn build_persistent_router(
+    root: impl AsRef<Path>,
+    actor: ActorId,
+) -> hydra_core::error::Result<Router> {
+    build_persistent_router_with_auth(root, actor, AuthConfig::off())
+}
+
+/// Build a fully persistent router with the supplied auth configuration.
+///
+/// Bootstrap order:
+/// 1. `HydraRuntime::open_persistent(root, actor)` — opens commit log +
+///    snapshot store, recovers, attaches both backends.
+/// 2. `RuntimeBuilder::from_hydra(hydra).build()` — wraps the recovered
+///    Hydra in a `RuntimeHandle`.
+/// 3. `build_router_with_auth(runtime, auth)` — composes legacy + schema
+///    + ingest + sensor + commits + events + snapshots routers, layers
+///    CORS, and (if `auth.is_enabled()`) layers the auth middleware.
+pub fn build_persistent_router_with_auth(
+    root: impl AsRef<Path>,
+    actor: ActorId,
+    auth: AuthConfig,
+) -> hydra_core::error::Result<Router> {
+    let (hydra, _report) = HydraRuntime::open_persistent(root, actor)?;
+    let (runtime, _processor) = RuntimeBuilder::from_hydra(hydra).build();
+    Ok(build_router_with_auth(runtime, auth))
+}
+
+/// Start a persistent HTTP server on the given address (no auth).
+pub async fn serve_persistent(
+    root: impl AsRef<Path>,
+    addr: &str,
+    actor: ActorId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    serve_persistent_with_auth(root, addr, actor, AuthConfig::off()).await
+}
+
+/// Start a persistent HTTP server with the supplied auth configuration.
+///
+/// This is the one-call production startup:
+/// recovers `Hydra` from `<root>/commits.jsonl` + `<root>/snapshots/`,
+/// wraps it in a runtime, and serves the full route surface on `addr`.
+/// Logs the recovery mode + commit counts to stderr at startup.
+pub async fn serve_persistent_with_auth(
+    root: impl AsRef<Path>,
+    addr: &str,
+    actor: ActorId,
+    auth: AuthConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (hydra, report) = HydraRuntime::open_persistent(root, actor)?;
+    eprintln!(
+        "hydra persistent recovery: mode={:?} commits_loaded={} replayed={}",
+        report.mode, report.total_commits_loaded, report.replayed_commit_count,
+    );
+    let (runtime, _processor) = RuntimeBuilder::from_hydra(hydra).build();
+    let router = build_router_with_auth(runtime, auth);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
     Ok(())
@@ -1090,5 +1160,130 @@ mod tests {
             .unwrap();
         // OPTIONS must NOT be 401 — the CORS layer below auth handles it.
         assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // === Persistent server bootstrap ===
+
+    fn persistent_temp_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "hydra_api_persistent_{name}_{}_{}",
+            std::process::id(),
+            chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ))
+    }
+
+    #[tokio::test]
+    async fn build_persistent_router_starts_from_empty_root() {
+        let root = persistent_temp_root("fresh");
+        let app = build_persistent_router(
+            &root,
+            hydra_core::ActorId::from_str("actor_api_persistent"),
+        )
+        .unwrap();
+        let response = app
+            .oneshot(empty_request("GET", "/health"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// End-to-end persistence proof: open persistent router, POST an
+    /// event with idempotency-key, drop. Reopen at the same root and GET
+    /// /events — the event must still be there. Proves the full
+    /// HTTP → engine → commit_log → disk → restart → recovery → HTTP
+    /// pipeline survives a process restart.
+    #[tokio::test]
+    async fn persistent_router_recovers_events_after_restart() {
+        use hydra_core::{ActorId, EventKind, NodeId};
+        use hydra_net::http::events::EventListResponse;
+        use hydra_net::http::ingest::IngestRequest;
+        use std::collections::HashMap;
+
+        let root = persistent_temp_root("restart");
+        let actor = ActorId::from_str("actor_api_persistent");
+
+        // Phase 1: open, POST event, drop router.
+        {
+            let app = build_persistent_router(&root, actor.clone()).unwrap();
+            let request = IngestRequest {
+                event_kind: EventKind::Signal {
+                    source: NodeId::from_str("api.persistent"),
+                    name: "persist_me".to_string(),
+                    payload: HashMap::new(),
+                },
+            };
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/ingest")
+                        .header("content-type", "application/json")
+                        .header("Idempotency-Key", "persistent-test-1")
+                        .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // Phase 2: reopen the same root — the event should still be there.
+        {
+            let app = build_persistent_router(&root, actor).unwrap();
+            let response = app
+                .oneshot(empty_request("GET", "/events"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let events: EventListResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(events.events.len(), 1);
+            assert_eq!(events.events[0].kind, "signal");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn persistent_router_with_auth_gates_mutations() {
+        use hydra_core::{ActorId, EventKind, NodeId};
+        use hydra_net::http::ingest::IngestRequest;
+        use std::collections::HashMap;
+
+        let root = persistent_temp_root("auth");
+        let app = build_persistent_router_with_auth(
+            &root,
+            ActorId::from_str("actor_api_persistent"),
+            AuthConfig::require_for_mutations(["secret"]),
+        )
+        .unwrap();
+
+        let request = IngestRequest {
+            event_kind: EventKind::Signal {
+                source: NodeId::from_str("api.persistent"),
+                name: "blocked".to_string(),
+                payload: HashMap::new(),
+            },
+        };
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -38,6 +38,31 @@
 //! For a schema-only deployment without the legacy surface, use
 //! [`server::serve_schema`] instead.
 //!
+//! ## Quick Start (persistent server — restart-safe, snapshot-aware, auth-gated)
+//!
+//! ```rust,ignore
+//! use hydra_api::auth::AuthConfig;
+//! use hydra_api::server::serve_persistent_with_auth;
+//! use hydra_core::ActorId;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     serve_persistent_with_auth(
+//!         "/var/lib/hydra",
+//!         "0.0.0.0:3000",
+//!         ActorId::from_str("actor_boot"),
+//!         AuthConfig::require_for_mutations(["change-me"]),
+//!     )
+//!     .await
+//!     .unwrap();
+//! }
+//! ```
+//!
+//! `serve_persistent_with_auth` opens the commit log + snapshot store at
+//! `root`, recovers from the fastest available source, attaches both
+//! backends for write-through, and serves the full route surface with
+//! the supplied auth policy.
+//!
 //! ## Authentication
 //!
 //! Authentication is opt-in in v0. Use [`server::build_router_with_auth`]

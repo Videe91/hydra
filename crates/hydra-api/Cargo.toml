@@ -12,6 +12,7 @@ hydra-engine = { path = "../hydra-engine" }
 hydra-sentinel = { path = "../hydra-sentinel" }
 hydra-sensor = { path = "../hydra-sensor" }
 hydra-net = { path = "../hydra-net" }
+hydra-sdk = { path = "../hydra-sdk" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

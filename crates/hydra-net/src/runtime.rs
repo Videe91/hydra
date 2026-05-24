@@ -40,6 +40,12 @@ pub struct RuntimeBuilder {
     config: RuntimeConfig,
     subscriptions: Vec<Subscription>,
     storage: Option<Box<dyn StorageBackend>>,
+    /// Optional pre-built engine. If set, [`build`] uses it instead of
+    /// constructing a fresh `Hydra::with_config(self.config.cascade)`.
+    /// Used by persistent bootstrap paths (e.g.
+    /// `HydraRuntime::open_persistent`) that recover a Hydra from disk
+    /// before wiring it into a runtime.
+    hydra: Option<Hydra>,
 }
 
 impl RuntimeBuilder {
@@ -48,6 +54,22 @@ impl RuntimeBuilder {
             config: RuntimeConfig::default(),
             subscriptions: Vec::new(),
             storage: None,
+            hydra: None,
+        }
+    }
+
+    /// Construct a `RuntimeBuilder` pre-seeded with a specific `Hydra`.
+    ///
+    /// `build()` will use this engine instead of creating a fresh one
+    /// from the cascade config. Subscriptions registered through
+    /// [`subscription`] are still applied on top of the supplied Hydra,
+    /// so this composes cleanly with `.subscription(...)` chains.
+    pub fn from_hydra(hydra: Hydra) -> Self {
+        Self {
+            config: RuntimeConfig::default(),
+            subscriptions: Vec::new(),
+            storage: None,
+            hydra: Some(hydra),
         }
     }
 
@@ -84,7 +106,12 @@ impl RuntimeBuilder {
     /// Build the runtime components without starting the processing loop.
     /// Returns a RuntimeHandle for interaction and a RuntimeProcessor for running.
     pub fn build(self) -> (RuntimeHandle, RuntimeProcessor) {
-        let mut hydra = Hydra::with_config(self.config.cascade.clone());
+        // Use a pre-seeded Hydra when present (persistent bootstrap path),
+        // otherwise construct one from the cascade config as before.
+        let mut hydra = match self.hydra {
+            Some(hydra) => hydra,
+            None => Hydra::with_config(self.config.cascade.clone()),
+        };
         for sub in self.subscriptions {
             hydra.register(sub);
         }
@@ -298,6 +325,27 @@ mod tests {
             type_id: type_id.to_string(),
             properties: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_builder_from_hydra_uses_supplied_engine() {
+        // Pre-seed a Hydra with an event, then hand it to RuntimeBuilder.
+        // The resulting RuntimeHandle should expose the same engine — proves
+        // build() reused the supplied Hydra instead of constructing a fresh one.
+        let mut hydra = Hydra::new();
+        hydra
+            .ingest(EventKind::Signal {
+                source: NodeId::from_str("runtime.from_hydra"),
+                name: "preloaded".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+
+        let (runtime, _processor) = RuntimeBuilder::from_hydra(hydra).build();
+        let hydra_arc = runtime.hydra();
+        let hydra = hydra_arc.read().await;
+        assert_eq!(hydra.events().len(), 1);
+        assert_eq!(hydra.events()[0].kind.kind_name(), "signal");
     }
 
     #[tokio::test]
