@@ -5,7 +5,7 @@ use hydra_core::id::{CascadeId, EdgeId, EventId, NodeId};
 use hydra_core::node::Node;
 use hydra_core::{
     Action, ActionId, ActionStatus, Claim, ClaimId, ClaimKind, ClaimStatus, ClaimSubject, Evidence,
-    EvidenceId, Outcome, OutcomeId,
+    EvidenceId, Outcome, OutcomeId, SensorCheckpoint, SensorId, SensorRun,
 };
 use hydra_engine::hydra::Hydra;
 use std::sync::Arc;
@@ -397,6 +397,42 @@ impl QueryService {
             .into_iter()
             .cloned()
             .collect()
+    }
+
+    // === Sensor queries ===
+
+    /// All sensor runs recorded for a given sensor. Returns an empty
+    /// vector when the sensor has no runs (sensor_id is just a string
+    /// key — there is no "sensor exists?" notion at this layer).
+    pub async fn runs_for_sensor(&self, sensor_id: &SensorId) -> Vec<SensorRun> {
+        let hydra = self.hydra.read().await;
+        hydra
+            .runs_for_sensor(sensor_id)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// All checkpoints recorded for a given sensor.
+    pub async fn checkpoints_for_sensor(&self, sensor_id: &SensorId) -> Vec<SensorCheckpoint> {
+        let hydra = self.hydra.read().await;
+        hydra
+            .checkpoints_for_sensor(sensor_id)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Latest checkpoint for a (sensor, source) pair, or `None` if no
+    /// checkpoint has been recorded for that combination yet. This is
+    /// the read pair to `Hydra::record_sensor_observation`.
+    pub async fn latest_sensor_checkpoint(
+        &self,
+        sensor_id: &SensorId,
+        source: &str,
+    ) -> Option<SensorCheckpoint> {
+        let hydra = self.hydra.read().await;
+        hydra.latest_sensor_checkpoint(sensor_id, source).cloned()
     }
 }
 
@@ -1059,5 +1095,96 @@ mod action_outcome_query_tests {
         let ids: Vec<_> = all.iter().map(|a| a.id.clone()).collect();
         assert!(ids.contains(&id_one));
         assert!(ids.contains(&id_two));
+    }
+}
+
+#[cfg(test)]
+mod sensor_query_tests {
+    use super::*;
+    use hydra_core::{EventKind, NodeId, SensorId, SourceCursor, Value};
+    use hydra_engine::hydra::Hydra;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn sensor() -> SensorId {
+        SensorId::from_str("sensor_bank")
+    }
+
+    fn signal(name: &str) -> EventKind {
+        EventKind::Signal {
+            source: NodeId::from_str("sensor.test"),
+            name: name.to_string(),
+            payload: HashMap::from([(
+                "id".to_string(),
+                Value::String(name.to_string()),
+            )]),
+        }
+    }
+
+    fn cursor(offset: &str) -> SourceCursor {
+        SourceCursor::Offset {
+            stream: "bank.transactions".to_string(),
+            partition: Some("acct-9001".to_string()),
+            offset: offset.to_string(),
+        }
+    }
+
+    fn observe(hydra: &mut Hydra, offset: &str) {
+        hydra
+            .record_sensor_observation(
+                sensor(),
+                "bank",
+                cursor(offset),
+                signal(&format!("obs_{offset}")),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn runs_for_sensor_is_empty_when_no_runs() {
+        let hydra = Arc::new(RwLock::new(Hydra::new()));
+        let service = QueryService::new(hydra);
+        assert!(service.runs_for_sensor(&sensor()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkpoints_for_sensor_reflects_recorded_observations() {
+        let mut hydra = Hydra::new();
+        observe(&mut hydra, "1");
+        observe(&mut hydra, "2");
+        let service = QueryService::new(Arc::new(RwLock::new(hydra)));
+        let checkpoints = service.checkpoints_for_sensor(&sensor()).await;
+        assert_eq!(checkpoints.len(), 2);
+        assert!(checkpoints.iter().any(|c| matches!(
+            &c.cursor,
+            SourceCursor::Offset { offset, .. } if offset == "1"
+        )));
+        assert!(checkpoints.iter().any(|c| matches!(
+            &c.cursor,
+            SourceCursor::Offset { offset, .. } if offset == "2"
+        )));
+    }
+
+    #[tokio::test]
+    async fn latest_sensor_checkpoint_tracks_most_recent() {
+        let mut hydra = Hydra::new();
+        observe(&mut hydra, "1");
+        observe(&mut hydra, "2");
+        let service = QueryService::new(Arc::new(RwLock::new(hydra)));
+        let latest = service
+            .latest_sensor_checkpoint(&sensor(), "bank.transactions")
+            .await
+            .expect("expected a latest checkpoint after two observations");
+        assert!(matches!(
+            latest.cursor,
+            SourceCursor::Offset { ref offset, .. } if offset == "2"
+        ));
+
+        // Unknown source returns None.
+        assert!(service
+            .latest_sensor_checkpoint(&sensor(), "unknown.stream")
+            .await
+            .is_none());
     }
 }

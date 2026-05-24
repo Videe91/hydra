@@ -26,6 +26,10 @@
 //! - `GET /query/actions/:action_id/outcomes`      — every outcome recorded for an action
 //! - `GET /query/actions/:action_id`               — single action lookup
 //! - `GET /query/actions`                          — list all actions
+//! - `GET /query/sensors/:sensor_id/sources/:source/latest-checkpoint`
+//!                                                 — latest checkpoint for (sensor, source)
+//! - `GET /query/sensors/:sensor_id/checkpoints`   — every recorded checkpoint for a sensor
+//! - `GET /query/sensors/:sensor_id/runs`          — every run recorded for a sensor
 //!
 //! Responses are JSON. Lookups return `404` on miss; status routes return
 //! `400` on an unknown status variant; list routes always return `200`.
@@ -43,7 +47,7 @@ use axum::{
 };
 use hydra_core::{
     Action, ActionId, ActionStatus, Claim, ClaimId, ClaimStatus, EdgeId, Evidence, EvidenceId,
-    NodeId, Outcome,
+    NodeId, Outcome, SensorCheckpoint, SensorId, SensorRun,
 };
 use hydra_core::edge::Edge;
 use hydra_core::node::Node;
@@ -93,6 +97,15 @@ pub fn query_router(runtime: RuntimeHandle) -> Router {
         .route("/query/actions/:action_id/outcomes", get(outcomes_for_action))
         .route("/query/actions/:action_id", get(get_action))
         .route("/query/actions", get(list_actions))
+        .route(
+            "/query/sensors/:sensor_id/sources/:source/latest-checkpoint",
+            get(latest_sensor_checkpoint),
+        )
+        .route(
+            "/query/sensors/:sensor_id/checkpoints",
+            get(sensor_checkpoints),
+        )
+        .route("/query/sensors/:sensor_id/runs", get(sensor_runs))
         .with_state(QueryHttpState::new(runtime))
 }
 
@@ -154,6 +167,21 @@ pub struct EvidenceListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceResponse {
     pub evidence: Evidence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorRunsResponse {
+    pub runs: Vec<SensorRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorCheckpointsResponse {
+    pub checkpoints: Vec<SensorCheckpoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorCheckpointResponse {
+    pub checkpoint: SensorCheckpoint,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +407,50 @@ async fn outcomes_for_action(
     }
     let outcomes = state.service.outcomes_for_action(&id).await;
     Json(OutcomesResponse { outcomes }).into_response()
+}
+
+// === Sensor handlers ===
+//
+// The list routes return 200 with an empty list when the sensor has no
+// matching rows; sensor_id is just a string key and there is no global
+// "this sensor exists" registry to gate against. The latest-checkpoint
+// route returns 404 when no checkpoint exists for the (sensor, source)
+// pair — consistent with single-lookup contracts elsewhere.
+
+async fn sensor_runs(
+    State(state): State<QueryHttpState>,
+    Path(sensor_id): Path<String>,
+) -> Response {
+    let id = SensorId::from_str(&sensor_id);
+    let runs = state.service.runs_for_sensor(&id).await;
+    Json(SensorRunsResponse { runs }).into_response()
+}
+
+async fn sensor_checkpoints(
+    State(state): State<QueryHttpState>,
+    Path(sensor_id): Path<String>,
+) -> Response {
+    let id = SensorId::from_str(&sensor_id);
+    let checkpoints = state.service.checkpoints_for_sensor(&id).await;
+    Json(SensorCheckpointsResponse { checkpoints }).into_response()
+}
+
+async fn latest_sensor_checkpoint(
+    State(state): State<QueryHttpState>,
+    Path((sensor_id, source)): Path<(String, String)>,
+) -> Response {
+    let id = SensorId::from_str(&sensor_id);
+    match state
+        .service
+        .latest_sensor_checkpoint(&id, &source)
+        .await
+    {
+        Some(checkpoint) => Json(SensorCheckpointResponse { checkpoint }).into_response(),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            format!("no checkpoint for sensor {sensor_id} source {source}"),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1090,6 +1162,139 @@ mod tests {
         let app = query_router(runtime);
         let response = app
             .oneshot(empty_get("/query/evidence/evd_missing"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // === Sensors ===
+
+    fn observe(
+        hydra: &mut hydra_engine::hydra::Hydra,
+        sensor_id: &SensorId,
+        offset: &str,
+    ) -> hydra_core::SensorCheckpoint {
+        use hydra_core::{NodeId, SourceCursor};
+        hydra
+            .record_sensor_observation(
+                sensor_id.clone(),
+                "bank",
+                SourceCursor::Offset {
+                    stream: "bank.transactions".to_string(),
+                    partition: Some("acct-9001".to_string()),
+                    offset: offset.to_string(),
+                },
+                EventKind::Signal {
+                    source: NodeId::from_str("sensor.test"),
+                    name: format!("obs_{offset}"),
+                    payload: HashMap::new(),
+                },
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sensor_runs_returns_empty_when_no_runs_for_sensor() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/sensors/sensor_bank/runs"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: SensorRunsResponse = read_json(response).await;
+        assert_eq!(decoded.runs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn sensor_checkpoints_returns_empty_when_no_checkpoints_for_sensor() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/sensors/sensor_bank/checkpoints"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: SensorCheckpointsResponse = read_json(response).await;
+        assert_eq!(decoded.checkpoints.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn sensor_checkpoints_returns_recorded_checkpoints() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let sensor = SensorId::from_str("sensor_bank");
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            observe(&mut hydra, &sensor, "1");
+            observe(&mut hydra, &sensor, "2");
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/sensors/sensor_bank/checkpoints"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: SensorCheckpointsResponse = read_json(response).await;
+        assert_eq!(decoded.checkpoints.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn latest_checkpoint_returns_most_recent_for_sensor_and_source() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let sensor = SensorId::from_str("sensor_bank");
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            observe(&mut hydra, &sensor, "1");
+            observe(&mut hydra, &sensor, "2");
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(
+                "/query/sensors/sensor_bank/sources/bank.transactions/latest-checkpoint",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: SensorCheckpointResponse = read_json(response).await;
+        let offset = match &decoded.checkpoint.cursor {
+            hydra_core::SourceCursor::Offset { offset, .. } => offset.clone(),
+            other => panic!("unexpected cursor: {other:?}"),
+        };
+        assert_eq!(offset, "2");
+    }
+
+    #[tokio::test]
+    async fn latest_checkpoint_returns_404_when_none_exists() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(
+                "/query/sensors/sensor_missing/sources/nowhere/latest-checkpoint",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn latest_checkpoint_404_when_sensor_has_checkpoints_for_other_source() {
+        // Sensor exists and has checkpoints, but for a different source.
+        // The route is sensor+source scoped, so this must 404 — not return
+        // an unrelated checkpoint.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let sensor = SensorId::from_str("sensor_bank");
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            observe(&mut hydra, &sensor, "1");
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(
+                "/query/sensors/sensor_bank/sources/other.stream/latest-checkpoint",
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
