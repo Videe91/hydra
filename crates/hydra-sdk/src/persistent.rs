@@ -116,6 +116,22 @@ impl HydraRuntime {
     /// the running process sees its log replaced under it on next
     /// `load_all` — recovery on that process's next restart still works.
     /// Concurrent-writer hardening (file locking) is a future patch.
+    /// Open a persistent Hydra root, take a durable snapshot, and return
+    /// its manifest.
+    ///
+    /// The opened `Hydra` has both the commit writer and snapshot backend
+    /// attached, so `snapshot(...)` writes the body through to disk before
+    /// committing the `SnapshotTaken` audit event. The Hydra is dropped at
+    /// the end of the call — this helper is for one-shot operator tooling
+    /// (cron snapshots, `hydra-cli snapshot`), not long-lived processes.
+    pub fn snapshot_persistent_root(
+        root: impl AsRef<Path>,
+        actor: ActorId,
+    ) -> Result<hydra_core::SnapshotManifest> {
+        let (mut hydra, _report) = Self::open_persistent(root, actor.clone())?;
+        hydra.snapshot(actor)
+    }
+
     /// Inspect persistent Hydra state without performing recovery or
     /// mutating anything on disk.
     ///
@@ -356,6 +372,67 @@ mod tests {
             assert!(names.contains(&"snapshot_taken".to_string()));
             assert!(names.contains(&"snapshot_restored".to_string()));
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_persistent_root_creates_snapshot_on_disk() {
+        let root = temp_root("snapshot_root");
+
+        // Phase 1: open, ingest one signal, drop.
+        {
+            let (mut hydra, report) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            assert_eq!(report.mode, RecoveryMode::Empty);
+            hydra.ingest(signal("before")).unwrap();
+        }
+
+        // Phase 2: snapshot via the SDK helper.
+        let manifest =
+            HydraRuntime::snapshot_persistent_root(&root, actor()).unwrap();
+        assert_eq!(manifest.sequence, 1);
+        assert_eq!(manifest.total_events, 1);
+        assert_eq!(manifest.total_commits, 1);
+
+        // Phase 3: inspect — the snapshot must be visible on disk.
+        let report = HydraRuntime::inspect_persistent_state(&root).unwrap();
+        assert_eq!(report.snapshot_count, 1);
+        assert_eq!(report.latest_snapshot_sequence, Some(1));
+        assert_eq!(report.recommended_recovery, RecoveryMode::SnapshotAndReplay);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_persistent_root_allows_snapshot_recovery_on_reopen() {
+        let root = temp_root("snapshot_reopen");
+
+        // Phase 1: open + ingest.
+        {
+            let (mut hydra, _) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            hydra.ingest(signal("before")).unwrap();
+        }
+
+        // Phase 2: snapshot through the helper.
+        let manifest =
+            HydraRuntime::snapshot_persistent_root(&root, actor()).unwrap();
+
+        // Phase 3: reopen — recovery picks SnapshotAndReplay using the
+        // snapshot we just took.
+        {
+            let (mut hydra, recovery) =
+                HydraRuntime::open_persistent(&root, actor()).unwrap();
+            assert_eq!(recovery.mode, RecoveryMode::SnapshotAndReplay);
+            assert_eq!(recovery.snapshot_id, Some(manifest.id.clone()));
+            hydra.ingest(signal("after")).unwrap();
+        }
+
+        // Snapshot count stable, commit count grew on reopen + ingest.
+        let report = HydraRuntime::inspect_persistent_state(&root).unwrap();
+        assert_eq!(report.snapshot_count, 1);
+        assert!(report.commit_count >= 3);
 
         let _ = std::fs::remove_dir_all(&root);
     }

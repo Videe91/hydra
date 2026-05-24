@@ -45,6 +45,19 @@ enum Command {
         /// Hydra data root directory.
         root: PathBuf,
     },
+    /// Take a durable snapshot of a persistent Hydra root.
+    ///
+    /// Opens the root, calls `Hydra::snapshot(actor)` (which writes the
+    /// body through to disk before committing `SnapshotTaken`), and
+    /// prints the resulting manifest's id + sequence + counts.
+    Snapshot {
+        /// Hydra data root directory.
+        root: PathBuf,
+        /// Actor ID to attribute the snapshot to. Required — snapshots
+        /// must be auditable.
+        #[arg(long)]
+        actor: String,
+    },
 }
 
 fn main() {
@@ -59,6 +72,7 @@ fn run() -> hydra_core::error::Result<()> {
     match cli.command {
         Command::Compact { root } => compact(root),
         Command::Inspect { root } => inspect(root),
+        Command::Snapshot { root, actor } => snapshot(root, actor),
     }
 }
 
@@ -86,5 +100,15 @@ fn inspect(root: PathBuf) -> hydra_core::error::Result<()> {
         None => println!("latest_snapshot_sequence: none"),
     }
     println!("recommended_recovery: {:?}", report.recommended_recovery);
+    Ok(())
+}
+
+fn snapshot(root: PathBuf, actor: String) -> hydra_core::error::Result<()> {
+    let actor = hydra_core::ActorId::from_str(&actor);
+    let manifest = HydraRuntime::snapshot_persistent_root(&root, actor)?;
+    println!(
+        "snapshot: id={} sequence={} events={} commits={}",
+        manifest.id, manifest.sequence, manifest.total_events, manifest.total_commits
+    );
     Ok(())
 }
