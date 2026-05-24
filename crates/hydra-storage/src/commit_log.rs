@@ -25,6 +25,15 @@ pub struct CommitLog {
     path: PathBuf,
 }
 
+/// Result of `CommitLog::compact_through`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitLogCompactionReport {
+    /// All batches with sequence `<= cutoff_sequence` were dropped.
+    pub cutoff_sequence: u64,
+    pub removed_count: usize,
+    pub retained_count: usize,
+}
+
 impl CommitLog {
     /// Open or create a commit log at `path`.
     ///
@@ -139,6 +148,92 @@ impl CommitLog {
     /// Return the number of committed batches in the log.
     pub fn len(&self) -> Result<usize> {
         Ok(self.load_all()?.len())
+    }
+
+    /// Compact the commit log by dropping every batch whose sequence is
+    /// `<= cutoff_sequence`. Batches with sequence `> cutoff_sequence` are
+    /// retained in their original order.
+    ///
+    /// Intended use: after taking a snapshot at sequence N, call
+    /// `compact_through(N)` to drop pre-snapshot batches — recovery can
+    /// reconstruct state from the snapshot body + the retained tail.
+    ///
+    /// **Do not** call this with a cutoff past your latest snapshot's
+    /// sequence; doing so would discard commits that the snapshot does
+    /// NOT cover, breaking recovery.
+    ///
+    /// Atomic write: serializes the retained batches into a sibling
+    /// `<path>.tmp` file, then `fs::rename`s it over the canonical path.
+    /// On POSIX the rename is atomic, so a crash mid-compaction leaves
+    /// either the original log or the fully compacted log — never a
+    /// partial file.
+    ///
+    /// Idempotent: a second call with the same cutoff is a no-op
+    /// (`removed_count: 0`) since the matching batches were already
+    /// dropped.
+    pub fn compact_through(
+        &self,
+        cutoff_sequence: u64,
+    ) -> Result<CommitLogCompactionReport> {
+        let batches = self.load_all()?;
+        let removed_count = batches
+            .iter()
+            .filter(|batch| batch.sequence <= cutoff_sequence)
+            .count();
+        let retained: Vec<CommitBatch> = batches
+            .into_iter()
+            .filter(|batch| batch.sequence > cutoff_sequence)
+            .collect();
+        let retained_count = retained.len();
+
+        let temp_path = self.path.with_extension("jsonl.tmp");
+        {
+            let file = File::create(&temp_path).map_err(|err| {
+                HydraError::StorageError(format!(
+                    "failed to create compacted commit log {}: {err}",
+                    temp_path.display()
+                ))
+            })?;
+            let mut writer = BufWriter::new(file);
+            for batch in &retained {
+                let line = serde_json::to_string(batch).map_err(|err| {
+                    HydraError::SerializationError(format!(
+                        "failed to serialize commit batch {} during compaction: {err}",
+                        batch.id
+                    ))
+                })?;
+                writer.write_all(line.as_bytes()).map_err(|err| {
+                    HydraError::StorageError(format!(
+                        "failed to write compacted commit log {}: {err}",
+                        temp_path.display()
+                    ))
+                })?;
+                writer.write_all(b"\n").map_err(|err| {
+                    HydraError::StorageError(format!(
+                        "failed to terminate compacted commit log line {}: {err}",
+                        temp_path.display()
+                    ))
+                })?;
+            }
+            writer.flush().map_err(|err| {
+                HydraError::StorageError(format!(
+                    "failed to flush compacted commit log {}: {err}",
+                    temp_path.display()
+                ))
+            })?;
+        }
+        fs::rename(&temp_path, &self.path).map_err(|err| {
+            HydraError::StorageError(format!(
+                "failed to atomically replace commit log {} with {}: {err}",
+                self.path.display(),
+                temp_path.display()
+            ))
+        })?;
+        Ok(CommitLogCompactionReport {
+            cutoff_sequence,
+            removed_count,
+            retained_count,
+        })
     }
 }
 
@@ -406,5 +501,66 @@ mod tests {
             .unwrap();
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_log_compact_through_removes_older_batches() {
+        let path = temp_path("compact_through_removes_older");
+        let log = CommitLog::open(&path).unwrap();
+        log.append(&commit_batch("a", 1)).unwrap();
+        log.append(&commit_batch("b", 2)).unwrap();
+        log.append(&commit_batch("c", 3)).unwrap();
+
+        let report = log.compact_through(2).unwrap();
+        assert_eq!(report.cutoff_sequence, 2);
+        assert_eq!(report.removed_count, 2);
+        assert_eq!(report.retained_count, 1);
+
+        let loaded = log.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].sequence, 3);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn commit_log_compact_through_is_idempotent() {
+        let path = temp_path("compact_through_idempotent");
+        let log = CommitLog::open(&path).unwrap();
+        log.append(&commit_batch("a", 1)).unwrap();
+        log.append(&commit_batch("b", 2)).unwrap();
+
+        let first = log.compact_through(1).unwrap();
+        let second = log.compact_through(1).unwrap();
+
+        assert_eq!(first.removed_count, 1);
+        assert_eq!(first.retained_count, 1);
+        // Second call sees a log that already lacks sequence 1.
+        assert_eq!(second.removed_count, 0);
+        assert_eq!(second.retained_count, 1);
+
+        let loaded = log.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].sequence, 2);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn commit_log_compact_through_zero_is_no_op() {
+        let path = temp_path("compact_through_zero");
+        let log = CommitLog::open(&path).unwrap();
+        log.append(&commit_batch("a", 1)).unwrap();
+        log.append(&commit_batch("b", 2)).unwrap();
+
+        // Sequence 0 doesn't exist — all batches survive.
+        let report = log.compact_through(0).unwrap();
+        assert_eq!(report.removed_count, 0);
+        assert_eq!(report.retained_count, 2);
+
+        let loaded = log.load_all().unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        let _ = fs::remove_file(&path);
     }
 }

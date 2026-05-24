@@ -9,7 +9,7 @@ pub mod prelude {
     pub use crate::backend::{Snapshot, StorageBackend};
     pub use crate::memory::MemoryBackend;
     pub use crate::file::FileBackend;
-    pub use crate::commit_log::CommitLog;
+    pub use crate::commit_log::{CommitLog, CommitLogCompactionReport};
     pub use crate::recovery::{
         recover_from_latest_snapshot_or_commit_log, RecoveryMode, RecoveryReport,
     };

@@ -249,4 +249,56 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// Load-bearing proof for commit-log compaction: snapshot at N, drop
+    /// commits <= N from the log, recovery must still rebuild the same
+    /// state from the snapshot body + the retained replay tail.
+    #[test]
+    fn recovery_works_after_snapshot_compacts_commit_log() {
+        let root = temp_root("compact_after_snapshot");
+        let snapshot_store = FileSnapshotStore::open(&root).unwrap();
+        let commit_log = CommitLog::open(root.join("commits.jsonl")).unwrap();
+
+        let mut source = Hydra::new();
+        source.set_commit_writer(commit_log.clone());
+        source.set_snapshot_backend(snapshot_store.clone());
+        source.ingest(signal("before")).unwrap();
+        let manifest = source.snapshot(actor()).unwrap();
+        source.ingest(signal("after_one")).unwrap();
+        source.ingest(signal("after_two")).unwrap();
+
+        // Compact pre-snapshot commits. After this, the on-disk log only
+        // contains sequence N+1 (SnapshotTaken), N+2, N+3.
+        let report = commit_log.compact_through(manifest.sequence).unwrap();
+        assert!(report.removed_count >= 1);
+        assert_eq!(report.retained_count, 3);
+
+        // Recovery must still succeed: snapshot body covers sequence <= N,
+        // retained log covers sequence > N. Together they reconstruct the
+        // full materialized state.
+        let mut recovered = Hydra::new();
+        let recovery = recover_from_latest_snapshot_or_commit_log(
+            &snapshot_store,
+            &commit_log,
+            &mut recovered,
+            actor(),
+        )
+        .unwrap();
+        assert_eq!(recovery.mode, RecoveryMode::SnapshotAndReplay);
+        assert_eq!(recovery.replayed_commit_count, 3);
+
+        let names = recovered
+            .events()
+            .into_iter()
+            .map(|event| event.kind.kind_name().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names.iter().filter(|name| *name == "signal").count(),
+            3
+        );
+        assert!(names.contains(&"snapshot_taken".to_string()));
+        assert!(names.contains(&"snapshot_restored".to_string()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
