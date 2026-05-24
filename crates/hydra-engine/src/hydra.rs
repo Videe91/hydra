@@ -822,6 +822,14 @@ impl Hydra {
         self.projection.node_count()
     }
 
+    /// All alive nodes in the projection (unfiltered).
+    ///
+    /// Used by the read-side query API. Edges and filtered views have their
+    /// own dedicated accessors; this is the flat "list everything" hook.
+    pub fn all_nodes(&self) -> Vec<&hydra_core::node::Node> {
+        self.projection.all_nodes()
+    }
+
     /// Edge count in the graph
     pub fn edge_count(&self) -> usize {
         self.projection.edge_count()

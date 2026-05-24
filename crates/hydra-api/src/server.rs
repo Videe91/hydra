@@ -11,7 +11,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use hydra_core::ActorId;
 use hydra_net::http::{
-    commits_router, events_router, ingest_router, schema_router, sensor_router, snapshots_router,
+    commits_router, events_router, ingest_router, query_router, schema_router, sensor_router,
+    snapshots_router,
 };
 use hydra_net::runtime::{RuntimeBuilder, RuntimeHandle};
 use hydra_sdk::HydraRuntime;
@@ -75,6 +76,7 @@ pub fn build_router_with_auth(runtime: RuntimeHandle, auth: AuthConfig) -> Route
         .merge(sensor_router(runtime.clone()))
         .merge(commits_router(runtime.clone()))
         .merge(events_router(runtime.clone()))
+        .merge(query_router(runtime.clone()))
         .merge(snapshots_router(runtime))
         .layer(cors_layer());
     if auth.is_enabled() {
@@ -1285,5 +1287,57 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn query_router_is_mounted_in_unified_build() {
+        // Proves `/query/*` is reachable through `build_router_with_auth`
+        // (and therefore through `serve_persistent_with_auth`), and that
+        // ingested state is immediately readable via the query surface —
+        // i.e. the query router shares the runtime engine, not a separate
+        // one.
+        use hydra_core::{EventKind, NodeId};
+        use hydra_net::http::query::{NodeResponse, NodesResponse};
+        use std::collections::HashMap;
+
+        let runtime = test_runtime();
+        let node_id = NodeId::new();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: node_id.clone(),
+                    type_id: "ec2".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+        }
+
+        let app = build_router(runtime);
+
+        let list_req = Request::builder()
+            .uri("/query/nodes")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(list_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoded: NodesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded.nodes.len(), 1);
+
+        let get_req = Request::builder()
+            .uri(format!("/query/nodes/{node_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(get_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoded: NodeResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded.node.id(), &node_id);
     }
 }

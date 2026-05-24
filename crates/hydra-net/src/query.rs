@@ -60,6 +60,13 @@ impl QueryService {
         guard.graph().node_count()
     }
 
+    /// All alive nodes (unfiltered). Read-side query API entry point —
+    /// pairs with [`Self::node`] for single lookups.
+    pub async fn nodes(&self) -> Vec<Node> {
+        let guard = self.hydra.read().await;
+        guard.all_nodes().into_iter().cloned().collect()
+    }
+
     // === Edge queries ===
 
     /// Get an edge by ID
@@ -197,6 +204,12 @@ impl QueryService {
         hydra.claim(id).cloned()
     }
 
+    /// All claims (unfiltered). Read-side query API entry point.
+    pub async fn claims(&self) -> Vec<Claim> {
+        let hydra = self.hydra.read().await;
+        hydra.epistemic_store().all_claims().cloned().collect()
+    }
+
     /// Get all claims about a subject.
     pub async fn claims_for_subject(&self, subject: ClaimSubject) -> Vec<Claim> {
         let hydra = self.hydra.read().await;
@@ -278,6 +291,12 @@ impl QueryService {
     pub async fn action(&self, id: &ActionId) -> Option<Action> {
         let hydra = self.hydra.read().await;
         hydra.action(id).cloned()
+    }
+
+    /// All actions (unfiltered). Read-side query API entry point.
+    pub async fn actions(&self) -> Vec<Action> {
+        let hydra = self.hydra.read().await;
+        hydra.action_store().all_actions().cloned().collect()
     }
 
     /// Get an outcome by ID.
@@ -491,6 +510,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nodes_returns_all_alive_nodes() {
+        let hydra = make_hydra();
+        let a = NodeId::new();
+        let b = NodeId::new();
+        {
+            let mut h = hydra.write().await;
+            h.ingest(EventKind::NodeCreated {
+                node_id: a.clone(),
+                type_id: "ec2".to_string(),
+                properties: HashMap::new(),
+            })
+            .unwrap();
+            h.ingest(EventKind::NodeCreated {
+                node_id: b.clone(),
+                type_id: "vpc".to_string(),
+                properties: HashMap::new(),
+            })
+            .unwrap();
+        }
+
+        let qs = QueryService::new(hydra);
+        let all = qs.nodes().await;
+        assert_eq!(all.len(), 2);
+        let ids: Vec<_> = all.iter().map(|n| n.id().clone()).collect();
+        assert!(ids.contains(&a));
+        assert!(ids.contains(&b));
+    }
+
+    #[tokio::test]
     async fn concurrent_reads_dont_block() {
         let hydra = make_hydra();
         {
@@ -685,6 +733,36 @@ mod epistemic_query_tests {
         assert_eq!(disputed.len(), 1);
         assert_eq!(disputed[0].id, claim_id);
         assert_eq!(disputed[0].status, ClaimStatus::Disputed);
+    }
+
+    #[tokio::test]
+    async fn claims_returns_all_claims_unfiltered() {
+        let mut hydra = Hydra::new();
+        let ev = evidence();
+        let claim_one = claim(ev.id.clone());
+        let claim_two = Claim {
+            id: ClaimId::new(),
+            ..claim(ev.id.clone())
+        };
+        let id_one = claim_one.id.clone();
+        let id_two = claim_two.id.clone();
+
+        hydra
+            .ingest_event(event(EventKind::EvidenceAdded { evidence: ev }))
+            .unwrap();
+        hydra
+            .ingest_event(event(EventKind::ClaimProposed { claim: claim_one }))
+            .unwrap();
+        hydra
+            .ingest_event(event(EventKind::ClaimProposed { claim: claim_two }))
+            .unwrap();
+
+        let service = QueryService::new(Arc::new(RwLock::new(hydra)));
+        let all = service.claims().await;
+        assert_eq!(all.len(), 2);
+        let ids: Vec<_> = all.iter().map(|c| c.id.clone()).collect();
+        assert!(ids.contains(&id_one));
+        assert!(ids.contains(&id_two));
     }
 }
 
@@ -883,5 +961,30 @@ mod action_outcome_query_tests {
         let outcomes = service.outcomes_for_action(&action_id).await;
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].id, outcome_id);
+    }
+
+    #[tokio::test]
+    async fn actions_returns_all_actions_unfiltered() {
+        let mut hydra = Hydra::new();
+        let action_one = action();
+        let action_two = Action {
+            id: ActionId::new(),
+            ..action()
+        };
+        let id_one = action_one.id.clone();
+        let id_two = action_two.id.clone();
+        hydra
+            .ingest(EventKind::ActionProposed { action: action_one })
+            .unwrap();
+        hydra
+            .ingest(EventKind::ActionProposed { action: action_two })
+            .unwrap();
+
+        let service = QueryService::new(Arc::new(RwLock::new(hydra)));
+        let all = service.actions().await;
+        assert_eq!(all.len(), 2);
+        let ids: Vec<_> = all.iter().map(|a| a.id.clone()).collect();
+        assert!(ids.contains(&id_one));
+        assert!(ids.contains(&id_two));
     }
 }

@@ -13,9 +13,9 @@ pub mod prelude {
     };
     pub use crate::bus::{BusConfig, BusMetrics, CascadeNotification};
     pub use crate::http::{
-        commits_router, events_router, ingest_router, schema_router, sensor_router,
-        snapshots_router, CommitsHttpState, EventsHttpState, IngestHttpState, SchemaHttpState,
-        SensorHttpState, SnapshotsHttpState,
+        commits_router, events_router, ingest_router, query_router, schema_router, sensor_router,
+        snapshots_router, CommitsHttpState, EventsHttpState, IngestHttpState, QueryHttpState,
+        SchemaHttpState, SensorHttpState, SnapshotsHttpState,
     };
     pub use crate::query::{QueryService, QueryStats};
     pub use crate::schema_admin_service::{SchemaAdminService, SchemaFields};
