@@ -9,10 +9,15 @@
 //!
 //! Routes:
 //!
-//! - `GET /replication/status`             — head + role + peers
-//! - `GET /replication/commits`            — paged commit export
-//! - `GET /replication/peers`              — all registered peers
-//! - `GET /replication/peers/:peer_id`     — single peer, 404 on miss
+//! - `GET  /replication/status`             — head + role + peers
+//! - `GET  /replication/commits`            — paged commit export
+//! - `GET  /replication/peers`              — all registered peers
+//! - `GET  /replication/peers/:peer_id`     — single peer, 404 on miss
+//! - `POST /replication/apply`              — V2 patch 3B: follower
+//!   applies a leader-supplied page of committed batches. Body is
+//!   `ApplyReplicationRequest`. Validation failures map to 400 with
+//!   `{error: "..."}`. See `Hydra::apply_replication_commits` for
+//!   the validation contract.
 //!
 //! Auth / tenant policy:
 //!
@@ -20,11 +25,11 @@
 //!   NOT required on any of these routes.
 //! - Scope gating lives in `hydra-api::auth::required_scopes_for`:
 //!   `GET /replication/*` → `read:replication`,
-//!   `POST /replication/*` → `admin:replication` (pre-wired for 3B).
+//!   `POST /replication/*` → `admin:replication`.
 //!
-//! Role is hardcoded `ReplicationRole::Leader` in this patch. A
-//! runtime "what role am I" config (loaded at startup or set via
-//! admin route) is a follow-up.
+//! Role is hardcoded `ReplicationRole::Leader` for both `/status` and
+//! `/apply` in this patch. A runtime "what role am I" config is a
+//! follow-up.
 
 use crate::http::pagination::normalized_limit;
 use crate::runtime::RuntimeHandle;
@@ -32,7 +37,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use hydra_core::{
@@ -59,6 +64,7 @@ pub fn replication_router(runtime: RuntimeHandle) -> Router {
         .route("/replication/commits", get(get_replication_commits))
         .route("/replication/peers", get(list_replication_peers))
         .route("/replication/peers/:peer_id", get(get_replication_peer))
+        .route("/replication/apply", post(post_replication_apply))
         .with_state(ReplicationHttpState::new(runtime))
 }
 
@@ -115,6 +121,31 @@ pub struct ReplicationPeersResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationPeerResponse {
     pub peer: ReplicationPeer,
+}
+
+/// V2 patch 3B — follower apply request body.
+///
+/// `peer_id` identifies the source/leader peer (echoed back on the
+/// response for audit). `commits` is the leader-supplied page from
+/// `GET /replication/commits` — order MUST be strictly ascending by
+/// sequence, with the first batch chaining onto the follower's
+/// current head.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyReplicationRequest {
+    pub peer_id: ReplicaId,
+    pub commits: Vec<CommitBatch>,
+}
+
+/// V2 patch 3B — follower apply response.
+///
+/// Always populated regardless of `applied_count` so pull loops learn
+/// the follower's cursor in one round trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyReplicationResponse {
+    pub peer_id: ReplicaId,
+    pub applied_count: usize,
+    pub latest_sequence: Option<u64>,
+    pub latest_commit_id: Option<CommitId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +257,28 @@ async fn get_replication_peer(
             StatusCode::NOT_FOUND,
             format!("replication peer not found: {peer_id}"),
         ),
+    }
+}
+
+async fn post_replication_apply(
+    State(state): State<ReplicationHttpState>,
+    Json(request): Json<ApplyReplicationRequest>,
+) -> Response {
+    let ApplyReplicationRequest { peer_id, commits } = request;
+    let hydra = state.runtime.hydra();
+    let mut hydra = hydra.write().await;
+    match hydra.apply_replication_commits(peer_id, commits) {
+        Ok(report) => Json(ApplyReplicationResponse {
+            peer_id: report.peer_id,
+            applied_count: report.applied_count,
+            latest_sequence: report.latest_sequence,
+            latest_commit_id: report.latest_commit_id,
+        })
+        .into_response(),
+        // All validation failures from apply_replication_commits surface
+        // as HydraError::QueryError; map uniformly to 400. Engine doesn't
+        // need a dedicated error variant for replication-input failures.
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
 
@@ -401,5 +454,125 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // === V2 patch 3B — POST /replication/apply ===
+
+    fn json_post(uri: &str, body: &impl Serialize) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    fn follower_peer_id() -> ReplicaId {
+        ReplicaId::from_str("replica_follower_http")
+    }
+
+    #[tokio::test]
+    async fn apply_empty_commits_returns_200_noop() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = replication_router(runtime);
+        let request = ApplyReplicationRequest {
+            peer_id: follower_peer_id(),
+            commits: vec![],
+        };
+        let response = app
+            .oneshot(json_post("/replication/apply", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ApplyReplicationResponse = read_json(response).await;
+        assert_eq!(decoded.applied_count, 0);
+        assert!(decoded.latest_sequence.is_none());
+        assert!(decoded.latest_commit_id.is_none());
+        assert_eq!(decoded.peer_id, follower_peer_id());
+    }
+
+    #[tokio::test]
+    async fn apply_full_export_round_trip() {
+        // Leader runs in its own runtime. Ingest two signals, export
+        // commit batches, then POST them to a fresh follower's
+        // /replication/apply.
+        let (leader_runtime, _leader_processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("one")).unwrap();
+            hydra.ingest(signal("two")).unwrap();
+        }
+        let commits = {
+            let hydra = leader_runtime.hydra();
+            let hydra = hydra.read().await;
+            hydra
+                .commit_ledger()
+                .batches_in_sequence()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let (follower_runtime, _follower_processor) = RuntimeBuilder::new().build();
+        let app = replication_router(follower_runtime.clone());
+        let request = ApplyReplicationRequest {
+            peer_id: follower_peer_id(),
+            commits,
+        };
+        let response = app
+            .oneshot(json_post("/replication/apply", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ApplyReplicationResponse = read_json(response).await;
+        assert_eq!(decoded.applied_count, 2);
+        assert_eq!(decoded.latest_sequence, Some(2));
+        assert!(decoded.latest_commit_id.is_some());
+
+        // Follower state should now match the leader.
+        let follower_hydra = follower_runtime.hydra();
+        let follower_hydra = follower_hydra.read().await;
+        assert_eq!(follower_hydra.commit_count(), 2);
+        assert_eq!(follower_hydra.events().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn apply_sequence_gap_returns_400() {
+        // Build a leader chain of 3 commits, then drop the middle one to
+        // manufacture a gap. The router must reject with 400.
+        let (leader_runtime, _leader_processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("a")).unwrap();
+            hydra.ingest(signal("b")).unwrap();
+            hydra.ingest(signal("c")).unwrap();
+        }
+        let mut commits = {
+            let hydra = leader_runtime.hydra();
+            let hydra = hydra.read().await;
+            hydra
+                .commit_ledger()
+                .batches_in_sequence()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        commits.remove(1); // [seq=1, seq=3] — gap at 2
+
+        let (follower_runtime, _follower_processor) = RuntimeBuilder::new().build();
+        let app = replication_router(follower_runtime);
+        let request = ApplyReplicationRequest {
+            peer_id: follower_peer_id(),
+            commits,
+        };
+        let response = app
+            .oneshot(json_post("/replication/apply", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err: ErrorResponse = read_json(response).await;
+        assert!(err.error.contains("sequence"), "got {}", err.error);
     }
 }

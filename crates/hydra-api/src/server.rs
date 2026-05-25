@@ -2024,4 +2024,66 @@ mod tests {
             RateLimitMode::PerIp { per_second: 50, burst: 100 }
         ));
     }
+
+    // === V2 patch 3B — POST /replication/apply auth scope wiring ===
+
+    #[tokio::test]
+    async fn post_replication_apply_without_admin_replication_scope_returns_403() {
+        // Token has only `read:replication` — enough for the GET routes,
+        // but POST /replication/apply requires `admin:replication`.
+        // Confirms the scope rule pre-wired in patch 3A actually fires
+        // through the auth middleware now that a real POST route exists.
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime.clone(),
+            AuthConfig::require_for_all_with_tokens([
+                AuthToken::unbound("alpha").with_scopes(["read:replication"]),
+            ]),
+        );
+        let body = serde_json::json!({
+            "peer_id": "replica_test",
+            "commits": [],
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/replication/apply")
+            .header("content-type", "application/json")
+            .header("Authorization", "Bearer alpha")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        // The request never reached the engine — follower ledger
+        // unchanged.
+        assert_eq!(runtime.hydra().read().await.commit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn post_replication_apply_with_admin_replication_scope_accepts_empty() {
+        // Same setup as above but with the correct scope. Empty commits
+        // is a 200 no-op — proves the route is reachable through auth
+        // when properly scoped.
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_all_with_tokens([
+                AuthToken::unbound("alpha").with_scopes(["admin:replication"]),
+            ]),
+        );
+        let body = serde_json::json!({
+            "peer_id": "replica_test",
+            "commits": [],
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/replication/apply")
+            .header("content-type", "application/json")
+            .header("Authorization", "Bearer alpha")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

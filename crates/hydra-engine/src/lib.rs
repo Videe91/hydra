@@ -81,5 +81,5 @@ pub mod prelude {
     pub use crate::remediation_agent::RemediationAgent;
     pub use crate::outcome_agent::OutcomeAgent;
     pub use crate::reflex::{Reflex, ReflexContext, ReflexRegistry};
-    pub use crate::hydra::{Hydra, ResourceLimits, WalWriter};
+    pub use crate::hydra::{Hydra, ReplicationApplyReport, ResourceLimits, WalWriter};
 }

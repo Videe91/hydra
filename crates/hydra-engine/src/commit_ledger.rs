@@ -189,6 +189,87 @@ impl CommitLedger {
         self.verify_chain()
     }
 
+    /// Append a leader-supplied committed batch as the next entry in this
+    /// ledger's chain.
+    ///
+    /// Stricter than `load_committed_batch` — validates ALL of:
+    ///   - `batch.sequence == self.next_sequence()`
+    ///   - `batch.previous_hash == self.head_hash`
+    ///   - `batch.status == Committed`
+    ///   - `batch.commit_hash` is `Some`
+    ///   - no duplicate commit id
+    ///   - no duplicate idempotency key
+    ///   - recomputed `hash_commit_material(&batch) == batch.commit_hash`
+    ///     (so a malicious or corrupt leader cannot slip in a doctored hash)
+    ///
+    /// On success: indexes the batch, pushes the record, advances head.
+    /// On failure: returns `Err` without mutating self.
+    ///
+    /// Used by V2 replication (`Hydra::apply_replication_commits`).
+    /// `load_committed_batch` stays the right call for recovery from a
+    /// trusted, well-ordered durable log; `append_committed_batch` is the
+    /// right call when accepting a batch from an external source.
+    pub fn append_committed_batch(&mut self, batch: CommitBatch) -> Result<()> {
+        let expected_sequence = self.next_sequence();
+        if batch.sequence != expected_sequence {
+            return Err(HydraError::QueryError(format!(
+                "replication batch sequence mismatch: expected {}, got {}",
+                expected_sequence, batch.sequence
+            )));
+        }
+        if batch.previous_hash != self.head_hash {
+            return Err(HydraError::QueryError(format!(
+                "replication batch previous_hash mismatch at sequence {}",
+                batch.sequence
+            )));
+        }
+        if batch.status != CommitStatus::Committed {
+            return Err(HydraError::QueryError(format!(
+                "replication batch {} is not committed (status {:?})",
+                batch.id, batch.status
+            )));
+        }
+        let Some(commit_hash) = batch.commit_hash.clone() else {
+            return Err(HydraError::QueryError(format!(
+                "replication batch {} missing commit_hash",
+                batch.id
+            )));
+        };
+        if self.batches_by_id.contains_key(&batch.id) {
+            return Err(HydraError::QueryError(format!(
+                "duplicate commit id during replication: {}",
+                batch.id
+            )));
+        }
+        if let Some(key) = &batch.idempotency_key {
+            if self.idempotency_index.contains_key(key) {
+                return Err(HydraError::QueryError(format!(
+                    "duplicate idempotency key during replication: {}",
+                    key.value()
+                )));
+            }
+        }
+        // Integrity recompute — a corrupt or hostile leader cannot ship
+        // a batch whose stored commit_hash disagrees with its material.
+        let recomputed = hash_commit_material(&batch)?;
+        if recomputed != commit_hash {
+            return Err(HydraError::QueryError(format!(
+                "replication batch {} commit_hash does not match recomputed hash",
+                batch.id
+            )));
+        }
+        let record = CommitRecord::try_from(&batch)
+            .map_err(|err| HydraError::QueryError(err.to_string()))?;
+        if let Some(key) = batch.idempotency_key.clone() {
+            self.idempotency_index.insert(key, batch.id.clone());
+        }
+        self.next_sequence = batch.sequence;
+        self.head_hash = Some(commit_hash);
+        self.records.push(record);
+        self.batches_by_id.insert(batch.id.clone(), batch);
+        Ok(())
+    }
+
     /// Return all loaded batches ordered by commit sequence.
     pub fn batches_in_sequence(&self) -> Vec<&CommitBatch> {
         let mut batches: Vec<&CommitBatch> = self.batches_by_id.values().collect();
@@ -538,5 +619,143 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].id, first.id);
         assert_eq!(batches[1].id, second.id);
+    }
+
+    // === V2 patch 3B — append_committed_batch ===
+
+    /// Build two leader batches with a valid chain. Returns owned clones
+    /// so each test can mutate them in isolation.
+    fn leader_batches(count: usize) -> Vec<CommitBatch> {
+        let mut leader = CommitLedger::new();
+        let mut batches = Vec::new();
+        for i in 0..count {
+            let batch = leader
+                .commit_events(vec![signal_event(&format!("evt_{i}"))], None)
+                .unwrap();
+            batches.push(batch);
+        }
+        batches
+    }
+
+    #[test]
+    fn append_committed_batch_appends_clean_chain() {
+        let leader = leader_batches(2);
+        let mut follower = CommitLedger::new();
+        follower.append_committed_batch(leader[0].clone()).unwrap();
+        follower.append_committed_batch(leader[1].clone()).unwrap();
+        assert_eq!(follower.commit_count(), 2);
+        assert_eq!(follower.head_hash(), leader[1].commit_hash.as_ref());
+        follower.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn append_committed_batch_rejects_sequence_gap() {
+        let leader = leader_batches(2);
+        let mut follower = CommitLedger::new();
+        // Skip seq=1 and try to apply seq=2 directly.
+        let err = follower
+            .append_committed_batch(leader[1].clone())
+            .unwrap_err();
+        assert!(matches!(err, HydraError::QueryError(_)));
+        assert_eq!(follower.commit_count(), 0);
+    }
+
+    #[test]
+    fn append_committed_batch_rejects_wrong_previous_hash() {
+        let leader = leader_batches(2);
+        let mut follower = CommitLedger::new();
+        follower.append_committed_batch(leader[0].clone()).unwrap();
+        let mut tampered = leader[1].clone();
+        tampered.previous_hash = Some(CommitHash("engine-v0:bogus".to_string()));
+        let err = follower
+            .append_committed_batch(tampered)
+            .unwrap_err();
+        assert!(matches!(err, HydraError::QueryError(_)));
+    }
+
+    #[test]
+    fn append_committed_batch_rejects_uncommitted_status() {
+        let leader = leader_batches(1);
+        let mut tampered = leader[0].clone();
+        tampered.status = CommitStatus::Pending;
+        let mut follower = CommitLedger::new();
+        let err = follower
+            .append_committed_batch(tampered)
+            .unwrap_err();
+        assert!(matches!(err, HydraError::QueryError(_)));
+    }
+
+    #[test]
+    fn append_committed_batch_rejects_missing_commit_hash() {
+        let leader = leader_batches(1);
+        let mut tampered = leader[0].clone();
+        tampered.commit_hash = None;
+        let mut follower = CommitLedger::new();
+        let err = follower
+            .append_committed_batch(tampered)
+            .unwrap_err();
+        assert!(matches!(err, HydraError::QueryError(_)));
+    }
+
+    #[test]
+    fn append_committed_batch_rejects_doctored_commit_hash() {
+        let leader = leader_batches(1);
+        let mut tampered = leader[0].clone();
+        // Keep the chain valid (previous_hash is None for first batch) but
+        // doctor the stored commit_hash. The recompute MUST catch this.
+        tampered.commit_hash = Some(CommitHash("engine-v0:fabricated".to_string()));
+        let mut follower = CommitLedger::new();
+        let err = follower
+            .append_committed_batch(tampered)
+            .unwrap_err();
+        assert!(matches!(err, HydraError::QueryError(_)));
+    }
+
+    #[test]
+    fn append_committed_batch_rejects_duplicate_commit_id() {
+        let leader = leader_batches(1);
+        let mut follower = CommitLedger::new();
+        follower.append_committed_batch(leader[0].clone()).unwrap();
+        // Re-applying the SAME batch now fails on sequence (head is at
+        // seq=1, expected next is seq=2). To exercise the dup-id check
+        // specifically, bump sequence so the gap check passes, then leave
+        // id colliding — but bumping seq invalidates the hash. So the
+        // sequence guard IS the dup-id guard at the ledger level.
+        let err = follower
+            .append_committed_batch(leader[0].clone())
+            .unwrap_err();
+        assert!(matches!(err, HydraError::QueryError(_)));
+    }
+
+    #[test]
+    fn append_committed_batch_rejects_duplicate_idempotency_key() {
+        // Two distinct batches with the same idempotency key on a single
+        // follower's chain. This is the realistic case the dup-key check
+        // protects against (a buggy/hostile leader shipping a colliding
+        // key). We build it by re-keying batch 2 to collide with batch 1.
+        let leader = leader_batches(2);
+        let key = IdempotencyKey::new("dup-key-test");
+
+        // Re-key batch 0 to carry the key, then re-hash so it's well-formed.
+        let mut batch_a = leader[0].clone();
+        batch_a.idempotency_key = Some(key.clone());
+        let hash_a = hash_commit_material(&batch_a).unwrap();
+        batch_a.commit_hash = Some(hash_a.clone());
+
+        // Re-key batch 1 to carry the same key; rebuild its previous_hash
+        // to chain off batch_a, then re-hash.
+        let mut batch_b = leader[1].clone();
+        batch_b.idempotency_key = Some(key.clone());
+        batch_b.previous_hash = Some(hash_a);
+        let hash_b = hash_commit_material(&batch_b).unwrap();
+        batch_b.commit_hash = Some(hash_b);
+
+        let mut follower = CommitLedger::new();
+        follower.append_committed_batch(batch_a).unwrap();
+        let err = follower
+            .append_committed_batch(batch_b)
+            .unwrap_err();
+        assert!(matches!(err, HydraError::QueryError(_)));
+        assert_eq!(follower.commit_count(), 1);
     }
 }

@@ -97,6 +97,21 @@ impl Default for ResourceLimits {
     }
 }
 
+/// V2 patch 3B — outcome of `Hydra::apply_replication_commits`.
+///
+/// `latest_sequence` / `latest_commit_id` reflect the follower's ledger
+/// head **after** the apply (or before, if `applied_count == 0`).
+/// Returned regardless of whether any commits were actually applied, so
+/// pull loops always learn the follower's current cursor in one round
+/// trip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplicationApplyReport {
+    pub peer_id: hydra_core::ReplicaId,
+    pub applied_count: usize,
+    pub latest_sequence: Option<u64>,
+    pub latest_commit_id: Option<hydra_core::CommitId>,
+}
+
 /// Write-ahead log trait. Implementations persist events durably
 /// before they are processed by the cascade engine.
 ///
@@ -484,18 +499,31 @@ impl Hydra {
     pub fn recover_from_events(&mut self, events: Vec<Event>) -> hydra_core::error::Result<usize> {
         let mut count = 0;
         for event in events {
-            self.projection.apply(&event)?;
-            self.event_log.append(event.clone());
-            self.temporal.record(&event);
-            self.epistemic_store.apply_event(&event)?;
-            self.action_store.apply_event(&event)?;
-            self.policy_store.apply_event(&event)?;
-            self.sensor_checkpoint_store.apply_event(&event)?;
-            self.replication_store.apply_event(&event)?;
-            self.schema_registry_store.apply_event(&event)?;
+            self.apply_replayed_event(&event)?;
             count += 1;
         }
         Ok(count)
+    }
+
+    /// Apply a single historical event to all materialized state in
+    /// pure-replay mode — projection, event log, temporal index, and
+    /// every store.
+    ///
+    /// **Does not** fire the cascade, agents, reflexes, WAL, or the
+    /// commit writer. Used by both `recover_from_events` (durable
+    /// recovery) and `apply_replication_commits` (V2 follower apply)
+    /// so the two replay paths stay byte-identical.
+    fn apply_replayed_event(&mut self, event: &Event) -> hydra_core::error::Result<()> {
+        self.projection.apply(event)?;
+        self.event_log.append(event.clone());
+        self.temporal.record(event);
+        self.epistemic_store.apply_event(event)?;
+        self.action_store.apply_event(event)?;
+        self.policy_store.apply_event(event)?;
+        self.sensor_checkpoint_store.apply_event(event)?;
+        self.replication_store.apply_event(event)?;
+        self.schema_registry_store.apply_event(event)?;
+        Ok(())
     }
 
     /// Validate that a sequence of commit batches forms a contiguous tail
@@ -1282,6 +1310,120 @@ impl Hydra {
         peer_id: &hydra_core::ReplicaId,
     ) -> Option<&hydra_core::ReplicationLag> {
         self.replication_store.latest_lag(peer_id)
+    }
+
+    /// V2 patch 3B — apply a leader-supplied page of committed batches to
+    /// this follower.
+    ///
+    /// Strictly leader-equivalent: appends to the commit ledger and
+    /// replays events into every materialized store, but does **not**
+    /// fire the cascade, agents, reflexes, WAL, or commit writer. This
+    /// keeps the follower's chain byte-identical to the leader's — no
+    /// follower-local commits are synthesized, including replication
+    /// heartbeats. Heartbeat / lag-recording lives in a future side
+    /// channel.
+    ///
+    /// Validation contract:
+    ///   - empty `commits` → success no-op (returns current head info)
+    ///   - reject unsorted (must be strictly ascending by sequence)
+    ///   - reject sequence gaps relative to current head
+    ///   - reject mismatched `previous_hash` continuity
+    ///   - reject `status != Committed`
+    ///   - reject missing `commit_hash`
+    ///   - reject duplicate commit id / idempotency key
+    ///   - `append_committed_batch` recomputes `commit_hash` and rejects
+    ///     if it doesn't match the stored value
+    ///
+    /// Validation runs as a **dry pass** against `(projected_sequence,
+    /// projected_head_hash)` before any mutation — so a bad batch list
+    /// can't leave the engine half-mutated.
+    ///
+    /// **Partial-state caveat**: if dry-run validation succeeds but
+    /// `apply_replayed_event` later errors mid-list (e.g. the leader's
+    /// events reference state this follower never had), the follower
+    /// may be left at a partial state. Recovery is "re-bootstrap from
+    /// snapshot" — landing in a later V2 patch. This method does not
+    /// yet provide transactional rollback across materialized stores.
+    pub fn apply_replication_commits(
+        &mut self,
+        peer_id: hydra_core::ReplicaId,
+        commits: Vec<hydra_core::CommitBatch>,
+    ) -> hydra_core::error::Result<ReplicationApplyReport> {
+        let head_report = || ReplicationApplyReport {
+            peer_id: peer_id.clone(),
+            applied_count: 0,
+            latest_sequence: self.commit_ledger.latest_record().map(|r| r.sequence),
+            latest_commit_id: self.commit_ledger.latest_record().map(|r| r.id.clone()),
+        };
+
+        if commits.is_empty() {
+            return Ok(head_report());
+        }
+
+        // Reject unsorted. Sorting silently would mask leader/export
+        // bugs — surface them.
+        for window in commits.windows(2) {
+            if window[0].sequence >= window[1].sequence {
+                return Err(hydra_core::error::HydraError::QueryError(format!(
+                    "replication commits not strictly ascending by sequence: {} then {}",
+                    window[0].sequence, window[1].sequence
+                )));
+            }
+        }
+
+        // Dry pass: walk a projected (next_sequence, head_hash) through
+        // the incoming list. Catches gaps + chain mismatches + status +
+        // hash-present BEFORE we touch the ledger.
+        let mut projected_seq = self.commit_ledger.next_sequence();
+        let mut projected_head = self.commit_ledger.head_hash().cloned();
+        for batch in &commits {
+            if batch.sequence != projected_seq {
+                return Err(hydra_core::error::HydraError::QueryError(format!(
+                    "replication batch sequence gap: expected {}, got {}",
+                    projected_seq, batch.sequence
+                )));
+            }
+            if batch.previous_hash != projected_head {
+                return Err(hydra_core::error::HydraError::QueryError(format!(
+                    "replication batch previous_hash mismatch at sequence {}",
+                    batch.sequence
+                )));
+            }
+            if batch.status != hydra_core::CommitStatus::Committed {
+                return Err(hydra_core::error::HydraError::QueryError(format!(
+                    "replication batch {} is not committed (status {:?})",
+                    batch.id, batch.status
+                )));
+            }
+            if batch.commit_hash.is_none() {
+                return Err(hydra_core::error::HydraError::QueryError(format!(
+                    "replication batch {} missing commit_hash",
+                    batch.id
+                )));
+            }
+            projected_seq += 1;
+            projected_head = batch.commit_hash.clone();
+        }
+
+        // Apply. `append_committed_batch` re-validates atomically at the
+        // ledger boundary (including hash recompute) so any divergence
+        // between dry pass and final apply still aborts cleanly.
+        let mut applied_count = 0usize;
+        for batch in commits {
+            let events = batch.events.clone();
+            self.commit_ledger.append_committed_batch(batch)?;
+            for event in &events {
+                self.apply_replayed_event(event)?;
+            }
+            applied_count += 1;
+        }
+
+        Ok(ReplicationApplyReport {
+            peer_id,
+            applied_count,
+            latest_sequence: self.commit_ledger.latest_record().map(|r| r.sequence),
+            latest_commit_id: self.commit_ledger.latest_record().map(|r| r.id.clone()),
+        })
     }
 
     // === Schema registry ===
@@ -5382,5 +5524,244 @@ mod sprint1_tests {
             .unwrap();
         assert!(target.replication_peer(&peer_id).is_some());
         assert!(target.replication_run(&run_id).is_some());
+    }
+
+    // === V2 patch 3B — apply_replication_commits ===
+
+    fn replication_signal(name: &str) -> hydra_core::EventKind {
+        hydra_core::EventKind::Signal {
+            source: hydra_core::NodeId::from_str("test.replication"),
+            name: name.to_string(),
+            payload: std::collections::HashMap::new(),
+        }
+    }
+
+    fn leader_with_signals(count: usize) -> Hydra {
+        let mut leader = Hydra::new();
+        for i in 0..count {
+            leader
+                .ingest(replication_signal(&format!("signal_{i}")))
+                .unwrap();
+        }
+        leader
+    }
+
+    fn batches_from(hydra: &Hydra) -> Vec<hydra_core::CommitBatch> {
+        hydra
+            .commit_ledger()
+            .batches_in_sequence()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    fn peer_id() -> hydra_core::ReplicaId {
+        hydra_core::ReplicaId::from_str("replica_follower_test")
+    }
+
+    #[test]
+    fn apply_empty_commits_is_noop() {
+        let mut follower = Hydra::new();
+        let report = follower
+            .apply_replication_commits(peer_id(), vec![])
+            .unwrap();
+        assert_eq!(report.applied_count, 0);
+        assert_eq!(report.latest_sequence, None);
+        assert_eq!(report.latest_commit_id, None);
+        assert_eq!(follower.commit_count(), 0);
+        assert_eq!(follower.events().len(), 0);
+    }
+
+    #[test]
+    fn apply_replication_commits_to_empty_follower() {
+        let leader = leader_with_signals(3);
+        let commits = batches_from(&leader);
+        let leader_commit_count = leader.commit_count();
+        let leader_event_count = leader.events().len();
+        let leader_head_id = leader.latest_commit().unwrap().id.clone();
+
+        let mut follower = Hydra::new();
+        let report = follower
+            .apply_replication_commits(peer_id(), commits)
+            .unwrap();
+        assert_eq!(report.applied_count, 3);
+        assert_eq!(report.latest_sequence, Some(3));
+        assert_eq!(report.latest_commit_id, Some(leader_head_id));
+        assert_eq!(follower.commit_count(), leader_commit_count);
+        assert_eq!(follower.events().len(), leader_event_count);
+        // Hash-chain consistency carried over.
+        follower.verify_commit_chain().unwrap();
+    }
+
+    #[test]
+    fn apply_replication_commits_rejects_sequence_gap() {
+        let leader = leader_with_signals(3);
+        // Drop the middle batch to manufacture a gap.
+        let mut commits = batches_from(&leader);
+        commits.remove(1); // now sequence 1, 3 — gap at 2
+
+        let mut follower = Hydra::new();
+        let err = follower
+            .apply_replication_commits(peer_id(), commits)
+            .unwrap_err();
+        assert!(
+            matches!(err, hydra_core::error::HydraError::QueryError(_)),
+            "expected QueryError for sequence gap, got {:?}",
+            err
+        );
+        // No mutation on failure.
+        assert_eq!(follower.commit_count(), 0);
+    }
+
+    #[test]
+    fn apply_replication_commits_rejects_wrong_previous_hash() {
+        let leader = leader_with_signals(2);
+        let mut commits = batches_from(&leader);
+        // Tamper with the previous_hash of the second batch.
+        commits[1].previous_hash = Some(hydra_core::CommitHash("engine-v0:bogus".to_string()));
+
+        let mut follower = Hydra::new();
+        let err = follower
+            .apply_replication_commits(peer_id(), commits)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            hydra_core::error::HydraError::QueryError(_)
+        ));
+        assert_eq!(follower.commit_count(), 0);
+    }
+
+    #[test]
+    fn apply_replication_commits_rejects_uncommitted_batch() {
+        let leader = leader_with_signals(1);
+        let mut commits = batches_from(&leader);
+        commits[0].status = hydra_core::CommitStatus::Pending;
+
+        let mut follower = Hydra::new();
+        let err = follower
+            .apply_replication_commits(peer_id(), commits)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            hydra_core::error::HydraError::QueryError(_)
+        ));
+        assert_eq!(follower.commit_count(), 0);
+    }
+
+    #[test]
+    fn apply_replication_commits_rejects_unsorted_batches() {
+        let leader = leader_with_signals(2);
+        let mut commits = batches_from(&leader);
+        commits.reverse(); // [seq=2, seq=1]
+
+        let mut follower = Hydra::new();
+        let err = follower
+            .apply_replication_commits(peer_id(), commits)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            hydra_core::error::HydraError::QueryError(_)
+        ));
+        assert_eq!(follower.commit_count(), 0);
+    }
+
+    #[test]
+    fn apply_replication_commits_rejects_replay_of_already_applied_batch() {
+        // Re-sending an already-applied batch is caught by the sequence
+        // gate (the head has already advanced past it). This is the
+        // strongest guard against follower double-apply.
+        let leader = leader_with_signals(1);
+        let commits = batches_from(&leader);
+
+        let mut follower = Hydra::new();
+        follower
+            .apply_replication_commits(peer_id(), commits.clone())
+            .unwrap();
+        // Same batch again — sequence is now 1 + 1 = 2 expected, batch is
+        // sequence 1 → reject.
+        let err = follower
+            .apply_replication_commits(peer_id(), commits)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            hydra_core::error::HydraError::QueryError(_)
+        ));
+    }
+
+    struct ReplicationFollowUpHandler;
+    impl hydra_core::subscription::SubscriptionHandler for ReplicationFollowUpHandler {
+        fn handle(
+            &self,
+            event: &Event,
+            _graph: &dyn hydra_core::graph::GraphReader,
+        ) -> Vec<EventKind> {
+            if let EventKind::NodeCreated { node_id, .. } = &event.kind {
+                vec![EventKind::NodeUpdated {
+                    node_id: node_id.clone(),
+                    changes: std::collections::HashMap::from([(
+                        "follow_up".to_string(),
+                        hydra_core::Value::Bool(true),
+                    )]),
+                }]
+            } else {
+                vec![]
+            }
+        }
+    }
+
+    #[test]
+    fn apply_replication_commits_replays_state_without_agents() {
+        use hydra_core::subscription::{EventFilter, Subscription};
+        // Leader runs a subscription that emits a NodeUpdated reaction
+        // whenever a NodeCreated is ingested. That reaction goes through
+        // the cascade and becomes a SEPARATE event in the leader's log.
+        // Two events per ingest, packaged into one commit batch.
+        let mut leader = Hydra::new();
+        leader.register(Subscription::new(
+            "follow_up",
+            EventFilter::Any,
+            100,
+            Box::new(ReplicationFollowUpHandler),
+        ));
+        let node_id = hydra_core::NodeId::new();
+        leader
+            .ingest(EventKind::NodeCreated {
+                node_id: node_id.clone(),
+                type_id: "test_node".to_string(),
+                properties: std::collections::HashMap::new(),
+            })
+            .unwrap();
+        let leader_event_count = leader.events().len();
+        let leader_commit_count = leader.commit_count();
+        // Sanity: the subscription DID fire on the leader (we should see
+        // both NodeCreated and the reactive NodeUpdated in the same
+        // cascade batch).
+        assert!(
+            leader_event_count >= 2,
+            "leader subscription must have fired — got {} events",
+            leader_event_count
+        );
+
+        let commits = batches_from(&leader);
+
+        // Follower is a fresh Hydra with NO subscription registered. If
+        // apply_replication_commits accidentally went through the cascade
+        // engine (or fired agents that synthesize new events), the
+        // follower's event count would differ. Strict equality is the
+        // contract.
+        let mut follower = Hydra::new();
+        follower
+            .apply_replication_commits(peer_id(), commits)
+            .unwrap();
+        assert_eq!(follower.commit_count(), leader_commit_count);
+        assert_eq!(follower.events().len(), leader_event_count);
+        // The replayed reaction (NodeUpdated with follow_up=true) is
+        // visible on the follower's projection — proves the replay path
+        // ran the EXISTING events, not a re-derived cascade.
+        let node = follower.graph().node(&node_id).unwrap();
+        assert_eq!(
+            node.properties.get("follow_up"),
+            Some(&hydra_core::Value::Bool(true))
+        );
     }
 }
