@@ -5,11 +5,12 @@ use hydra_core::event::{Event, Value};
 use hydra_core::graph::GraphReader;
 use hydra_core::id::{EdgeId, EventId, NodeId};
 use hydra_core::node::Node;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// The difference between two graph states.
 /// Produced by comparing actual state to counterfactual state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphDiff {
     /// Nodes that exist in actual but not in counterfactual (created by the removed subtree)
     pub nodes_only_in_actual: Vec<NodeId>,
@@ -48,7 +49,7 @@ impl GraphDiff {
 }
 
 /// A specific node that differs between actual and counterfactual state
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDiff {
     pub node_id: NodeId,
     /// Properties that differ: key → (actual_value, counterfactual_value)
@@ -58,7 +59,7 @@ pub struct NodeDiff {
 }
 
 /// A specific edge that differs between actual and counterfactual state
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeDiff {
     pub edge_id: EdgeId,
     pub property_diffs: Vec<PropertyDiff>,
@@ -66,7 +67,7 @@ pub struct EdgeDiff {
 }
 
 /// A single property difference
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PropertyDiff {
     pub key: String,
     /// Value in the actual graph (None if the property doesn't exist)
@@ -77,7 +78,7 @@ pub struct PropertyDiff {
 
 /// Impact score derived from a counterfactual analysis.
 /// Quantifies how much a single event changed the graph.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImpactScore {
     /// The event that was analyzed
     pub event_id: EventId,

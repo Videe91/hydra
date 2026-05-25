@@ -259,7 +259,7 @@ pub fn bfs_dyn(
 }
 
 /// Direction for graph traversal
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TraversalDirection {
     Outgoing,
     Incoming,

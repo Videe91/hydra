@@ -150,6 +150,15 @@ impl QueryService {
         guard.cascade_events(cascade_id).into_iter().cloned().collect()
     }
 
+    /// Single event by id. Pair to the causal-chain / root-cause /
+    /// counterfactual / impact routes — those need an existence check
+    /// because their own return shapes (empty Vec, Err) don't always
+    /// distinguish a leaf event from an unknown one.
+    pub async fn event(&self, id: &EventId) -> Option<Event> {
+        let guard = self.hydra.read().await;
+        guard.event(id).cloned()
+    }
+
     // === Counterfactual queries ===
 
     /// What would the graph look like if this event hadn't happened?

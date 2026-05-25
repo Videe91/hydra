@@ -47,11 +47,13 @@ use axum::{
     Json, Router,
 };
 use hydra_core::edge::Edge;
+use hydra_core::graph::TraversalDirection;
 use hydra_core::node::Node;
 use hydra_core::{
-    Action, ActionId, ActionStatus, Claim, ClaimId, ClaimStatus, EdgeId, Evidence, EvidenceId,
-    NodeId, Outcome, SensorCheckpoint, SensorId,
+    Action, ActionId, ActionStatus, Claim, ClaimId, ClaimKind, ClaimStatus, ClaimSubject, EdgeId,
+    Event, EventId, Evidence, EvidenceId, NodeId, Outcome, OutcomeId, SensorCheckpoint, SensorId,
 };
+use hydra_engine::counterfactual::{GraphDiff, ImpactScore};
 use serde::{Deserialize, Serialize};
 
 /// Shared HTTP state for the query routes.
@@ -85,12 +87,16 @@ pub fn query_router(runtime: RuntimeHandle) -> Router {
             get(node_incoming_edges),
         )
         .route("/query/nodes/:node_id/neighbors", get(node_neighbors))
+        .route("/query/nodes/:node_id/bfs", get(node_bfs))
         .route("/query/nodes/:node_id", get(get_node))
         .route("/query/nodes", get(list_nodes))
         .route("/query/edges/:edge_id", get(get_edge))
         .route("/query/edges", get(list_edges))
+        .route("/query/evidence/:evidence_id/claims", get(claims_using_evidence))
         .route("/query/evidence/:evidence_id", get(get_evidence))
         .route("/query/evidence", get(list_evidence))
+        .route("/query/claims-for-subject", get(claims_for_subject))
+        .route("/query/claims/kind/:kind", get(claims_by_kind))
         .route("/query/claims/status/:status", get(claims_by_status))
         .route("/query/claims/:claim_id", get(get_claim))
         .route("/query/claims", get(list_claims))
@@ -98,6 +104,12 @@ pub fn query_router(runtime: RuntimeHandle) -> Router {
         .route("/query/actions/:action_id/outcomes", get(outcomes_for_action))
         .route("/query/actions/:action_id", get(get_action))
         .route("/query/actions", get(list_actions))
+        .route("/query/outcomes/:outcome_id", get(get_outcome))
+        .route("/query/events/:event_id/causal-chain", get(event_causal_chain))
+        .route("/query/events/:event_id/root-cause", get(event_root_cause))
+        .route("/query/events/:event_id/counterfactual", get(event_counterfactual))
+        .route("/query/events/:event_id/impact-score", get(event_impact_score))
+        .route("/query/stats", get(query_stats))
         .route(
             "/query/sensors/:sensor_id/sources/:source/latest-checkpoint",
             get(latest_sensor_checkpoint),
@@ -172,6 +184,62 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+// === Advanced Reads DTOs ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeResponse {
+    pub outcome: Outcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsResponse {
+    pub events: Vec<Event>,
+}
+
+/// BFS result: a list of node IDs in traversal order plus the total
+/// count. Clients fetch full node bodies via `/query/nodes/:id` as
+/// needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BfsResponse {
+    pub node_ids: Vec<NodeId>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CounterfactualResponse {
+    pub diff: GraphDiff,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactScoreResponse {
+    pub score: ImpactScore,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsResponse {
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub total_events: usize,
+    pub subscription_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BfsQuery {
+    /// `outgoing`, `incoming`, or `both`. Case-insensitive.
+    pub direction: Option<String>,
+    /// Optional type_id filter — restricts BFS to nodes whose
+    /// `type_id` matches.
+    pub type_filter: Option<String>,
+    pub limit: Option<usize>,
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimsForSubjectQuery {
+    pub subject_kind: String,
+    pub subject_value: String,
+}
+
 fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
     (
         status,
@@ -207,6 +275,47 @@ fn parse_action_status(status: &str) -> Option<ActionStatus> {
         "Executed" => Some(ActionStatus::Executed),
         "Failed" => Some(ActionStatus::Failed),
         "Cancelled" => Some(ActionStatus::Cancelled),
+        _ => None,
+    }
+}
+
+fn parse_claim_kind(kind: &str) -> Option<ClaimKind> {
+    match kind {
+        "Fact" => Some(ClaimKind::Fact),
+        "Inference" => Some(ClaimKind::Inference),
+        "Hypothesis" => Some(ClaimKind::Hypothesis),
+        "Prediction" => Some(ClaimKind::Prediction),
+        "Recommendation" => Some(ClaimKind::Recommendation),
+        "PolicyFinding" => Some(ClaimKind::PolicyFinding),
+        "AnomalyFinding" => Some(ClaimKind::AnomalyFinding),
+        "LineageFinding" => Some(ClaimKind::LineageFinding),
+        _ => None,
+    }
+}
+
+/// Parse `?direction=outgoing|incoming|both` (case-insensitive,
+/// defaulting to `both` when not supplied).
+fn parse_traversal_direction(value: Option<&str>) -> Option<TraversalDirection> {
+    match value.map(|s| s.to_ascii_lowercase()).as_deref() {
+        None | Some("both") => Some(TraversalDirection::Both),
+        Some("outgoing") => Some(TraversalDirection::Outgoing),
+        Some("incoming") => Some(TraversalDirection::Incoming),
+        Some(_) => None,
+    }
+}
+
+/// Parse `?subject_kind=X&subject_value=Y` into a `ClaimSubject`. The
+/// value semantics differ by kind: for `Node` / `Edge` it is the
+/// canonical id string; for `Dataset` / `Metric` / `System` /
+/// `ExternalRef` it is the free-form identifier.
+fn parse_claim_subject(subject_kind: &str, subject_value: &str) -> Option<ClaimSubject> {
+    match subject_kind {
+        "Node" => Some(ClaimSubject::Node(NodeId::from_str(subject_value))),
+        "Edge" => Some(ClaimSubject::Edge(EdgeId::from_str(subject_value))),
+        "ExternalRef" => Some(ClaimSubject::ExternalRef(subject_value.to_string())),
+        "Dataset" => Some(ClaimSubject::Dataset(subject_value.to_string())),
+        "Metric" => Some(ClaimSubject::Metric(subject_value.to_string())),
+        "System" => Some(ClaimSubject::System(subject_value.to_string())),
         _ => None,
     }
 }
@@ -516,6 +625,187 @@ async fn latest_sensor_checkpoint(
             format!("no checkpoint for sensor {sensor_id} source {source}"),
         ),
     }
+}
+
+// === Advanced reads handlers ===
+//
+// Engine already implements every method here — these handlers are
+// thin HTTP shims over QueryService. The only non-trivial parts are
+// the query-string parsers (TraversalDirection, ClaimKind,
+// ClaimSubject) and the BFS pagination via the shared helper.
+
+async fn query_stats(State(state): State<QueryHttpState>) -> Response {
+    let stats = state.service.stats().await;
+    Json(StatsResponse {
+        node_count: stats.node_count,
+        edge_count: stats.edge_count,
+        total_events: stats.total_events,
+        subscription_count: stats.subscription_count,
+    })
+    .into_response()
+}
+
+async fn node_bfs(
+    State(state): State<QueryHttpState>,
+    Path(node_id): Path<String>,
+    Query(query): Query<BfsQuery>,
+) -> Response {
+    let id = NodeId::from_str(&node_id);
+    if state.service.node(&id).await.is_none() {
+        return error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}"));
+    }
+    let direction = match parse_traversal_direction(query.direction.as_deref()) {
+        Some(d) => d,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown direction: {} (expected outgoing|incoming|both)",
+                    query.direction.unwrap_or_default()
+                ),
+            );
+        }
+    };
+    let traversal: Vec<NodeId> = match query.type_filter {
+        Some(type_filter) => state.service.bfs_by_type(&id, direction, type_filter).await,
+        None => state.service.bfs(&id, direction).await,
+    };
+    // Paginate the resulting NodeId list — BFS from a hub node can
+    // return thousands of ids and the response would otherwise be
+    // unbounded.
+    match paginate_by_cursor(
+        &traversal,
+        query.after.as_deref(),
+        query.limit,
+        |node_id| node_id.to_string(),
+    ) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("unknown bfs cursor: {}", query.after.unwrap_or_default()),
+        ),
+    }
+}
+
+async fn event_causal_chain(
+    State(state): State<QueryHttpState>,
+    Path(event_id): Path<String>,
+) -> Response {
+    let id = EventId::from_str(&event_id);
+    // Existence check up front — `causal_chain` returns an empty Vec
+    // both for "leaf event with no descendants" and "unknown event",
+    // so we can't infer 404 from emptiness alone.
+    if state.service.event(&id).await.is_none() {
+        return error_response(StatusCode::NOT_FOUND, format!("event not found: {event_id}"));
+    }
+    let events = state.service.causal_chain(&id).await;
+    Json(EventsResponse { events }).into_response()
+}
+
+async fn event_root_cause(
+    State(state): State<QueryHttpState>,
+    Path(event_id): Path<String>,
+) -> Response {
+    let id = EventId::from_str(&event_id);
+    if state.service.event(&id).await.is_none() {
+        return error_response(StatusCode::NOT_FOUND, format!("event not found: {event_id}"));
+    }
+    let events = state.service.root_cause(&id).await;
+    Json(EventsResponse { events }).into_response()
+}
+
+async fn event_counterfactual(
+    State(state): State<QueryHttpState>,
+    Path(event_id): Path<String>,
+) -> Response {
+    let id = EventId::from_str(&event_id);
+    match state.service.counterfactual(&id).await {
+        Ok(diff) => Json(CounterfactualResponse { diff }).into_response(),
+        Err(err) => error_response(
+            StatusCode::NOT_FOUND,
+            format!("counterfactual failed for {event_id}: {err}"),
+        ),
+    }
+}
+
+async fn event_impact_score(
+    State(state): State<QueryHttpState>,
+    Path(event_id): Path<String>,
+) -> Response {
+    let id = EventId::from_str(&event_id);
+    match state.service.impact_score(&id).await {
+        Ok(score) => Json(ImpactScoreResponse { score }).into_response(),
+        Err(err) => error_response(
+            StatusCode::NOT_FOUND,
+            format!("impact_score failed for {event_id}: {err}"),
+        ),
+    }
+}
+
+async fn claims_using_evidence(
+    State(state): State<QueryHttpState>,
+    Path(evidence_id): Path<String>,
+) -> Response {
+    let id = EvidenceId::from_str(&evidence_id);
+    if state.service.evidence(&id).await.is_none() {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("evidence not found: {evidence_id}"),
+        );
+    }
+    let claims = state.service.claims_using_evidence(&id).await;
+    Json(ClaimsResponse { claims }).into_response()
+}
+
+async fn get_outcome(
+    State(state): State<QueryHttpState>,
+    Path(outcome_id): Path<String>,
+) -> Response {
+    let id = OutcomeId::from_str(&outcome_id);
+    match state.service.outcome(&id).await {
+        Some(outcome) => Json(OutcomeResponse { outcome }).into_response(),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            format!("outcome not found: {outcome_id}"),
+        ),
+    }
+}
+
+async fn claims_by_kind(
+    State(state): State<QueryHttpState>,
+    Path(kind): Path<String>,
+) -> Response {
+    let kind_enum = match parse_claim_kind(&kind) {
+        Some(k) => k,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("unknown claim kind: {kind}"),
+            );
+        }
+    };
+    let claims = state.service.claims_with_kind(kind_enum).await;
+    Json(ClaimsResponse { claims }).into_response()
+}
+
+async fn claims_for_subject(
+    State(state): State<QueryHttpState>,
+    Query(query): Query<ClaimsForSubjectQuery>,
+) -> Response {
+    let subject = match parse_claim_subject(&query.subject_kind, &query.subject_value) {
+        Some(s) => s,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown subject_kind: {} (expected Node|Edge|ExternalRef|Dataset|Metric|System)",
+                    query.subject_kind
+                ),
+            );
+        }
+    };
+    let claims = state.service.claims_for_subject(subject).await;
+    Json(ClaimsResponse { claims }).into_response()
 }
 
 #[cfg(test)]
@@ -1549,6 +1839,533 @@ mod tests {
         let response = app
             .oneshot(empty_get(
                 "/query/sensors/sensor_bank/checkpoints?after=chkpt_bogus",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // === Advanced reads ===
+
+    #[tokio::test]
+    async fn stats_returns_current_counts() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: NodeId::new(),
+                    type_id: "ec2".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+        }
+        let app = query_router(runtime);
+        let response = app.oneshot(empty_get("/query/stats")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: StatsResponse = read_json(response).await;
+        assert_eq!(decoded.node_count, 1);
+        assert_eq!(decoded.edge_count, 0);
+        assert_eq!(decoded.total_events, 1);
+    }
+
+    #[tokio::test]
+    async fn node_bfs_returns_outgoing_traversal() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let c = NodeId::new();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            for (id, type_id) in [(&a, "ec2"), (&b, "vpc"), (&c, "subnet")] {
+                hydra
+                    .ingest(EventKind::NodeCreated {
+                        node_id: id.clone(),
+                        type_id: type_id.to_string(),
+                        properties: HashMap::new(),
+                    })
+                    .unwrap();
+            }
+            hydra
+                .ingest(EventKind::EdgeCreated {
+                    edge_id: hydra_core::EdgeId::new(),
+                    source: a.clone(),
+                    target: b.clone(),
+                    type_id: "in_vpc".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+            hydra
+                .ingest(EventKind::EdgeCreated {
+                    edge_id: hydra_core::EdgeId::new(),
+                    source: b.clone(),
+                    target: c.clone(),
+                    type_id: "in_vpc".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/query/nodes/{a}/bfs?direction=outgoing"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: Page<NodeId> = read_json(response).await;
+        // bfs_dyn includes the start node, so the traversal from `a`
+        // through the a -> b -> c chain returns [a, b, c].
+        assert_eq!(decoded.items.len(), 3);
+        assert!(decoded.items.contains(&a));
+        assert!(decoded.items.contains(&b));
+        assert!(decoded.items.contains(&c));
+    }
+
+    #[tokio::test]
+    async fn node_bfs_returns_404_when_node_missing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/nodes/node_missing/bfs"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn node_bfs_returns_400_on_bad_direction() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let start = NodeId::new();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: start.clone(),
+                    type_id: "ec2".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/query/nodes/{start}/bfs?direction=sideways"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn node_bfs_paginates_with_limit_and_cursor() {
+        // Build a 4-node chain a -> b -> c -> d and walk the BFS in pages.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let c = NodeId::new();
+        let d = NodeId::new();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            for id in [&a, &b, &c, &d] {
+                hydra
+                    .ingest(EventKind::NodeCreated {
+                        node_id: id.clone(),
+                        type_id: "ec2".to_string(),
+                        properties: HashMap::new(),
+                    })
+                    .unwrap();
+            }
+            for (src, tgt) in [(&a, &b), (&b, &c), (&c, &d)] {
+                hydra
+                    .ingest(EventKind::EdgeCreated {
+                        edge_id: hydra_core::EdgeId::new(),
+                        source: src.clone(),
+                        target: tgt.clone(),
+                        type_id: "linked".to_string(),
+                        properties: HashMap::new(),
+                    })
+                    .unwrap();
+            }
+        }
+        let app = query_router(runtime);
+        let response = app
+            .clone()
+            .oneshot(empty_get(&format!(
+                "/query/nodes/{a}/bfs?direction=outgoing&limit=2"
+            )))
+            .await
+            .unwrap();
+        let first: Page<NodeId> = read_json(response).await;
+        // bfs returns [a, b, c, d] — first page of 2 → [a, b].
+        assert_eq!(first.items.len(), 2);
+        let cursor = first.next_cursor.clone().expect("expected next_cursor");
+
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/query/nodes/{a}/bfs?direction=outgoing&limit=2&after={cursor}"
+            )))
+            .await
+            .unwrap();
+        let second: Page<NodeId> = read_json(response).await;
+        assert_eq!(second.items.len(), 2);
+        assert_eq!(second.next_cursor, None);
+    }
+
+    fn signal_event(name: &str) -> EventKind {
+        EventKind::Signal {
+            source: NodeId::from_str("advanced.reads"),
+            name: name.to_string(),
+            payload: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn event_causal_chain_returns_descendants() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let trigger_id;
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            let result = hydra.ingest(signal_event("kickoff")).unwrap();
+            trigger_id = result.events[0].id.clone();
+        }
+        let app = query_router(runtime);
+        // Even leaf events return 200 with an empty list — the route
+        // only 404s when the event itself doesn't exist.
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/query/events/{trigger_id}/causal-chain"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EventsResponse = read_json(response).await;
+        // No reflexes registered, so the kickoff signal has no
+        // descendants — the chain is empty.
+        assert_eq!(decoded.events.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn event_causal_chain_returns_404_when_event_missing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/events/evt_missing/causal-chain"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn event_root_cause_returns_chain_including_target() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let event_id;
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            let result = hydra.ingest(signal_event("only")).unwrap();
+            event_id = result.events[0].id.clone();
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!("/query/events/{event_id}/root-cause")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EventsResponse = read_json(response).await;
+        // Root-cause includes the event itself — chain length 1 for a
+        // signal that has no cause.
+        assert_eq!(decoded.events.len(), 1);
+        assert_eq!(decoded.events[0].id, event_id);
+    }
+
+    #[tokio::test]
+    async fn event_root_cause_returns_404_when_event_missing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/events/evt_missing/root-cause"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn event_counterfactual_returns_diff() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let create_id;
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            let result = hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: NodeId::new(),
+                    type_id: "ec2".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+            create_id = result.events[0].id.clone();
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/query/events/{create_id}/counterfactual"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: CounterfactualResponse = read_json(response).await;
+        // Removing the create event from history would remove that
+        // node — so the diff should show one node only in the actual
+        // state.
+        assert_eq!(decoded.diff.nodes_only_in_actual.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn event_counterfactual_returns_404_when_event_missing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(
+                "/query/events/evt_missing/counterfactual",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn event_impact_score_returns_score() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let create_id;
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            let result = hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: NodeId::new(),
+                    type_id: "ec2".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+            create_id = result.events[0].id.clone();
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/query/events/{create_id}/impact-score"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ImpactScoreResponse = read_json(response).await;
+        assert_eq!(decoded.score.event_id, create_id);
+        assert!(decoded.score.nodes_affected >= 1);
+    }
+
+    #[tokio::test]
+    async fn event_impact_score_returns_404_when_event_missing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/events/evt_missing/impact-score"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn evidence_claims_returns_supporting_claims() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let ev = evidence();
+        let evidence_id = ev.id.clone();
+        let cl = claim(evidence_id.clone());
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest_event(event(EventKind::EvidenceAdded { evidence: ev }))
+                .unwrap();
+            hydra
+                .ingest_event(event(EventKind::ClaimProposed { claim: cl }))
+                .unwrap();
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/query/evidence/{evidence_id}/claims"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ClaimsResponse = read_json(response).await;
+        assert_eq!(decoded.claims.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn evidence_claims_returns_404_when_evidence_missing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/evidence/evd_missing/claims"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_outcome_returns_outcome_when_present() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let action_id;
+        let outcome_id;
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            let act = action();
+            action_id = act.id.clone();
+            hydra
+                .ingest(EventKind::ActionProposed { action: act })
+                .unwrap();
+            // ActionExecuted triggers OutcomeAgent which emits a
+            // synthetic Unknown outcome.
+            hydra
+                .ingest(EventKind::ActionExecuting {
+                    action_id: action_id.clone(),
+                })
+                .unwrap();
+            hydra
+                .ingest(EventKind::ActionExecuted {
+                    action_id: action_id.clone(),
+                })
+                .unwrap();
+            let outcomes = hydra
+                .outcomes_for_action(&action_id)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            outcome_id = outcomes[0].id.clone();
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!("/query/outcomes/{outcome_id}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: OutcomeResponse = read_json(response).await;
+        assert_eq!(decoded.outcome.id, outcome_id);
+        assert_eq!(decoded.outcome.action_id, action_id);
+    }
+
+    #[tokio::test]
+    async fn get_outcome_returns_404_when_missing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/outcomes/outc_missing"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn claims_by_kind_filters_results() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let ev = evidence();
+        let cl = claim(ev.id.clone()); // claim() uses ClaimKind::AnomalyFinding
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest_event(event(EventKind::EvidenceAdded { evidence: ev }))
+                .unwrap();
+            hydra
+                .ingest_event(event(EventKind::ClaimProposed { claim: cl }))
+                .unwrap();
+        }
+        let app = query_router(runtime);
+        let response = app
+            .clone()
+            .oneshot(empty_get("/query/claims/kind/AnomalyFinding"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ClaimsResponse = read_json(response).await;
+        assert_eq!(decoded.claims.len(), 1);
+
+        // A different kind that wasn't ingested returns 200 + empty.
+        let response = app
+            .oneshot(empty_get("/query/claims/kind/PolicyFinding"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ClaimsResponse = read_json(response).await;
+        assert_eq!(decoded.claims.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn claims_by_kind_returns_400_on_unknown_kind() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/claims/kind/bogus"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn claims_for_subject_returns_claims_about_dataset() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let ev = evidence();
+        // Build a claim with a known simple subject value so the URL
+        // round-trip is trivially verifiable.
+        let mut cl = claim(ev.id.clone());
+        cl.subject = ClaimSubject::Dataset("demo_dataset".to_string());
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest_event(event(EventKind::EvidenceAdded { evidence: ev }))
+                .unwrap();
+            hydra
+                .ingest_event(event(EventKind::ClaimProposed { claim: cl }))
+                .unwrap();
+        }
+        let app = query_router(runtime);
+        let response = app
+            .clone()
+            .oneshot(empty_get(
+                "/query/claims-for-subject?subject_kind=Dataset&subject_value=demo_dataset",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ClaimsResponse = read_json(response).await;
+        assert_eq!(decoded.claims.len(), 1);
+
+        // Different subject value returns 200 with empty list.
+        let response = app
+            .oneshot(empty_get(
+                "/query/claims-for-subject?subject_kind=Dataset&subject_value=other",
+            ))
+            .await
+            .unwrap();
+        let decoded: ClaimsResponse = read_json(response).await;
+        assert_eq!(decoded.claims.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn claims_for_subject_returns_400_on_unknown_subject_kind() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(
+                "/query/claims-for-subject?subject_kind=Galaxy&subject_value=milky_way",
             ))
             .await
             .unwrap();
