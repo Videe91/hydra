@@ -10,6 +10,7 @@ members = [
     "crates/hydra-sensor",
     "crates/hydra-api",
     "crates/hydra-cli",
+    "crates/hydra-bench",
 ]
 
 [workspace.package]
