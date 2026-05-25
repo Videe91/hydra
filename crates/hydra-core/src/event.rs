@@ -1093,7 +1093,7 @@ mod tests {
 
     #[test]
     fn replication_event_kind_names() {
-        use crate::id::{ActorId, ReplicaId, ReplicationRunId};
+        use crate::id::{ActorId, ReplicaId};
         use crate::replication::{
             ReplicationLag, ReplicationMode, ReplicationOffset, ReplicationPeer,
             ReplicationPeerStatus, ReplicationRole, ReplicationRun,

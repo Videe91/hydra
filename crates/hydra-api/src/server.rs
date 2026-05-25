@@ -12,8 +12,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use hydra_core::ActorId;
 use hydra_net::http::{
-    commits_router, events_router, ingest_router, query_router, schema_router, sensor_router,
-    snapshots_router,
+    commits_router, events_router, ingest_router, query_router, replication_router,
+    schema_router, sensor_router, snapshots_router,
 };
 use hydra_net::runtime::{RuntimeBuilder, RuntimeHandle};
 use hydra_sdk::HydraRuntime;
@@ -100,6 +100,7 @@ pub fn build_router_with_security(
         .merge(commits_router(runtime.clone()))
         .merge(events_router(runtime.clone()))
         .merge(query_router(runtime.clone()))
+        .merge(replication_router(runtime.clone()))
         .merge(snapshots_router(runtime))
         .layer(cors_layer());
 

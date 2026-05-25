@@ -299,6 +299,13 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
         if path.starts_with("/maintenance/") {
             return vec!["admin:ops"];
         }
+        // V2 patch 3A: replication is cluster control plane — gate writes
+        // with `admin:replication`. The POST entry is pre-wired now so V2
+        // patch 3B's `POST /replication/apply` lands without re-touching
+        // this function. Patch 3A itself adds no POST routes.
+        if path == "/replication" || path.starts_with("/replication/") {
+            return vec!["admin:replication"];
+        }
         return Vec::new();
     }
     // Reads.
@@ -316,6 +323,9 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
     }
     if path.starts_with("/schemas/") || path == "/schemas" {
         return vec!["read:schemas"];
+    }
+    if path == "/replication" || path.starts_with("/replication/") {
+        return vec!["read:replication"];
     }
     Vec::new()
 }
@@ -739,6 +749,25 @@ mod tests {
         assert_eq!(
             required_scopes_for(&Method::GET, "/commits"),
             vec!["read:audit"]
+        );
+        // V2 patch 3A — replication routes. GET → read:replication.
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/replication/status"),
+            vec!["read:replication"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/replication/commits"),
+            vec!["read:replication"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/replication/peers"),
+            vec!["read:replication"]
+        );
+        // POST is pre-wired to admin:replication for 3B even though
+        // no POST route exists yet.
+        assert_eq!(
+            required_scopes_for(&Method::POST, "/replication/apply"),
+            vec!["admin:replication"]
         );
         // OPTIONS always has no scope requirement (CORS preflight).
         assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());
