@@ -327,11 +327,22 @@ impl Hydra {
                 .node(node_id)
                 .map(|node| hydra_core::TypeId::from_str(&node.meta.type_id))
         };
-        self.schema_gate.validate_event_with_node_resolver(
+        // EdgeUpdated needs the same projection-backed lookup that
+        // NodeUpdated does. With Patch 2B + Edge Gating, the engine
+        // already stamps NodeMeta/EdgeMeta with tenant + type_id at
+        // projection apply time, so this resolver only needs the
+        // type lookup.
+        let edge_type_resolver = |edge_id: &hydra_core::EdgeId| -> Option<hydra_core::TypeId> {
+            projection
+                .edge(edge_id)
+                .map(|edge| hydra_core::TypeId::from_str(&edge.meta.type_id))
+        };
+        self.schema_gate.validate_event_with_resolvers(
             &self.schema_registry_store,
             &self.schema_validator,
             &event,
             Some(&node_type_resolver),
+            Some(&edge_type_resolver),
         )?;
 
         // The cascade engine drives both topology projection AND the epistemic
@@ -1316,6 +1327,44 @@ impl Hydra {
             Some(schema) => self.schema_validator.validate_node_update(schema, changes),
             None => crate::schema_validator::SchemaValidationReport::valid(None),
         }
+    }
+
+    /// Look up an edge type schema by `TypeId`.
+    pub fn edge_schema(
+        &self,
+        type_id: &hydra_core::TypeId,
+    ) -> Option<&hydra_core::EdgeTypeSchema> {
+        self.schema_registry_store.edge_schema(type_id)
+    }
+
+    /// Read-only validation entrypoint for an edge create. Useful
+    /// for HTTP preflight (`POST /schemas/validate/edge-create` will
+    /// land in Edge Gating Patch 2).
+    pub fn validate_edge_create(
+        &self,
+        type_id: &hydra_core::TypeId,
+        properties: &std::collections::HashMap<String, hydra_core::Value>,
+    ) -> crate::schema_validator::SchemaValidationReport {
+        self.schema_validator
+            .validate_edge_create(&self.schema_registry_store, type_id, properties)
+    }
+
+    /// Read-only validation entrypoint for an edge update. Resolves
+    /// the edge's `type_id` via the projection, then runs the
+    /// validator. Returns `None` if the edge doesn't exist (so HTTP
+    /// callers can 404 cleanly).
+    pub fn validate_edge_update(
+        &self,
+        edge_id: &hydra_core::EdgeId,
+        changes: &std::collections::HashMap<String, hydra_core::Value>,
+    ) -> Option<crate::schema_validator::SchemaValidationReport> {
+        let edge = self.projection.edge(edge_id)?;
+        let type_id = hydra_core::TypeId::from_str(&edge.meta.type_id);
+        let report = match self.edge_schema(&type_id) {
+            Some(schema) => self.schema_validator.validate_edge_update(schema, changes),
+            None => crate::schema_validator::SchemaValidationReport::valid(None),
+        };
+        Some(report)
     }
 
     /// Look up the current TypeId for a node by reading the projection.

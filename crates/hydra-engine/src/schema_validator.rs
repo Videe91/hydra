@@ -1,7 +1,8 @@
 use crate::schema_registry_store::SchemaRegistryStore;
 use hydra_core::error::{HydraError, Result};
 use hydra_core::{
-    Action, ActionKind, Claim, ClaimObject, EntityTypeSchema, FieldSchema, Policy, PolicyKind,
+    Action, ActionKind, Claim, ClaimObject, EdgeTypeSchema, EntityTypeSchema, FieldSchema, Policy,
+    PolicyKind,
     SchemaId, SchemaStatus, TypeId, Value, ValueType,
 };
 use std::collections::HashMap;
@@ -356,6 +357,93 @@ impl SchemaValidator {
                     schema_id.clone(),
                     field_name.clone(),
                     "unknown field for entity type",
+                ));
+                continue;
+            };
+            if let Err(message) = value_matches_type(value, &field.value_type) {
+                errors.push(SchemaValidationError::new(
+                    schema_id.clone(),
+                    field_name.clone(),
+                    message,
+                ));
+            }
+        }
+        if errors.is_empty() {
+            SchemaValidationReport::valid(schema_id)
+        } else {
+            SchemaValidationReport::invalid(schema_id, errors)
+        }
+    }
+
+    // === Edge Gating Patch 1 — symmetric to node create/update ===
+
+    /// Validate a full edge payload against an `EdgeTypeSchema`.
+    /// Reuses the same field-by-field policy as
+    /// [`Self::validate_entity_payload`] so users get one mental
+    /// model: required fields enforced, unknown fields rejected,
+    /// value types checked.
+    pub fn validate_edge_payload(
+        &self,
+        schema: &EdgeTypeSchema,
+        payload: &HashMap<String, Value>,
+    ) -> SchemaValidationReport {
+        if schema.status != SchemaStatus::Active {
+            return SchemaValidationReport::invalid(
+                Some(schema.id.clone()),
+                vec![SchemaValidationError::new(
+                    Some(schema.id.clone()),
+                    schema.type_id.to_string(),
+                    "edge type schema is not active",
+                )],
+            );
+        }
+        self.validate_fields(Some(schema.id.clone()), &schema.fields, payload)
+    }
+
+    /// Validate an edge create by `TypeId`. Mirrors
+    /// [`Self::validate_node_create`]: unknown schemas return
+    /// `valid(None)` in read-only v0 — the SchemaGate is the place
+    /// where unknown-schema-policy decides reject-vs-allow.
+    pub fn validate_edge_create(
+        &self,
+        store: &SchemaRegistryStore,
+        type_id: &TypeId,
+        properties: &HashMap<String, Value>,
+    ) -> SchemaValidationReport {
+        let Some(schema) = store.edge_schema(type_id) else {
+            return SchemaValidationReport::valid(None);
+        };
+        self.validate_edge_payload(schema, properties)
+    }
+
+    /// Validate a partial edge update against an `EdgeTypeSchema`.
+    /// Mirrors [`Self::validate_node_update`]: required fields are
+    /// NOT enforced (partial change payload), unknown / wrong-type
+    /// changes are rejected.
+    pub fn validate_edge_update(
+        &self,
+        schema: &EdgeTypeSchema,
+        changes: &HashMap<String, Value>,
+    ) -> SchemaValidationReport {
+        let schema_id = Some(schema.id.clone());
+        if schema.status != SchemaStatus::Active {
+            return SchemaValidationReport::invalid(
+                schema_id.clone(),
+                vec![SchemaValidationError::new(
+                    schema_id.clone(),
+                    schema.type_id.to_string(),
+                    "edge type schema is not active",
+                )],
+            );
+        }
+        let mut errors = Vec::new();
+        for (field_name, value) in changes {
+            let Some(field) = schema.fields.iter().find(|field| &field.name == field_name)
+            else {
+                errors.push(SchemaValidationError::new(
+                    schema_id.clone(),
+                    field_name.clone(),
+                    "unknown field for edge type",
                 ));
                 continue;
             };
@@ -1025,5 +1113,142 @@ mod tests {
         );
         let result = report.into_result();
         assert!(result.is_err());
+    }
+
+    // === Edge Gating Patch 1 ===
+
+    fn store_with_edge_schema(status: SchemaStatus) -> SchemaRegistryStore {
+        let now = chrono::Utc::now();
+        let mut store = SchemaRegistryStore::new();
+        let schema = EdgeTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            type_id: TypeId::from_str("edge_depends_on"),
+            name: "DependsOn".to_string(),
+            status,
+            fields: vec![
+                FieldSchema::required("dependency_type", ValueType::String),
+                FieldSchema::optional("confidence", ValueType::Float),
+            ],
+            created_by: ActorId::from_str("actor_test"),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        store
+            .apply_event(&event(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::EdgeType(schema),
+            }))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn validates_edge_create_against_edge_schema() {
+        let store = store_with_edge_schema(SchemaStatus::Active);
+        let validator = SchemaValidator::new();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "dependency_type".to_string(),
+            Value::String("hard".to_string()),
+        );
+        let report = validator.validate_edge_create(
+            &store,
+            &TypeId::from_str("edge_depends_on"),
+            &properties,
+        );
+        assert!(report.is_valid());
+        assert!(report.schema_id.is_some());
+    }
+
+    #[test]
+    fn edge_create_missing_required_field_is_invalid() {
+        let store = store_with_edge_schema(SchemaStatus::Active);
+        let validator = SchemaValidator::new();
+        let properties = HashMap::new();
+        let report = validator.validate_edge_create(
+            &store,
+            &TypeId::from_str("edge_depends_on"),
+            &properties,
+        );
+        assert!(report.is_invalid());
+        assert_eq!(report.errors[0].path, "dependency_type");
+    }
+
+    #[test]
+    fn edge_create_wrong_field_type_is_invalid() {
+        let store = store_with_edge_schema(SchemaStatus::Active);
+        let validator = SchemaValidator::new();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "dependency_type".to_string(),
+            Value::Float(1.0), // wrong type: required to be String
+        );
+        let report = validator.validate_edge_create(
+            &store,
+            &TypeId::from_str("edge_depends_on"),
+            &properties,
+        );
+        assert!(report.is_invalid());
+        assert_eq!(report.errors[0].path, "dependency_type");
+    }
+
+    #[test]
+    fn edge_create_unknown_schema_returns_valid_with_no_id() {
+        // Unknown-schema policy lives at the SchemaGate layer.
+        // The validator returns valid(None) so the gate can decide
+        // reject-vs-allow based on its own config.
+        let store = SchemaRegistryStore::new();
+        let validator = SchemaValidator::new();
+        let report = validator.validate_edge_create(
+            &store,
+            &TypeId::from_str("edge_unknown"),
+            &HashMap::new(),
+        );
+        assert!(report.is_valid());
+        assert!(report.schema_id.is_none());
+    }
+
+    #[test]
+    fn edge_update_partial_valid() {
+        let store = store_with_edge_schema(SchemaStatus::Active);
+        let validator = SchemaValidator::new();
+        let schema = store
+            .edge_schema(&TypeId::from_str("edge_depends_on"))
+            .unwrap();
+        let mut changes = HashMap::new();
+        changes.insert("confidence".to_string(), Value::Float(0.9));
+        let report = validator.validate_edge_update(schema, &changes);
+        assert!(report.is_valid());
+    }
+
+    #[test]
+    fn edge_update_unknown_field_is_invalid() {
+        let store = store_with_edge_schema(SchemaStatus::Active);
+        let validator = SchemaValidator::new();
+        let schema = store
+            .edge_schema(&TypeId::from_str("edge_depends_on"))
+            .unwrap();
+        let mut changes = HashMap::new();
+        changes.insert("bogus".to_string(), Value::String("x".to_string()));
+        let report = validator.validate_edge_update(schema, &changes);
+        assert!(report.is_invalid());
+        assert_eq!(report.errors[0].path, "bogus");
+    }
+
+    #[test]
+    fn edge_update_against_inactive_schema_is_invalid() {
+        let store = store_with_edge_schema(SchemaStatus::Disabled);
+        let validator = SchemaValidator::new();
+        let schema = store
+            .edge_schema(&TypeId::from_str("edge_depends_on"))
+            .unwrap();
+        let mut changes = HashMap::new();
+        changes.insert(
+            "dependency_type".to_string(),
+            Value::String("soft".to_string()),
+        );
+        let report = validator.validate_edge_update(schema, &changes);
+        assert!(report.is_invalid());
     }
 }

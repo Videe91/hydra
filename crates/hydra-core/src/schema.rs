@@ -89,6 +89,29 @@ pub struct EntityTypeSchema {
     pub metadata: HashMap<String, Value>,
 }
 
+/// Schema for an edge type. Closes the typed-write gap that
+/// EntityTypeSchema covers for nodes: an `EdgeCreated { type_id, ... }`
+/// must conform to the schema registered for that edge type when the
+/// SchemaGate is in Strict mode.
+///
+/// Example:
+/// - "DependsOn" — edges between services
+/// - "in_vpc"    — connects a host to its VPC
+/// - "owns"      — connects an account to a resource
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeTypeSchema {
+    pub id: SchemaId,
+    pub tenant_id: Option<TenantId>,
+    pub type_id: TypeId,
+    pub name: String,
+    pub status: SchemaStatus,
+    pub fields: Vec<FieldSchema>,
+    pub created_by: ActorId,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub metadata: HashMap<String, Value>,
+}
+
 /// Schema for an evidence payload kind.
 ///
 /// Example:
@@ -177,6 +200,7 @@ pub struct PolicyConditionSchema {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SchemaDefinition {
     EntityType(EntityTypeSchema),
+    EdgeType(EdgeTypeSchema),
     EvidencePayload(EvidencePayloadSchema),
     ClaimPredicate(ClaimPredicateSchema),
     ActionPayload(ActionPayloadSchema),
@@ -187,6 +211,7 @@ impl SchemaDefinition {
     pub fn id(&self) -> &SchemaId {
         match self {
             SchemaDefinition::EntityType(schema) => &schema.id,
+            SchemaDefinition::EdgeType(schema) => &schema.id,
             SchemaDefinition::EvidencePayload(schema) => &schema.id,
             SchemaDefinition::ClaimPredicate(schema) => &schema.id,
             SchemaDefinition::ActionPayload(schema) => &schema.id,
@@ -197,6 +222,7 @@ impl SchemaDefinition {
     pub fn tenant_id(&self) -> Option<&TenantId> {
         match self {
             SchemaDefinition::EntityType(schema) => schema.tenant_id.as_ref(),
+            SchemaDefinition::EdgeType(schema) => schema.tenant_id.as_ref(),
             SchemaDefinition::EvidencePayload(schema) => schema.tenant_id.as_ref(),
             SchemaDefinition::ClaimPredicate(schema) => schema.tenant_id.as_ref(),
             SchemaDefinition::ActionPayload(schema) => schema.tenant_id.as_ref(),
@@ -207,6 +233,7 @@ impl SchemaDefinition {
     pub fn status(&self) -> &SchemaStatus {
         match self {
             SchemaDefinition::EntityType(schema) => &schema.status,
+            SchemaDefinition::EdgeType(schema) => &schema.status,
             SchemaDefinition::EvidencePayload(schema) => &schema.status,
             SchemaDefinition::ClaimPredicate(schema) => &schema.status,
             SchemaDefinition::ActionPayload(schema) => &schema.status,
@@ -217,6 +244,7 @@ impl SchemaDefinition {
     pub fn status_mut(&mut self) -> &mut SchemaStatus {
         match self {
             SchemaDefinition::EntityType(schema) => &mut schema.status,
+            SchemaDefinition::EdgeType(schema) => &mut schema.status,
             SchemaDefinition::EvidencePayload(schema) => &mut schema.status,
             SchemaDefinition::ClaimPredicate(schema) => &mut schema.status,
             SchemaDefinition::ActionPayload(schema) => &mut schema.status,
@@ -227,6 +255,7 @@ impl SchemaDefinition {
     pub fn updated_at_mut(&mut self) -> &mut DateTime<Utc> {
         match self {
             SchemaDefinition::EntityType(schema) => &mut schema.updated_at,
+            SchemaDefinition::EdgeType(schema) => &mut schema.updated_at,
             SchemaDefinition::EvidencePayload(schema) => &mut schema.updated_at,
             SchemaDefinition::ClaimPredicate(schema) => &mut schema.updated_at,
             SchemaDefinition::ActionPayload(schema) => &mut schema.updated_at,
@@ -237,6 +266,7 @@ impl SchemaDefinition {
     pub fn kind_name(&self) -> &'static str {
         match self {
             SchemaDefinition::EntityType(_) => "entity_type",
+            SchemaDefinition::EdgeType(_) => "edge_type",
             SchemaDefinition::EvidencePayload(_) => "evidence_payload",
             SchemaDefinition::ClaimPredicate(_) => "claim_predicate",
             SchemaDefinition::ActionPayload(_) => "action_payload",
@@ -288,6 +318,56 @@ mod tests {
         let json = serde_json::to_string(&schema).unwrap();
         let restored: EntityTypeSchema = serde_json::from_str(&json).unwrap();
         assert_eq!(schema, restored);
+    }
+
+    #[test]
+    fn edge_type_schema_serde_roundtrip() {
+        let now = now();
+        let schema = EdgeTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            type_id: TypeId::from_str("edge_depends_on"),
+            name: "DependsOn".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("dependency_type", ValueType::String),
+                FieldSchema::optional("discovered_at", ValueType::String),
+            ],
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&schema).unwrap();
+        let restored: EdgeTypeSchema = serde_json::from_str(&json).unwrap();
+        assert_eq!(schema, restored);
+    }
+
+    #[test]
+    fn schema_definition_common_accessors_cover_edge_type() {
+        let now = now();
+        let schema = EdgeTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            type_id: TypeId::from_str("edge_in_vpc"),
+            name: "in_vpc".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![FieldSchema::required("region", ValueType::String)],
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        let schema_id = schema.id.clone();
+        let mut definition = SchemaDefinition::EdgeType(schema);
+        assert_eq!(definition.id(), &schema_id);
+        assert_eq!(definition.tenant_id(), None);
+        assert_eq!(*definition.status(), SchemaStatus::Active);
+        assert_eq!(definition.kind_name(), "edge_type");
+        *definition.status_mut() = SchemaStatus::Disabled;
+        assert_eq!(*definition.status(), SchemaStatus::Disabled);
+        let new_ts = now + chrono::Duration::seconds(1);
+        *definition.updated_at_mut() = new_ts;
     }
 
     #[test]

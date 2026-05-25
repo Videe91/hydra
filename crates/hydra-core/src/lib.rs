@@ -67,6 +67,7 @@ pub use sensor::{
 pub use schema::{
     ActionPayloadSchema,
     ClaimPredicateSchema,
+    EdgeTypeSchema,
     EntityTypeSchema,
     EvidencePayloadSchema,
     FieldSchema,
@@ -105,8 +106,9 @@ pub mod prelude {
         SensorCheckpoint, SensorCheckpointStatus, SensorRun, SensorRunStatus, SourceCursor,
     };
     pub use crate::schema::{
-        ActionPayloadSchema, ClaimPredicateSchema, EntityTypeSchema, EvidencePayloadSchema,
-        FieldSchema, PolicyConditionSchema, SchemaDefinition, SchemaStatus, ValueType,
+        ActionPayloadSchema, ClaimPredicateSchema, EdgeTypeSchema, EntityTypeSchema,
+        EvidencePayloadSchema, FieldSchema, PolicyConditionSchema, SchemaDefinition, SchemaStatus,
+        ValueType,
     };
     pub use crate::snapshot::{SnapshotBody, SnapshotManifest, SnapshotStatus};
     pub use crate::node::{Node, NodeMeta, NodeValidator};

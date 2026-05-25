@@ -11,6 +11,12 @@ use std::collections::HashMap;
 /// (typically Hydra::ingest_event_internal) supply this to bridge in.
 pub type NodeTypeResolver<'a> = dyn Fn(&hydra_core::NodeId) -> Option<hydra_core::TypeId> + 'a;
 
+/// Closure type used to resolve an EdgeId to its current TypeId
+/// during EdgeUpdated validation. Same shape as
+/// [`NodeTypeResolver`]; the gate cannot read the projection on
+/// its own.
+pub type EdgeTypeResolver<'a> = dyn Fn(&hydra_core::EdgeId) -> Option<hydra_core::TypeId> + 'a;
+
 /// How aggressively Hydra should enforce schema validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaGateMode {
@@ -126,34 +132,77 @@ impl SchemaGate {
         event: &hydra_core::Event,
         node_type_resolver: Option<&NodeTypeResolver<'_>>,
     ) -> Result<()> {
-        self.validate_event_kind_with_node_resolver(
+        self.validate_event_kind_with_resolvers(
             store,
             validator,
             &event.kind,
             node_type_resolver,
+            None,
         )
     }
 
-    /// Validate one incoming EventKind before it enters the cascade. No node
-    /// resolver supplied — NodeUpdated passes through. For full coverage,
-    /// use validate_event_kind_with_node_resolver.
+    /// Validate one incoming event with both node and edge type
+    /// resolvers — the full-coverage entrypoint. NodeUpdated and
+    /// EdgeUpdated both need engine-side lookups to recover the
+    /// TypeId from the id alone.
+    pub fn validate_event_with_resolvers(
+        &self,
+        store: &SchemaRegistryStore,
+        validator: &SchemaValidator,
+        event: &hydra_core::Event,
+        node_type_resolver: Option<&NodeTypeResolver<'_>>,
+        edge_type_resolver: Option<&EdgeTypeResolver<'_>>,
+    ) -> Result<()> {
+        self.validate_event_kind_with_resolvers(
+            store,
+            validator,
+            &event.kind,
+            node_type_resolver,
+            edge_type_resolver,
+        )
+    }
+
+    /// Validate one incoming EventKind before it enters the cascade. No
+    /// resolvers supplied — NodeUpdated / EdgeUpdated pass through. For
+    /// full coverage, use [`Self::validate_event_kind_with_resolvers`].
     pub fn validate_event_kind(
         &self,
         store: &SchemaRegistryStore,
         validator: &SchemaValidator,
         kind: &EventKind,
     ) -> Result<()> {
-        self.validate_event_kind_with_node_resolver(store, validator, kind, None)
+        self.validate_event_kind_with_resolvers(store, validator, kind, None, None)
     }
 
-    /// Validate one incoming EventKind before it enters the cascade with an
-    /// optional NodeId → TypeId resolver for NodeUpdated.
+    /// Backwards-compatible single-resolver entrypoint. Delegates to
+    /// [`Self::validate_event_kind_with_resolvers`] with no edge
+    /// resolver.
     pub fn validate_event_kind_with_node_resolver(
         &self,
         store: &SchemaRegistryStore,
         validator: &SchemaValidator,
         kind: &EventKind,
         node_type_resolver: Option<&NodeTypeResolver<'_>>,
+    ) -> Result<()> {
+        self.validate_event_kind_with_resolvers(
+            store,
+            validator,
+            kind,
+            node_type_resolver,
+            None,
+        )
+    }
+
+    /// Validate one incoming EventKind before it enters the cascade,
+    /// with optional resolvers for NodeUpdated (NodeId → TypeId) and
+    /// EdgeUpdated (EdgeId → TypeId).
+    pub fn validate_event_kind_with_resolvers(
+        &self,
+        store: &SchemaRegistryStore,
+        validator: &SchemaValidator,
+        kind: &EventKind,
+        node_type_resolver: Option<&NodeTypeResolver<'_>>,
+        edge_type_resolver: Option<&EdgeTypeResolver<'_>>,
     ) -> Result<()> {
         if self.config.mode == SchemaGateMode::Off {
             return Ok(());
@@ -254,9 +303,33 @@ impl SchemaGate {
                 changes,
                 node_type_resolver,
             ),
-            // v0 only gates shapes that the validator can unambiguously check.
-            // EdgeCreated/EdgeUpdated can be added once their shape mapping
-            // is finalized — they need a parallel edge type schema.
+            EventKind::EdgeCreated {
+                type_id, properties, ..
+            } => {
+                let type_id = hydra_core::TypeId::from_str(type_id);
+                let report = validator.validate_edge_create(store, &type_id, properties);
+                if report.schema_id.is_none()
+                    && self.config.unknown_schema_policy == UnknownSchemaPolicy::Reject
+                {
+                    SchemaValidationReport::invalid(
+                        None,
+                        vec![SchemaValidationError::new(
+                            None,
+                            format!("edge.{}", type_id),
+                            "no registered edge type schema",
+                        )],
+                    )
+                } else {
+                    report
+                }
+            }
+            EventKind::EdgeUpdated { edge_id, changes } => self.evaluate_edge_update(
+                store,
+                validator,
+                edge_id,
+                changes,
+                edge_type_resolver,
+            ),
             _ => SchemaValidationReport::valid(None),
         };
         match self.config.mode {
@@ -332,6 +405,71 @@ impl SchemaGate {
             }
         };
         validator.validate_node_update(schema, changes)
+    }
+
+    /// Resolve TypeId for EdgeUpdated and validate the changes —
+    /// parallel to [`Self::evaluate_node_update`].
+    fn evaluate_edge_update(
+        &self,
+        store: &SchemaRegistryStore,
+        validator: &SchemaValidator,
+        edge_id: &hydra_core::EdgeId,
+        changes: &HashMap<String, Value>,
+        edge_type_resolver: Option<&EdgeTypeResolver<'_>>,
+    ) -> SchemaValidationReport {
+        let reject_unknown = self.config.unknown_schema_policy == UnknownSchemaPolicy::Reject;
+        let resolver = match edge_type_resolver {
+            Some(resolver) => resolver,
+            None => {
+                return if reject_unknown {
+                    SchemaValidationReport::invalid(
+                        None,
+                        vec![SchemaValidationError::new(
+                            None,
+                            format!("edge.{}", edge_id),
+                            "edge update gating requires an edge type resolver",
+                        )],
+                    )
+                } else {
+                    SchemaValidationReport::valid(None)
+                };
+            }
+        };
+        let type_id = match resolver(edge_id) {
+            Some(type_id) => type_id,
+            None => {
+                return if reject_unknown {
+                    SchemaValidationReport::invalid(
+                        None,
+                        vec![SchemaValidationError::new(
+                            None,
+                            format!("edge.{}", edge_id),
+                            "cannot resolve edge type for update",
+                        )],
+                    )
+                } else {
+                    SchemaValidationReport::valid(None)
+                };
+            }
+        };
+        let schema = match store.edge_schema(&type_id) {
+            Some(schema) => schema,
+            None => {
+                return if reject_unknown {
+                    SchemaValidationReport::invalid(
+                        None,
+                        vec![SchemaValidationError::new(
+                            None,
+                            format!("edge.{}", type_id),
+                            "no registered edge type schema",
+                        )],
+                    )
+                } else {
+                    SchemaValidationReport::valid(None)
+                };
+            }
+        };
+        validator.validate_edge_update(schema, changes)
     }
 
     /// Build a diagnostic Signal for permissive-mode future wiring.
@@ -1067,5 +1205,159 @@ mod tests {
             }
             other => panic!("expected Signal, got {other:?}"),
         }
+    }
+
+    // === Edge Gating Patch 1 ===
+
+    fn store_with_edge_schema() -> SchemaRegistryStore {
+        let mut store = SchemaRegistryStore::new();
+        let now = chrono::Utc::now();
+        let schema = hydra_core::EdgeTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: None,
+            type_id: TypeId::from_str("edge_depends_on"),
+            name: "DependsOn".to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![
+                FieldSchema::required("dependency_type", ValueType::String),
+                FieldSchema::optional("confidence", ValueType::Float),
+            ],
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        store
+            .apply_event(&event(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::EdgeType(schema),
+            }))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn strict_gate_allows_valid_edge_create() {
+        let store = store_with_edge_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "dependency_type".to_string(),
+            Value::String("hard".to_string()),
+        );
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::EdgeCreated {
+                edge_id: hydra_core::EdgeId::new(),
+                source: NodeId::new(),
+                target: NodeId::new(),
+                type_id: "edge_depends_on".to_string(),
+                properties,
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn strict_gate_rejects_invalid_edge_create() {
+        let store = store_with_edge_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        // Missing the required `dependency_type` field.
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::EdgeCreated {
+                edge_id: hydra_core::EdgeId::new(),
+                source: NodeId::new(),
+                target: NodeId::new(),
+                type_id: "edge_depends_on".to_string(),
+                properties: HashMap::new(),
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_reject_unknown_blocks_edge_create_without_schema() {
+        let store = SchemaRegistryStore::new();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_reject_unknown();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "dependency_type".to_string(),
+            Value::String("hard".to_string()),
+        );
+        let result = gate.validate_event_kind(
+            &store,
+            &validator,
+            &EventKind::EdgeCreated {
+                edge_id: hydra_core::EdgeId::new(),
+                source: NodeId::new(),
+                target: NodeId::new(),
+                type_id: "edge_unknown".to_string(),
+                properties,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn strict_gate_allows_valid_edge_update_with_resolver() {
+        let store = store_with_edge_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let edge_id = hydra_core::EdgeId::new();
+        // Resolver returns the registered type_id, simulating a
+        // projection-backed lookup.
+        let resolver = |id: &hydra_core::EdgeId| -> Option<TypeId> {
+            if id == &edge_id {
+                Some(TypeId::from_str("edge_depends_on"))
+            } else {
+                None
+            }
+        };
+        let mut changes = HashMap::new();
+        changes.insert("confidence".to_string(), Value::Float(0.95));
+        let result = gate.validate_event_kind_with_resolvers(
+            &store,
+            &validator,
+            &EventKind::EdgeUpdated {
+                edge_id: edge_id.clone(),
+                changes,
+            },
+            None,
+            Some(&resolver),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn strict_gate_rejects_invalid_edge_update_with_resolver() {
+        let store = store_with_edge_schema();
+        let validator = SchemaValidator::new();
+        let gate = SchemaGate::strict_allow_unknown();
+        let edge_id = hydra_core::EdgeId::new();
+        let resolver = |id: &hydra_core::EdgeId| -> Option<TypeId> {
+            if id == &edge_id {
+                Some(TypeId::from_str("edge_depends_on"))
+            } else {
+                None
+            }
+        };
+        let mut changes = HashMap::new();
+        changes.insert("bogus_field".to_string(), Value::String("x".to_string()));
+        let result = gate.validate_event_kind_with_resolvers(
+            &store,
+            &validator,
+            &EventKind::EdgeUpdated {
+                edge_id: edge_id.clone(),
+                changes,
+            },
+            None,
+            Some(&resolver),
+        );
+        assert!(result.is_err());
     }
 }

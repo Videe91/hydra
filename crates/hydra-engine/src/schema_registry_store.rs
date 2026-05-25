@@ -1,6 +1,6 @@
 use hydra_core::error::{HydraError, Result};
 use hydra_core::{
-    ActionPayloadSchema, ClaimPredicateSchema, EntityTypeSchema, Event, EventKind,
+    ActionPayloadSchema, ClaimPredicateSchema, EdgeTypeSchema, EntityTypeSchema, Event, EventKind,
     EvidencePayloadSchema, PolicyConditionSchema, SchemaDefinition, SchemaId, SchemaStatus, TypeId,
 };
 use std::collections::{HashMap, HashSet};
@@ -19,6 +19,7 @@ pub struct SchemaRegistryStore {
     schemas: HashMap<SchemaId, SchemaDefinition>,
     schemas_by_status: HashMap<SchemaStatus, HashSet<SchemaId>>,
     entity_schema_by_type_id: HashMap<TypeId, SchemaId>,
+    edge_schema_by_type_id: HashMap<TypeId, SchemaId>,
     evidence_schema_by_kind: HashMap<String, SchemaId>,
     claim_schema_by_predicate: HashMap<String, SchemaId>,
     action_schema_by_kind: HashMap<String, SchemaId>,
@@ -67,6 +68,17 @@ impl SchemaRegistryStore {
         let schema_id = self.entity_schema_by_type_id.get(type_id)?;
         match self.schemas.get(schema_id)? {
             SchemaDefinition::EntityType(schema) => Some(schema),
+            _ => None,
+        }
+    }
+
+    /// Look up the edge type schema registered for a given `TypeId`.
+    /// Closes the parallel gap to [`Self::entity_schema`] — Edge
+    /// Gating Patch 1.
+    pub fn edge_schema(&self, type_id: &TypeId) -> Option<&EdgeTypeSchema> {
+        let schema_id = self.edge_schema_by_type_id.get(type_id)?;
+        match self.schemas.get(schema_id)? {
+            SchemaDefinition::EdgeType(schema) => Some(schema),
             _ => None,
         }
     }
@@ -172,6 +184,10 @@ impl SchemaRegistryStore {
                 self.entity_schema_by_type_id
                     .insert(entity.type_id.clone(), schema_id);
             }
+            SchemaDefinition::EdgeType(edge) => {
+                self.edge_schema_by_type_id
+                    .insert(edge.type_id.clone(), schema_id);
+            }
             SchemaDefinition::EvidencePayload(evidence) => {
                 self.evidence_schema_by_kind
                     .insert(evidence.kind.clone(), schema_id);
@@ -199,6 +215,13 @@ impl SchemaRegistryStore {
                 remove_if_points_to(
                     &mut self.entity_schema_by_type_id,
                     &entity.type_id,
+                    schema_id,
+                );
+            }
+            SchemaDefinition::EdgeType(edge) => {
+                remove_if_points_to(
+                    &mut self.edge_schema_by_type_id,
+                    &edge.type_id,
                     schema_id,
                 );
             }
@@ -377,6 +400,22 @@ mod tests {
         })
     }
 
+    fn edge_schema(type_id: TypeId, name: &str) -> SchemaDefinition {
+        let now = now();
+        SchemaDefinition::EdgeType(EdgeTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: Some(tenant()),
+            type_id,
+            name: name.to_string(),
+            status: SchemaStatus::Active,
+            fields: vec![FieldSchema::required("region", ValueType::String)],
+            created_by: actor(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        })
+    }
+
     #[test]
     fn stores_entity_schema_and_indexes_by_type_id() {
         let mut store = SchemaRegistryStore::new();
@@ -547,5 +586,66 @@ mod tests {
     #[test]
     fn unused_import_guard() {
         let _ = Value::Bool(true);
+    }
+
+    // === Edge Gating Patch 1 ===
+
+    #[test]
+    fn register_edge_schema_indexes_by_type_id() {
+        let mut store = SchemaRegistryStore::new();
+        let type_id = TypeId::from_str("edge_depends_on");
+        let schema = edge_schema(type_id.clone(), "DependsOn");
+        let schema_id = schema.id().clone();
+        store
+            .apply_event(&event(EventKind::SchemaRegistered {
+                schema: schema.clone(),
+            }))
+            .unwrap();
+        assert_eq!(store.schema_count(), 1);
+        assert_eq!(store.schema(&schema_id), Some(&schema));
+        assert_eq!(store.active_schemas().len(), 1);
+        assert_eq!(store.edge_schema(&type_id).unwrap().name, "DependsOn");
+        // Entity index is untouched — edge schemas live in their own
+        // index.
+        assert!(store.entity_schema(&type_id).is_none());
+    }
+
+    #[test]
+    fn disable_archive_edge_schema_status_lifecycle() {
+        let mut store = SchemaRegistryStore::new();
+        let type_id = TypeId::from_str("edge_in_vpc");
+        let schema = edge_schema(type_id.clone(), "in_vpc");
+        let schema_id = schema.id().clone();
+        store
+            .apply_event(&event(EventKind::SchemaRegistered { schema }))
+            .unwrap();
+        assert_eq!(store.active_schemas().len(), 1);
+
+        store
+            .apply_event(&event(EventKind::SchemaDisabled {
+                schema_id: schema_id.clone(),
+                disabled_by: actor(),
+                reason: Some("test disable".to_string()),
+            }))
+            .unwrap();
+        assert_eq!(store.active_schemas().len(), 0);
+        assert_eq!(store.disabled_schemas().len(), 1);
+        assert_eq!(
+            store.edge_schema(&type_id).unwrap().status,
+            SchemaStatus::Disabled
+        );
+
+        store
+            .apply_event(&event(EventKind::SchemaArchived {
+                schema_id: schema_id.clone(),
+                archived_by: actor(),
+                reason: None,
+            }))
+            .unwrap();
+        assert_eq!(store.archived_schemas().len(), 1);
+        assert_eq!(
+            store.edge_schema(&type_id).unwrap().status,
+            SchemaStatus::Archived
+        );
     }
 }
