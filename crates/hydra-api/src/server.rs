@@ -151,33 +151,46 @@ pub async fn serve_with_auth(
     serve_with_security(runtime, addr, ServerSecurityConfig::with_auth(auth)).await
 }
 
-/// Start the HTTP server on the given address with the full
+/// Start the HTTP(S) server on the given address with the full
 /// server-security configuration (auth + TLS + rate limit).
 ///
-/// TLS is a placeholder until the TLS patch lands — passing a
-/// `Some(TlsConfig)` here today returns an error rather than silently
-/// serving plain HTTP under a config that asked for TLS.
+/// When `security.tls` is `Some`, the server binds via
+/// `axum_server::bind_rustls` using PEM cert + key files. PEM
+/// loading happens BEFORE bind, so a bad cert path errors out fast
+/// without holding the socket.
 pub async fn serve_with_security(
     runtime: RuntimeHandle,
     addr: &str,
     security: ServerSecurityConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if security.tls.is_some() {
-        return Err(
-            "TLS is not yet wired (placeholder); leave `tls = None` until the TLS patch lands".into(),
-        );
-    }
+    let tls = security.tls.clone();
     let router = build_router_with_security(runtime, security);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     // `into_make_service_with_connect_info::<SocketAddr>()` is what
     // gives the rate-limit middleware access to the peer IP via the
     // `ConnectInfo<SocketAddr>` extension. The cost is negligible
-    // when rate limiting is `Off` — the extension is set but unused.
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    // when rate limiting is `Off`. Both the TLS and plain paths use
+    // the same make-service so PeerIpKeyExtractor works in either.
+    let service =
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    match tls {
+        Some(tls) => {
+            // Load cert + key BEFORE binding so bad paths fail fast
+            // (caller sees the io::Error, no socket leaks).
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                tls.cert_path,
+                tls.key_path,
+            )
+            .await?;
+            let socket_addr: std::net::SocketAddr = addr.parse()?;
+            axum_server::bind_rustls(socket_addr, config)
+                .serve(service)
+                .await?;
+        }
+        None => {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(listener, service).await?;
+        }
+    }
     Ok(())
 }
 
@@ -269,25 +282,16 @@ pub async fn serve_persistent_with_security(
     actor: ActorId,
     security: ServerSecurityConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if security.tls.is_some() {
-        return Err(
-            "TLS is not yet wired (placeholder); leave `tls = None` until the TLS patch lands".into(),
-        );
-    }
     let (hydra, report) = HydraRuntime::open_persistent(root, actor)?;
     eprintln!(
         "hydra persistent recovery: mode={:?} commits_loaded={} replayed={}",
         report.mode, report.total_commits_loaded, report.replayed_commit_count,
     );
     let (runtime, _processor) = RuntimeBuilder::from_hydra(hydra).build();
-    let router = build_router_with_security(runtime, security);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+    // Delegate to `serve_with_security` so TLS/rate-limit wiring
+    // lives in one place — persistent serve is just "recover, then
+    // serve".
+    serve_with_security(runtime, addr, security).await
 }
 
 #[cfg(test)]
@@ -1954,11 +1958,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_with_security_rejects_tls_placeholder() {
-        // Until the TLS patch lands, serve_with_security with
-        // `tls = Some(...)` must return an error rather than
-        // silently serving plain HTTP. Documents the contract
-        // before TLS exists.
+    async fn serve_with_security_tls_invalid_paths_returns_error() {
+        // PEM loading happens BEFORE bind, so a non-existent cert
+        // path fails fast without opening a socket.
         let runtime = test_runtime();
         let bad = ServerSecurityConfig {
             auth: AuthConfig::off(),
@@ -1968,10 +1970,57 @@ mod tests {
             }),
             rate_limit: RateLimitMode::Off,
         };
-        // Bind to port 0 so we don't actually open a socket — the
-        // tls check fires before bind.
         let result = serve_with_security(runtime, "127.0.0.1:0", bad).await;
         assert!(result.is_err());
-        assert!(format!("{}", result.unwrap_err()).contains("TLS"));
+    }
+
+    #[tokio::test]
+    async fn tls_config_loads_valid_pem_files() {
+        // Generate a self-signed cert in a temp dir, write cert.pem
+        // + key.pem, and confirm `RustlsConfig::from_pem_file` loads
+        // both. This is the integration-light path — we don't run a
+        // real HTTPS server in tests, just prove the config-load
+        // step is wired correctly.
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen generates valid self-signed cert");
+        let dir = std::env::temp_dir().join(format!(
+            "hydra_tls_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            &cert_path, &key_path,
+        )
+        .await;
+        assert!(config.is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_security_config_builder_chains() {
+        // Proves the new with_tls / with_rate_limit builders compose
+        // cleanly with `with_auth`.
+        use crate::security::TlsConfig;
+        let cfg = ServerSecurityConfig::with_auth(AuthConfig::off())
+            .with_tls(TlsConfig {
+                cert_path: "/tmp/cert.pem".into(),
+                key_path: "/tmp/key.pem".into(),
+            })
+            .with_rate_limit(RateLimitMode::PerIp {
+                per_second: 50,
+                burst: 100,
+            });
+        assert!(cfg.tls.is_some());
+        assert!(matches!(
+            cfg.rate_limit,
+            RateLimitMode::PerIp { per_second: 50, burst: 100 }
+        ));
     }
 }

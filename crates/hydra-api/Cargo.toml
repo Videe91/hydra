@@ -19,9 +19,11 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 axum = "0.7"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { version = "0.5", features = ["cors"] }
 tower_governor = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 hydra-storage = { path = "../hydra-storage" }
+rcgen = "0.13"

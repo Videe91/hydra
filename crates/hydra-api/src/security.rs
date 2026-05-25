@@ -17,13 +17,14 @@
 use crate::auth::AuthConfig;
 use std::path::PathBuf;
 
-/// File-backed TLS configuration.
+/// File-backed TLS configuration. PEM-encoded cert + key paths.
 ///
-/// **Status**: this is a placeholder in the Rate Limiting patch.
-/// The TLS patch wires `axum-server` + `rustls` and starts serving
-/// HTTPS when `tls = Some(...)`. Until then `tls` MUST be `None` on
-/// every [`ServerSecurityConfig`] passed to `serve_*` — non-`None`
-/// values return an `Err` at server start.
+/// `serve_with_security` and `serve_persistent_with_security` route
+/// requests through `axum-server` + `rustls` when this is `Some`.
+/// PEM-string-only config is intentionally not supported in v0 —
+/// operators usually mount files; adding a separate
+/// "from-string" path doubles the test surface for a feature nobody
+/// has asked for yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsConfig {
     pub cert_path: PathBuf,
@@ -84,6 +85,26 @@ impl ServerSecurityConfig {
             tls: None,
             rate_limit: RateLimitMode::Off,
         }
+    }
+
+    /// Builder: attach a TLS configuration. Chainable with the other
+    /// constructors so production wire-up reads top-to-bottom:
+    ///
+    /// ```ignore
+    /// ServerSecurityConfig::with_auth(auth)
+    ///     .with_tls(TlsConfig { cert_path, key_path })
+    ///     .with_rate_limit(RateLimitMode::PerIp { per_second: 50, burst: 100 })
+    /// ```
+    pub fn with_tls(mut self, tls: TlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    /// Builder: attach a rate-limit policy. See [`Self::with_tls`]
+    /// for the chaining pattern.
+    pub fn with_rate_limit(mut self, rate_limit: RateLimitMode) -> Self {
+        self.rate_limit = rate_limit;
+        self
     }
 }
 
