@@ -4,6 +4,7 @@
 
 use crate::auth::{auth_middleware, tenant_binding_middleware, AuthConfig, AuthState};
 use crate::routes;
+use crate::security::{RateLimitMode, ServerSecurityConfig};
 use crate::state::AppState;
 use axum::http::{header, HeaderValue, Method};
 use axum::middleware;
@@ -17,6 +18,10 @@ use hydra_net::http::{
 use hydra_net::runtime::{RuntimeBuilder, RuntimeHandle};
 use hydra_sdk::HydraRuntime;
 use std::path::Path;
+use std::sync::Arc;
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::key_extractor::PeerIpKeyExtractor;
+use tower_governor::GovernorLayer;
 use tower_http::cors::CorsLayer;
 
 /// Shared CORS policy used by every hydra-api router build.
@@ -57,20 +62,38 @@ fn legacy_routes(state: AppState) -> Router {
 /// CloudTrail ingestion writes are immediately visible to schema reads
 /// and vice versa.
 pub fn build_router(runtime: RuntimeHandle) -> Router {
-    build_router_with_auth(runtime, AuthConfig::off())
+    build_router_with_security(runtime, ServerSecurityConfig::off())
 }
 
 /// Build the unified Axum router with optional bearer-token authentication.
 ///
-/// `AuthConfig::off()` preserves the existing public-by-default behavior.
-/// `AuthConfig::require_for_mutations(tokens)` gates POST/PUT/PATCH/DELETE.
-/// `AuthConfig::require_for_all(tokens)` gates everything except OPTIONS.
-///
-/// Auth is layered AFTER CORS so the auth check runs first on inbound
-/// requests; rejected requests never reach the route handlers.
+/// Now a thin wrapper over [`build_router_with_security`]. Preserved so
+/// existing callers don't churn.
 pub fn build_router_with_auth(runtime: RuntimeHandle, auth: AuthConfig) -> Router {
+    build_router_with_security(runtime, ServerSecurityConfig::with_auth(auth))
+}
+
+/// Build the unified Axum router with the full server-security
+/// configuration: auth + (future) TLS + rate limit.
+///
+/// **Layer order** for inbound requests:
+///
+/// ```text
+///   request → rate-limit → auth → tenant-binding → CORS → handler
+/// ```
+///
+/// In axum, the LAST `.layer()` call is the outermost (wraps everything
+/// before it). To get the order above, layer CORS first (innermost),
+/// then tenant-binding, then auth, then rate-limit (outermost).
+/// `RateLimitMode::Off` and `AuthMode::Off` skip their respective
+/// layers entirely so unsecured callers stay on the pre-Rate-Limiting
+/// hot path.
+pub fn build_router_with_security(
+    runtime: RuntimeHandle,
+    security: ServerSecurityConfig,
+) -> Router {
     let state = AppState::new(runtime.clone());
-    let app = legacy_routes(state)
+    let mut app = legacy_routes(state)
         .merge(schema_router(runtime.clone()))
         .merge(ingest_router(runtime.clone()))
         .merge(sensor_router(runtime.clone()))
@@ -79,43 +102,82 @@ pub fn build_router_with_auth(runtime: RuntimeHandle, auth: AuthConfig) -> Route
         .merge(query_router(runtime.clone()))
         .merge(snapshots_router(runtime))
         .layer(cors_layer());
-    if auth.is_enabled() {
-        // Layer order matters. axum applies layers outside-in for
-        // requests: the LAST `.layer()` wraps everything before it.
-        // Desired request flow:
-        //   request → auth_middleware → tenant_binding_middleware → handler
-        // To get that, layer tenant_binding FIRST (inner), then auth
-        // (outer). auth attaches AuthContext to extensions; if the
-        // matched token has a tenant binding, tenant_binding then
-        // validates X-Hydra-Tenant against it.
-        app.layer(middleware::from_fn(tenant_binding_middleware))
+
+    if security.auth.is_enabled() {
+        // auth → tenant_binding → handler (see the comment block at
+        // the top of this function for layering rationale).
+        app = app
+            .layer(middleware::from_fn(tenant_binding_middleware))
             .layer(middleware::from_fn_with_state(
-                AuthState::new(auth),
+                AuthState::new(security.auth),
                 auth_middleware,
-            ))
-    } else {
-        app
+            ));
     }
+
+    if let RateLimitMode::PerIp { per_second, burst } = security.rate_limit {
+        // Rate limit is the OUTERMOST layer: it should reject before
+        // auth, tenant-binding, or handler work runs. Cheaper for the
+        // server and matches the "fail loud, fail early" rule.
+        let config = GovernorConfigBuilder::default()
+            .per_second(per_second)
+            .burst_size(burst)
+            .key_extractor(PeerIpKeyExtractor)
+            .finish()
+            .expect("valid GovernorConfig — per_second/burst already validated");
+        app = app.layer(GovernorLayer {
+            config: Arc::new(config),
+        });
+    }
+
+    app
 }
 
-/// Start the HTTP server on the given address (no auth).
+/// Start the HTTP server on the given address (no auth, no TLS, no
+/// rate limit).
 pub async fn serve(
     runtime: RuntimeHandle,
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    serve_with_auth(runtime, addr, AuthConfig::off()).await
+    serve_with_security(runtime, addr, ServerSecurityConfig::off()).await
 }
 
 /// Start the HTTP server on the given address with the supplied auth
-/// configuration.
+/// configuration. Thin wrapper over [`serve_with_security`].
 pub async fn serve_with_auth(
     runtime: RuntimeHandle,
     addr: &str,
     auth: AuthConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let router = build_router_with_auth(runtime, auth);
+    serve_with_security(runtime, addr, ServerSecurityConfig::with_auth(auth)).await
+}
+
+/// Start the HTTP server on the given address with the full
+/// server-security configuration (auth + TLS + rate limit).
+///
+/// TLS is a placeholder until the TLS patch lands — passing a
+/// `Some(TlsConfig)` here today returns an error rather than silently
+/// serving plain HTTP under a config that asked for TLS.
+pub async fn serve_with_security(
+    runtime: RuntimeHandle,
+    addr: &str,
+    security: ServerSecurityConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if security.tls.is_some() {
+        return Err(
+            "TLS is not yet wired (placeholder); leave `tls = None` until the TLS patch lands".into(),
+        );
+    }
+    let router = build_router_with_security(runtime, security);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router).await?;
+    // `into_make_service_with_connect_info::<SocketAddr>()` is what
+    // gives the rate-limit middleware access to the peer IP via the
+    // `ConnectInfo<SocketAddr>` extension. The cost is negligible
+    // when rate limiting is `Off` — the extension is set but unused.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -181,30 +243,50 @@ pub async fn serve_persistent(
     addr: &str,
     actor: ActorId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    serve_persistent_with_auth(root, addr, actor, AuthConfig::off()).await
+    serve_persistent_with_security(root, addr, actor, ServerSecurityConfig::off()).await
 }
 
 /// Start a persistent HTTP server with the supplied auth configuration.
-///
-/// This is the one-call production startup:
-/// recovers `Hydra` from `<root>/commits.jsonl` + `<root>/snapshots/`,
-/// wraps it in a runtime, and serves the full route surface on `addr`.
-/// Logs the recovery mode + commit counts to stderr at startup.
+/// Thin wrapper over [`serve_persistent_with_security`].
 pub async fn serve_persistent_with_auth(
     root: impl AsRef<Path>,
     addr: &str,
     actor: ActorId,
     auth: AuthConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    serve_persistent_with_security(root, addr, actor, ServerSecurityConfig::with_auth(auth)).await
+}
+
+/// Start a persistent HTTP server with the full server-security
+/// configuration. This is the one-call production startup:
+/// recovers `Hydra` from `<root>/commits.jsonl` + `<root>/snapshots/`,
+/// wraps it in a runtime, and serves the full route surface on `addr`
+/// with auth + (eventually TLS) + rate limit applied. Logs the
+/// recovery mode + commit counts to stderr at startup.
+pub async fn serve_persistent_with_security(
+    root: impl AsRef<Path>,
+    addr: &str,
+    actor: ActorId,
+    security: ServerSecurityConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if security.tls.is_some() {
+        return Err(
+            "TLS is not yet wired (placeholder); leave `tls = None` until the TLS patch lands".into(),
+        );
+    }
     let (hydra, report) = HydraRuntime::open_persistent(root, actor)?;
     eprintln!(
         "hydra persistent recovery: mode={:?} commits_loaded={} replayed={}",
         report.mode, report.total_commits_loaded, report.replayed_commit_count,
     );
     let (runtime, _processor) = RuntimeBuilder::from_hydra(hydra).build();
-    let router = build_router_with_auth(runtime, auth);
+    let router = build_router_with_security(runtime, security);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router).await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1672,5 +1754,224 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get.status(), StatusCode::OK);
+    }
+
+    // === Rate Limiting (Patch A of TLS+RateLimit) ===
+    //
+    // tower_governor's PeerIpKeyExtractor pulls the peer IP out of
+    // axum's `ConnectInfo<SocketAddr>` request extension. With
+    // `oneshot` there is no real socket — the test helper below
+    // inserts a synthetic ConnectInfo so the extractor has a key
+    // and the bucket can actually fill.
+
+    fn rate_limit_get(uri: &str, peer: std::net::SocketAddr) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        request
+    }
+
+    fn test_peer() -> std::net::SocketAddr {
+        // Deterministic per-test peer so the bucket starts fresh
+        // each test case.
+        "127.0.0.1:50000".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn build_router_with_security_off_allows_health() {
+        let runtime = test_runtime();
+        let app = build_router_with_security(runtime, ServerSecurityConfig::off());
+        let response = app
+            .oneshot(rate_limit_get("/health", test_peer()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_allows_request_under_burst() {
+        let runtime = test_runtime();
+        let app = build_router_with_security(
+            runtime,
+            ServerSecurityConfig {
+                auth: AuthConfig::off(),
+                tls: None,
+                rate_limit: RateLimitMode::PerIp {
+                    per_second: 1,
+                    burst: 2,
+                },
+            },
+        );
+        // One request fits comfortably in burst=2.
+        let response = app
+            .oneshot(rate_limit_get("/health", test_peer()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_rejects_after_burst_with_429() {
+        let runtime = test_runtime();
+        let app = build_router_with_security(
+            runtime,
+            ServerSecurityConfig {
+                auth: AuthConfig::off(),
+                tls: None,
+                rate_limit: RateLimitMode::PerIp {
+                    per_second: 1,
+                    burst: 1,
+                },
+            },
+        );
+        let peer = test_peer();
+        // Burst is 1 — the first GET fills the bucket, the second
+        // gets 429. No sleep between requests so the token can't
+        // refill.
+        let first = app
+            .clone()
+            .oneshot(rate_limit_get("/health", peer))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = app
+            .oneshot(rate_limit_get("/health", peer))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_keys_separately_by_peer_ip() {
+        // Two different peer IPs hitting the same router should NOT
+        // exhaust each other's buckets — proves PeerIpKeyExtractor
+        // is wired and not collapsing to a global bucket.
+        let runtime = test_runtime();
+        let app = build_router_with_security(
+            runtime,
+            ServerSecurityConfig {
+                auth: AuthConfig::off(),
+                tls: None,
+                rate_limit: RateLimitMode::PerIp {
+                    per_second: 1,
+                    burst: 1,
+                },
+            },
+        );
+        let peer_a: std::net::SocketAddr = "127.0.0.1:50100".parse().unwrap();
+        let peer_b: std::net::SocketAddr = "127.0.0.2:50100".parse().unwrap();
+        // A consumes its token.
+        let r1 = app.clone().oneshot(rate_limit_get("/health", peer_a)).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        // B still has its own token.
+        let r2 = app.clone().oneshot(rate_limit_get("/health", peer_b)).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        // A is throttled.
+        let r3 = app.oneshot(rate_limit_get("/health", peer_a)).await.unwrap();
+        assert_eq!(r3.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn security_wrapper_preserves_auth_401() {
+        // ServerSecurityConfig that gates POST + has no rate limit
+        // should behave exactly like the old build_router_with_auth
+        // path — no token on a POST is 401.
+        let runtime = test_runtime();
+        let app = build_router_with_security(
+            runtime,
+            ServerSecurityConfig {
+                auth: AuthConfig::require_for_mutations(["secret-token"]),
+                tls: None,
+                rate_limit: RateLimitMode::Off,
+            },
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/snapshots")
+            .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
+            .body(Body::from(
+                serde_json::to_vec(&hydra_net::http::snapshots::CreateSnapshotRequest {
+                    created_by: ActorId::from_str("actor_auth_test"),
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn security_wrapper_preserves_tenant_binding_403() {
+        // Bound token + mismatching tenant header should 403 the
+        // same way it did under build_router_with_auth.
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_security(
+            runtime,
+            ServerSecurityConfig {
+                auth: AuthConfig::require_for_all_with_tokens([AuthToken::bound(
+                    "alpha",
+                    hydra_core::TenantId::from_str("tenant_acme"),
+                )]),
+                tls: None,
+                rate_limit: RateLimitMode::Off,
+            },
+        );
+        let response = app
+            .oneshot(ingest_post(Some("alpha"), Some("tenant_other")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn legacy_build_router_with_auth_still_works() {
+        // The pre-Rate-Limiting public API stays callable and
+        // behaves identically — `build_router_with_auth` is now a
+        // wrapper but its contract didn't change.
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_mutations(["secret-token"]),
+        );
+        // GET /health under RequireForMutations is unauthenticated.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn serve_with_security_rejects_tls_placeholder() {
+        // Until the TLS patch lands, serve_with_security with
+        // `tls = Some(...)` must return an error rather than
+        // silently serving plain HTTP. Documents the contract
+        // before TLS exists.
+        let runtime = test_runtime();
+        let bad = ServerSecurityConfig {
+            auth: AuthConfig::off(),
+            tls: Some(crate::security::TlsConfig {
+                cert_path: "/nowhere/cert.pem".into(),
+                key_path: "/nowhere/key.pem".into(),
+            }),
+            rate_limit: RateLimitMode::Off,
+        };
+        // Bind to port 0 so we don't actually open a socket — the
+        // tls check fires before bind.
+        let result = serve_with_security(runtime, "127.0.0.1:0", bad).await;
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("TLS"));
     }
 }
