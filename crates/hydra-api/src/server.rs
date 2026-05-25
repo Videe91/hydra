@@ -2,7 +2,7 @@
 //!
 //! Axum server with all routes, CORS, security middleware.
 
-use crate::auth::{auth_middleware, AuthConfig, AuthState};
+use crate::auth::{auth_middleware, tenant_binding_middleware, AuthConfig, AuthState};
 use crate::routes;
 use crate::state::AppState;
 use axum::http::{header, HeaderValue, Method};
@@ -80,10 +80,19 @@ pub fn build_router_with_auth(runtime: RuntimeHandle, auth: AuthConfig) -> Route
         .merge(snapshots_router(runtime))
         .layer(cors_layer());
     if auth.is_enabled() {
-        app.layer(middleware::from_fn_with_state(
-            AuthState::new(auth),
-            auth_middleware,
-        ))
+        // Layer order matters. axum applies layers outside-in for
+        // requests: the LAST `.layer()` wraps everything before it.
+        // Desired request flow:
+        //   request → auth_middleware → tenant_binding_middleware → handler
+        // To get that, layer tenant_binding FIRST (inner), then auth
+        // (outer). auth attaches AuthContext to extensions; if the
+        // matched token has a tenant binding, tenant_binding then
+        // validates X-Hydra-Tenant against it.
+        app.layer(middleware::from_fn(tenant_binding_middleware))
+            .layer(middleware::from_fn_with_state(
+                AuthState::new(auth),
+                auth_middleware,
+            ))
     } else {
         app
     }
@@ -1375,5 +1384,182 @@ mod tests {
         let stats: StatsResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(stats.node_count, 1);
         assert!(stats.total_events >= 1);
+    }
+
+    // === Multi-tenant Patch 3: token-tenant binding ===
+    //
+    // Status policy under test:
+    //   - 400  missing or invalid X-Hydra-Tenant header (from
+    //          handler OR tenant_binding middleware — both use the
+    //          same hydra-net parser)
+    //   - 401  missing or invalid bearer token (auth middleware)
+    //   - 403  authenticated token bound to tenant X, header is Y
+    //          (tenant_binding middleware)
+
+    fn ingest_request_body() -> Vec<u8> {
+        use hydra_core::{EventKind, NodeId};
+        use hydra_net::http::ingest::IngestRequest;
+        let request = IngestRequest {
+            event_kind: EventKind::Signal {
+                source: NodeId::from_str("token-binding-test"),
+                name: "ping".to_string(),
+                payload: std::collections::HashMap::new(),
+            },
+        };
+        serde_json::to_vec(&request).unwrap()
+    }
+
+    fn ingest_post(token: Option<&str>, tenant_header: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        if let Some(tenant) = tenant_header {
+            builder = builder.header("X-Hydra-Tenant", tenant);
+        }
+        builder.body(Body::from(ingest_request_body())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn token_binding_unbound_token_accepts_any_tenant_header() {
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_all_with_tokens([AuthToken::unbound("alpha")]),
+        );
+        let response = app
+            .oneshot(ingest_post(Some("alpha"), Some("tenant_anything")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_binding_bound_token_accepts_matching_tenant_header() {
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_all_with_tokens([AuthToken::bound(
+                "alpha",
+                hydra_core::TenantId::from_str("tenant_acme"),
+            )]),
+        );
+        let response = app
+            .oneshot(ingest_post(Some("alpha"), Some("tenant_acme")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_binding_bound_token_rejects_mismatching_tenant_header_with_403() {
+        // The critical "match, not override" assertion: a token
+        // bound to tenant_a presented with X-Hydra-Tenant=tenant_b
+        // must NOT succeed — and must NOT silently rewrite the
+        // write into tenant_a.
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime.clone(),
+            AuthConfig::require_for_all_with_tokens([AuthToken::bound(
+                "alpha",
+                hydra_core::TenantId::from_str("tenant_acme"),
+            )]),
+        );
+        let response = app
+            .oneshot(ingest_post(Some("alpha"), Some("tenant_other")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        // And nothing was committed under either tenant.
+        assert_eq!(runtime.hydra().read().await.commit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn token_binding_bound_token_returns_400_when_tenant_header_missing() {
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_all_with_tokens([AuthToken::bound(
+                "alpha",
+                hydra_core::TenantId::from_str("tenant_acme"),
+            )]),
+        );
+        let response = app
+            .oneshot(ingest_post(Some("alpha"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn token_binding_missing_bearer_token_returns_401() {
+        // Auth fires before tenant binding — missing token is 401
+        // regardless of the header.
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_all_with_tokens([AuthToken::bound(
+                "alpha",
+                hydra_core::TenantId::from_str("tenant_acme"),
+            )]),
+        );
+        let response = app
+            .oneshot(ingest_post(None, Some("tenant_acme")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_binding_invalid_bearer_token_returns_401() {
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_all_with_tokens([AuthToken::bound(
+                "alpha",
+                hydra_core::TenantId::from_str("tenant_acme"),
+            )]),
+        );
+        let response = app
+            .oneshot(ingest_post(Some("wrong-token"), Some("tenant_acme")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_binding_get_under_require_for_mutations_skips_binding() {
+        // RequireForMutations doesn't auth GET requests, so no
+        // AuthContext is inserted — tenant binding can't apply.
+        // Documented behavior: production deployments that want
+        // tenant-bound reads must use RequireForAll.
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_mutations_with_tokens([AuthToken::bound(
+                "alpha",
+                hydra_core::TenantId::from_str("tenant_acme"),
+            )]),
+        );
+        // GET /query/stats with a non-matching tenant header: 200
+        // because the auth + binding chain didn't run for the GET.
+        let request = Request::builder()
+            .method("GET")
+            .uri("/query/stats")
+            .header("X-Hydra-Tenant", "tenant_unrelated")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
