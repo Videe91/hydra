@@ -1,8 +1,8 @@
 use hydra_core::error::Result;
 use hydra_core::{
-    ActionPayloadSchema, ActorId, ClaimPredicateSchema, EntityTypeSchema, EventKind,
-    EvidencePayloadSchema, FieldSchema, PolicyConditionSchema, SchemaDefinition, SchemaId,
-    SchemaStatus, TenantId, TypeId, ValueType,
+    ActionPayloadSchema, ActorId, ClaimPredicateSchema, EdgeTypeSchema, EntityTypeSchema,
+    EventKind, EvidencePayloadSchema, FieldSchema, PolicyConditionSchema, SchemaDefinition,
+    SchemaId, SchemaStatus, TenantId, TypeId, ValueType,
 };
 use hydra_engine::hydra::Hydra;
 use std::collections::HashMap;
@@ -125,6 +125,39 @@ impl SchemaAdminService {
             .await
             .ingest(EventKind::SchemaRegistered {
                 schema: SchemaDefinition::EntityType(schema),
+            })?;
+        Ok(schema_id)
+    }
+
+    /// Register an `EdgeTypeSchema` — Edge Gating Patch 2 surface
+    /// counterpart to [`Self::register_entity_schema`]. The shape is
+    /// identical to entity registration; only the SchemaDefinition
+    /// variant differs.
+    pub async fn register_edge_schema(
+        &self,
+        type_id: TypeId,
+        name: impl Into<String>,
+        fields: Vec<FieldSchema>,
+    ) -> Result<SchemaId> {
+        let now = chrono::Utc::now();
+        let schema = EdgeTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: self.tenant_id.clone(),
+            type_id,
+            name: name.into(),
+            status: SchemaStatus::Active,
+            fields,
+            created_by: self.default_actor.clone(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        let schema_id = schema.id.clone();
+        self.hydra
+            .write()
+            .await
+            .ingest(EventKind::SchemaRegistered {
+                schema: SchemaDefinition::EdgeType(schema),
             })?;
         Ok(schema_id)
     }
@@ -473,5 +506,40 @@ mod tests {
             .policy_condition_schema("HumanApproval")
             .await
             .is_some());
+    }
+
+    // === Edge Gating Patch 2 ===
+
+    #[tokio::test]
+    async fn schema_admin_service_register_edge_schema_round_trips() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let schema_id = runtime
+            .schema_admin()
+            .register_edge_schema(
+                TypeId::from_str("edge_depends_on"),
+                "DependsOn",
+                SchemaFields::new()
+                    .required("dependency_type", ValueType::String)
+                    .optional("confidence", ValueType::Float)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        // Schema visible via the generic id lookup and the typed
+        // edge accessor — proves the registry indexed it correctly.
+        assert!(runtime.schema().schema(&schema_id).await.is_some());
+        let edge = runtime
+            .schema()
+            .edge_schema(&TypeId::from_str("edge_depends_on"))
+            .await
+            .expect("edge schema must be registered");
+        assert_eq!(edge.name, "DependsOn");
+        assert_eq!(edge.fields.len(), 2);
+        // Entity index unaffected by edge registration.
+        assert!(runtime
+            .schema()
+            .entity_schema(&TypeId::from_str("edge_depends_on"))
+            .await
+            .is_none());
     }
 }

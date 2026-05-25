@@ -1,7 +1,7 @@
 use hydra_core::{
-    Action, ActionPayloadSchema, Claim, ClaimPredicateSchema, EntityTypeSchema, Evidence,
-    EvidencePayloadSchema, Policy, PolicyConditionSchema, SchemaDefinition, SchemaId, TypeId,
-    Value,
+    Action, ActionPayloadSchema, Claim, ClaimPredicateSchema, EdgeId, EdgeTypeSchema,
+    EntityTypeSchema, Evidence, EvidencePayloadSchema, Policy, PolicyConditionSchema,
+    SchemaDefinition, SchemaId, TypeId, Value,
 };
 use hydra_engine::hydra::Hydra;
 use hydra_engine::schema_validator::SchemaValidationReport;
@@ -53,6 +53,11 @@ impl<'a> SchemaApi<'a> {
 
     pub fn entity_schema(&self, type_id: &TypeId) -> Option<&'a EntityTypeSchema> {
         self.hydra.entity_schema(type_id)
+    }
+
+    /// Edge type schema lookup — Edge Gating Patch 2.
+    pub fn edge_schema(&self, type_id: &TypeId) -> Option<&'a EdgeTypeSchema> {
+        self.hydra.edge_schema(type_id)
     }
 
     pub fn evidence_schema(&self, kind: &str) -> Option<&'a EvidencePayloadSchema> {
@@ -107,6 +112,28 @@ impl<'a> SchemaApi<'a> {
         changes: &HashMap<String, Value>,
     ) -> SchemaValidationReport {
         self.hydra.validate_node_update(type_id, changes)
+    }
+
+    /// Preflight an edge create against any registered
+    /// `EdgeTypeSchema`. Unknown type → `valid(None)`; the
+    /// SchemaGate decides reject vs allow at ingest time.
+    pub fn validate_edge_create(
+        &self,
+        type_id: &TypeId,
+        properties: &HashMap<String, Value>,
+    ) -> SchemaValidationReport {
+        self.hydra.validate_edge_create(type_id, properties)
+    }
+
+    /// Preflight an edge update. Returns `None` if the edge doesn't
+    /// exist (the engine cannot resolve its type) — callers that
+    /// expect the edge to exist should treat that as 404.
+    pub fn validate_edge_update(
+        &self,
+        edge_id: &EdgeId,
+        changes: &HashMap<String, Value>,
+    ) -> Option<SchemaValidationReport> {
+        self.hydra.validate_edge_update(edge_id, changes)
     }
 }
 

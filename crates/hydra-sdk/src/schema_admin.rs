@@ -1,8 +1,8 @@
 use hydra_core::error::Result;
 use hydra_core::{
-    ActionPayloadSchema, ActorId, ClaimPredicateSchema, EntityTypeSchema, EventKind,
-    EvidencePayloadSchema, FieldSchema, PolicyConditionSchema, SchemaDefinition, SchemaId,
-    SchemaStatus, TenantId, TypeId, ValueType,
+    ActionPayloadSchema, ActorId, ClaimPredicateSchema, EdgeTypeSchema, EntityTypeSchema,
+    EventKind, EvidencePayloadSchema, FieldSchema, PolicyConditionSchema, SchemaDefinition,
+    SchemaId, SchemaStatus, TenantId, TypeId, ValueType,
 };
 use hydra_engine::hydra::Hydra;
 use std::collections::HashMap;
@@ -102,6 +102,34 @@ impl<'a> SchemaAdmin<'a> {
         let schema_id = schema.id.clone();
         self.hydra.ingest(EventKind::SchemaRegistered {
             schema: SchemaDefinition::EntityType(schema),
+        })?;
+        Ok(schema_id)
+    }
+
+    /// Register an [`EdgeTypeSchema`] — Edge Gating Patch 2.
+    /// Symmetric with [`Self::register_entity_schema`].
+    pub fn register_edge_schema(
+        &mut self,
+        type_id: TypeId,
+        name: impl Into<String>,
+        fields: Vec<FieldSchema>,
+    ) -> Result<SchemaId> {
+        let now = chrono::Utc::now();
+        let schema = EdgeTypeSchema {
+            id: SchemaId::new(),
+            tenant_id: self.tenant_id.clone(),
+            type_id,
+            name: name.into(),
+            status: SchemaStatus::Active,
+            fields,
+            created_by: self.actor_id.clone(),
+            created_at: now,
+            updated_at: now,
+            metadata: HashMap::new(),
+        };
+        let schema_id = schema.id.clone();
+        self.hydra.ingest(EventKind::SchemaRegistered {
+            schema: SchemaDefinition::EdgeType(schema),
         })?;
         Ok(schema_id)
     }
@@ -442,5 +470,36 @@ mod tests {
             }
             other => panic!("expected ActionPayload, got {:?}", other.kind_name()),
         }
+    }
+
+    // === Edge Gating Patch 2 ===
+
+    #[test]
+    fn registers_edge_schema_round_trips() {
+        let mut hydra = Hydra::new();
+        let schema_id = {
+            let mut admin = SchemaAdmin::new(&mut hydra, actor());
+            admin
+                .register_edge_schema(
+                    TypeId::from_str("edge_depends_on"),
+                    "DependsOn",
+                    SchemaFields::new()
+                        .required("dependency_type", ValueType::String)
+                        .optional("confidence", ValueType::Float)
+                        .build(),
+                )
+                .unwrap()
+        };
+        // Generic registry lookup sees it.
+        assert!(hydra.schema(&schema_id).is_some());
+        // Edge index sees it; entity index does not.
+        let edge = hydra
+            .edge_schema(&TypeId::from_str("edge_depends_on"))
+            .expect("edge schema must be registered");
+        assert_eq!(edge.name, "DependsOn");
+        assert_eq!(edge.fields.len(), 2);
+        assert!(hydra
+            .entity_schema(&TypeId::from_str("edge_depends_on"))
+            .is_none());
     }
 }

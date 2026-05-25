@@ -1,7 +1,7 @@
 use hydra_core::{
-    Action, ActionPayloadSchema, Claim, ClaimPredicateSchema, EntityTypeSchema, Evidence,
-    EvidencePayloadSchema, Policy, PolicyConditionSchema, SchemaDefinition, SchemaId, TypeId,
-    Value,
+    Action, ActionPayloadSchema, Claim, ClaimPredicateSchema, EdgeId, EdgeTypeSchema,
+    EntityTypeSchema, Evidence, EvidencePayloadSchema, Policy, PolicyConditionSchema,
+    SchemaDefinition, SchemaId, TypeId, Value,
 };
 use hydra_engine::hydra::Hydra;
 use hydra_engine::schema_validator::SchemaValidationReport;
@@ -67,6 +67,11 @@ impl SchemaService {
 
     pub async fn entity_schema(&self, type_id: &TypeId) -> Option<EntityTypeSchema> {
         self.hydra.read().await.entity_schema(type_id).cloned()
+    }
+
+    /// Edge type schema lookup — Edge Gating Patch 2.
+    pub async fn edge_schema(&self, type_id: &TypeId) -> Option<EdgeTypeSchema> {
+        self.hydra.read().await.edge_schema(type_id).cloned()
     }
 
     pub async fn evidence_schema(&self, kind: &str) -> Option<EvidencePayloadSchema> {
@@ -141,6 +146,35 @@ impl SchemaService {
             .read()
             .await
             .validate_node_update(type_id, changes)
+    }
+
+    /// Preflight an edge create against the registered EdgeTypeSchema
+    /// (if any). Unknown-schema policy is the SchemaGate's
+    /// responsibility — this method returns `valid(None)` for
+    /// unregistered types, same as `validate_node_create`.
+    pub async fn validate_edge_create(
+        &self,
+        type_id: &TypeId,
+        properties: &HashMap<String, Value>,
+    ) -> SchemaValidationReport {
+        self.hydra
+            .read()
+            .await
+            .validate_edge_create(type_id, properties)
+    }
+
+    /// Preflight an edge update. Returns `None` when the edge id
+    /// doesn't exist so HTTP callers can 404 — mirrors
+    /// [`hydra_engine::hydra::Hydra::validate_edge_update`].
+    pub async fn validate_edge_update(
+        &self,
+        edge_id: &EdgeId,
+        changes: &HashMap<String, Value>,
+    ) -> Option<SchemaValidationReport> {
+        self.hydra
+            .read()
+            .await
+            .validate_edge_update(edge_id, changes)
     }
 }
 

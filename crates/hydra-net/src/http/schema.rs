@@ -8,8 +8,8 @@ use axum::{
     Json, Router,
 };
 use hydra_core::{
-    Action, Claim, Evidence, FieldSchema, Policy, SchemaDefinition, SchemaId, TypeId, Value,
-    ValueType,
+    Action, Claim, EdgeId, Evidence, FieldSchema, Policy, SchemaDefinition, SchemaId, TypeId,
+    Value, ValueType,
 };
 use hydra_engine::schema_validator::{SchemaValidationError, SchemaValidationReport};
 use serde::{Deserialize, Serialize};
@@ -29,13 +29,15 @@ impl SchemaHttpState {
 
 /// Build the schema HTTP router.
 ///
-/// Mounted route shape (full schema HTTP surface):
+/// Mounted route shape (full schema HTTP surface — 25 routes after
+/// Edge Gating Patch 2 added 4 edge routes):
 ///
 /// Read:
 /// - GET  /schemas/active
 /// - GET  /schemas/disabled
 /// - GET  /schemas/archived
 /// - GET  /schemas/entity/:type_id
+/// - GET  /schemas/edge/:type_id
 /// - GET  /schemas/evidence/:kind
 /// - GET  /schemas/claim/:predicate
 /// - GET  /schemas/action/:action_kind
@@ -43,6 +45,7 @@ impl SchemaHttpState {
 ///
 /// Register:
 /// - POST /schemas/entity
+/// - POST /schemas/edge
 /// - POST /schemas/evidence
 /// - POST /schemas/claim-predicate
 /// - POST /schemas/action
@@ -59,6 +62,8 @@ impl SchemaHttpState {
 /// - POST /schemas/validate/policy
 /// - POST /schemas/validate/node-create
 /// - POST /schemas/validate/node-update
+/// - POST /schemas/validate/edge-create
+/// - POST /schemas/validate/edge-update
 pub fn schema_router(runtime: RuntimeHandle) -> Router {
     Router::new()
         // Read
@@ -66,6 +71,7 @@ pub fn schema_router(runtime: RuntimeHandle) -> Router {
         .route("/schemas/disabled", get(disabled_schemas))
         .route("/schemas/archived", get(archived_schemas))
         .route("/schemas/entity/:type_id", get(get_entity_schema))
+        .route("/schemas/edge/:type_id", get(get_edge_schema))
         .route("/schemas/evidence/:kind", get(get_evidence_schema))
         .route("/schemas/claim/:predicate", get(get_claim_predicate_schema))
         .route("/schemas/action/:action_kind", get(get_action_payload_schema))
@@ -75,6 +81,7 @@ pub fn schema_router(runtime: RuntimeHandle) -> Router {
         )
         // Register
         .route("/schemas/entity", post(register_entity_schema))
+        .route("/schemas/edge", post(register_edge_schema))
         .route("/schemas/evidence", post(register_evidence_schema))
         .route(
             "/schemas/claim-predicate",
@@ -95,6 +102,8 @@ pub fn schema_router(runtime: RuntimeHandle) -> Router {
         .route("/schemas/validate/policy", post(validate_policy))
         .route("/schemas/validate/node-create", post(validate_node_create))
         .route("/schemas/validate/node-update", post(validate_node_update))
+        .route("/schemas/validate/edge-create", post(validate_edge_create))
+        .route("/schemas/validate/edge-update", post(validate_edge_update))
         .with_state(SchemaHttpState::new(runtime))
 }
 
@@ -130,6 +139,13 @@ pub struct RegisterActionSchemaRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterPolicyConditionSchemaRequest {
     pub policy_kind: String,
+    pub fields: Vec<FieldSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterEdgeSchemaRequest {
+    pub type_id: TypeId,
+    pub name: String,
     pub fields: Vec<FieldSchema>,
 }
 
@@ -171,6 +187,18 @@ pub struct ValidateNodeCreateRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidateNodeUpdateRequest {
     pub type_id: TypeId,
+    pub changes: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateEdgeCreateRequest {
+    pub type_id: TypeId,
+    pub properties: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateEdgeUpdateRequest {
+    pub edge_id: EdgeId,
     pub changes: HashMap<String, Value>,
 }
 
@@ -275,6 +303,17 @@ async fn get_entity_schema(
     }
 }
 
+async fn get_edge_schema(
+    State(state): State<SchemaHttpState>,
+    Path(type_id): Path<String>,
+) -> Response {
+    let type_id = TypeId::from_str(&type_id);
+    match state.runtime.schema().edge_schema(&type_id).await {
+        Some(schema) => Json(schema).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "edge schema not found"),
+    }
+}
+
 async fn get_evidence_schema(
     State(state): State<SchemaHttpState>,
     Path(kind): Path<String>,
@@ -339,6 +378,32 @@ async fn register_entity_schema(
         Err(error) => error_response(
             StatusCode::BAD_REQUEST,
             format!("failed to register entity schema: {error}"),
+        ),
+    }
+}
+
+async fn register_edge_schema(
+    State(state): State<SchemaHttpState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterEdgeSchemaRequest>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    match state
+        .runtime
+        .schema_admin()
+        .for_tenant(tenant)
+        .register_edge_schema(request.type_id, request.name, request.fields)
+        .await
+    {
+        Ok(schema_id) => {
+            (StatusCode::CREATED, Json(SchemaIdResponse { schema_id })).into_response()
+        }
+        Err(error) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("failed to register edge schema: {error}"),
         ),
     }
 }
@@ -574,6 +639,39 @@ async fn validate_node_update(
         .validate_node_update(&request.type_id, &request.changes)
         .await;
     Json(ValidationResponse::from(report)).into_response()
+}
+
+async fn validate_edge_create(
+    State(state): State<SchemaHttpState>,
+    Json(request): Json<ValidateEdgeCreateRequest>,
+) -> Response {
+    let report = state
+        .runtime
+        .schema()
+        .validate_edge_create(&request.type_id, &request.properties)
+        .await;
+    Json(ValidationResponse::from(report)).into_response()
+}
+
+/// Validate an edge update. Returns 404 when the engine cannot find
+/// the edge (`Hydra::validate_edge_update` returns `None`); otherwise
+/// returns the validation report.
+async fn validate_edge_update(
+    State(state): State<SchemaHttpState>,
+    Json(request): Json<ValidateEdgeUpdateRequest>,
+) -> Response {
+    match state
+        .runtime
+        .schema()
+        .validate_edge_update(&request.edge_id, &request.changes)
+        .await
+    {
+        Some(report) => Json(ValidationResponse::from(report)).into_response(),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            format!("edge not found: {}", request.edge_id),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1236,5 +1334,264 @@ mod tests {
             schema.tenant_id().map(|t| t.to_string()),
             Some(TEST_TENANT.to_string()),
         );
+    }
+
+    // === Edge Gating Patch 2 ===
+
+    fn edge_schema_fields() -> Vec<FieldSchema> {
+        vec![
+            FieldSchema::required("dependency_type", ValueType::String),
+            FieldSchema::optional("confidence", ValueType::Float),
+        ]
+    }
+
+    #[tokio::test]
+    async fn register_edge_schema_http_round_trip() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = schema_router(runtime.clone());
+        let request = RegisterEdgeSchemaRequest {
+            type_id: TypeId::from_str("edge_depends_on"),
+            name: "DependsOn".to_string(),
+            fields: edge_schema_fields(),
+        };
+        let response = app
+            .oneshot(request_json(Method::POST, "/schemas/edge", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = read_body_bytes(response).await;
+        let decoded: SchemaIdResponse = serde_json::from_slice(&body).unwrap();
+        // Schema must be in the edge index after registration.
+        let stored = runtime
+            .schema()
+            .edge_schema(&TypeId::from_str("edge_depends_on"))
+            .await
+            .expect("edge schema must exist");
+        assert_eq!(stored.id, decoded.schema_id);
+        assert_eq!(stored.name, "DependsOn");
+    }
+
+    #[tokio::test]
+    async fn register_edge_schema_without_tenant_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = schema_router(runtime);
+        let request = RegisterEdgeSchemaRequest {
+            type_id: TypeId::from_str("edge_x"),
+            name: "X".to_string(),
+            fields: edge_schema_fields(),
+        };
+        let response = app
+            .oneshot(request_json_without_tenant(
+                Method::POST,
+                "/schemas/edge",
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_edge_schema_by_type_id() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        runtime
+            .schema_admin()
+            .register_edge_schema(
+                TypeId::from_str("edge_depends_on"),
+                "DependsOn",
+                edge_schema_fields(),
+            )
+            .await
+            .unwrap();
+        let app = schema_router(runtime);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/schemas/edge/edge_depends_on")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_edge_schema_missing_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = schema_router(runtime);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/schemas/edge/edge_does_not_exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn validate_edge_create_returns_valid_for_good_payload() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        runtime
+            .schema_admin()
+            .register_edge_schema(
+                TypeId::from_str("edge_depends_on"),
+                "DependsOn",
+                edge_schema_fields(),
+            )
+            .await
+            .unwrap();
+        let app = schema_router(runtime);
+        let mut properties = HashMap::new();
+        properties.insert(
+            "dependency_type".to_string(),
+            Value::String("hard".to_string()),
+        );
+        let request = ValidateEdgeCreateRequest {
+            type_id: TypeId::from_str("edge_depends_on"),
+            properties,
+        };
+        let response = app
+            .oneshot(request_json(
+                Method::POST,
+                "/schemas/validate/edge-create",
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_body_bytes(response).await;
+        let decoded: ValidationResponse = serde_json::from_slice(&body).unwrap();
+        assert!(decoded.valid);
+        assert!(decoded.schema_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn validate_edge_create_invalid_missing_required() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        runtime
+            .schema_admin()
+            .register_edge_schema(
+                TypeId::from_str("edge_depends_on"),
+                "DependsOn",
+                edge_schema_fields(),
+            )
+            .await
+            .unwrap();
+        let app = schema_router(runtime);
+        let request = ValidateEdgeCreateRequest {
+            type_id: TypeId::from_str("edge_depends_on"),
+            properties: HashMap::new(), // missing required dependency_type
+        };
+        let response = app
+            .oneshot(request_json(
+                Method::POST,
+                "/schemas/validate/edge-create",
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_body_bytes(response).await;
+        let decoded: ValidationResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!decoded.valid);
+        assert_eq!(decoded.errors[0].path, "dependency_type");
+    }
+
+    #[tokio::test]
+    async fn validate_edge_update_invalid_unknown_field() {
+        // First ingest a real edge so validate_edge_update can resolve
+        // it via the projection (the engine returns None for missing
+        // edges — that's the 404 path).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        runtime
+            .schema_admin()
+            .register_edge_schema(
+                TypeId::from_str("edge_depends_on"),
+                "DependsOn",
+                edge_schema_fields(),
+            )
+            .await
+            .unwrap();
+        let edge_id = hydra_core::EdgeId::new();
+        {
+            use hydra_core::{EventKind, NodeId};
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            let source = NodeId::new();
+            let target = NodeId::new();
+            hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: source.clone(),
+                    type_id: "ec2".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+            hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: target.clone(),
+                    type_id: "ec2".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+            let mut props = HashMap::new();
+            props.insert(
+                "dependency_type".to_string(),
+                Value::String("hard".to_string()),
+            );
+            hydra
+                .ingest(EventKind::EdgeCreated {
+                    edge_id: edge_id.clone(),
+                    source,
+                    target,
+                    type_id: "edge_depends_on".to_string(),
+                    properties: props,
+                })
+                .unwrap();
+        }
+        let app = schema_router(runtime);
+        let mut changes = HashMap::new();
+        changes.insert("bogus".to_string(), Value::String("x".to_string()));
+        let request = ValidateEdgeUpdateRequest {
+            edge_id: edge_id.clone(),
+            changes,
+        };
+        let response = app
+            .oneshot(request_json(
+                Method::POST,
+                "/schemas/validate/edge-update",
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_body_bytes(response).await;
+        let decoded: ValidationResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!decoded.valid);
+        assert_eq!(decoded.errors[0].path, "bogus");
+    }
+
+    #[tokio::test]
+    async fn validate_edge_update_missing_edge_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = schema_router(runtime);
+        let request = ValidateEdgeUpdateRequest {
+            edge_id: hydra_core::EdgeId::new(),
+            changes: HashMap::new(),
+        };
+        let response = app
+            .oneshot(request_json(
+                Method::POST,
+                "/schemas/validate/edge-update",
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
