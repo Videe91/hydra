@@ -37,11 +37,12 @@
 //! callers can extend the shape without breaking deserialization.
 
 use crate::http::pagination::{paginate_by_cursor, PaginationQuery};
+use crate::http::tenant::{extract_tenant, tenant_error_response};
 use crate::query::QueryService;
 use crate::runtime::RuntimeHandle;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -250,6 +251,19 @@ fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// 501 response used by every `/query/nodes/*` and `/query/edges/*`
+/// route until Multi-tenant Patch 2B lands `NodeMeta.tenant_id` and
+/// `EdgeMeta.tenant_id`. Graph topology has no tenant field today, so
+/// any "tenant-filtered" result would be a lie — better to fail
+/// honestly than to fake isolation.
+fn graph_topology_not_tenant_scoped() -> Response {
+    error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "tenant-scoped graph topology not yet supported; will land in \
+         Multi-tenant Patch 2B once NodeMeta/EdgeMeta carry tenant_id",
+    )
+}
+
 // === Status parsers (return None on unknown variant → 400) ===
 
 fn parse_claim_status(status: &str) -> Option<ClaimStatus> {
@@ -323,104 +337,96 @@ fn parse_claim_subject(subject_kind: &str, subject_value: &str) -> Option<ClaimS
 // === Node handlers ===
 
 async fn list_nodes(
-    State(state): State<QueryHttpState>,
-    Query(query): Query<PaginationQuery>,
+    State(_state): State<QueryHttpState>,
+    headers: HeaderMap,
+    Query(_query): Query<PaginationQuery>,
 ) -> Response {
-    let nodes = state.service.nodes().await;
-    match paginate_by_cursor(&nodes, query.after.as_deref(), query.limit, |node| {
-        node.id().to_string()
-    }) {
-        Ok(page) => Json(page).into_response(),
-        Err(_) => error_response(
-            StatusCode::BAD_REQUEST,
-            format!("unknown node cursor: {}", query.after.unwrap_or_default()),
-        ),
+    if let Err(error) = extract_tenant(&headers) {
+        return tenant_error_response(error);
     }
+    graph_topology_not_tenant_scoped()
 }
 
 async fn get_node(
-    State(state): State<QueryHttpState>,
-    Path(node_id): Path<String>,
+    State(_state): State<QueryHttpState>,
+    headers: HeaderMap,
+    Path(_node_id): Path<String>,
 ) -> Response {
-    let id = NodeId::from_str(&node_id);
-    match state.service.node(&id).await {
-        Some(node) => Json(NodeResponse { node }).into_response(),
-        None => error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}")),
+    if let Err(error) = extract_tenant(&headers) {
+        return tenant_error_response(error);
     }
+    graph_topology_not_tenant_scoped()
 }
 
 async fn node_neighbors(
-    State(state): State<QueryHttpState>,
-    Path(node_id): Path<String>,
+    State(_state): State<QueryHttpState>,
+    headers: HeaderMap,
+    Path(_node_id): Path<String>,
 ) -> Response {
-    let id = NodeId::from_str(&node_id);
-    if state.service.node(&id).await.is_none() {
-        return error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}"));
+    if let Err(error) = extract_tenant(&headers) {
+        return tenant_error_response(error);
     }
-    let nodes = state.service.neighbors(&id).await;
-    Json(NodesResponse { nodes }).into_response()
+    graph_topology_not_tenant_scoped()
 }
 
 async fn node_outgoing_edges(
-    State(state): State<QueryHttpState>,
-    Path(node_id): Path<String>,
+    State(_state): State<QueryHttpState>,
+    headers: HeaderMap,
+    Path(_node_id): Path<String>,
 ) -> Response {
-    let id = NodeId::from_str(&node_id);
-    if state.service.node(&id).await.is_none() {
-        return error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}"));
+    if let Err(error) = extract_tenant(&headers) {
+        return tenant_error_response(error);
     }
-    let edges = state.service.outgoing_edges(&id).await;
-    Json(EdgesResponse { edges }).into_response()
+    graph_topology_not_tenant_scoped()
 }
 
 async fn node_incoming_edges(
-    State(state): State<QueryHttpState>,
-    Path(node_id): Path<String>,
+    State(_state): State<QueryHttpState>,
+    headers: HeaderMap,
+    Path(_node_id): Path<String>,
 ) -> Response {
-    let id = NodeId::from_str(&node_id);
-    if state.service.node(&id).await.is_none() {
-        return error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}"));
+    if let Err(error) = extract_tenant(&headers) {
+        return tenant_error_response(error);
     }
-    let edges = state.service.incoming_edges(&id).await;
-    Json(EdgesResponse { edges }).into_response()
+    graph_topology_not_tenant_scoped()
 }
 
 // === Edge handlers ===
 
 async fn list_edges(
-    State(state): State<QueryHttpState>,
-    Query(query): Query<PaginationQuery>,
+    State(_state): State<QueryHttpState>,
+    headers: HeaderMap,
+    Query(_query): Query<PaginationQuery>,
 ) -> Response {
-    let edges = state.service.edges().await;
-    match paginate_by_cursor(&edges, query.after.as_deref(), query.limit, |edge| {
-        edge.id().to_string()
-    }) {
-        Ok(page) => Json(page).into_response(),
-        Err(_) => error_response(
-            StatusCode::BAD_REQUEST,
-            format!("unknown edge cursor: {}", query.after.unwrap_or_default()),
-        ),
+    if let Err(error) = extract_tenant(&headers) {
+        return tenant_error_response(error);
     }
+    graph_topology_not_tenant_scoped()
 }
 
 async fn get_edge(
-    State(state): State<QueryHttpState>,
-    Path(edge_id): Path<String>,
+    State(_state): State<QueryHttpState>,
+    headers: HeaderMap,
+    Path(_edge_id): Path<String>,
 ) -> Response {
-    let id = EdgeId::from_str(&edge_id);
-    match state.service.edge(&id).await {
-        Some(edge) => Json(EdgeResponse { edge }).into_response(),
-        None => error_response(StatusCode::NOT_FOUND, format!("edge not found: {edge_id}")),
+    if let Err(error) = extract_tenant(&headers) {
+        return tenant_error_response(error);
     }
+    graph_topology_not_tenant_scoped()
 }
 
 // === Evidence handlers ===
 
 async fn list_evidence(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Query(query): Query<PaginationQuery>,
 ) -> Response {
-    let evidence = state.service.evidence_items().await;
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    let evidence = state.service.evidence_items_for_tenant(&tenant).await;
     match paginate_by_cursor(&evidence, query.after.as_deref(), query.limit, |evidence| {
         evidence.id.to_string()
     }) {
@@ -434,10 +440,15 @@ async fn list_evidence(
 
 async fn get_evidence(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(evidence_id): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = EvidenceId::from_str(&evidence_id);
-    match state.service.evidence(&id).await {
+    match state.service.evidence_for_tenant(&id, &tenant).await {
         Some(evidence) => Json(EvidenceResponse { evidence }).into_response(),
         None => error_response(
             StatusCode::NOT_FOUND,
@@ -450,9 +461,14 @@ async fn get_evidence(
 
 async fn list_claims(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Query(query): Query<PaginationQuery>,
 ) -> Response {
-    let claims = state.service.claims().await;
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    let claims = state.service.claims_for_tenant(&tenant).await;
     match paginate_by_cursor(&claims, query.after.as_deref(), query.limit, |claim| {
         claim.id.to_string()
     }) {
@@ -466,10 +482,15 @@ async fn list_claims(
 
 async fn get_claim(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(claim_id): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = ClaimId::from_str(&claim_id);
-    match state.service.claim(&id).await {
+    match state.service.claim_for_tenant(&id, &tenant).await {
         Some(claim) => Json(ClaimResponse { claim }).into_response(),
         None => error_response(StatusCode::NOT_FOUND, format!("claim not found: {claim_id}")),
     }
@@ -477,8 +498,13 @@ async fn get_claim(
 
 async fn claims_by_status(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(status): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let status_enum = match parse_claim_status(&status) {
         Some(s) => s,
         None => {
@@ -488,7 +514,10 @@ async fn claims_by_status(
             );
         }
     };
-    let claims = state.service.claims_with_status(status_enum).await;
+    let claims = state
+        .service
+        .claims_with_status_for_tenant(status_enum, &tenant)
+        .await;
     Json(ClaimsResponse { claims }).into_response()
 }
 
@@ -496,9 +525,14 @@ async fn claims_by_status(
 
 async fn list_actions(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Query(query): Query<PaginationQuery>,
 ) -> Response {
-    let actions = state.service.actions().await;
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    let actions = state.service.actions_for_tenant(&tenant).await;
     match paginate_by_cursor(&actions, query.after.as_deref(), query.limit, |action| {
         action.id.to_string()
     }) {
@@ -512,10 +546,15 @@ async fn list_actions(
 
 async fn get_action(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(action_id): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = ActionId::from_str(&action_id);
-    match state.service.action(&id).await {
+    match state.service.action_for_tenant(&id, &tenant).await {
         Some(action) => Json(ActionResponse { action }).into_response(),
         None => error_response(
             StatusCode::NOT_FOUND,
@@ -526,8 +565,13 @@ async fn get_action(
 
 async fn actions_by_status(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(status): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let status_enum = match parse_action_status(&status) {
         Some(s) => s,
         None => {
@@ -537,22 +581,33 @@ async fn actions_by_status(
             );
         }
     };
-    let actions = state.service.actions_with_status(status_enum).await;
+    let actions = state
+        .service
+        .actions_with_status_for_tenant(status_enum, &tenant)
+        .await;
     Json(ActionsResponse { actions }).into_response()
 }
 
 async fn outcomes_for_action(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(action_id): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = ActionId::from_str(&action_id);
-    if state.service.action(&id).await.is_none() {
+    if state.service.action_for_tenant(&id, &tenant).await.is_none() {
         return error_response(
             StatusCode::NOT_FOUND,
             format!("action not found: {action_id}"),
         );
     }
-    let outcomes = state.service.outcomes_for_action(&id).await;
+    let outcomes = state
+        .service
+        .outcomes_for_action_for_tenant(&id, &tenant)
+        .await;
     Json(OutcomesResponse { outcomes }).into_response()
 }
 
@@ -566,11 +621,16 @@ async fn outcomes_for_action(
 
 async fn sensor_runs(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(sensor_id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = SensorId::from_str(&sensor_id);
-    let runs = state.service.runs_for_sensor(&id).await;
+    let runs = state.service.runs_for_sensor_for_tenant(&id, &tenant).await;
     match paginate_by_cursor(&runs, query.after.as_deref(), query.limit, |run| {
         run.id.to_string()
     }) {
@@ -587,11 +647,19 @@ async fn sensor_runs(
 
 async fn sensor_checkpoints(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(sensor_id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = SensorId::from_str(&sensor_id);
-    let checkpoints = state.service.checkpoints_for_sensor(&id).await;
+    let checkpoints = state
+        .service
+        .checkpoints_for_sensor_for_tenant(&id, &tenant)
+        .await;
     match paginate_by_cursor(
         &checkpoints,
         query.after.as_deref(),
@@ -611,12 +679,17 @@ async fn sensor_checkpoints(
 
 async fn latest_sensor_checkpoint(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path((sensor_id, source)): Path<(String, String)>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = SensorId::from_str(&sensor_id);
     match state
         .service
-        .latest_sensor_checkpoint(&id, &source)
+        .latest_sensor_checkpoint_for_tenant(&id, &source, &tenant)
         .await
     {
         Some(checkpoint) => Json(SensorCheckpointResponse { checkpoint }).into_response(),
@@ -634,7 +707,18 @@ async fn latest_sensor_checkpoint(
 // the query-string parsers (TraversalDirection, ClaimKind,
 // ClaimSubject) and the BFS pagination via the shared helper.
 
-async fn query_stats(State(state): State<QueryHttpState>) -> Response {
+async fn query_stats(
+    State(state): State<QueryHttpState>,
+    headers: HeaderMap,
+) -> Response {
+    // Tenant header is required but stats are global in v0 — counts
+    // span all tenants. This is a control-plane convenience, not a
+    // data-leak surface (no per-row data is exposed). Per-tenant
+    // counts are a future patch alongside true tenant scoping for
+    // graph topology.
+    if let Err(error) = extract_tenant(&headers) {
+        return tenant_error_response(error);
+    }
     let stats = state.service.stats().await;
     Json(StatsResponse {
         node_count: stats.node_count,
@@ -646,56 +730,35 @@ async fn query_stats(State(state): State<QueryHttpState>) -> Response {
 }
 
 async fn node_bfs(
-    State(state): State<QueryHttpState>,
-    Path(node_id): Path<String>,
-    Query(query): Query<BfsQuery>,
+    State(_state): State<QueryHttpState>,
+    headers: HeaderMap,
+    Path(_node_id): Path<String>,
+    Query(_query): Query<BfsQuery>,
 ) -> Response {
-    let id = NodeId::from_str(&node_id);
-    if state.service.node(&id).await.is_none() {
-        return error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}"));
+    if let Err(error) = extract_tenant(&headers) {
+        return tenant_error_response(error);
     }
-    let direction = match parse_traversal_direction(query.direction.as_deref()) {
-        Some(d) => d,
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "unknown direction: {} (expected outgoing|incoming|both)",
-                    query.direction.unwrap_or_default()
-                ),
-            );
-        }
-    };
-    let traversal: Vec<NodeId> = match query.type_filter {
-        Some(type_filter) => state.service.bfs_by_type(&id, direction, type_filter).await,
-        None => state.service.bfs(&id, direction).await,
-    };
-    // Paginate the resulting NodeId list — BFS from a hub node can
-    // return thousands of ids and the response would otherwise be
-    // unbounded.
-    match paginate_by_cursor(
-        &traversal,
-        query.after.as_deref(),
-        query.limit,
-        |node_id| node_id.to_string(),
-    ) {
-        Ok(page) => Json(page).into_response(),
-        Err(_) => error_response(
-            StatusCode::BAD_REQUEST,
-            format!("unknown bfs cursor: {}", query.after.unwrap_or_default()),
-        ),
-    }
+    graph_topology_not_tenant_scoped()
 }
+
+// Causal/counterfactual routes are gated on the *seed* event's
+// tenant ownership. v0 returns the engine's traversal result as-is —
+// cross-tenant descendants are possible if the engine emitted them
+// in the same causal chain (a cascade reflex producing a
+// system-level event in response to a tenant event, for example).
+// Strict descendant filtering is deferred to a future patch.
 
 async fn event_causal_chain(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(event_id): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = EventId::from_str(&event_id);
-    // Existence check up front — `causal_chain` returns an empty Vec
-    // both for "leaf event with no descendants" and "unknown event",
-    // so we can't infer 404 from emptiness alone.
-    if state.service.event(&id).await.is_none() {
+    if state.service.event_for_tenant(&id, &tenant).await.is_none() {
         return error_response(StatusCode::NOT_FOUND, format!("event not found: {event_id}"));
     }
     let events = state.service.causal_chain(&id).await;
@@ -704,10 +767,15 @@ async fn event_causal_chain(
 
 async fn event_root_cause(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(event_id): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = EventId::from_str(&event_id);
-    if state.service.event(&id).await.is_none() {
+    if state.service.event_for_tenant(&id, &tenant).await.is_none() {
         return error_response(StatusCode::NOT_FOUND, format!("event not found: {event_id}"));
     }
     let events = state.service.root_cause(&id).await;
@@ -716,9 +784,17 @@ async fn event_root_cause(
 
 async fn event_counterfactual(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(event_id): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = EventId::from_str(&event_id);
+    if state.service.event_for_tenant(&id, &tenant).await.is_none() {
+        return error_response(StatusCode::NOT_FOUND, format!("event not found: {event_id}"));
+    }
     match state.service.counterfactual(&id).await {
         Ok(diff) => Json(CounterfactualResponse { diff }).into_response(),
         Err(err) => error_response(
@@ -730,9 +806,17 @@ async fn event_counterfactual(
 
 async fn event_impact_score(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(event_id): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = EventId::from_str(&event_id);
+    if state.service.event_for_tenant(&id, &tenant).await.is_none() {
+        return error_response(StatusCode::NOT_FOUND, format!("event not found: {event_id}"));
+    }
     match state.service.impact_score(&id).await {
         Ok(score) => Json(ImpactScoreResponse { score }).into_response(),
         Err(err) => error_response(
@@ -744,25 +828,43 @@ async fn event_impact_score(
 
 async fn claims_using_evidence(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(evidence_id): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = EvidenceId::from_str(&evidence_id);
-    if state.service.evidence(&id).await.is_none() {
+    if state
+        .service
+        .evidence_for_tenant(&id, &tenant)
+        .await
+        .is_none()
+    {
         return error_response(
             StatusCode::NOT_FOUND,
             format!("evidence not found: {evidence_id}"),
         );
     }
-    let claims = state.service.claims_using_evidence(&id).await;
+    let claims = state
+        .service
+        .claims_using_evidence_for_tenant(&id, &tenant)
+        .await;
     Json(ClaimsResponse { claims }).into_response()
 }
 
 async fn get_outcome(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(outcome_id): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let id = OutcomeId::from_str(&outcome_id);
-    match state.service.outcome(&id).await {
+    match state.service.outcome_for_tenant(&id, &tenant).await {
         Some(outcome) => Json(OutcomeResponse { outcome }).into_response(),
         None => error_response(
             StatusCode::NOT_FOUND,
@@ -773,8 +875,13 @@ async fn get_outcome(
 
 async fn claims_by_kind(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Path(kind): Path<String>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let kind_enum = match parse_claim_kind(&kind) {
         Some(k) => k,
         None => {
@@ -784,14 +891,22 @@ async fn claims_by_kind(
             );
         }
     };
-    let claims = state.service.claims_with_kind(kind_enum).await;
+    let claims = state
+        .service
+        .claims_with_kind_for_tenant(kind_enum, &tenant)
+        .await;
     Json(ClaimsResponse { claims }).into_response()
 }
 
 async fn claims_for_subject(
     State(state): State<QueryHttpState>,
+    headers: HeaderMap,
     Query(query): Query<ClaimsForSubjectQuery>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let subject = match parse_claim_subject(&query.subject_kind, &query.subject_value) {
         Some(s) => s,
         None => {
@@ -804,7 +919,10 @@ async fn claims_for_subject(
             );
         }
     };
-    let claims = state.service.claims_for_subject(subject).await;
+    let claims = state
+        .service
+        .claims_for_subject_for_tenant(subject, &tenant)
+        .await;
     Json(ClaimsResponse { claims }).into_response()
 }
 
@@ -824,7 +942,26 @@ mod tests {
     use std::collections::HashMap;
     use tower::ServiceExt;
 
+    const TEST_TENANT: &str = "tenant_http_query_test";
+
+    /// Default GET helper that injects the canonical test tenant
+    /// header. Existing tests that built data with the same tenant
+    /// (via the `tenant()` helper) get tenant-filtered reads "for
+    /// free" without modification.
     fn empty_get(uri: &str) -> Request<Body> {
+        empty_get_for(uri, TEST_TENANT)
+    }
+
+    fn empty_get_for(uri: &str, tenant: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("X-Hydra-Tenant", tenant)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn empty_get_without_tenant(uri: &str) -> Request<Body> {
         Request::builder()
             .method(Method::GET)
             .uri(uri)
@@ -909,7 +1046,7 @@ mod tests {
         let now = chrono::Utc::now();
         Action {
             id: ActionId::new(),
-            tenant_id: None,
+            tenant_id: Some(tenant()),
             kind: ActionKind::Backfill,
             status: ActionStatus::Proposed,
             targets: vec![ActionTarget::Dataset("ds".to_string())],
@@ -927,132 +1064,56 @@ mod tests {
         }
     }
 
-    // === Nodes ===
+    // === Graph topology (501 until Patch 2B) ===
+    //
+    // Node and edge routes return 501 because NodeMeta/EdgeMeta don't
+    // carry tenant_id yet — see `graph_topology_not_tenant_scoped`.
+    // Pre-Patch 2A tests that exercised tenant-less node/edge filtering
+    // are deliberately removed. Patch 2B will bring them back with
+    // real tenant scoping.
 
     #[tokio::test]
-    async fn list_nodes_returns_empty_when_no_nodes() {
+    async fn list_nodes_returns_501_with_tenant() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
         let app = query_router(runtime);
         let response = app.oneshot(empty_get("/query/nodes")).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: Page<Node> = read_json(response).await;
-        assert_eq!(decoded.items.len(), 0);
-        assert_eq!(decoded.next_cursor, None);
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
-    async fn list_nodes_returns_ingested_nodes() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        let node_id = NodeId::new();
-        {
-            let hydra = runtime.hydra();
-            let mut hydra = hydra.write().await;
-            hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: node_id.clone(),
-                    type_id: "ec2".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-        }
-        let app = query_router(runtime);
-        let response = app.oneshot(empty_get("/query/nodes")).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: Page<Node> = read_json(response).await;
-        assert_eq!(decoded.items.len(), 1);
-        assert_eq!(decoded.items[0].id(), &node_id);
-        assert_eq!(decoded.next_cursor, None);
-    }
-
-    #[tokio::test]
-    async fn get_node_returns_node_when_present() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        let node_id = NodeId::new();
-        {
-            let hydra = runtime.hydra();
-            let mut hydra = hydra.write().await;
-            hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: node_id.clone(),
-                    type_id: "ec2".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-        }
-        let app = query_router(runtime);
-        let response = app
-            .oneshot(empty_get(&format!("/query/nodes/{node_id}")))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: NodeResponse = read_json(response).await;
-        assert_eq!(decoded.node.id(), &node_id);
-        assert_eq!(decoded.node.type_id(), "ec2");
-    }
-
-    #[tokio::test]
-    async fn get_node_returns_404_when_missing() {
+    async fn get_node_returns_501_with_tenant() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
         let app = query_router(runtime);
         let response = app
-            .oneshot(empty_get("/query/nodes/node_missing"))
+            .oneshot(empty_get("/query/nodes/node_x"))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
-    async fn node_neighbors_returns_connected_nodes() {
+    async fn node_neighbors_returns_501_with_tenant() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
-        let a = NodeId::new();
-        let b = NodeId::new();
-        {
-            let hydra = runtime.hydra();
-            let mut hydra = hydra.write().await;
-            hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: a.clone(),
-                    type_id: "ec2".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-            hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: b.clone(),
-                    type_id: "vpc".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-            hydra
-                .ingest(EventKind::EdgeCreated {
-                    edge_id: hydra_core::EdgeId::new(),
-                    source: a.clone(),
-                    target: b.clone(),
-                    type_id: "in_vpc".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-        }
         let app = query_router(runtime);
         let response = app
-            .oneshot(empty_get(&format!("/query/nodes/{a}/neighbors")))
+            .oneshot(empty_get("/query/nodes/node_x/neighbors"))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: NodesResponse = read_json(response).await;
-        assert_eq!(decoded.nodes.len(), 1);
-        assert_eq!(decoded.nodes[0].id(), &b);
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
-    async fn node_neighbors_returns_404_when_missing() {
+    async fn list_nodes_without_tenant_returns_400_not_501() {
+        // The 400 check fires BEFORE the 501 — proves we're not
+        // accidentally leaking the 501 message to unauthenticated
+        // requests.
         let (runtime, _processor) = RuntimeBuilder::new().build();
         let app = query_router(runtime);
         let response = app
-            .oneshot(empty_get("/query/nodes/node_missing/neighbors"))
+            .oneshot(empty_get_without_tenant("/query/nodes"))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     // === Claims ===
@@ -1298,178 +1359,42 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    // === Edges ===
+    // === Edges (501 until Patch 2B) ===
 
     #[tokio::test]
-    async fn list_edges_returns_empty_when_no_edges() {
+    async fn list_edges_returns_501_with_tenant() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
         let app = query_router(runtime);
         let response = app.oneshot(empty_get("/query/edges")).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: Page<Edge> = read_json(response).await;
-        assert_eq!(decoded.items.len(), 0);
-        assert_eq!(decoded.next_cursor, None);
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
-    async fn list_and_get_edge_round_trip() {
+    async fn get_edge_returns_501_with_tenant() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
-        let a = NodeId::new();
-        let b = NodeId::new();
-        let edge_id = hydra_core::EdgeId::new();
-        {
-            let hydra = runtime.hydra();
-            let mut hydra = hydra.write().await;
-            hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: a.clone(),
-                    type_id: "ec2".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-            hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: b.clone(),
-                    type_id: "vpc".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-            hydra
-                .ingest(EventKind::EdgeCreated {
-                    edge_id: edge_id.clone(),
-                    source: a.clone(),
-                    target: b.clone(),
-                    type_id: "in_vpc".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-        }
         let app = query_router(runtime);
-
         let response = app
+            .oneshot(empty_get("/query/edges/edg_x"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn node_outgoing_and_incoming_edges_return_501() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let outgoing = app
             .clone()
-            .oneshot(empty_get("/query/edges"))
+            .oneshot(empty_get("/query/nodes/node_x/outgoing-edges"))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: Page<Edge> = read_json(response).await;
-        assert_eq!(decoded.items.len(), 1);
-        assert_eq!(decoded.items[0].id(), &edge_id);
-
-        let response = app
-            .oneshot(empty_get(&format!("/query/edges/{edge_id}")))
+        assert_eq!(outgoing.status(), StatusCode::NOT_IMPLEMENTED);
+        let incoming = app
+            .oneshot(empty_get("/query/nodes/node_x/incoming-edges"))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: EdgeResponse = read_json(response).await;
-        assert_eq!(decoded.edge.id(), &edge_id);
-        assert_eq!(decoded.edge.source(), &a);
-        assert_eq!(decoded.edge.target(), &b);
-    }
-
-    #[tokio::test]
-    async fn get_edge_returns_404_when_missing() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        let app = query_router(runtime);
-        let response = app
-            .oneshot(empty_get("/query/edges/edg_missing"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn node_outgoing_and_incoming_edges() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        let a = NodeId::new();
-        let b = NodeId::new();
-        let edge_id = hydra_core::EdgeId::new();
-        {
-            let hydra = runtime.hydra();
-            let mut hydra = hydra.write().await;
-            hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: a.clone(),
-                    type_id: "ec2".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-            hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: b.clone(),
-                    type_id: "vpc".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-            hydra
-                .ingest(EventKind::EdgeCreated {
-                    edge_id: edge_id.clone(),
-                    source: a.clone(),
-                    target: b.clone(),
-                    type_id: "in_vpc".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-        }
-        let app = query_router(runtime);
-
-        let response = app
-            .clone()
-            .oneshot(empty_get(&format!("/query/nodes/{a}/outgoing-edges")))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: EdgesResponse = read_json(response).await;
-        assert_eq!(decoded.edges.len(), 1);
-        assert_eq!(decoded.edges[0].id(), &edge_id);
-
-        let response = app
-            .clone()
-            .oneshot(empty_get(&format!("/query/nodes/{b}/incoming-edges")))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: EdgesResponse = read_json(response).await;
-        assert_eq!(decoded.edges.len(), 1);
-        assert_eq!(decoded.edges[0].id(), &edge_id);
-
-        // Source has no incoming, target has no outgoing.
-        let response = app
-            .clone()
-            .oneshot(empty_get(&format!("/query/nodes/{a}/incoming-edges")))
-            .await
-            .unwrap();
-        let decoded: EdgesResponse = read_json(response).await;
-        assert_eq!(decoded.edges.len(), 0);
-
-        let response = app
-            .oneshot(empty_get(&format!("/query/nodes/{b}/outgoing-edges")))
-            .await
-            .unwrap();
-        let decoded: EdgesResponse = read_json(response).await;
-        assert_eq!(decoded.edges.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn node_outgoing_edges_returns_404_when_node_missing() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        let app = query_router(runtime);
-        let response = app
-            .oneshot(empty_get("/query/nodes/node_missing/outgoing-edges"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn node_incoming_edges_returns_404_when_node_missing() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        let app = query_router(runtime);
-        let response = app
-            .oneshot(empty_get("/query/nodes/node_missing/incoming-edges"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(incoming.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     // === Evidence ===
@@ -1536,9 +1461,18 @@ mod tests {
         sensor_id: &SensorId,
         offset: &str,
     ) -> hydra_core::SensorCheckpoint {
+        observe_for(hydra, sensor_id, offset, tenant())
+    }
+
+    fn observe_for(
+        hydra: &mut hydra_engine::hydra::Hydra,
+        sensor_id: &SensorId,
+        offset: &str,
+        owner: TenantId,
+    ) -> hydra_core::SensorCheckpoint {
         use hydra_core::{NodeId, SourceCursor};
         hydra
-            .record_sensor_observation(
+            .record_sensor_observation_for_tenant(
                 sensor_id.clone(),
                 "bank",
                 SourceCursor::Offset {
@@ -1551,6 +1485,7 @@ mod tests {
                     name: format!("obs_{offset}"),
                     payload: HashMap::new(),
                 },
+                owner,
             )
             .unwrap()
     }
@@ -1685,128 +1620,11 @@ mod tests {
     }
 
     // === Pagination ===
-
-    #[tokio::test]
-    async fn list_nodes_respects_limit_and_returns_cursor() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        {
-            let hydra = runtime.hydra();
-            let mut hydra = hydra.write().await;
-            for _ in 0..3 {
-                hydra
-                    .ingest(EventKind::NodeCreated {
-                        node_id: NodeId::new(),
-                        type_id: "ec2".to_string(),
-                        properties: HashMap::new(),
-                    })
-                    .unwrap();
-            }
-        }
-        let app = query_router(runtime);
-        let response = app
-            .oneshot(empty_get("/query/nodes?limit=2"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: Page<Node> = read_json(response).await;
-        assert_eq!(decoded.items.len(), 2);
-        assert!(decoded.next_cursor.is_some());
-    }
-
-    #[tokio::test]
-    async fn list_nodes_walks_full_set_with_after_cursor() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        {
-            let hydra = runtime.hydra();
-            let mut hydra = hydra.write().await;
-            for _ in 0..3 {
-                hydra
-                    .ingest(EventKind::NodeCreated {
-                        node_id: NodeId::new(),
-                        type_id: "ec2".to_string(),
-                        properties: HashMap::new(),
-                    })
-                    .unwrap();
-            }
-        }
-        let app = query_router(runtime);
-
-        let response = app
-            .clone()
-            .oneshot(empty_get("/query/nodes?limit=2"))
-            .await
-            .unwrap();
-        let first: Page<Node> = read_json(response).await;
-        assert_eq!(first.items.len(), 2);
-        let cursor = first.next_cursor.expect("first page must have cursor");
-
-        let response = app
-            .oneshot(empty_get(&format!("/query/nodes?limit=2&after={cursor}")))
-            .await
-            .unwrap();
-        let second: Page<Node> = read_json(response).await;
-        assert_eq!(second.items.len(), 1);
-        assert_eq!(second.next_cursor, None);
-    }
-
-    #[tokio::test]
-    async fn list_nodes_unknown_cursor_returns_400() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        let app = query_router(runtime);
-        let response = app
-            .oneshot(empty_get("/query/nodes?after=node_bogus"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn list_edges_paginates() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        let mut edge_ids = Vec::new();
-        {
-            let hydra = runtime.hydra();
-            let mut hydra = hydra.write().await;
-            let a = NodeId::new();
-            let b = NodeId::new();
-            hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: a.clone(),
-                    type_id: "ec2".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-            hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: b.clone(),
-                    type_id: "vpc".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-            for _ in 0..2 {
-                let edge_id = hydra_core::EdgeId::new();
-                hydra
-                    .ingest(EventKind::EdgeCreated {
-                        edge_id: edge_id.clone(),
-                        source: a.clone(),
-                        target: b.clone(),
-                        type_id: "in_vpc".to_string(),
-                        properties: HashMap::new(),
-                    })
-                    .unwrap();
-                edge_ids.push(edge_id);
-            }
-        }
-        let app = query_router(runtime);
-        let response = app
-            .oneshot(empty_get("/query/edges?limit=1"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: Page<Edge> = read_json(response).await;
-        assert_eq!(decoded.items.len(), 1);
-        assert!(decoded.next_cursor.is_some());
-    }
+    //
+    // Node/edge pagination tests are gone with Patch 2A — the routes
+    // now 501. Tenant-scoped pagination over node/edge data lands in
+    // Patch 2B together with NodeMeta.tenant_id. Sensor pagination
+    // survives.
 
     #[tokio::test]
     async fn sensor_checkpoints_paginates() {
@@ -1871,149 +1689,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_bfs_returns_outgoing_traversal() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        let a = NodeId::new();
-        let b = NodeId::new();
-        let c = NodeId::new();
-        {
-            let hydra = runtime.hydra();
-            let mut hydra = hydra.write().await;
-            for (id, type_id) in [(&a, "ec2"), (&b, "vpc"), (&c, "subnet")] {
-                hydra
-                    .ingest(EventKind::NodeCreated {
-                        node_id: id.clone(),
-                        type_id: type_id.to_string(),
-                        properties: HashMap::new(),
-                    })
-                    .unwrap();
-            }
-            hydra
-                .ingest(EventKind::EdgeCreated {
-                    edge_id: hydra_core::EdgeId::new(),
-                    source: a.clone(),
-                    target: b.clone(),
-                    type_id: "in_vpc".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-            hydra
-                .ingest(EventKind::EdgeCreated {
-                    edge_id: hydra_core::EdgeId::new(),
-                    source: b.clone(),
-                    target: c.clone(),
-                    type_id: "in_vpc".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-        }
-        let app = query_router(runtime);
-        let response = app
-            .oneshot(empty_get(&format!(
-                "/query/nodes/{a}/bfs?direction=outgoing"
-            )))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let decoded: Page<NodeId> = read_json(response).await;
-        // bfs_dyn includes the start node, so the traversal from `a`
-        // through the a -> b -> c chain returns [a, b, c].
-        assert_eq!(decoded.items.len(), 3);
-        assert!(decoded.items.contains(&a));
-        assert!(decoded.items.contains(&b));
-        assert!(decoded.items.contains(&c));
-    }
-
-    #[tokio::test]
-    async fn node_bfs_returns_404_when_node_missing() {
+    async fn node_bfs_returns_501_with_tenant() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
         let app = query_router(runtime);
         let response = app
-            .oneshot(empty_get("/query/nodes/node_missing/bfs"))
+            .oneshot(empty_get("/query/nodes/node_x/bfs?direction=outgoing"))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn node_bfs_returns_400_on_bad_direction() {
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        let start = NodeId::new();
-        {
-            let hydra = runtime.hydra();
-            let mut hydra = hydra.write().await;
-            hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: start.clone(),
-                    type_id: "ec2".to_string(),
-                    properties: HashMap::new(),
-                })
-                .unwrap();
-        }
-        let app = query_router(runtime);
-        let response = app
-            .oneshot(empty_get(&format!(
-                "/query/nodes/{start}/bfs?direction=sideways"
-            )))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn node_bfs_paginates_with_limit_and_cursor() {
-        // Build a 4-node chain a -> b -> c -> d and walk the BFS in pages.
-        let (runtime, _processor) = RuntimeBuilder::new().build();
-        let a = NodeId::new();
-        let b = NodeId::new();
-        let c = NodeId::new();
-        let d = NodeId::new();
-        {
-            let hydra = runtime.hydra();
-            let mut hydra = hydra.write().await;
-            for id in [&a, &b, &c, &d] {
-                hydra
-                    .ingest(EventKind::NodeCreated {
-                        node_id: id.clone(),
-                        type_id: "ec2".to_string(),
-                        properties: HashMap::new(),
-                    })
-                    .unwrap();
-            }
-            for (src, tgt) in [(&a, &b), (&b, &c), (&c, &d)] {
-                hydra
-                    .ingest(EventKind::EdgeCreated {
-                        edge_id: hydra_core::EdgeId::new(),
-                        source: src.clone(),
-                        target: tgt.clone(),
-                        type_id: "linked".to_string(),
-                        properties: HashMap::new(),
-                    })
-                    .unwrap();
-            }
-        }
-        let app = query_router(runtime);
-        let response = app
-            .clone()
-            .oneshot(empty_get(&format!(
-                "/query/nodes/{a}/bfs?direction=outgoing&limit=2"
-            )))
-            .await
-            .unwrap();
-        let first: Page<NodeId> = read_json(response).await;
-        // bfs returns [a, b, c, d] — first page of 2 → [a, b].
-        assert_eq!(first.items.len(), 2);
-        let cursor = first.next_cursor.clone().expect("expected next_cursor");
-
-        let response = app
-            .oneshot(empty_get(&format!(
-                "/query/nodes/{a}/bfs?direction=outgoing&limit=2&after={cursor}"
-            )))
-            .await
-            .unwrap();
-        let second: Page<NodeId> = read_json(response).await;
-        assert_eq!(second.items.len(), 2);
-        assert_eq!(second.next_cursor, None);
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     fn signal_event(name: &str) -> EventKind {
@@ -2031,7 +1714,9 @@ mod tests {
         {
             let hydra = runtime.hydra();
             let mut hydra = hydra.write().await;
-            let result = hydra.ingest(signal_event("kickoff")).unwrap();
+            let result = hydra
+                .ingest_for_tenant(signal_event("kickoff"), tenant())
+                .unwrap();
             trigger_id = result.events[0].id.clone();
         }
         let app = query_router(runtime);
@@ -2068,7 +1753,9 @@ mod tests {
         {
             let hydra = runtime.hydra();
             let mut hydra = hydra.write().await;
-            let result = hydra.ingest(signal_event("only")).unwrap();
+            let result = hydra
+                .ingest_for_tenant(signal_event("only"), tenant())
+                .unwrap();
             event_id = result.events[0].id.clone();
         }
         let app = query_router(runtime);
@@ -2103,11 +1790,14 @@ mod tests {
             let hydra = runtime.hydra();
             let mut hydra = hydra.write().await;
             let result = hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: NodeId::new(),
-                    type_id: "ec2".to_string(),
-                    properties: HashMap::new(),
-                })
+                .ingest_for_tenant(
+                    EventKind::NodeCreated {
+                        node_id: NodeId::new(),
+                        type_id: "ec2".to_string(),
+                        properties: HashMap::new(),
+                    },
+                    tenant(),
+                )
                 .unwrap();
             create_id = result.events[0].id.clone();
         }
@@ -2147,11 +1837,14 @@ mod tests {
             let hydra = runtime.hydra();
             let mut hydra = hydra.write().await;
             let result = hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: NodeId::new(),
-                    type_id: "ec2".to_string(),
-                    properties: HashMap::new(),
-                })
+                .ingest_for_tenant(
+                    EventKind::NodeCreated {
+                        node_id: NodeId::new(),
+                        type_id: "ec2".to_string(),
+                        properties: HashMap::new(),
+                    },
+                    tenant(),
+                )
                 .unwrap();
             create_id = result.events[0].id.clone();
         }
@@ -2370,5 +2063,284 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // === Tenant isolation (Multi-tenant Patch 2A) ===
+    //
+    // Focused tests that prove tenant A cannot see tenant B's data
+    // across the main read families. Helper-test coverage (missing
+    // tenant → 400, invalid tenant → 400) is centralized in
+    // `http::tenant::tests` — these tests focus on isolation
+    // behavior end-to-end through the router.
+
+    fn tenant_b() -> TenantId {
+        TenantId::from_str("tenant_other_b")
+    }
+
+    #[tokio::test]
+    async fn list_claims_without_tenant_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get_without_tenant("/query/claims"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_claims_with_invalid_tenant_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get_for("/query/claims", "../../etc/passwd"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn tenant_a_sees_own_claim_not_tenant_b_claim() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let ev = evidence(); // tenant_id = tenant_http_query_test (tenant A)
+        let claim_a = claim(ev.id.clone());
+        let claim_a_id = claim_a.id.clone();
+
+        let mut claim_b = claim(ev.id.clone());
+        claim_b.tenant_id = Some(tenant_b());
+        let claim_b_id = claim_b.id.clone();
+
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest_event(event(EventKind::EvidenceAdded { evidence: ev }))
+                .unwrap();
+            hydra
+                .ingest_event(event(EventKind::ClaimProposed { claim: claim_a }))
+                .unwrap();
+            // Build a tenant-B event envelope around the claim_b ingest.
+            let event_b = Event {
+                id: EventId::new(),
+                tenant_id: Some(tenant_b()),
+                timestamp: chrono::Utc::now(),
+                kind: EventKind::ClaimProposed { claim: claim_b },
+                caused_by: vec![],
+                cascade_id: CascadeId::new(),
+                cascade_depth: 0,
+                cascade_breadth_index: 0,
+            };
+            hydra.ingest_event(event_b).unwrap();
+        }
+        let app = query_router(runtime);
+
+        // Tenant A's list shows only claim_a.
+        let response = app
+            .clone()
+            .oneshot(empty_get("/query/claims"))
+            .await
+            .unwrap();
+        let decoded: Page<Claim> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.items[0].id, claim_a_id);
+
+        // Tenant A cannot get claim_b by id — 404, not 200 with body
+        // and not 403 (no existence leak).
+        let response = app
+            .oneshot(empty_get(&format!("/query/claims/{claim_b_id}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tenant_a_sees_own_evidence_only() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let ev_a = evidence(); // tenant A
+        let ev_a_id = ev_a.id.clone();
+        let ev_b = Evidence {
+            id: EvidenceId::new(),
+            tenant_id: Some(tenant_b()),
+            ..evidence()
+        };
+        let ev_b_id = ev_b.id.clone();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest_event(event(EventKind::EvidenceAdded { evidence: ev_a }))
+                .unwrap();
+            let event_b = Event {
+                id: EventId::new(),
+                tenant_id: Some(tenant_b()),
+                timestamp: chrono::Utc::now(),
+                kind: EventKind::EvidenceAdded { evidence: ev_b },
+                caused_by: vec![],
+                cascade_id: CascadeId::new(),
+                cascade_depth: 0,
+                cascade_breadth_index: 0,
+            };
+            hydra.ingest_event(event_b).unwrap();
+        }
+        let app = query_router(runtime);
+
+        let response = app
+            .clone()
+            .oneshot(empty_get("/query/evidence"))
+            .await
+            .unwrap();
+        let decoded: Page<Evidence> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.items[0].id, ev_a_id);
+
+        let response = app
+            .oneshot(empty_get(&format!("/query/evidence/{ev_b_id}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tenant_a_sees_own_actions_only() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let action_a = action(); // tenant A (action() helper now stamps tenant)
+        let action_a_id = action_a.id.clone();
+        let action_b = Action {
+            id: ActionId::new(),
+            tenant_id: Some(tenant_b()),
+            ..action()
+        };
+        let action_b_id = action_b.id.clone();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest_for_tenant(
+                    EventKind::ActionProposed { action: action_a },
+                    tenant(),
+                )
+                .unwrap();
+            hydra
+                .ingest_for_tenant(
+                    EventKind::ActionProposed { action: action_b },
+                    tenant_b(),
+                )
+                .unwrap();
+        }
+        let app = query_router(runtime);
+
+        let response = app
+            .clone()
+            .oneshot(empty_get("/query/actions"))
+            .await
+            .unwrap();
+        let decoded: Page<Action> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.items[0].id, action_a_id);
+
+        let response = app
+            .oneshot(empty_get(&format!("/query/actions/{action_b_id}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tenant_a_sees_own_sensor_checkpoints_only() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let sensor = SensorId::from_str("sensor_shared");
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            observe_for(&mut hydra, &sensor, "a1", tenant());
+            observe_for(&mut hydra, &sensor, "b1", tenant_b());
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/sensors/sensor_shared/checkpoints"))
+            .await
+            .unwrap();
+        let decoded: Page<SensorCheckpoint> = read_json(response).await;
+        // Tenant A sees only their own checkpoint.
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(
+            decoded.items[0].tenant_id.as_ref().map(|t| t.to_string()),
+            Some(tenant().to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn causal_chain_seed_from_other_tenant_returns_404() {
+        // Event ingested under tenant_b cannot be reached via
+        // /query/events/:id/causal-chain by tenant_a (the default
+        // header) — the seed lookup is gated by tenant ownership.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let seed_id;
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            let result = hydra
+                .ingest_for_tenant(
+                    EventKind::Signal {
+                        source: NodeId::from_str("other.tenant"),
+                        name: "tenant_b_seed".to_string(),
+                        payload: HashMap::new(),
+                    },
+                    tenant_b(),
+                )
+                .unwrap();
+            seed_id = result.events[0].id.clone();
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!("/query/events/{seed_id}/causal-chain")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stats_returns_global_counts_with_any_tenant() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest_for_tenant(
+                    EventKind::Signal {
+                        source: NodeId::from_str("any"),
+                        name: "a".to_string(),
+                        payload: HashMap::new(),
+                    },
+                    tenant(),
+                )
+                .unwrap();
+            hydra
+                .ingest_for_tenant(
+                    EventKind::Signal {
+                        source: NodeId::from_str("any"),
+                        name: "b".to_string(),
+                        payload: HashMap::new(),
+                    },
+                    tenant_b(),
+                )
+                .unwrap();
+        }
+        let app = query_router(runtime);
+        // Tenant A and tenant B both see the same global counts in v0.
+        let response = app
+            .clone()
+            .oneshot(empty_get("/query/stats"))
+            .await
+            .unwrap();
+        let a_view: StatsResponse = read_json(response).await;
+        assert_eq!(a_view.total_events, 2);
+
+        let response = app
+            .oneshot(empty_get_for("/query/stats", "tenant_other_b"))
+            .await
+            .unwrap();
+        let b_view: StatsResponse = read_json(response).await;
+        assert_eq!(b_view.total_events, 2);
     }
 }

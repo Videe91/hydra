@@ -5,7 +5,7 @@ use hydra_core::id::{CascadeId, EdgeId, EventId, NodeId};
 use hydra_core::node::Node;
 use hydra_core::{
     Action, ActionId, ActionStatus, Claim, ClaimId, ClaimKind, ClaimStatus, ClaimSubject, Evidence,
-    EvidenceId, Outcome, OutcomeId, SensorCheckpoint, SensorId, SensorRun,
+    EvidenceId, Outcome, OutcomeId, SensorCheckpoint, SensorId, SensorRun, TenantId,
 };
 use hydra_engine::hydra::Hydra;
 use std::sync::Arc;
@@ -442,6 +442,186 @@ impl QueryService {
     ) -> Option<SensorCheckpoint> {
         let hydra = self.hydra.read().await;
         hydra.latest_sensor_checkpoint(sensor_id, source).cloned()
+    }
+
+    // === Tenant-aware queries (Multi-tenant Patch 2A) ===
+    //
+    // These mirror the non-tenant accessors above with strict scope:
+    // `entity.tenant_id == Some(tenant)` — entities with `tenant_id: None`
+    // (system/global data) are *not* returned. Single-id lookups return
+    // `None` when the entity exists but belongs to another tenant so
+    // HTTP handlers can 404 without leaking existence.
+
+    pub async fn claims_for_tenant(&self, tenant: &TenantId) -> Vec<Claim> {
+        self.claims()
+            .await
+            .into_iter()
+            .filter(|c| c.tenant_id.as_ref() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn claim_for_tenant(&self, id: &ClaimId, tenant: &TenantId) -> Option<Claim> {
+        self.claim(id)
+            .await
+            .filter(|c| c.tenant_id.as_ref() == Some(tenant))
+    }
+
+    pub async fn claims_with_status_for_tenant(
+        &self,
+        status: ClaimStatus,
+        tenant: &TenantId,
+    ) -> Vec<Claim> {
+        self.claims_with_status(status)
+            .await
+            .into_iter()
+            .filter(|c| c.tenant_id.as_ref() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn claims_with_kind_for_tenant(
+        &self,
+        kind: ClaimKind,
+        tenant: &TenantId,
+    ) -> Vec<Claim> {
+        self.claims_with_kind(kind)
+            .await
+            .into_iter()
+            .filter(|c| c.tenant_id.as_ref() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn claims_for_subject_for_tenant(
+        &self,
+        subject: ClaimSubject,
+        tenant: &TenantId,
+    ) -> Vec<Claim> {
+        self.claims_for_subject(subject)
+            .await
+            .into_iter()
+            .filter(|c| c.tenant_id.as_ref() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn claims_using_evidence_for_tenant(
+        &self,
+        evidence_id: &EvidenceId,
+        tenant: &TenantId,
+    ) -> Vec<Claim> {
+        self.claims_using_evidence(evidence_id)
+            .await
+            .into_iter()
+            .filter(|c| c.tenant_id.as_ref() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn evidence_for_tenant(
+        &self,
+        id: &EvidenceId,
+        tenant: &TenantId,
+    ) -> Option<Evidence> {
+        self.evidence(id)
+            .await
+            .filter(|e| e.tenant_id.as_ref() == Some(tenant))
+    }
+
+    pub async fn evidence_items_for_tenant(&self, tenant: &TenantId) -> Vec<Evidence> {
+        self.evidence_items()
+            .await
+            .into_iter()
+            .filter(|e| e.tenant_id.as_ref() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn action_for_tenant(&self, id: &ActionId, tenant: &TenantId) -> Option<Action> {
+        self.action(id)
+            .await
+            .filter(|a| a.tenant_id.as_ref() == Some(tenant))
+    }
+
+    pub async fn actions_for_tenant(&self, tenant: &TenantId) -> Vec<Action> {
+        self.actions()
+            .await
+            .into_iter()
+            .filter(|a| a.tenant_id.as_ref() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn actions_with_status_for_tenant(
+        &self,
+        status: ActionStatus,
+        tenant: &TenantId,
+    ) -> Vec<Action> {
+        self.actions_with_status(status)
+            .await
+            .into_iter()
+            .filter(|a| a.tenant_id.as_ref() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn outcome_for_tenant(
+        &self,
+        id: &OutcomeId,
+        tenant: &TenantId,
+    ) -> Option<Outcome> {
+        self.outcome(id)
+            .await
+            .filter(|o| o.tenant_id.as_ref() == Some(tenant))
+    }
+
+    pub async fn outcomes_for_action_for_tenant(
+        &self,
+        action_id: &ActionId,
+        tenant: &TenantId,
+    ) -> Vec<Outcome> {
+        self.outcomes_for_action(action_id)
+            .await
+            .into_iter()
+            .filter(|o| o.tenant_id.as_ref() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn runs_for_sensor_for_tenant(
+        &self,
+        sensor_id: &SensorId,
+        tenant: &TenantId,
+    ) -> Vec<SensorRun> {
+        self.runs_for_sensor(sensor_id)
+            .await
+            .into_iter()
+            .filter(|r| r.tenant_id.as_ref() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn checkpoints_for_sensor_for_tenant(
+        &self,
+        sensor_id: &SensorId,
+        tenant: &TenantId,
+    ) -> Vec<SensorCheckpoint> {
+        self.checkpoints_for_sensor(sensor_id)
+            .await
+            .into_iter()
+            .filter(|c| c.tenant_id.as_ref() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn latest_sensor_checkpoint_for_tenant(
+        &self,
+        sensor_id: &SensorId,
+        source: &str,
+        tenant: &TenantId,
+    ) -> Option<SensorCheckpoint> {
+        self.latest_sensor_checkpoint(sensor_id, source)
+            .await
+            .filter(|c| c.tenant_id.as_ref() == Some(tenant))
+    }
+
+    /// Event lookup gated by tenant. Returns `None` when the event
+    /// exists but its envelope's `tenant_id` doesn't match — same
+    /// 404-on-other-tenant policy as the entity lookups above.
+    pub async fn event_for_tenant(&self, id: &EventId, tenant: &TenantId) -> Option<Event> {
+        self.event(id)
+            .await
+            .filter(|e| e.tenant_id.as_ref() == Some(tenant))
     }
 }
 
@@ -1193,6 +1373,276 @@ mod sensor_query_tests {
         // Unknown source returns None.
         assert!(service
             .latest_sensor_checkpoint(&sensor(), "unknown.stream")
+            .await
+            .is_none());
+    }
+}
+
+#[cfg(test)]
+mod tenant_query_tests {
+    //! Tenant Patch 2A: QueryService tenant-aware filter tests.
+    //! Helper coverage for `_for_tenant` variants — proves each
+    //! filter actually excludes other-tenant data (no leaks).
+
+    use super::*;
+    use hydra_core::{
+        ActionKind, ActionStatus, ActionTarget, ActorId, CascadeId, Confidence, Event, EventId,
+        EventKind, EvidenceId, EvidencePayload, EvidenceSource, NodeId, SourceCursor, TenantId,
+        Value,
+    };
+    use hydra_engine::hydra::Hydra;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn tenant_a() -> TenantId {
+        TenantId::from_str("tenant_a")
+    }
+    fn tenant_b() -> TenantId {
+        TenantId::from_str("tenant_b")
+    }
+
+    fn evt(kind: EventKind, owner: TenantId) -> Event {
+        Event {
+            id: EventId::new(),
+            tenant_id: Some(owner),
+            timestamp: chrono::Utc::now(),
+            kind,
+            caused_by: vec![],
+            cascade_id: CascadeId::new(),
+            cascade_depth: 0,
+            cascade_breadth_index: 0,
+        }
+    }
+
+    fn evidence_for(owner: TenantId) -> Evidence {
+        Evidence {
+            id: EvidenceId::new(),
+            tenant_id: Some(owner),
+            source: EvidenceSource::Warehouse {
+                system: "x".into(),
+                database: None,
+                schema: None,
+                table: None,
+            },
+            payload: EvidencePayload {
+                kind: "k".to_string(),
+                data: HashMap::new(),
+            },
+            reliability: Confidence::new(0.9),
+            observed_at: chrono::Utc::now(),
+            recorded_at: chrono::Utc::now(),
+            caused_by: None,
+        }
+    }
+
+    fn claim_for(owner: TenantId, ev_id: EvidenceId) -> Claim {
+        let now = chrono::Utc::now();
+        Claim {
+            id: ClaimId::new(),
+            tenant_id: Some(owner),
+            kind: ClaimKind::AnomalyFinding,
+            subject: ClaimSubject::Dataset("d".to_string()),
+            predicate: "p".to_string(),
+            object: hydra_core::ClaimObject::Value(Value::Bool(true)),
+            confidence: Confidence::new(0.9),
+            status: ClaimStatus::Proposed,
+            evidence_for: vec![ev_id],
+            evidence_against: vec![],
+            valid_from: now,
+            valid_until: None,
+            created_by: ActorId::from_str("actor_a"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        }
+    }
+
+    fn action_for(owner: TenantId) -> Action {
+        let now = chrono::Utc::now();
+        Action {
+            id: ActionId::new(),
+            tenant_id: Some(owner),
+            kind: ActionKind::Backfill,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::Dataset("d".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: ActorId::from_str("actor_a"),
+            approved_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn claims_for_tenant_filters() {
+        let mut hydra = Hydra::new();
+        let ev_a = evidence_for(tenant_a());
+        let ev_b = evidence_for(tenant_b());
+        let cl_a = claim_for(tenant_a(), ev_a.id.clone());
+        let cl_b = claim_for(tenant_b(), ev_b.id.clone());
+        let cl_a_id = cl_a.id.clone();
+        hydra
+            .ingest_event(evt(EventKind::EvidenceAdded { evidence: ev_a }, tenant_a()))
+            .unwrap();
+        hydra
+            .ingest_event(evt(EventKind::EvidenceAdded { evidence: ev_b }, tenant_b()))
+            .unwrap();
+        hydra
+            .ingest_event(evt(EventKind::ClaimProposed { claim: cl_a }, tenant_a()))
+            .unwrap();
+        hydra
+            .ingest_event(evt(EventKind::ClaimProposed { claim: cl_b }, tenant_b()))
+            .unwrap();
+
+        let service = QueryService::new(Arc::new(RwLock::new(hydra)));
+        let a_claims = service.claims_for_tenant(&tenant_a()).await;
+        assert_eq!(a_claims.len(), 1);
+        assert_eq!(a_claims[0].id, cl_a_id);
+
+        // Single-id lookup across tenants: tenant_a can fetch their
+        // claim, but lookup of tenant_b's claim returns None.
+        assert!(service
+            .claim_for_tenant(&cl_a_id, &tenant_a())
+            .await
+            .is_some());
+        let b_claim_id = service.claims_for_tenant(&tenant_b()).await[0].id.clone();
+        assert!(service
+            .claim_for_tenant(&b_claim_id, &tenant_a())
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn evidence_for_tenant_filters() {
+        let mut hydra = Hydra::new();
+        let ev_a = evidence_for(tenant_a());
+        let ev_b = evidence_for(tenant_b());
+        let ev_a_id = ev_a.id.clone();
+        let ev_b_id = ev_b.id.clone();
+        hydra
+            .ingest_event(evt(EventKind::EvidenceAdded { evidence: ev_a }, tenant_a()))
+            .unwrap();
+        hydra
+            .ingest_event(evt(EventKind::EvidenceAdded { evidence: ev_b }, tenant_b()))
+            .unwrap();
+
+        let service = QueryService::new(Arc::new(RwLock::new(hydra)));
+        let a_view = service.evidence_items_for_tenant(&tenant_a()).await;
+        assert_eq!(a_view.len(), 1);
+        assert_eq!(a_view[0].id, ev_a_id);
+        assert!(service
+            .evidence_for_tenant(&ev_b_id, &tenant_a())
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn actions_for_tenant_filters() {
+        let mut hydra = Hydra::new();
+        let action_a = action_for(tenant_a());
+        let action_a_id = action_a.id.clone();
+        let action_b = action_for(tenant_b());
+        let action_b_id = action_b.id.clone();
+        hydra
+            .ingest_for_tenant(EventKind::ActionProposed { action: action_a }, tenant_a())
+            .unwrap();
+        hydra
+            .ingest_for_tenant(EventKind::ActionProposed { action: action_b }, tenant_b())
+            .unwrap();
+
+        let service = QueryService::new(Arc::new(RwLock::new(hydra)));
+        let a_view = service.actions_for_tenant(&tenant_a()).await;
+        assert_eq!(a_view.len(), 1);
+        assert_eq!(a_view[0].id, action_a_id);
+        assert!(service
+            .action_for_tenant(&action_b_id, &tenant_a())
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn sensor_checkpoints_for_tenant_filters() {
+        let mut hydra = Hydra::new();
+        let cursor = |off: &str| SourceCursor::Offset {
+            stream: "s".to_string(),
+            partition: Some("p".to_string()),
+            offset: off.to_string(),
+        };
+        let signal = |name: &str| EventKind::Signal {
+            source: NodeId::from_str("test"),
+            name: name.to_string(),
+            payload: HashMap::new(),
+        };
+        let cp_a = hydra
+            .record_sensor_observation_for_tenant(
+                hydra_core::SensorId::from_str("sensor_x"),
+                "sys",
+                cursor("a"),
+                signal("a"),
+                tenant_a(),
+            )
+            .unwrap();
+        let _cp_b = hydra
+            .record_sensor_observation_for_tenant(
+                hydra_core::SensorId::from_str("sensor_x"),
+                "sys",
+                cursor("b"),
+                signal("b"),
+                tenant_b(),
+            )
+            .unwrap();
+
+        let service = QueryService::new(Arc::new(RwLock::new(hydra)));
+        let a_view = service
+            .checkpoints_for_sensor_for_tenant(
+                &hydra_core::SensorId::from_str("sensor_x"),
+                &tenant_a(),
+            )
+            .await;
+        assert_eq!(a_view.len(), 1);
+        assert_eq!(a_view[0].id, cp_a.id);
+    }
+
+    #[tokio::test]
+    async fn event_for_tenant_hides_other_tenant() {
+        let mut hydra = Hydra::new();
+        let result_a = hydra
+            .ingest_for_tenant(
+                EventKind::Signal {
+                    source: NodeId::from_str("a"),
+                    name: "a".to_string(),
+                    payload: HashMap::new(),
+                },
+                tenant_a(),
+            )
+            .unwrap();
+        let result_b = hydra
+            .ingest_for_tenant(
+                EventKind::Signal {
+                    source: NodeId::from_str("b"),
+                    name: "b".to_string(),
+                    payload: HashMap::new(),
+                },
+                tenant_b(),
+            )
+            .unwrap();
+        let event_a_id = result_a.events[0].id.clone();
+        let event_b_id = result_b.events[0].id.clone();
+
+        let service = QueryService::new(Arc::new(RwLock::new(hydra)));
+        assert!(service
+            .event_for_tenant(&event_a_id, &tenant_a())
+            .await
+            .is_some());
+        assert!(service
+            .event_for_tenant(&event_b_id, &tenant_a())
             .await
             .is_none());
     }

@@ -1317,51 +1317,55 @@ mod tests {
         // i.e. the query router shares the runtime engine, not a separate
         // one.
         use hydra_core::{EventKind, NodeId};
-        use hydra_core::node::Node;
-        use hydra_net::http::pagination::Page;
-        use hydra_net::http::query::NodeResponse;
+        use hydra_net::http::query::StatsResponse;
         use std::collections::HashMap;
 
         let runtime = test_runtime();
-        let node_id = NodeId::new();
         {
             let hydra = runtime.hydra();
             let mut hydra = hydra.write().await;
             hydra
-                .ingest(EventKind::NodeCreated {
-                    node_id: node_id.clone(),
-                    type_id: "ec2".to_string(),
-                    properties: HashMap::new(),
-                })
+                .ingest_for_tenant(
+                    EventKind::NodeCreated {
+                        node_id: NodeId::new(),
+                        type_id: "ec2".to_string(),
+                        properties: HashMap::new(),
+                    },
+                    hydra_core::TenantId::from_str("tenant_api_test"),
+                )
                 .unwrap();
         }
 
         let app = build_router(runtime);
 
-        // List route now returns `Page<Node>` after Pagination v0.
+        // After Multi-tenant Patch 2A, /query/nodes returns 501
+        // (graph topology not tenant-scoped yet). The test still
+        // needs to prove `/query/*` is reachable through the
+        // unified router — assert the 501 contract instead. The
+        // ingest engine sharing is verified via /query/stats below.
         let list_req = Request::builder()
             .uri("/query/nodes?limit=1")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(list_req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let decoded: Page<Node> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(decoded.items.len(), 1);
-        assert_eq!(decoded.next_cursor, None);
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
 
-        let get_req = Request::builder()
-            .uri(format!("/query/nodes/{node_id}"))
+        // /query/stats is the tenant-aware route that proves the
+        // shared engine state — ingest above should show up in
+        // total_events.
+        let stats_req = Request::builder()
+            .uri("/query/stats")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::empty())
             .unwrap();
-        let resp = app.oneshot(get_req).await.unwrap();
+        let resp = app.oneshot(stats_req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let decoded: NodeResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(decoded.node.id(), &node_id);
+        let stats: StatsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stats.node_count, 1);
+        assert!(stats.total_events >= 1);
     }
 }
