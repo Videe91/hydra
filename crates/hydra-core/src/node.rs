@@ -1,5 +1,5 @@
 use crate::event::Value;
-use crate::id::NodeId;
+use crate::id::{NodeId, TenantId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -14,10 +14,24 @@ pub struct NodeMeta {
     pub updated_at: DateTime<Utc>,
     pub version: u64,
     pub alive: bool,
+    /// Tenant that owns this node, stamped from the creating Event's
+    /// envelope at projection-apply time (Multi-tenant Patch 2B).
+    /// `serde(default)` keeps snapshots written before Patch 2B
+    /// loadable — older bodies deserialize this as `None` and the
+    /// engine treats them as system/global nodes.
+    #[serde(default)]
+    pub tenant_id: Option<TenantId>,
 }
 
 impl NodeMeta {
     pub fn new(id: NodeId, type_id: String) -> Self {
+        Self::new_for_tenant(id, type_id, None)
+    }
+
+    /// Construct a NodeMeta scoped to a tenant. The projection's
+    /// `NodeCreated` handler uses this so the resulting `Node` carries
+    /// the same tenant as the `Event` envelope.
+    pub fn new_for_tenant(id: NodeId, type_id: String, tenant_id: Option<TenantId>) -> Self {
         let now = Utc::now();
         Self {
             id,
@@ -26,6 +40,7 @@ impl NodeMeta {
             updated_at: now,
             version: 1,
             alive: true,
+            tenant_id,
         }
     }
 
@@ -48,8 +63,17 @@ pub struct Node {
 
 impl Node {
     pub fn new(id: NodeId, type_id: String, properties: HashMap<String, Value>) -> Self {
+        Self::new_for_tenant(id, type_id, properties, None)
+    }
+
+    pub fn new_for_tenant(
+        id: NodeId,
+        type_id: String,
+        properties: HashMap<String, Value>,
+        tenant_id: Option<TenantId>,
+    ) -> Self {
         Self {
-            meta: NodeMeta::new(id, type_id),
+            meta: NodeMeta::new_for_tenant(id, type_id, tenant_id),
             properties,
         }
     }
@@ -60,6 +84,10 @@ impl Node {
 
     pub fn type_id(&self) -> &str {
         &self.meta.type_id
+    }
+
+    pub fn tenant_id(&self) -> Option<&TenantId> {
+        self.meta.tenant_id.as_ref()
     }
 
     pub fn is_alive(&self) -> bool {

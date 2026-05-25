@@ -251,19 +251,6 @@ fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
         .into_response()
 }
 
-/// 501 response used by every `/query/nodes/*` and `/query/edges/*`
-/// route until Multi-tenant Patch 2B lands `NodeMeta.tenant_id` and
-/// `EdgeMeta.tenant_id`. Graph topology has no tenant field today, so
-/// any "tenant-filtered" result would be a lie — better to fail
-/// honestly than to fake isolation.
-fn graph_topology_not_tenant_scoped() -> Response {
-    error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "tenant-scoped graph topology not yet supported; will land in \
-         Multi-tenant Patch 2B once NodeMeta/EdgeMeta carry tenant_id",
-    )
-}
-
 // === Status parsers (return None on unknown variant → 400) ===
 
 fn parse_claim_status(status: &str) -> Option<ClaimStatus> {
@@ -334,85 +321,138 @@ fn parse_claim_subject(subject_kind: &str, subject_value: &str) -> Option<ClaimS
     }
 }
 
-// === Node handlers ===
+// === Node handlers (Patch 2B: real tenant-filtered handlers) ===
+//
+// NodeMeta.tenant_id is now populated by the projection from the
+// creating Event's envelope. The 501 placeholder from Patch 2A is
+// gone — these handlers strictly scope reads to the requesting
+// tenant.
 
 async fn list_nodes(
-    State(_state): State<QueryHttpState>,
+    State(state): State<QueryHttpState>,
     headers: HeaderMap,
-    Query(_query): Query<PaginationQuery>,
+    Query(query): Query<PaginationQuery>,
 ) -> Response {
-    if let Err(error) = extract_tenant(&headers) {
-        return tenant_error_response(error);
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    let nodes = state.service.nodes_for_tenant(&tenant).await;
+    match paginate_by_cursor(&nodes, query.after.as_deref(), query.limit, |node| {
+        node.id().to_string()
+    }) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("unknown node cursor: {}", query.after.unwrap_or_default()),
+        ),
     }
-    graph_topology_not_tenant_scoped()
 }
 
 async fn get_node(
-    State(_state): State<QueryHttpState>,
+    State(state): State<QueryHttpState>,
     headers: HeaderMap,
-    Path(_node_id): Path<String>,
+    Path(node_id): Path<String>,
 ) -> Response {
-    if let Err(error) = extract_tenant(&headers) {
-        return tenant_error_response(error);
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    let id = NodeId::from_str(&node_id);
+    match state.service.node_for_tenant(&id, &tenant).await {
+        Some(node) => Json(NodeResponse { node }).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}")),
     }
-    graph_topology_not_tenant_scoped()
 }
 
 async fn node_neighbors(
-    State(_state): State<QueryHttpState>,
+    State(state): State<QueryHttpState>,
     headers: HeaderMap,
-    Path(_node_id): Path<String>,
+    Path(node_id): Path<String>,
 ) -> Response {
-    if let Err(error) = extract_tenant(&headers) {
-        return tenant_error_response(error);
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    let id = NodeId::from_str(&node_id);
+    if state.service.node_for_tenant(&id, &tenant).await.is_none() {
+        return error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}"));
     }
-    graph_topology_not_tenant_scoped()
+    let nodes = state.service.neighbors_for_tenant(&id, &tenant).await;
+    Json(NodesResponse { nodes }).into_response()
 }
 
 async fn node_outgoing_edges(
-    State(_state): State<QueryHttpState>,
+    State(state): State<QueryHttpState>,
     headers: HeaderMap,
-    Path(_node_id): Path<String>,
+    Path(node_id): Path<String>,
 ) -> Response {
-    if let Err(error) = extract_tenant(&headers) {
-        return tenant_error_response(error);
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    let id = NodeId::from_str(&node_id);
+    if state.service.node_for_tenant(&id, &tenant).await.is_none() {
+        return error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}"));
     }
-    graph_topology_not_tenant_scoped()
+    let edges = state.service.outgoing_edges_for_tenant(&id, &tenant).await;
+    Json(EdgesResponse { edges }).into_response()
 }
 
 async fn node_incoming_edges(
-    State(_state): State<QueryHttpState>,
+    State(state): State<QueryHttpState>,
     headers: HeaderMap,
-    Path(_node_id): Path<String>,
+    Path(node_id): Path<String>,
 ) -> Response {
-    if let Err(error) = extract_tenant(&headers) {
-        return tenant_error_response(error);
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    let id = NodeId::from_str(&node_id);
+    if state.service.node_for_tenant(&id, &tenant).await.is_none() {
+        return error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}"));
     }
-    graph_topology_not_tenant_scoped()
+    let edges = state.service.incoming_edges_for_tenant(&id, &tenant).await;
+    Json(EdgesResponse { edges }).into_response()
 }
 
 // === Edge handlers ===
 
 async fn list_edges(
-    State(_state): State<QueryHttpState>,
+    State(state): State<QueryHttpState>,
     headers: HeaderMap,
-    Query(_query): Query<PaginationQuery>,
+    Query(query): Query<PaginationQuery>,
 ) -> Response {
-    if let Err(error) = extract_tenant(&headers) {
-        return tenant_error_response(error);
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    let edges = state.service.edges_for_tenant(&tenant).await;
+    match paginate_by_cursor(&edges, query.after.as_deref(), query.limit, |edge| {
+        edge.id().to_string()
+    }) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("unknown edge cursor: {}", query.after.unwrap_or_default()),
+        ),
     }
-    graph_topology_not_tenant_scoped()
 }
 
 async fn get_edge(
-    State(_state): State<QueryHttpState>,
+    State(state): State<QueryHttpState>,
     headers: HeaderMap,
-    Path(_edge_id): Path<String>,
+    Path(edge_id): Path<String>,
 ) -> Response {
-    if let Err(error) = extract_tenant(&headers) {
-        return tenant_error_response(error);
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    let id = EdgeId::from_str(&edge_id);
+    match state.service.edge_for_tenant(&id, &tenant).await {
+        Some(edge) => Json(EdgeResponse { edge }).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, format!("edge not found: {edge_id}")),
     }
-    graph_topology_not_tenant_scoped()
 }
 
 // === Evidence handlers ===
@@ -730,15 +770,55 @@ async fn query_stats(
 }
 
 async fn node_bfs(
-    State(_state): State<QueryHttpState>,
+    State(state): State<QueryHttpState>,
     headers: HeaderMap,
-    Path(_node_id): Path<String>,
-    Query(_query): Query<BfsQuery>,
+    Path(node_id): Path<String>,
+    Query(query): Query<BfsQuery>,
 ) -> Response {
-    if let Err(error) = extract_tenant(&headers) {
-        return tenant_error_response(error);
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+    let id = NodeId::from_str(&node_id);
+    // Existence + tenant ownership check up front. The strict BFS
+    // would also short-circuit on this, but doing the check here
+    // lets us return a clean 404 instead of an empty 200 page.
+    if state.service.node_for_tenant(&id, &tenant).await.is_none() {
+        return error_response(StatusCode::NOT_FOUND, format!("node not found: {node_id}"));
     }
-    graph_topology_not_tenant_scoped()
+    let direction = match parse_traversal_direction(query.direction.as_deref()) {
+        Some(d) => d,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown direction: {} (expected outgoing|incoming|both)",
+                    query.direction.unwrap_or_default()
+                ),
+            );
+        }
+    };
+    let traversal: Vec<NodeId> = match query.type_filter {
+        Some(type_filter) => {
+            state
+                .service
+                .bfs_by_type_for_tenant(&id, direction, type_filter, &tenant)
+                .await
+        }
+        None => state.service.bfs_for_tenant(&id, direction, &tenant).await,
+    };
+    match paginate_by_cursor(
+        &traversal,
+        query.after.as_deref(),
+        query.limit,
+        |node_id| node_id.to_string(),
+    ) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("unknown bfs cursor: {}", query.after.unwrap_or_default()),
+        ),
+    }
 }
 
 // Causal/counterfactual routes are gated on the *seed* event's
@@ -1064,49 +1144,113 @@ mod tests {
         }
     }
 
-    // === Graph topology (501 until Patch 2B) ===
+    // === Graph topology (Patch 2B: tenant-scoped) ===
     //
-    // Node and edge routes return 501 because NodeMeta/EdgeMeta don't
-    // carry tenant_id yet — see `graph_topology_not_tenant_scoped`.
-    // Pre-Patch 2A tests that exercised tenant-less node/edge filtering
-    // are deliberately removed. Patch 2B will bring them back with
-    // real tenant scoping.
+    // NodeMeta/EdgeMeta now carry tenant_id (stamped by the
+    // projection from the Event envelope). These tests prove tenant
+    // isolation end-to-end through the router.
+
+    /// Helper: ingest a node under the canonical test tenant via the
+    /// engine's `ingest_for_tenant` path. This is the same path the
+    /// /ingest HTTP route takes for tenant-scoped writes.
+    async fn ingest_node_for(
+        runtime: &crate::runtime::RuntimeHandle,
+        tenant: TenantId,
+        type_id: &str,
+    ) -> NodeId {
+        let node_id = NodeId::new();
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        hydra
+            .ingest_for_tenant(
+                EventKind::NodeCreated {
+                    node_id: node_id.clone(),
+                    type_id: type_id.to_string(),
+                    properties: HashMap::new(),
+                },
+                tenant,
+            )
+            .unwrap();
+        node_id
+    }
+
+    async fn ingest_edge_for(
+        runtime: &crate::runtime::RuntimeHandle,
+        tenant: TenantId,
+        source: &NodeId,
+        target: &NodeId,
+    ) -> hydra_core::EdgeId {
+        let edge_id = hydra_core::EdgeId::new();
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        hydra
+            .ingest_for_tenant(
+                EventKind::EdgeCreated {
+                    edge_id: edge_id.clone(),
+                    source: source.clone(),
+                    target: target.clone(),
+                    type_id: "linked".to_string(),
+                    properties: HashMap::new(),
+                },
+                tenant,
+            )
+            .unwrap();
+        edge_id
+    }
+
+    fn tenant_id_a() -> TenantId {
+        TenantId::from_str(TEST_TENANT)
+    }
+
+    fn tenant_id_b() -> TenantId {
+        TenantId::from_str("tenant_other_graph_b")
+    }
 
     #[tokio::test]
-    async fn list_nodes_returns_501_with_tenant() {
+    async fn list_nodes_returns_only_own_tenant_nodes() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
+        let a = ingest_node_for(&runtime, tenant_id_a(), "ec2").await;
+        let _b = ingest_node_for(&runtime, tenant_id_b(), "ec2").await;
         let app = query_router(runtime);
         let response = app.oneshot(empty_get("/query/nodes")).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: Page<Node> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.items[0].id(), &a);
+        assert_eq!(decoded.items[0].tenant_id(), Some(&tenant_id_a()));
     }
 
     #[tokio::test]
-    async fn get_node_returns_501_with_tenant() {
+    async fn get_node_returns_404_when_owned_by_other_tenant() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
+        let b_node = ingest_node_for(&runtime, tenant_id_b(), "ec2").await;
         let app = query_router(runtime);
         let response = app
-            .oneshot(empty_get("/query/nodes/node_x"))
+            .oneshot(empty_get(&format!("/query/nodes/{b_node}")))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn node_neighbors_returns_501_with_tenant() {
+    async fn list_nodes_paginates() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
+        for _ in 0..3 {
+            ingest_node_for(&runtime, tenant_id_a(), "ec2").await;
+        }
         let app = query_router(runtime);
         let response = app
-            .oneshot(empty_get("/query/nodes/node_x/neighbors"))
+            .oneshot(empty_get("/query/nodes?limit=2"))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: Page<Node> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 2);
+        assert!(decoded.next_cursor.is_some());
     }
 
     #[tokio::test]
-    async fn list_nodes_without_tenant_returns_400_not_501() {
-        // The 400 check fires BEFORE the 501 — proves we're not
-        // accidentally leaking the 501 message to unauthenticated
-        // requests.
+    async fn list_nodes_without_tenant_returns_400() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
         let app = query_router(runtime);
         let response = app
@@ -1114,6 +1258,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn node_neighbors_returns_only_own_tenant_neighbors() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        // Build two parallel graphs: A's a→b, and B's b'→a (note:
+        // edges can't cross tenants under v0 — the EdgeCreated
+        // event's tenant scopes the edge — so A and B remain
+        // strictly disjoint).
+        let a_src = ingest_node_for(&runtime, tenant_id_a(), "ec2").await;
+        let a_dst = ingest_node_for(&runtime, tenant_id_a(), "vpc").await;
+        let _ = ingest_edge_for(&runtime, tenant_id_a(), &a_src, &a_dst).await;
+        let _ = ingest_node_for(&runtime, tenant_id_b(), "ec2").await;
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!("/query/nodes/{a_src}/neighbors")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: NodesResponse = read_json(response).await;
+        assert_eq!(decoded.nodes.len(), 1);
+        assert_eq!(decoded.nodes[0].id(), &a_dst);
     }
 
     // === Claims ===
@@ -1359,42 +1525,67 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    // === Edges (501 until Patch 2B) ===
+    // === Edges (Patch 2B) ===
 
     #[tokio::test]
-    async fn list_edges_returns_501_with_tenant() {
+    async fn list_edges_returns_only_own_tenant_edges() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
+        let a_src = ingest_node_for(&runtime, tenant_id_a(), "ec2").await;
+        let a_dst = ingest_node_for(&runtime, tenant_id_a(), "vpc").await;
+        let a_edge = ingest_edge_for(&runtime, tenant_id_a(), &a_src, &a_dst).await;
+
+        let b_src = ingest_node_for(&runtime, tenant_id_b(), "ec2").await;
+        let b_dst = ingest_node_for(&runtime, tenant_id_b(), "vpc").await;
+        let _ = ingest_edge_for(&runtime, tenant_id_b(), &b_src, &b_dst).await;
+
         let app = query_router(runtime);
         let response = app.oneshot(empty_get("/query/edges")).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: Page<Edge> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.items[0].id(), &a_edge);
     }
 
     #[tokio::test]
-    async fn get_edge_returns_501_with_tenant() {
+    async fn get_edge_returns_404_when_owned_by_other_tenant() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
+        let b_src = ingest_node_for(&runtime, tenant_id_b(), "ec2").await;
+        let b_dst = ingest_node_for(&runtime, tenant_id_b(), "vpc").await;
+        let b_edge = ingest_edge_for(&runtime, tenant_id_b(), &b_src, &b_dst).await;
         let app = query_router(runtime);
         let response = app
-            .oneshot(empty_get("/query/edges/edg_x"))
+            .oneshot(empty_get(&format!("/query/edges/{b_edge}")))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn node_outgoing_and_incoming_edges_return_501() {
+    async fn node_outgoing_and_incoming_edges_are_tenant_scoped() {
         let (runtime, _processor) = RuntimeBuilder::new().build();
+        let a = ingest_node_for(&runtime, tenant_id_a(), "ec2").await;
+        let b = ingest_node_for(&runtime, tenant_id_a(), "vpc").await;
+        let edge_a = ingest_edge_for(&runtime, tenant_id_a(), &a, &b).await;
         let app = query_router(runtime);
-        let outgoing = app
+
+        let response = app
             .clone()
-            .oneshot(empty_get("/query/nodes/node_x/outgoing-edges"))
+            .oneshot(empty_get(&format!("/query/nodes/{a}/outgoing-edges")))
             .await
             .unwrap();
-        assert_eq!(outgoing.status(), StatusCode::NOT_IMPLEMENTED);
-        let incoming = app
-            .oneshot(empty_get("/query/nodes/node_x/incoming-edges"))
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EdgesResponse = read_json(response).await;
+        assert_eq!(decoded.edges.len(), 1);
+        assert_eq!(decoded.edges[0].id(), &edge_a);
+
+        let response = app
+            .oneshot(empty_get(&format!("/query/nodes/{b}/incoming-edges")))
             .await
             .unwrap();
-        assert_eq!(incoming.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EdgesResponse = read_json(response).await;
+        assert_eq!(decoded.edges.len(), 1);
+        assert_eq!(decoded.edges[0].id(), &edge_a);
     }
 
     // === Evidence ===
@@ -1689,14 +1880,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_bfs_returns_501_with_tenant() {
+    async fn node_bfs_returns_tenant_scoped_traversal() {
+        // Build a 3-node chain a -> b -> c under tenant A, plus a
+        // disjoint node z under tenant B. BFS from `a` returns only
+        // A's chain — z is unreachable and so is excluded.
         let (runtime, _processor) = RuntimeBuilder::new().build();
+        let a = ingest_node_for(&runtime, tenant_id_a(), "ec2").await;
+        let b = ingest_node_for(&runtime, tenant_id_a(), "vpc").await;
+        let c = ingest_node_for(&runtime, tenant_id_a(), "subnet").await;
+        let _ = ingest_edge_for(&runtime, tenant_id_a(), &a, &b).await;
+        let _ = ingest_edge_for(&runtime, tenant_id_a(), &b, &c).await;
+        let _ = ingest_node_for(&runtime, tenant_id_b(), "ec2").await;
+
         let app = query_router(runtime);
         let response = app
-            .oneshot(empty_get("/query/nodes/node_x/bfs?direction=outgoing"))
+            .oneshot(empty_get(&format!(
+                "/query/nodes/{a}/bfs?direction=outgoing"
+            )))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: Page<NodeId> = read_json(response).await;
+        // a, b, c — start is always included; z is in another tenant
+        // so it's never reachable.
+        assert_eq!(decoded.items.len(), 3);
+        assert!(decoded.items.contains(&a));
+        assert!(decoded.items.contains(&b));
+        assert!(decoded.items.contains(&c));
+    }
+
+    #[tokio::test]
+    async fn node_bfs_returns_404_when_start_belongs_to_other_tenant() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let b_node = ingest_node_for(&runtime, tenant_id_b(), "ec2").await;
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/query/nodes/{b_node}/bfs?direction=outgoing"
+            )))
+            .await
+            .unwrap();
+        // Tenant A asks for BFS from a node B owns — 404 (no
+        // existence leak).
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn node_bfs_paginates() {
+        // 4-node chain — confirm pagination still works after Patch 2B.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let a = ingest_node_for(&runtime, tenant_id_a(), "ec2").await;
+        let b = ingest_node_for(&runtime, tenant_id_a(), "ec2").await;
+        let c = ingest_node_for(&runtime, tenant_id_a(), "ec2").await;
+        let d = ingest_node_for(&runtime, tenant_id_a(), "ec2").await;
+        let _ = ingest_edge_for(&runtime, tenant_id_a(), &a, &b).await;
+        let _ = ingest_edge_for(&runtime, tenant_id_a(), &b, &c).await;
+        let _ = ingest_edge_for(&runtime, tenant_id_a(), &c, &d).await;
+        let app = query_router(runtime);
+        let response = app
+            .clone()
+            .oneshot(empty_get(&format!(
+                "/query/nodes/{a}/bfs?direction=outgoing&limit=2"
+            )))
+            .await
+            .unwrap();
+        let first: Page<NodeId> = read_json(response).await;
+        assert_eq!(first.items.len(), 2);
+        let cursor = first.next_cursor.clone().expect("expected next_cursor");
+
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/query/nodes/{a}/bfs?direction=outgoing&limit=2&after={cursor}"
+            )))
+            .await
+            .unwrap();
+        let second: Page<NodeId> = read_json(response).await;
+        assert_eq!(second.items.len(), 2);
+        assert_eq!(second.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn node_bfs_returns_400_on_bad_direction() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let start = ingest_node_for(&runtime, tenant_id_a(), "ec2").await;
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/query/nodes/{start}/bfs?direction=sideways"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     fn signal_event(name: &str) -> EventKind {

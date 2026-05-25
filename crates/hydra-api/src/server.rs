@@ -1338,22 +1338,30 @@ mod tests {
 
         let app = build_router(runtime);
 
-        // After Multi-tenant Patch 2A, /query/nodes returns 501
-        // (graph topology not tenant-scoped yet). The test still
-        // needs to prove `/query/*` is reachable through the
-        // unified router — assert the 501 contract instead. The
-        // ingest engine sharing is verified via /query/stats below.
+        // After Multi-tenant Patch 2B, /query/nodes is tenant-scoped
+        // and returns the requesting tenant's nodes. Patch 2A's 501
+        // path is gone — graph topology is now a real read surface.
+        use hydra_core::node::Node;
+        use hydra_net::http::pagination::Page;
         let list_req = Request::builder()
-            .uri("/query/nodes?limit=1")
+            .uri("/query/nodes?limit=10")
             .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(list_req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let nodes: Page<Node> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(nodes.items.len(), 1);
+        assert_eq!(
+            nodes.items[0].tenant_id().map(|t| t.to_string()),
+            Some("tenant_api_test".to_string())
+        );
 
-        // /query/stats is the tenant-aware route that proves the
-        // shared engine state — ingest above should show up in
-        // total_events.
+        // /query/stats still confirms shared engine state across the
+        // unified router — global counts include the node we ingested.
         let stats_req = Request::builder()
             .uri("/query/stats")
             .header("X-Hydra-Tenant", "tenant_api_test")

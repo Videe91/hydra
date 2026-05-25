@@ -623,6 +623,204 @@ impl QueryService {
             .await
             .filter(|e| e.tenant_id.as_ref() == Some(tenant))
     }
+
+    // === Tenant-aware graph topology (Multi-tenant Patch 2B) ===
+    //
+    // NodeMeta and EdgeMeta gained `tenant_id` in Patch 2B (stamped
+    // from the creating Event's envelope), so these methods are now
+    // strict filters on a real field rather than approximations.
+
+    pub async fn nodes_for_tenant(&self, tenant: &TenantId) -> Vec<Node> {
+        let guard = self.hydra.read().await;
+        guard
+            .all_nodes()
+            .into_iter()
+            .filter(|n| n.tenant_id() == Some(tenant))
+            .cloned()
+            .collect()
+    }
+
+    pub async fn node_for_tenant(&self, id: &NodeId, tenant: &TenantId) -> Option<Node> {
+        self.node(id)
+            .await
+            .filter(|n| n.tenant_id() == Some(tenant))
+    }
+
+    pub async fn edges_for_tenant(&self, tenant: &TenantId) -> Vec<Edge> {
+        let guard = self.hydra.read().await;
+        guard
+            .all_edges()
+            .into_iter()
+            .filter(|e| e.tenant_id() == Some(tenant))
+            .cloned()
+            .collect()
+    }
+
+    pub async fn edge_for_tenant(&self, id: &EdgeId, tenant: &TenantId) -> Option<Edge> {
+        self.edge(id)
+            .await
+            .filter(|e| e.tenant_id() == Some(tenant))
+    }
+
+    /// Neighbors filtered to the requesting tenant. Other-tenant
+    /// nodes connected to `node_id` are excluded — clients see only
+    /// the slice of the graph they own.
+    pub async fn neighbors_for_tenant(
+        &self,
+        node_id: &NodeId,
+        tenant: &TenantId,
+    ) -> Vec<Node> {
+        self.neighbors(node_id)
+            .await
+            .into_iter()
+            .filter(|n| n.tenant_id() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn outgoing_edges_for_tenant(
+        &self,
+        node_id: &NodeId,
+        tenant: &TenantId,
+    ) -> Vec<Edge> {
+        self.outgoing_edges(node_id)
+            .await
+            .into_iter()
+            .filter(|e| e.tenant_id() == Some(tenant))
+            .collect()
+    }
+
+    pub async fn incoming_edges_for_tenant(
+        &self,
+        node_id: &NodeId,
+        tenant: &TenantId,
+    ) -> Vec<Edge> {
+        self.incoming_edges(node_id)
+            .await
+            .into_iter()
+            .filter(|e| e.tenant_id() == Some(tenant))
+            .collect()
+    }
+
+    /// Strict tenant-scoped BFS. Both the start node and every node
+    /// visited must belong to `tenant`; cross-tenant nodes are
+    /// excluded from the result *and* from the traversal frontier
+    /// (so an attacker can't reach into another tenant's graph by
+    /// hopping through a shared node — there are no shared nodes
+    /// under this contract).
+    ///
+    /// Returns an empty vector when:
+    ///   - the start node doesn't exist, OR
+    ///   - the start node belongs to a different tenant
+    /// (HTTP handlers translate that into 404.)
+    pub async fn bfs_for_tenant(
+        &self,
+        start: &NodeId,
+        direction: TraversalDirection,
+        tenant: &TenantId,
+    ) -> Vec<NodeId> {
+        self.bfs_for_tenant_inner(start, direction, tenant, None).await
+    }
+
+    /// Tenant-scoped BFS with an additional node-type filter.
+    pub async fn bfs_by_type_for_tenant(
+        &self,
+        start: &NodeId,
+        direction: TraversalDirection,
+        type_filter: String,
+        tenant: &TenantId,
+    ) -> Vec<NodeId> {
+        self.bfs_for_tenant_inner(start, direction, tenant, Some(type_filter)).await
+    }
+
+    async fn bfs_for_tenant_inner(
+        &self,
+        start: &NodeId,
+        direction: TraversalDirection,
+        tenant: &TenantId,
+        type_filter: Option<String>,
+    ) -> Vec<NodeId> {
+        use std::collections::{HashSet, VecDeque};
+
+        let guard = self.hydra.read().await;
+        let graph = guard.graph();
+        let mut result = Vec::new();
+
+        // Gate the start: must exist, be alive, and belong to the
+        // requesting tenant.
+        match graph.node(start) {
+            Some(node)
+                if node.is_alive()
+                    && node.tenant_id() == Some(tenant)
+                    && type_filter
+                        .as_deref()
+                        .map_or(true, |t| node.type_id() == t) => {}
+            _ => return result,
+        }
+
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+        visited.insert(start.clone());
+        queue.push_back(start.clone());
+
+        while let Some(current) = queue.pop_front() {
+            let Some(node) = graph.node(&current) else { continue };
+            if !node.is_alive() || node.tenant_id() != Some(tenant) {
+                continue;
+            }
+            if let Some(ref t) = type_filter {
+                if node.type_id() != t {
+                    continue;
+                }
+            }
+            result.push(current.clone());
+
+            let next_ids: Vec<NodeId> = match direction {
+                TraversalDirection::Outgoing => graph
+                    .outgoing_edges(&current)
+                    .iter()
+                    .map(|e| e.target().clone())
+                    .collect(),
+                TraversalDirection::Incoming => graph
+                    .incoming_edges(&current)
+                    .iter()
+                    .map(|e| e.source().clone())
+                    .collect(),
+                TraversalDirection::Both => {
+                    let mut ids: Vec<NodeId> = graph
+                        .outgoing_edges(&current)
+                        .iter()
+                        .map(|e| e.target().clone())
+                        .collect();
+                    ids.extend(
+                        graph
+                            .incoming_edges(&current)
+                            .iter()
+                            .map(|e| e.source().clone()),
+                    );
+                    ids
+                }
+            };
+
+            for next_id in next_ids {
+                if visited.contains(&next_id) {
+                    continue;
+                }
+                if let Some(next_node) = graph.node(&next_id) {
+                    if next_node.is_alive() && next_node.tenant_id() == Some(tenant) {
+                        if let Some(ref t) = type_filter {
+                            if next_node.type_id() != t {
+                                continue;
+                            }
+                        }
+                        visited.insert(next_id.clone());
+                        queue.push_back(next_id);
+                    }
+                }
+            }
+        }
+
+        result
+    }
 }
 
 /// A snapshot of graph statistics

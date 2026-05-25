@@ -692,6 +692,12 @@ impl TemporalGraphView {
                 updated_at: at,
                 version: history.version_count() as u64,
                 alive: true,
+                // TODO(tenant): temporal AS-OF reconstruction does not
+                // track tenant_id in the history table. Once Patch 2C
+                // teaches temporal to retain tenant per node, fill
+                // this from history. For now, AS-OF views return
+                // tenant-less nodes (caller has to be aware).
+                tenant_id: None,
             };
 
             let node = Node { meta, properties };
@@ -739,6 +745,8 @@ impl TemporalGraphView {
                 updated_at: at,
                 version: history.version_count() as u64,
                 alive: true,
+                // Same TODO(tenant) as NodeMeta above.
+                tenant_id: None,
             };
 
             let edge = Edge { meta, properties };

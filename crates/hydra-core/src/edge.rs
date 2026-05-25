@@ -1,5 +1,5 @@
 use crate::event::Value;
-use crate::id::{EdgeId, NodeId};
+use crate::id::{EdgeId, NodeId, TenantId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,10 +16,26 @@ pub struct EdgeMeta {
     pub updated_at: DateTime<Utc>,
     pub version: u64,
     pub alive: bool,
+    /// Tenant that owns this edge, stamped from the creating Event's
+    /// envelope at projection-apply time. See [`crate::node::NodeMeta`]
+    /// for the same back-compat note: `serde(default)` keeps
+    /// pre-Patch-2B snapshots loadable as `None`.
+    #[serde(default)]
+    pub tenant_id: Option<TenantId>,
 }
 
 impl EdgeMeta {
     pub fn new(id: EdgeId, type_id: String, source: NodeId, target: NodeId) -> Self {
+        Self::new_for_tenant(id, type_id, source, target, None)
+    }
+
+    pub fn new_for_tenant(
+        id: EdgeId,
+        type_id: String,
+        source: NodeId,
+        target: NodeId,
+        tenant_id: Option<TenantId>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id,
@@ -30,6 +46,7 @@ impl EdgeMeta {
             updated_at: now,
             version: 1,
             alive: true,
+            tenant_id,
         }
     }
 
@@ -56,8 +73,19 @@ impl Edge {
         target: NodeId,
         properties: HashMap<String, Value>,
     ) -> Self {
+        Self::new_for_tenant(id, type_id, source, target, properties, None)
+    }
+
+    pub fn new_for_tenant(
+        id: EdgeId,
+        type_id: String,
+        source: NodeId,
+        target: NodeId,
+        properties: HashMap<String, Value>,
+        tenant_id: Option<TenantId>,
+    ) -> Self {
         Self {
-            meta: EdgeMeta::new(id, type_id, source, target),
+            meta: EdgeMeta::new_for_tenant(id, type_id, source, target, tenant_id),
             properties,
         }
     }
@@ -76,6 +104,10 @@ impl Edge {
 
     pub fn target(&self) -> &NodeId {
         &self.meta.target
+    }
+
+    pub fn tenant_id(&self) -> Option<&TenantId> {
+        self.meta.tenant_id.as_ref()
     }
 
     pub fn is_alive(&self) -> bool {

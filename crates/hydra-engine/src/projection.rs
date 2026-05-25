@@ -59,7 +59,17 @@ impl Projection {
                         node_id.clone(),
                     ));
                 }
-                let node = Node::new(node_id.clone(), type_id.clone(), properties.clone());
+                // Multi-tenant Patch 2B: stamp the creating Event's
+                // tenant onto NodeMeta. Tenant-less events (system
+                // writes, replay of pre-Patch-2B snapshots) leave it
+                // as None and the engine treats those nodes as
+                // system/global.
+                let node = Node::new_for_tenant(
+                    node_id.clone(),
+                    type_id.clone(),
+                    properties.clone(),
+                    event.tenant_id.clone(),
+                );
                 // Update type index
                 self.type_index
                     .entry(type_id.clone())
@@ -166,12 +176,14 @@ impl Projection {
                     });
                 }
 
-                let edge = Edge::new(
+                // Same tenant-stamping policy as NodeCreated.
+                let edge = Edge::new_for_tenant(
                     edge_id.clone(),
                     type_id.clone(),
                     source.clone(),
                     target.clone(),
                     properties.clone(),
+                    event.tenant_id.clone(),
                 );
 
                 // Update topology indexes
