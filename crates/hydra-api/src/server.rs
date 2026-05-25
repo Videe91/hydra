@@ -1297,7 +1297,9 @@ mod tests {
         // i.e. the query router shares the runtime engine, not a separate
         // one.
         use hydra_core::{EventKind, NodeId};
-        use hydra_net::http::query::{NodeResponse, NodesResponse};
+        use hydra_core::node::Node;
+        use hydra_net::http::pagination::Page;
+        use hydra_net::http::query::NodeResponse;
         use std::collections::HashMap;
 
         let runtime = test_runtime();
@@ -1316,8 +1318,9 @@ mod tests {
 
         let app = build_router(runtime);
 
+        // List route now returns `Page<Node>` after Pagination v0.
         let list_req = Request::builder()
-            .uri("/query/nodes")
+            .uri("/query/nodes?limit=1")
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(list_req).await.unwrap();
@@ -1325,8 +1328,9 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let decoded: NodesResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(decoded.nodes.len(), 1);
+        let decoded: Page<Node> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.next_cursor, None);
 
         let get_req = Request::builder()
             .uri(format!("/query/nodes/{node_id}"))

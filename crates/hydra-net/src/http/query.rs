@@ -36,21 +36,22 @@
 //! Single-object responses are wrapped (`NodeResponse { node }`, …) so
 //! callers can extend the shape without breaking deserialization.
 
+use crate::http::pagination::{paginate_by_cursor, PaginationQuery};
 use crate::query::QueryService;
 use crate::runtime::RuntimeHandle;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
-use hydra_core::{
-    Action, ActionId, ActionStatus, Claim, ClaimId, ClaimStatus, EdgeId, Evidence, EvidenceId,
-    NodeId, Outcome, SensorCheckpoint, SensorId, SensorRun,
-};
 use hydra_core::edge::Edge;
 use hydra_core::node::Node;
+use hydra_core::{
+    Action, ActionId, ActionStatus, Claim, ClaimId, ClaimStatus, EdgeId, Evidence, EvidenceId,
+    NodeId, Outcome, SensorCheckpoint, SensorId,
+};
 use serde::{Deserialize, Serialize};
 
 /// Shared HTTP state for the query routes.
@@ -156,27 +157,9 @@ pub struct EdgeResponse {
     pub edge: Edge,
 }
 
-/// List view of evidence. The JSON key is `evidence` (singular) because
-/// "evidence" is an uncountable noun — same shape as the wrapped single
-/// response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvidenceListResponse {
-    pub evidence: Vec<Evidence>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceResponse {
     pub evidence: Evidence,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SensorRunsResponse {
-    pub runs: Vec<SensorRun>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SensorCheckpointsResponse {
-    pub checkpoints: Vec<SensorCheckpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,9 +213,20 @@ fn parse_action_status(status: &str) -> Option<ActionStatus> {
 
 // === Node handlers ===
 
-async fn list_nodes(State(state): State<QueryHttpState>) -> Response {
+async fn list_nodes(
+    State(state): State<QueryHttpState>,
+    Query(query): Query<PaginationQuery>,
+) -> Response {
     let nodes = state.service.nodes().await;
-    Json(NodesResponse { nodes }).into_response()
+    match paginate_by_cursor(&nodes, query.after.as_deref(), query.limit, |node| {
+        node.id().to_string()
+    }) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("unknown node cursor: {}", query.after.unwrap_or_default()),
+        ),
+    }
 }
 
 async fn get_node(
@@ -284,9 +278,20 @@ async fn node_incoming_edges(
 
 // === Edge handlers ===
 
-async fn list_edges(State(state): State<QueryHttpState>) -> Response {
+async fn list_edges(
+    State(state): State<QueryHttpState>,
+    Query(query): Query<PaginationQuery>,
+) -> Response {
     let edges = state.service.edges().await;
-    Json(EdgesResponse { edges }).into_response()
+    match paginate_by_cursor(&edges, query.after.as_deref(), query.limit, |edge| {
+        edge.id().to_string()
+    }) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("unknown edge cursor: {}", query.after.unwrap_or_default()),
+        ),
+    }
 }
 
 async fn get_edge(
@@ -302,9 +307,20 @@ async fn get_edge(
 
 // === Evidence handlers ===
 
-async fn list_evidence(State(state): State<QueryHttpState>) -> Response {
+async fn list_evidence(
+    State(state): State<QueryHttpState>,
+    Query(query): Query<PaginationQuery>,
+) -> Response {
     let evidence = state.service.evidence_items().await;
-    Json(EvidenceListResponse { evidence }).into_response()
+    match paginate_by_cursor(&evidence, query.after.as_deref(), query.limit, |evidence| {
+        evidence.id.to_string()
+    }) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("unknown evidence cursor: {}", query.after.unwrap_or_default()),
+        ),
+    }
 }
 
 async fn get_evidence(
@@ -323,9 +339,20 @@ async fn get_evidence(
 
 // === Claim handlers ===
 
-async fn list_claims(State(state): State<QueryHttpState>) -> Response {
+async fn list_claims(
+    State(state): State<QueryHttpState>,
+    Query(query): Query<PaginationQuery>,
+) -> Response {
     let claims = state.service.claims().await;
-    Json(ClaimsResponse { claims }).into_response()
+    match paginate_by_cursor(&claims, query.after.as_deref(), query.limit, |claim| {
+        claim.id.to_string()
+    }) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("unknown claim cursor: {}", query.after.unwrap_or_default()),
+        ),
+    }
 }
 
 async fn get_claim(
@@ -358,9 +385,20 @@ async fn claims_by_status(
 
 // === Action handlers ===
 
-async fn list_actions(State(state): State<QueryHttpState>) -> Response {
+async fn list_actions(
+    State(state): State<QueryHttpState>,
+    Query(query): Query<PaginationQuery>,
+) -> Response {
     let actions = state.service.actions().await;
-    Json(ActionsResponse { actions }).into_response()
+    match paginate_by_cursor(&actions, query.after.as_deref(), query.limit, |action| {
+        action.id.to_string()
+    }) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("unknown action cursor: {}", query.after.unwrap_or_default()),
+        ),
+    }
 }
 
 async fn get_action(
@@ -420,19 +458,46 @@ async fn outcomes_for_action(
 async fn sensor_runs(
     State(state): State<QueryHttpState>,
     Path(sensor_id): Path<String>,
+    Query(query): Query<PaginationQuery>,
 ) -> Response {
     let id = SensorId::from_str(&sensor_id);
     let runs = state.service.runs_for_sensor(&id).await;
-    Json(SensorRunsResponse { runs }).into_response()
+    match paginate_by_cursor(&runs, query.after.as_deref(), query.limit, |run| {
+        run.id.to_string()
+    }) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown sensor run cursor: {}",
+                query.after.unwrap_or_default()
+            ),
+        ),
+    }
 }
 
 async fn sensor_checkpoints(
     State(state): State<QueryHttpState>,
     Path(sensor_id): Path<String>,
+    Query(query): Query<PaginationQuery>,
 ) -> Response {
     let id = SensorId::from_str(&sensor_id);
     let checkpoints = state.service.checkpoints_for_sensor(&id).await;
-    Json(SensorCheckpointsResponse { checkpoints }).into_response()
+    match paginate_by_cursor(
+        &checkpoints,
+        query.after.as_deref(),
+        query.limit,
+        |checkpoint| checkpoint.id.to_string(),
+    ) {
+        Ok(page) => Json(page).into_response(),
+        Err(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown sensor checkpoint cursor: {}",
+                query.after.unwrap_or_default()
+            ),
+        ),
+    }
 }
 
 async fn latest_sensor_checkpoint(
@@ -456,7 +521,9 @@ async fn latest_sensor_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::pagination::Page;
     use crate::runtime::RuntimeBuilder;
+    use hydra_core::SensorRun;
     use axum::body::Body;
     use axum::http::{Method, Request};
     use hydra_core::{
@@ -578,8 +645,9 @@ mod tests {
         let app = query_router(runtime);
         let response = app.oneshot(empty_get("/query/nodes")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: NodesResponse = read_json(response).await;
-        assert_eq!(decoded.nodes.len(), 0);
+        let decoded: Page<Node> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 0);
+        assert_eq!(decoded.next_cursor, None);
     }
 
     #[tokio::test]
@@ -600,9 +668,10 @@ mod tests {
         let app = query_router(runtime);
         let response = app.oneshot(empty_get("/query/nodes")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: NodesResponse = read_json(response).await;
-        assert_eq!(decoded.nodes.len(), 1);
-        assert_eq!(decoded.nodes[0].id(), &node_id);
+        let decoded: Page<Node> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.items[0].id(), &node_id);
+        assert_eq!(decoded.next_cursor, None);
     }
 
     #[tokio::test]
@@ -704,8 +773,9 @@ mod tests {
         let app = query_router(runtime);
         let response = app.oneshot(empty_get("/query/claims")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: ClaimsResponse = read_json(response).await;
-        assert_eq!(decoded.claims.len(), 0);
+        let decoded: Page<Claim> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 0);
+        assert_eq!(decoded.next_cursor, None);
     }
 
     #[tokio::test]
@@ -732,9 +802,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: ClaimsResponse = read_json(response).await;
-        assert_eq!(decoded.claims.len(), 1);
-        assert_eq!(decoded.claims[0].id, claim_id);
+        let decoded: Page<Claim> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.items[0].id, claim_id);
 
         let response = app
             .oneshot(empty_get(&format!("/query/claims/{claim_id}")))
@@ -829,9 +899,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: ActionsResponse = read_json(response).await;
-        assert_eq!(decoded.actions.len(), 1);
-        assert_eq!(decoded.actions[0].id, action_id);
+        let decoded: Page<Action> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.items[0].id, action_id);
 
         let response = app
             .oneshot(empty_get(&format!("/query/actions/{action_id}")))
@@ -946,8 +1016,9 @@ mod tests {
         let app = query_router(runtime);
         let response = app.oneshot(empty_get("/query/edges")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: EdgesResponse = read_json(response).await;
-        assert_eq!(decoded.edges.len(), 0);
+        let decoded: Page<Edge> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 0);
+        assert_eq!(decoded.next_cursor, None);
     }
 
     #[tokio::test]
@@ -991,9 +1062,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: EdgesResponse = read_json(response).await;
-        assert_eq!(decoded.edges.len(), 1);
-        assert_eq!(decoded.edges[0].id(), &edge_id);
+        let decoded: Page<Edge> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.items[0].id(), &edge_id);
 
         let response = app
             .oneshot(empty_get(&format!("/query/edges/{edge_id}")))
@@ -1119,8 +1190,9 @@ mod tests {
         let app = query_router(runtime);
         let response = app.oneshot(empty_get("/query/evidence")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: EvidenceListResponse = read_json(response).await;
-        assert_eq!(decoded.evidence.len(), 0);
+        let decoded: Page<Evidence> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 0);
+        assert_eq!(decoded.next_cursor, None);
     }
 
     #[tokio::test]
@@ -1143,9 +1215,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: EvidenceListResponse = read_json(response).await;
-        assert_eq!(decoded.evidence.len(), 1);
-        assert_eq!(decoded.evidence[0].id, evidence_id);
+        let decoded: Page<Evidence> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 1);
+        assert_eq!(decoded.items[0].id, evidence_id);
 
         let response = app
             .oneshot(empty_get(&format!("/query/evidence/{evidence_id}")))
@@ -1202,8 +1274,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: SensorRunsResponse = read_json(response).await;
-        assert_eq!(decoded.runs.len(), 0);
+        let decoded: Page<SensorRun> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 0);
+        assert_eq!(decoded.next_cursor, None);
     }
 
     #[tokio::test]
@@ -1215,8 +1288,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: SensorCheckpointsResponse = read_json(response).await;
-        assert_eq!(decoded.checkpoints.len(), 0);
+        let decoded: Page<SensorCheckpoint> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 0);
+        assert_eq!(decoded.next_cursor, None);
     }
 
     #[tokio::test]
@@ -1235,8 +1309,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let decoded: SensorCheckpointsResponse = read_json(response).await;
-        assert_eq!(decoded.checkpoints.len(), 2);
+        let decoded: Page<SensorCheckpoint> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 2);
     }
 
     #[tokio::test]
@@ -1318,5 +1392,166 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let decoded: ClaimsResponse = read_json(response).await;
         assert_eq!(decoded.claims.len(), 0);
+    }
+
+    // === Pagination ===
+
+    #[tokio::test]
+    async fn list_nodes_respects_limit_and_returns_cursor() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            for _ in 0..3 {
+                hydra
+                    .ingest(EventKind::NodeCreated {
+                        node_id: NodeId::new(),
+                        type_id: "ec2".to_string(),
+                        properties: HashMap::new(),
+                    })
+                    .unwrap();
+            }
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/nodes?limit=2"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: Page<Node> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 2);
+        assert!(decoded.next_cursor.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_nodes_walks_full_set_with_after_cursor() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            for _ in 0..3 {
+                hydra
+                    .ingest(EventKind::NodeCreated {
+                        node_id: NodeId::new(),
+                        type_id: "ec2".to_string(),
+                        properties: HashMap::new(),
+                    })
+                    .unwrap();
+            }
+        }
+        let app = query_router(runtime);
+
+        let response = app
+            .clone()
+            .oneshot(empty_get("/query/nodes?limit=2"))
+            .await
+            .unwrap();
+        let first: Page<Node> = read_json(response).await;
+        assert_eq!(first.items.len(), 2);
+        let cursor = first.next_cursor.expect("first page must have cursor");
+
+        let response = app
+            .oneshot(empty_get(&format!("/query/nodes?limit=2&after={cursor}")))
+            .await
+            .unwrap();
+        let second: Page<Node> = read_json(response).await;
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn list_nodes_unknown_cursor_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/nodes?after=node_bogus"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_edges_paginates() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let mut edge_ids = Vec::new();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            let a = NodeId::new();
+            let b = NodeId::new();
+            hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: a.clone(),
+                    type_id: "ec2".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+            hydra
+                .ingest(EventKind::NodeCreated {
+                    node_id: b.clone(),
+                    type_id: "vpc".to_string(),
+                    properties: HashMap::new(),
+                })
+                .unwrap();
+            for _ in 0..2 {
+                let edge_id = hydra_core::EdgeId::new();
+                hydra
+                    .ingest(EventKind::EdgeCreated {
+                        edge_id: edge_id.clone(),
+                        source: a.clone(),
+                        target: b.clone(),
+                        type_id: "in_vpc".to_string(),
+                        properties: HashMap::new(),
+                    })
+                    .unwrap();
+                edge_ids.push(edge_id);
+            }
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get("/query/edges?limit=1"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: Page<Edge> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 1);
+        assert!(decoded.next_cursor.is_some());
+    }
+
+    #[tokio::test]
+    async fn sensor_checkpoints_paginates() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let sensor = SensorId::from_str("sensor_bank");
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            observe(&mut hydra, &sensor, "1");
+            observe(&mut hydra, &sensor, "2");
+            observe(&mut hydra, &sensor, "3");
+        }
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(
+                "/query/sensors/sensor_bank/checkpoints?limit=2",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: Page<SensorCheckpoint> = read_json(response).await;
+        assert_eq!(decoded.items.len(), 2);
+        assert!(decoded.next_cursor.is_some());
+    }
+
+    #[tokio::test]
+    async fn sensor_checkpoints_unknown_cursor_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = query_router(runtime);
+        let response = app
+            .oneshot(empty_get(
+                "/query/sensors/sensor_bank/checkpoints?after=chkpt_bogus",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

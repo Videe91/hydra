@@ -1,3 +1,4 @@
+use crate::http::pagination::normalized_limit;
 use crate::runtime::RuntimeHandle;
 use axum::{
     extract::{Path, Query, State},
@@ -129,7 +130,7 @@ async fn list_commits(
         }
     }
 
-    let limit = query.limit.unwrap_or(100).min(500);
+    let limit = normalized_limit(query.limit);
     let commits: Vec<CommitSummary> = records
         .iter()
         .skip(start_index)
