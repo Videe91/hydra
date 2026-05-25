@@ -40,9 +40,11 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use chrono::{DateTime, Utc};
 use hydra_core::TenantId;
 use hydra_net::http::tenant::{extract_tenant, tenant_error_response};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthMode {
@@ -51,16 +53,29 @@ pub enum AuthMode {
     RequireForAll,
 }
 
-/// A configured bearer token, optionally bound to a tenant.
+/// A configured bearer token, optionally bound to a tenant, with
+/// optional scope and expiry constraints (Auth hardening).
 ///
 /// Unbound tokens (`tenant_id = None`) authenticate any tenant
 /// reachable via the `X-Hydra-Tenant` header. Bound tokens require the
-/// header to equal the token's tenant — see the module docs for the
-/// rationale.
+/// header to equal the token's tenant.
+///
+/// **Scopes** are additive and backwards-compatible:
+/// - Empty `scopes` (the default) = legacy "super-token" that bypasses
+///   scope checks entirely on every route.
+/// - Non-empty `scopes` = the token must contain every scope listed by
+///   [`required_scopes_for`] for the requested (method, path). Missing
+///   any required scope → 403.
+///
+/// **Expiry** is checked at lookup time. `expires_at = None` = the
+/// token never expires. Otherwise the request must be served at a
+/// time `<= expires_at`. Expired token → 401.
 #[derive(Debug, Clone)]
 pub struct AuthToken {
     pub token: String,
     pub tenant_id: Option<TenantId>,
+    pub scopes: HashSet<String>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl AuthToken {
@@ -70,6 +85,8 @@ impl AuthToken {
         Self {
             token: token.into(),
             tenant_id: None,
+            scopes: HashSet::new(),
+            expires_at: None,
         }
     }
 
@@ -80,6 +97,35 @@ impl AuthToken {
         Self {
             token: token.into(),
             tenant_id: Some(tenant),
+            scopes: HashSet::new(),
+            expires_at: None,
+        }
+    }
+
+    /// Builder: attach a scope set. Non-empty `scopes` opt the token
+    /// into per-route scope enforcement; empty `scopes` keeps the
+    /// legacy bypass behavior.
+    pub fn with_scopes<I, S>(mut self, scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.scopes = scopes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Builder: attach an expiry timestamp. Requests at or before
+    /// this time succeed; after it the token returns 401.
+    pub fn with_expiry(mut self, expires_at: DateTime<Utc>) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    /// Has this token's `expires_at` (if any) already passed at `now`?
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        match self.expires_at {
+            Some(deadline) => now > deadline,
+            None => false,
         }
     }
 }
@@ -164,29 +210,114 @@ impl AuthConfig {
         !self.tokens.is_empty()
     }
 
-    /// Look up a candidate string against the configured tokens.
-    /// Returns the matching [`AuthToken`] (with its tenant binding)
-    /// on hit, `None` on miss.
+    /// Look up a candidate token against the configured tokens at a
+    /// specific point in time. Returns:
     ///
-    /// The comparison is constant-time per token via
-    /// [`constant_time_eq`]. Whether *any* token matched leaks
-    /// (return is `Some` vs `None`), but the value of the matched
-    /// token does not.
-    pub fn token_lookup(&self, candidate: &str) -> Option<&AuthToken> {
+    /// - `Valid(&AuthToken)` — token matched and is unexpired
+    /// - `Expired` — token matched but its `expires_at` has passed
+    /// - `NotFound` — no token matched
+    ///
+    /// The byte comparison is constant-time per token via
+    /// [`constant_time_eq`] (whether *any* token matched does leak —
+    /// the result is `Valid` vs `NotFound` — but the matched token's
+    /// value does not).
+    pub fn token_lookup(&self, candidate: &str, now: DateTime<Utc>) -> TokenLookupResult<'_> {
+        let mut matched: Option<&AuthToken> = None;
         for token in &self.tokens {
             if constant_time_eq(token.token.as_bytes(), candidate.as_bytes()) {
-                return Some(token);
+                matched = Some(token);
+                break;
             }
         }
-        None
+        match matched {
+            Some(token) if token.is_expired_at(now) => TokenLookupResult::Expired,
+            Some(token) => TokenLookupResult::Valid(token),
+            None => TokenLookupResult::NotFound,
+        }
     }
 
     /// Convenience predicate for callers that only need "is this
-    /// token configured?" Backwards-compatible with pre-Patch-3
-    /// tests.
+    /// token configured *right now*?". Pre-Auth-Hardening tests use
+    /// this; new code should prefer [`Self::token_lookup`].
     pub fn token_is_allowed(&self, candidate: &str) -> bool {
-        self.token_lookup(candidate).is_some()
+        matches!(
+            self.token_lookup(candidate, Utc::now()),
+            TokenLookupResult::Valid(_)
+        )
     }
+}
+
+/// Result of looking up a candidate bearer token in [`AuthConfig`].
+///
+/// Three-way outcome so the middleware can map cleanly:
+/// - `Valid` → 200 + AuthContext insertion
+/// - `Expired` → 401 with `expired bearer token`
+/// - `NotFound` → 401 with `invalid bearer token`
+#[derive(Debug, Clone)]
+pub enum TokenLookupResult<'a> {
+    Valid(&'a AuthToken),
+    Expired,
+    NotFound,
+}
+
+/// Per-(method, path) required scopes table.
+///
+/// Returns the scopes any *scoped* token must contain to be allowed
+/// to invoke this route. Empty result means "no scope requirement"
+/// — either the route is open or scope grain doesn't matter yet.
+///
+/// Path matching is **prefix** so future sub-routes (e.g.
+/// `/query/nodes/:id/bfs`) inherit their parent's scopes without an
+/// entry per leaf.
+///
+/// Important: this table is consulted only when the matched token
+/// has non-empty `scopes`. Empty-scope tokens (the default for
+/// pre-Auth-Hardening builders) bypass scope checks entirely.
+pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
+    if *method == Method::OPTIONS {
+        return Vec::new();
+    }
+    let mutating = matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    if mutating {
+        // Mutating routes — most specific paths first because
+        // `starts_with` is a prefix test.
+        if path == "/ingest" {
+            return vec!["write:ingest"];
+        }
+        if path.starts_with("/sensor/") {
+            return vec!["write:sensor"];
+        }
+        if path.starts_with("/schemas/") {
+            return vec!["admin:schemas"];
+        }
+        if path == "/snapshots" || path.starts_with("/snapshots/") {
+            return vec!["admin:ops"];
+        }
+        if path.starts_with("/maintenance/") {
+            return vec!["admin:ops"];
+        }
+        return Vec::new();
+    }
+    // Reads.
+    if path.starts_with("/query/") {
+        return vec!["read:query"];
+    }
+    if path == "/events" || path.starts_with("/events/") {
+        return vec!["read:audit"];
+    }
+    if path == "/commits" || path.starts_with("/commits/") {
+        return vec!["read:audit"];
+    }
+    if path == "/snapshots" || path.starts_with("/snapshots/") {
+        return vec!["read:ops"];
+    }
+    if path.starts_with("/schemas/") || path == "/schemas" {
+        return vec!["read:schemas"];
+    }
+    Vec::new()
 }
 
 fn is_mutating_method(method: &Method) -> bool {
@@ -266,17 +397,59 @@ pub async fn auth_middleware(
     if !state.config.should_authenticate(request.method()) {
         return next.run(request).await;
     }
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
     if !state.config.has_tokens() {
+        tracing::warn!(
+            target: "hydra::auth",
+            reason = "no configured tokens",
+            method = %method,
+            path = %path,
+            "auth failure"
+        );
         return auth_error(
             StatusCode::UNAUTHORIZED,
             "authentication is required but no bearer tokens are configured",
         );
     }
     let Some(token) = bearer_token(request.headers()) else {
+        tracing::warn!(
+            target: "hydra::auth",
+            reason = "missing bearer token",
+            method = %method,
+            path = %path,
+            "auth failure"
+        );
         return auth_error(StatusCode::UNAUTHORIZED, "missing bearer token");
     };
-    match state.config.token_lookup(token) {
-        Some(matched) => {
+    let now = Utc::now();
+    match state.config.token_lookup(token, now) {
+        TokenLookupResult::Valid(matched) => {
+            // Scope check — only enforced when the matched token has
+            // non-empty `scopes`. Empty-scope tokens preserve legacy
+            // bypass behavior so pre-Auth-Hardening configurations
+            // keep working unchanged.
+            if !matched.scopes.is_empty() {
+                let required = required_scopes_for(&method, &path);
+                if !required.is_empty()
+                    && !required.iter().all(|scope| matched.scopes.contains(*scope))
+                {
+                    tracing::warn!(
+                        target: "hydra::auth",
+                        reason = "missing required scope",
+                        method = %method,
+                        path = %path,
+                        required = ?required,
+                        "auth failure"
+                    );
+                    return auth_error(
+                        StatusCode::FORBIDDEN,
+                        format!(
+                            "bearer token is missing required scope(s) for {method} {path}"
+                        ),
+                    );
+                }
+            }
             // Hand the tenant binding (if any) downstream so the
             // tenant-binding middleware can enforce match-not-override.
             request.extensions_mut().insert(AuthContext {
@@ -284,7 +457,26 @@ pub async fn auth_middleware(
             });
             next.run(request).await
         }
-        None => auth_error(StatusCode::UNAUTHORIZED, "invalid bearer token"),
+        TokenLookupResult::Expired => {
+            tracing::warn!(
+                target: "hydra::auth",
+                reason = "expired bearer token",
+                method = %method,
+                path = %path,
+                "auth failure"
+            );
+            auth_error(StatusCode::UNAUTHORIZED, "expired bearer token")
+        }
+        TokenLookupResult::NotFound => {
+            tracing::warn!(
+                target: "hydra::auth",
+                reason = "invalid bearer token",
+                method = %method,
+                path = %path,
+                "auth failure"
+            );
+            auth_error(StatusCode::UNAUTHORIZED, "invalid bearer token")
+        }
     }
 }
 
@@ -314,14 +506,34 @@ pub async fn tenant_binding_middleware(
     let Some(bound) = bound_tenant else {
         return next.run(request).await;
     };
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
     // Token is bound — header is required and must match. Reuse the
     // same parser hydra-net handlers use so the 400 contract stays
     // consistent.
     let header_tenant = match extract_tenant(request.headers()) {
         Ok(t) => t,
-        Err(err) => return tenant_error_response(err),
+        Err(err) => {
+            tracing::warn!(
+                target: "hydra::auth",
+                reason = ?err,
+                method = %method,
+                path = %path,
+                "tenant header invalid on bound-token request"
+            );
+            return tenant_error_response(err);
+        }
     };
     if header_tenant != bound {
+        tracing::warn!(
+            target: "hydra::auth",
+            reason = "tenant binding mismatch",
+            method = %method,
+            path = %path,
+            bound = %bound,
+            header = %header_tenant,
+            "auth failure"
+        );
         return auth_error(
             StatusCode::FORBIDDEN,
             format!(
@@ -407,14 +619,28 @@ mod tests {
 
     // === Multi-tenant Patch 3: token binding ===
 
+    fn now() -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    fn matched_token<'a>(result: TokenLookupResult<'a>) -> &'a AuthToken {
+        match result {
+            TokenLookupResult::Valid(token) => token,
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
     #[test]
     fn string_token_builder_creates_unbound_tokens() {
         // Backwards-compat: pre-Patch-3 callers using the string
-        // builder get tokens with no tenant binding.
+        // builder get tokens with no tenant binding, no scopes, and
+        // no expiry.
         let config = AuthConfig::require_for_mutations(["alpha"]);
-        let token = config.token_lookup("alpha").expect("token must match");
+        let token = matched_token(config.token_lookup("alpha", now()));
         assert_eq!(token.token, "alpha");
         assert!(token.tenant_id.is_none());
+        assert!(token.scopes.is_empty());
+        assert!(token.expires_at.is_none());
     }
 
     #[test]
@@ -424,16 +650,121 @@ mod tests {
             AuthToken::bound("alpha", tenant.clone()),
             AuthToken::unbound("beta"),
         ]);
-        let alpha = config.token_lookup("alpha").expect("alpha must match");
+        let alpha = matched_token(config.token_lookup("alpha", now()));
         assert_eq!(alpha.tenant_id.as_ref(), Some(&tenant));
-        let beta = config.token_lookup("beta").expect("beta must match");
+        let beta = matched_token(config.token_lookup("beta", now()));
         assert!(beta.tenant_id.is_none());
     }
 
     #[test]
-    fn token_lookup_returns_none_for_unconfigured() {
+    fn token_lookup_returns_not_found_for_unconfigured() {
         let config = AuthConfig::require_for_all(["alpha"]);
-        assert!(config.token_lookup("beta").is_none());
-        assert!(config.token_lookup("").is_none());
+        assert!(matches!(
+            config.token_lookup("beta", now()),
+            TokenLookupResult::NotFound
+        ));
+        assert!(matches!(
+            config.token_lookup("", now()),
+            TokenLookupResult::NotFound
+        ));
+    }
+
+    // === Auth Hardening ===
+
+    #[test]
+    fn token_lookup_reports_expired_when_past_deadline() {
+        let now_ts = Utc::now();
+        let past = now_ts - chrono::Duration::seconds(60);
+        let config = AuthConfig::require_for_all_with_tokens([
+            AuthToken::unbound("alpha").with_expiry(past),
+        ]);
+        assert!(matches!(
+            config.token_lookup("alpha", now_ts),
+            TokenLookupResult::Expired
+        ));
+    }
+
+    #[test]
+    fn token_lookup_is_valid_before_deadline() {
+        let now_ts = Utc::now();
+        let future = now_ts + chrono::Duration::seconds(60);
+        let config = AuthConfig::require_for_all_with_tokens([
+            AuthToken::unbound("alpha").with_expiry(future),
+        ]);
+        assert!(matches!(
+            config.token_lookup("alpha", now_ts),
+            TokenLookupResult::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn token_lookup_with_no_expiry_is_always_valid() {
+        // expires_at = None means "never expires" — token_lookup
+        // returns Valid even at far-future timestamps.
+        let config = AuthConfig::require_for_all(["alpha"]);
+        let far_future = Utc::now() + chrono::Duration::days(365 * 10);
+        assert!(matches!(
+            config.token_lookup("alpha", far_future),
+            TokenLookupResult::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn required_scopes_table_covers_write_and_read_buckets() {
+        // Spot-check the policy without being exhaustive.
+        assert_eq!(
+            required_scopes_for(&Method::POST, "/ingest"),
+            vec!["write:ingest"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::POST, "/sensor/observation"),
+            vec!["write:sensor"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::POST, "/schemas/entity"),
+            vec!["admin:schemas"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::POST, "/snapshots"),
+            vec!["admin:ops"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/query/nodes"),
+            vec!["read:query"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/events"),
+            vec!["read:audit"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/commits"),
+            vec!["read:audit"]
+        );
+        // OPTIONS always has no scope requirement (CORS preflight).
+        assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());
+        // Routes with no entry don't require any scope.
+        assert!(required_scopes_for(&Method::GET, "/health").is_empty());
+    }
+
+    #[test]
+    fn auth_token_with_scopes_builder_round_trips() {
+        let token = AuthToken::unbound("alpha")
+            .with_scopes(["read:query", "write:ingest"]);
+        assert_eq!(token.scopes.len(), 2);
+        assert!(token.scopes.contains("read:query"));
+        assert!(token.scopes.contains("write:ingest"));
+    }
+
+    #[test]
+    fn auth_token_is_expired_at_checks_deadline() {
+        let now_ts = Utc::now();
+        let unexpired = AuthToken::unbound("a")
+            .with_expiry(now_ts + chrono::Duration::seconds(60));
+        let expired = AuthToken::unbound("b")
+            .with_expiry(now_ts - chrono::Duration::seconds(60));
+        let no_expiry = AuthToken::unbound("c");
+        assert!(!unexpired.is_expired_at(now_ts));
+        assert!(expired.is_expired_at(now_ts));
+        assert!(!no_expiry.is_expired_at(now_ts));
     }
 }

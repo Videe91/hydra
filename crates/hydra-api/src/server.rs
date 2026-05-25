@@ -1562,4 +1562,115 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    // === Auth Hardening: scopes + expiry end-to-end ===
+
+    #[tokio::test]
+    async fn auth_hardening_scoped_token_allows_route_with_matching_scope() {
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_all_with_tokens([
+                AuthToken::unbound("alpha").with_scopes(["write:ingest"]),
+            ]),
+        );
+        let response = app
+            .oneshot(ingest_post(Some("alpha"), Some("tenant_any")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_hardening_scoped_token_rejects_route_without_required_scope_403() {
+        // Token has only `read:query`. POST /ingest requires
+        // `write:ingest`. The token authenticates (it's configured)
+        // but is not authorized for this route — 403, not 401.
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime.clone(),
+            AuthConfig::require_for_all_with_tokens([
+                AuthToken::unbound("alpha").with_scopes(["read:query"]),
+            ]),
+        );
+        let response = app
+            .oneshot(ingest_post(Some("alpha"), Some("tenant_any")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        // And the request never reached the engine.
+        assert_eq!(runtime.hydra().read().await.commit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn auth_hardening_empty_scope_token_bypasses_scope_checks() {
+        // Legacy super-token: empty `scopes` opts out of scope
+        // enforcement entirely. Pre-Auth-Hardening configs that
+        // used the string builders keep working unchanged.
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_all_with_tokens([AuthToken::unbound("alpha")]),
+        );
+        let response = app
+            .oneshot(ingest_post(Some("alpha"), Some("tenant_any")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_hardening_expired_token_returns_401() {
+        use crate::auth::AuthToken;
+        use chrono::Utc;
+        let runtime = test_runtime();
+        let past = Utc::now() - chrono::Duration::seconds(60);
+        let app = build_router_with_auth(
+            runtime.clone(),
+            AuthConfig::require_for_all_with_tokens([
+                AuthToken::unbound("alpha").with_expiry(past),
+            ]),
+        );
+        let response = app
+            .oneshot(ingest_post(Some("alpha"), Some("tenant_any")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(runtime.hydra().read().await.commit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn auth_hardening_scoped_token_with_multiple_scopes_satisfies_route() {
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        // A token with both ingest and query scopes can hit /ingest
+        // and /query/stats.
+        let app = build_router_with_auth(
+            runtime,
+            AuthConfig::require_for_all_with_tokens([AuthToken::unbound("alpha")
+                .with_scopes(["write:ingest", "read:query"])]),
+        );
+        let post = app
+            .clone()
+            .oneshot(ingest_post(Some("alpha"), Some("tenant_any")))
+            .await
+            .unwrap();
+        assert_eq!(post.status(), StatusCode::OK);
+        let get = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/query/stats")
+                    .header("Authorization", "Bearer alpha")
+                    .header("X-Hydra-Tenant", "tenant_any")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+    }
 }
