@@ -82,6 +82,16 @@ impl SchemaAdminService {
         }
     }
 
+    /// Return a per-request clone of this admin service scoped to the
+    /// supplied tenant. Used by HTTP handlers under Tenant v0 to
+    /// thread the `X-Hydra-Tenant` header into the schema mutation
+    /// without rebuilding the engine reference.
+    pub fn for_tenant(&self, tenant_id: TenantId) -> Self {
+        let mut clone = self.clone();
+        clone.tenant_id = Some(tenant_id);
+        clone
+    }
+
     pub fn default_actor(&self) -> &ActorId {
         &self.default_actor
     }

@@ -1,7 +1,8 @@
+use crate::http::tenant::{extract_tenant, tenant_error_response};
 use crate::runtime::RuntimeHandle;
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -318,11 +319,17 @@ async fn get_policy_condition_schema(
 
 async fn register_entity_schema(
     State(state): State<SchemaHttpState>,
+    headers: HeaderMap,
     Json(request): Json<RegisterEntitySchemaRequest>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     match state
         .runtime
         .schema_admin()
+        .for_tenant(tenant)
         .register_entity_schema(request.type_id, request.name, request.fields)
         .await
     {
@@ -338,11 +345,17 @@ async fn register_entity_schema(
 
 async fn register_evidence_schema(
     State(state): State<SchemaHttpState>,
+    headers: HeaderMap,
     Json(request): Json<RegisterEvidenceSchemaRequest>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     match state
         .runtime
         .schema_admin()
+        .for_tenant(tenant)
         .register_evidence_schema(request.kind, request.fields)
         .await
     {
@@ -358,11 +371,17 @@ async fn register_evidence_schema(
 
 async fn register_claim_predicate_schema(
     State(state): State<SchemaHttpState>,
+    headers: HeaderMap,
     Json(request): Json<RegisterClaimPredicateSchemaRequest>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     match state
         .runtime
         .schema_admin()
+        .for_tenant(tenant)
         .register_claim_predicate_schema(
             request.predicate,
             request.subject_type,
@@ -383,11 +402,17 @@ async fn register_claim_predicate_schema(
 
 async fn register_action_schema(
     State(state): State<SchemaHttpState>,
+    headers: HeaderMap,
     Json(request): Json<RegisterActionSchemaRequest>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     match state
         .runtime
         .schema_admin()
+        .for_tenant(tenant)
         .register_action_payload_schema(request.action_kind, request.fields)
         .await
     {
@@ -403,11 +428,17 @@ async fn register_action_schema(
 
 async fn register_policy_condition_schema(
     State(state): State<SchemaHttpState>,
+    headers: HeaderMap,
     Json(request): Json<RegisterPolicyConditionSchemaRequest>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     match state
         .runtime
         .schema_admin()
+        .for_tenant(tenant)
         .register_policy_condition_schema(request.policy_kind, request.fields)
         .await
     {
@@ -425,13 +456,19 @@ async fn register_policy_condition_schema(
 
 async fn disable_schema(
     State(state): State<SchemaHttpState>,
+    headers: HeaderMap,
     Path(schema_id): Path<String>,
     Json(request): Json<SchemaLifecycleRequest>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let schema_id = SchemaId::from_str(&schema_id);
     match state
         .runtime
         .schema_admin()
+        .for_tenant(tenant)
         .disable_schema(schema_id, request.reason)
         .await
     {
@@ -445,13 +482,19 @@ async fn disable_schema(
 
 async fn archive_schema(
     State(state): State<SchemaHttpState>,
+    headers: HeaderMap,
     Path(schema_id): Path<String>,
     Json(request): Json<SchemaLifecycleRequest>,
 ) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let schema_id = SchemaId::from_str(&schema_id);
     match state
         .runtime
         .schema_admin()
+        .for_tenant(tenant)
         .archive_schema(schema_id, request.reason)
         .await
     {
@@ -574,7 +617,27 @@ mod tests {
         }
     }
 
+    const TEST_TENANT: &str = "tenant_schema_http_test";
+
     fn request_json<T: Serialize>(method: Method, uri: &str, body: &T) -> Request<Body> {
+        // GET requests don't need the tenant header (no enforcement on
+        // reads in Tenant v0 Patch 1), but adding it on every test
+        // request keeps the helper uniform and matches the SDK
+        // contract of always sending it.
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", TEST_TENANT)
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    fn request_json_without_tenant<T: Serialize>(
+        method: Method,
+        uri: &str,
+        body: &T,
+    ) -> Request<Body> {
         Request::builder()
             .method(method)
             .uri(uri)
@@ -1123,5 +1186,55 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(runtime.schema().active_schemas().await.len(), 0);
         assert_eq!(runtime.schema().archived_schemas().await.len(), 1);
+    }
+
+    // === Tenant v0 patch 1 ===
+
+    #[tokio::test]
+    async fn post_entity_schema_without_tenant_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = schema_router(runtime);
+        let request = RegisterEntitySchemaRequest {
+            type_id: TypeId::from_str("Account"),
+            name: "Account".to_string(),
+            fields: vec![FieldSchema::required("id", ValueType::String)],
+        };
+        let response = app
+            .oneshot(request_json_without_tenant(
+                Method::POST,
+                "/schemas/entity",
+                &request,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn registered_schema_carries_tenant_id() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = schema_router(runtime.clone());
+        let request = RegisterEntitySchemaRequest {
+            type_id: TypeId::from_str("Customer"),
+            name: "Customer".to_string(),
+            fields: vec![FieldSchema::required("id", ValueType::String)],
+        };
+        let response = app
+            .oneshot(request_json(Method::POST, "/schemas/entity", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // The schema registry should hold the schema with the tenant_id
+        // we supplied — verify via the underlying schema service.
+        let schemas = runtime.schema().active_schemas().await;
+        let schema = schemas
+            .iter()
+            .find(|s| matches!(s, SchemaDefinition::EntityType(_)))
+            .expect("registered entity schema must exist");
+        assert_eq!(
+            schema.tenant_id().map(|t| t.to_string()),
+            Some(TEST_TENANT.to_string()),
+        );
     }
 }

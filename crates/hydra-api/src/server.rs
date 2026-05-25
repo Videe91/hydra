@@ -329,6 +329,7 @@ mod tests {
             .method("POST")
             .uri("/schemas/action")
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::from(serde_json::to_vec(&register).unwrap()))
             .unwrap();
         let resp = app.clone().oneshot(register_req).await.unwrap();
@@ -376,6 +377,7 @@ mod tests {
             .method("POST")
             .uri("/schemas/action")
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::from(serde_json::to_vec(&register).unwrap()))
             .unwrap();
         assert_eq!(
@@ -411,6 +413,7 @@ mod tests {
             .method("POST")
             .uri("/schemas/validate/action")
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::from(serde_json::to_vec(&validate).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -500,6 +503,7 @@ mod tests {
             .method("POST")
             .uri("/sensor/cloudtrail")
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::from(cloudtrail))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -560,6 +564,7 @@ mod tests {
             .method("POST")
             .uri("/schemas/action")
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::from(serde_json::to_vec(&register).unwrap()))
             .unwrap();
         assert_eq!(
@@ -620,6 +625,7 @@ mod tests {
             .method("POST")
             .uri("/ingest")
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .header("Idempotency-Key", "api-ingest-1")
             .body(Body::from(serde_json::to_vec(&request).unwrap()))
             .unwrap();
@@ -636,6 +642,7 @@ mod tests {
             .method("POST")
             .uri("/ingest")
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .header("Idempotency-Key", "api-ingest-1")
             .body(Body::from(serde_json::to_vec(&request).unwrap()))
             .unwrap();
@@ -735,6 +742,7 @@ mod tests {
             .method("POST")
             .uri("/ingest")
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::from(serde_json::to_vec(&request).unwrap()))
             .unwrap();
         let response = app.oneshot(http_request).await.unwrap();
@@ -777,6 +785,7 @@ mod tests {
             .method("POST")
             .uri("/sensor/observation")
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::from(body.clone()))
             .unwrap();
         let response = app.clone().oneshot(http_request).await.unwrap();
@@ -791,6 +800,7 @@ mod tests {
             .method("POST")
             .uri("/sensor/observation")
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::from(body))
             .unwrap();
         let response = app.oneshot(duplicate).await.unwrap();
@@ -923,6 +933,8 @@ mod tests {
                     .method("POST")
                     .uri("/snapshots")
                     .header("content-type", "application/json")
+                    .header("X-Hydra-Tenant", "tenant_api_test")
+            .header("X-Hydra-Tenant", "tenant_api_test")
                     .body(Body::from(serde_json::to_vec(&create).unwrap()))
                     .unwrap(),
             )
@@ -987,6 +999,8 @@ mod tests {
                     .method("POST")
                     .uri("/snapshots")
                     .header("content-type", "application/json")
+                    .header("X-Hydra-Tenant", "tenant_api_test")
+            .header("X-Hydra-Tenant", "tenant_api_test")
                     .body(Body::from(
                         serde_json::to_vec(&CreateSnapshotRequest {
                             created_by: ActorId::from_str("actor_api_snapshot"),
@@ -1029,6 +1043,7 @@ mod tests {
             .method(method)
             .uri(uri)
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "tenant_api_test")
             .body(Body::from(serde_json::to_vec(body).unwrap()))
             .unwrap()
     }
@@ -1224,6 +1239,9 @@ mod tests {
                         .method("POST")
                         .uri("/ingest")
                         .header("content-type", "application/json")
+                        .header("X-Hydra-Tenant", "tenant_api_test")
+                    .header("X-Hydra-Tenant", "tenant_api_test")
+            .header("X-Hydra-Tenant", "tenant_api_test")
                         .header("Idempotency-Key", "persistent-test-1")
                         .body(Body::from(serde_json::to_vec(&request).unwrap()))
                         .unwrap(),
@@ -1279,6 +1297,8 @@ mod tests {
                     .method("POST")
                     .uri("/ingest")
                     .header("content-type", "application/json")
+                    .header("X-Hydra-Tenant", "tenant_api_test")
+            .header("X-Hydra-Tenant", "tenant_api_test")
                     .body(Body::from(serde_json::to_vec(&request).unwrap()))
                     .unwrap(),
             )

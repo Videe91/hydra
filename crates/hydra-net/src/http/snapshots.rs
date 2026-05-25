@@ -1,7 +1,8 @@
+use crate::http::tenant::{extract_tenant, tenant_error_response};
 use crate::runtime::RuntimeHandle;
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -85,11 +86,19 @@ fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
 
 async fn create_snapshot(
     State(state): State<SnapshotsHttpState>,
+    headers: HeaderMap,
     Json(request): Json<CreateSnapshotRequest>,
 ) -> Response {
+    // Tenant header is required. The snapshot body still covers
+    // global engine state in v0 (snapshots are not tenant-scoped),
+    // but the manifest carries the requesting tenant for audit.
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
     let hydra_arc = state.runtime.hydra();
     let mut hydra = hydra_arc.write().await;
-    match hydra.snapshot(request.created_by) {
+    match hydra.snapshot_for_tenant(request.created_by, tenant) {
         Ok(manifest) => (
             StatusCode::CREATED,
             Json(SnapshotManifestResponse { manifest }),
@@ -169,7 +178,23 @@ mod tests {
         }
     }
 
+    const TEST_TENANT: &str = "tenant_snapshot_http_test";
+
     fn request_json<T: Serialize>(method: Method, uri: &str, body: &T) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", TEST_TENANT)
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    fn request_json_without_tenant<T: Serialize>(
+        method: Method,
+        uri: &str,
+        body: &T,
+    ) -> Request<Body> {
         Request::builder()
             .method(method)
             .uri(uri)
@@ -346,5 +371,51 @@ mod tests {
             &event.kind,
             EventKind::Signal { name, .. } if name == "after"
         )));
+    }
+
+    // === Tenant v0 patch 1 ===
+
+    #[tokio::test]
+    async fn post_snapshot_without_tenant_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = snapshots_router(runtime.clone());
+        let response = app
+            .oneshot(request_json_without_tenant(
+                Method::POST,
+                "/snapshots",
+                &CreateSnapshotRequest {
+                    created_by: actor(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // No snapshot was created.
+        assert_eq!(
+            runtime.hydra().read().await.snapshot_manifests().len(),
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn post_snapshot_stamps_tenant_on_manifest() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = snapshots_router(runtime);
+        let response = app
+            .oneshot(request_json(
+                Method::POST,
+                "/snapshots",
+                &CreateSnapshotRequest {
+                    created_by: actor(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let decoded: SnapshotManifestResponse = read_json(response).await;
+        assert_eq!(
+            decoded.manifest.tenant_id.as_ref().map(|t| t.to_string()),
+            Some(TEST_TENANT.to_string()),
+        );
     }
 }

@@ -6,6 +6,7 @@ pub mod query;
 pub mod schema;
 pub mod sensor;
 pub mod snapshots;
+pub mod tenant;
 
 pub use commits::{commits_router, CommitsHttpState};
 pub use events::{events_router, EventsHttpState};
@@ -15,3 +16,4 @@ pub use query::{query_router, QueryHttpState};
 pub use schema::{schema_router, SchemaHttpState};
 pub use sensor::{sensor_router, SensorHttpState};
 pub use snapshots::{snapshots_router, SnapshotsHttpState};
+pub use tenant::{extract_tenant, tenant_error_response, TenantError, TENANT_HEADER};

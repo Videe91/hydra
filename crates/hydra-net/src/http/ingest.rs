@@ -1,3 +1,4 @@
+use crate::http::tenant::{extract_tenant, tenant_error_response};
 use crate::runtime::RuntimeHandle;
 use axum::{
     extract::State,
@@ -6,7 +7,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use hydra_core::{CascadeId, EventId, EventKind, IdempotencyKey};
+use hydra_core::{CascadeId, Event, EventId, EventKind, IdempotencyKey};
 use serde::{Deserialize, Serialize};
 
 /// Shared HTTP state for ingest routes.
@@ -60,6 +61,14 @@ async fn ingest_event(
     headers: HeaderMap,
     Json(request): Json<IngestRequest>,
 ) -> Response {
+    // Tenant header is required for every mutating route per Tenant
+    // v0. The event envelope carries the parsed `TenantId` so the
+    // commit ledger and every downstream store see the correct scope.
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+
     let idempotency_key = headers
         .get("Idempotency-Key")
         .and_then(|value| value.to_str().ok())
@@ -72,8 +81,16 @@ async fn ingest_event(
     let mut hydra = hydra_arc.write().await;
     let commit_count_before = hydra.commit_count();
     let result = match idempotency_key {
-        Some(key) => hydra.ingest_with_idempotency_key(request.event_kind, key),
-        None => hydra.ingest(request.event_kind),
+        Some(key) => {
+            // Manual Event construction — there's no
+            // `ingest_with_idempotency_key_for_tenant` engine method
+            // yet, so we build the tenant-scoped envelope here and
+            // hand it to `ingest_event_with_idempotency_key`. Same
+            // semantics, one fewer engine method to maintain.
+            let event = Event::trigger_for_tenant(request.event_kind, tenant.clone());
+            hydra.ingest_event_with_idempotency_key(event, key)
+        }
+        None => hydra.ingest_for_tenant(request.event_kind, tenant.clone()),
     };
     match result {
         Ok(cascade) => {
@@ -113,11 +130,33 @@ mod tests {
     use std::collections::HashMap;
     use tower::ServiceExt;
 
+    const TEST_TENANT: &str = "tenant_ingest_test";
+
     fn request_json<T: Serialize>(uri: &str, body: &T) -> Request<Body> {
         Request::builder()
             .method(Method::POST)
             .uri(uri)
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", TEST_TENANT)
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    fn request_json_without_tenant<T: Serialize>(uri: &str, body: &T) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    fn request_json_with_invalid_tenant<T: Serialize>(uri: &str, body: &T) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", "../../etc/passwd")
             .body(Body::from(serde_json::to_vec(body).unwrap()))
             .unwrap()
     }
@@ -131,6 +170,7 @@ mod tests {
             .method(Method::POST)
             .uri(uri)
             .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", TEST_TENANT)
             .header("Idempotency-Key", key)
             .body(Body::from(serde_json::to_vec(body).unwrap()))
             .unwrap()
@@ -241,5 +281,90 @@ mod tests {
         let decoded: IngestResponse = read_json(response).await;
         assert!(!decoded.idempotent_hit);
         assert_eq!(runtime.hydra().read().await.commit_count(), 1);
+    }
+
+    // === Tenant v0 patch 1 ===
+
+    #[tokio::test]
+    async fn post_ingest_without_tenant_header_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = ingest_router(runtime.clone());
+
+        let request = IngestRequest {
+            event_kind: signal("no-tenant"),
+        };
+        let response = app
+            .oneshot(request_json_without_tenant("/ingest", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Nothing committed — the write was rejected at the boundary.
+        assert_eq!(runtime.hydra().read().await.commit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn post_ingest_with_invalid_tenant_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = ingest_router(runtime.clone());
+
+        let request = IngestRequest {
+            event_kind: signal("bad-tenant"),
+        };
+        let response = app
+            .oneshot(request_json_with_invalid_tenant("/ingest", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(runtime.hydra().read().await.commit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn post_ingest_stamps_tenant_on_committed_event() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = ingest_router(runtime.clone());
+
+        let request = IngestRequest {
+            event_kind: signal("with-tenant"),
+        };
+        let response = app
+            .oneshot(request_json("/ingest", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: IngestResponse = read_json(response).await;
+        let event_id = decoded.event_ids[0].clone();
+
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        let stored = hydra.event(&event_id).expect("event must exist");
+        assert_eq!(
+            stored.tenant_id.as_ref().map(|t| t.to_string()),
+            Some(TEST_TENANT.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn post_ingest_idempotent_path_also_stamps_tenant() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = ingest_router(runtime.clone());
+
+        let request = IngestRequest {
+            event_kind: signal("idempotent-with-tenant"),
+        };
+        let response = app
+            .oneshot(request_json_with_key("/ingest", "req-tenant-1", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: IngestResponse = read_json(response).await;
+        let event_id = decoded.event_ids[0].clone();
+
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        let stored = hydra.event(&event_id).expect("event must exist");
+        assert_eq!(
+            stored.tenant_id.as_ref().map(|t| t.to_string()),
+            Some(TEST_TENANT.to_string())
+        );
     }
 }

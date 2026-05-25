@@ -1381,6 +1381,68 @@ impl Hydra {
         cursor: hydra_core::SourceCursor,
         business_event: hydra_core::EventKind,
     ) -> hydra_core::error::Result<hydra_core::SensorCheckpoint> {
+        self.record_sensor_observation_for_run_inner(
+            run_id,
+            sensor_id,
+            source_system,
+            cursor,
+            business_event,
+            None,
+        )
+    }
+
+    /// Tenant-scoped variant of [`Self::record_sensor_observation`].
+    /// Stamps the business event, the checkpoint manifest, AND the
+    /// resulting `SensorCheckpointRecorded` event with the supplied
+    /// tenant.
+    pub fn record_sensor_observation_for_tenant(
+        &mut self,
+        sensor_id: hydra_core::SensorId,
+        source_system: impl Into<String>,
+        cursor: hydra_core::SourceCursor,
+        business_event: hydra_core::EventKind,
+        tenant: TenantId,
+    ) -> hydra_core::error::Result<hydra_core::SensorCheckpoint> {
+        self.record_sensor_observation_for_run_inner(
+            None,
+            sensor_id,
+            source_system,
+            cursor,
+            business_event,
+            Some(tenant),
+        )
+    }
+
+    /// Tenant-scoped variant of [`Self::record_sensor_observation_for_run`].
+    pub fn record_sensor_observation_for_run_for_tenant(
+        &mut self,
+        run_id: Option<hydra_core::SensorRunId>,
+        sensor_id: hydra_core::SensorId,
+        source_system: impl Into<String>,
+        cursor: hydra_core::SourceCursor,
+        business_event: hydra_core::EventKind,
+        tenant: TenantId,
+    ) -> hydra_core::error::Result<hydra_core::SensorCheckpoint> {
+        self.record_sensor_observation_for_run_inner(
+            run_id,
+            sensor_id,
+            source_system,
+            cursor,
+            business_event,
+            Some(tenant),
+        )
+    }
+
+    /// Shared body for the four sensor-observation entry points.
+    fn record_sensor_observation_for_run_inner(
+        &mut self,
+        run_id: Option<hydra_core::SensorRunId>,
+        sensor_id: hydra_core::SensorId,
+        source_system: impl Into<String>,
+        cursor: hydra_core::SourceCursor,
+        business_event: hydra_core::EventKind,
+        tenant: Option<TenantId>,
+    ) -> hydra_core::error::Result<hydra_core::SensorCheckpoint> {
         let source_system = source_system.into();
         let key = hydra_core::IdempotencyKey::new(cursor.stable_key_material());
 
@@ -1388,7 +1450,14 @@ impl Hydra {
             return Ok(existing.clone());
         }
 
-        let result = self.ingest_with_idempotency_key(business_event, key.clone())?;
+        // Build the business event with the right tenant envelope so
+        // the commit ledger and downstream stores see the correct
+        // scope.
+        let event = match &tenant {
+            Some(t) => Event::trigger_for_tenant(business_event, t.clone()),
+            None => Event::trigger(business_event),
+        };
+        let result = self.ingest_event_with_idempotency_key(event, key.clone())?;
 
         let commit = self
             .commit_ledger
@@ -1410,7 +1479,7 @@ impl Hydra {
         let now = chrono::Utc::now();
         let checkpoint = hydra_core::SensorCheckpoint {
             id: hydra_core::SensorCheckpointId::new(),
-            tenant_id: commit.tenant_id.clone(),
+            tenant_id: tenant.clone().or_else(|| commit.tenant_id.clone()),
             sensor_id,
             run_id,
             status: hydra_core::SensorCheckpointStatus::Recorded,
@@ -1424,9 +1493,18 @@ impl Hydra {
             metadata: std::collections::HashMap::new(),
         };
 
-        self.ingest(hydra_core::EventKind::SensorCheckpointRecorded {
-            checkpoint: checkpoint.clone(),
-        })?;
+        let recorded_event = match &tenant {
+            Some(t) => Event::trigger_for_tenant(
+                hydra_core::EventKind::SensorCheckpointRecorded {
+                    checkpoint: checkpoint.clone(),
+                },
+                t.clone(),
+            ),
+            None => Event::trigger(hydra_core::EventKind::SensorCheckpointRecorded {
+                checkpoint: checkpoint.clone(),
+            }),
+        };
+        self.ingest_event(recorded_event)?;
 
         Ok(checkpoint)
     }
@@ -1505,9 +1583,30 @@ impl Hydra {
     /// `SnapshotTaken` audit event. The returned manifest's `sequence`
     /// reflects the last commit included in the body; the `SnapshotTaken`
     /// audit event is committed as a separate (later) commit.
+    /// Tenant-scoped snapshot. The body still captures global engine
+    /// state (snapshots are not per-tenant in v0), but the manifest
+    /// records the tenant that requested the snapshot — useful for
+    /// audit trails. True tenant-scoped snapshot bodies are a future
+    /// patch.
+    pub fn snapshot_for_tenant(
+        &mut self,
+        created_by: hydra_core::ActorId,
+        tenant: TenantId,
+    ) -> hydra_core::error::Result<hydra_core::SnapshotManifest> {
+        self.snapshot_internal(created_by, Some(tenant))
+    }
+
     pub fn snapshot(
         &mut self,
         created_by: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::SnapshotManifest> {
+        self.snapshot_internal(created_by, None)
+    }
+
+    fn snapshot_internal(
+        &mut self,
+        created_by: hydra_core::ActorId,
+        tenant: Option<TenantId>,
     ) -> hydra_core::error::Result<hydra_core::SnapshotManifest> {
         let latest_commit = self.latest_commit().cloned();
         let sequence = latest_commit
@@ -1586,7 +1685,7 @@ impl Hydra {
 
         let manifest = hydra_core::SnapshotManifest::committed(
             hydra_core::SnapshotId::new(),
-            None,
+            tenant.clone(),
             sequence,
             head_commit_id,
             head_commit_hash,
@@ -1630,9 +1729,19 @@ impl Hydra {
             backend.write_snapshot(&body)?;
         }
         self.snapshot_store.insert(body);
-        self.ingest(hydra_core::EventKind::SnapshotTaken {
-            manifest: manifest.clone(),
-        })?;
+        // Audit event is tenant-scoped when the snapshot itself was.
+        let snapshot_event = match &tenant {
+            Some(t) => Event::trigger_for_tenant(
+                hydra_core::EventKind::SnapshotTaken {
+                    manifest: manifest.clone(),
+                },
+                t.clone(),
+            ),
+            None => Event::trigger(hydra_core::EventKind::SnapshotTaken {
+                manifest: manifest.clone(),
+            }),
+        };
+        self.ingest_event(snapshot_event)?;
         Ok(manifest)
     }
 

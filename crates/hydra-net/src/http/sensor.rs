@@ -1,7 +1,8 @@
+use crate::http::tenant::{extract_tenant, tenant_error_response};
 use crate::runtime::RuntimeHandle;
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
@@ -63,8 +64,17 @@ pub struct ErrorResponse {
 
 async fn record_sensor_observation(
     State(state): State<SensorHttpState>,
+    headers: HeaderMap,
     Json(request): Json<SensorObservationRequest>,
 ) -> Response {
+    // Tenant header is required — the business event, the checkpoint
+    // manifest, and the `SensorCheckpointRecorded` event all carry
+    // the parsed tenant.
+    let tenant = match extract_tenant(&headers) {
+        Ok(tenant) => tenant,
+        Err(error) => return tenant_error_response(error),
+    };
+
     let hydra_arc = state.runtime.hydra();
     let mut hydra = hydra_arc.write().await;
 
@@ -76,18 +86,20 @@ async fn record_sensor_observation(
         .map(|checkpoint| checkpoint.id.clone());
 
     let result = match request.run_id {
-        Some(run_id) => hydra.record_sensor_observation_for_run(
+        Some(run_id) => hydra.record_sensor_observation_for_run_for_tenant(
             Some(run_id),
             request.sensor_id,
             request.source_system,
             request.source_cursor,
             request.event_kind,
+            tenant,
         ),
-        None => hydra.record_sensor_observation(
+        None => hydra.record_sensor_observation_for_tenant(
             request.sensor_id,
             request.source_system,
             request.source_cursor,
             request.event_kind,
+            tenant,
         ),
     };
 
@@ -139,7 +151,19 @@ mod tests {
         }
     }
 
+    const TEST_TENANT: &str = "tenant_sensor_http_test";
+
     fn request_json<T: Serialize>(uri: &str, body: &T) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("X-Hydra-Tenant", TEST_TENANT)
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    fn request_json_without_tenant<T: Serialize>(uri: &str, body: &T) -> Request<Body> {
         Request::builder()
             .method(Method::POST)
             .uri(uri)
@@ -278,5 +302,68 @@ mod tests {
         let hydra = hydra.read().await;
         // Two observations × (business commit + checkpoint commit)
         assert_eq!(hydra.commit_count(), 4);
+    }
+
+    // === Tenant v0 patch 1 ===
+
+    #[tokio::test]
+    async fn sensor_observation_without_tenant_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = sensor_router(runtime.clone());
+        let request = SensorObservationRequest {
+            sensor_id: SensorId::from_str("sensor_stripe"),
+            source_system: "stripe".to_string(),
+            source_cursor: cursor("evt_no_tenant"),
+            event_kind: signal("no_tenant"),
+            run_id: None,
+        };
+        let response = app
+            .oneshot(request_json_without_tenant("/sensor/observation", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(runtime.hydra().read().await.commit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn sensor_observation_stamps_tenant_on_checkpoint_and_event() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = sensor_router(runtime.clone());
+        let request = SensorObservationRequest {
+            sensor_id: SensorId::from_str("sensor_stripe"),
+            source_system: "stripe".to_string(),
+            source_cursor: cursor("evt_with_tenant"),
+            event_kind: signal("with_tenant"),
+            run_id: None,
+        };
+        let response = app
+            .oneshot(request_json("/sensor/observation", &request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: SensorObservationResponse = read_json(response).await;
+
+        // Checkpoint manifest carries the tenant.
+        assert_eq!(
+            decoded
+                .checkpoint
+                .tenant_id
+                .as_ref()
+                .map(|t| t.to_string()),
+            Some(TEST_TENANT.to_string())
+        );
+
+        // Both the business event and the SensorCheckpointRecorded
+        // event carry the tenant — verify via the commit ledger.
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        let commits = hydra.commit_records();
+        assert_eq!(commits.len(), 2);
+        for record in commits {
+            assert_eq!(
+                record.tenant_id.as_ref().map(|t| t.to_string()),
+                Some(TEST_TENANT.to_string()),
+            );
+        }
     }
 }
