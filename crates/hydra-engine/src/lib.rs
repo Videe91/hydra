@@ -16,6 +16,7 @@ pub mod policy_engine;
 pub mod policy_agent;
 pub mod commit_ledger;
 pub mod sensor_checkpoint_store;
+pub mod replication_store;
 pub mod schema_registry_store;
 pub mod schema_validator;
 pub mod schema_gate;
@@ -68,6 +69,7 @@ pub mod prelude {
     pub use crate::sensor_checkpoint_store::{
         SensorCheckpointStore, SensorSourceKey, SourceCursorKey,
     };
+    pub use crate::replication_store::ReplicationStore;
     pub use crate::schema_registry_store::SchemaRegistryStore;
     pub use crate::schema_validator::{
         SchemaValidationError, SchemaValidationReport, SchemaValidator,

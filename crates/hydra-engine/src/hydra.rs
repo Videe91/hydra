@@ -7,6 +7,7 @@ use crate::schema_registry_store::SchemaRegistryStore;
 use crate::snapshot_store::SnapshotStore;
 use crate::schema_validator::SchemaValidator;
 use crate::sensor_checkpoint_store::SensorCheckpointStore;
+use crate::replication_store::ReplicationStore;
 use crate::action_store::ActionStore;
 use crate::epistemic_store::EpistemicStore;
 use crate::event_log::EventLog;
@@ -65,6 +66,7 @@ pub struct Hydra {
     commit_ledger: CommitLedger,
     commit_writer: Option<Box<dyn crate::commit_ledger::CommitBatchWriter>>,
     sensor_checkpoint_store: SensorCheckpointStore,
+    replication_store: ReplicationStore,
     schema_registry_store: SchemaRegistryStore,
     schema_validator: SchemaValidator,
     schema_gate: SchemaGate,
@@ -143,6 +145,7 @@ impl Hydra {
             commit_ledger: CommitLedger::new(),
             commit_writer: None,
             sensor_checkpoint_store: SensorCheckpointStore::new(),
+            replication_store: ReplicationStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
@@ -179,6 +182,7 @@ impl Hydra {
             commit_ledger: CommitLedger::new(),
             commit_writer: None,
             sensor_checkpoint_store: SensorCheckpointStore::new(),
+            replication_store: ReplicationStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
@@ -371,6 +375,7 @@ impl Hydra {
             self.event_log.append(event.clone());
             self.temporal.record(event);
             self.sensor_checkpoint_store.apply_event(event)?;
+            self.replication_store.apply_event(event)?;
             self.schema_registry_store.apply_event(event)?;
         }
 
@@ -486,6 +491,7 @@ impl Hydra {
             self.action_store.apply_event(&event)?;
             self.policy_store.apply_event(&event)?;
             self.sensor_checkpoint_store.apply_event(&event)?;
+            self.replication_store.apply_event(&event)?;
             self.schema_registry_store.apply_event(&event)?;
             count += 1;
         }
@@ -667,6 +673,7 @@ impl Hydra {
         self.action_store = ActionStore::new();
         self.policy_store = PolicyStore::new();
         self.sensor_checkpoint_store = SensorCheckpointStore::new();
+        self.replication_store = ReplicationStore::new();
         self.schema_registry_store = SchemaRegistryStore::new();
     }
 
@@ -1196,6 +1203,85 @@ impl Hydra {
     ) -> Option<&hydra_core::SensorCheckpoint> {
         self.sensor_checkpoint_store
             .checkpoint_for_commit(commit_id)
+    }
+
+    // === Replication (V2 patch 2) ===
+
+    /// Read access to the replication control-plane store. Returns the
+    /// materialized view of registered peers + runs derived from the
+    /// event log; no network or background behavior is implied.
+    pub fn replication_store(&self) -> &ReplicationStore {
+        &self.replication_store
+    }
+
+    pub fn replication_peer(
+        &self,
+        id: &hydra_core::ReplicaId,
+    ) -> Option<&hydra_core::ReplicationPeer> {
+        self.replication_store.peer(id)
+    }
+
+    pub fn replication_run(
+        &self,
+        id: &hydra_core::ReplicationRunId,
+    ) -> Option<&hydra_core::ReplicationRun> {
+        self.replication_store.run(id)
+    }
+
+    pub fn replication_peers_with_role(
+        &self,
+        role: hydra_core::ReplicationRole,
+    ) -> Vec<&hydra_core::ReplicationPeer> {
+        self.replication_store.peers_with_role(role)
+    }
+
+    pub fn replication_peers_with_status(
+        &self,
+        status: hydra_core::ReplicationPeerStatus,
+    ) -> Vec<&hydra_core::ReplicationPeer> {
+        self.replication_store.peers_with_status(status)
+    }
+
+    pub fn replication_peers_for_tenant(
+        &self,
+        tenant: &hydra_core::TenantId,
+    ) -> Vec<&hydra_core::ReplicationPeer> {
+        self.replication_store.peers_for_tenant(tenant)
+    }
+
+    pub fn replication_runs_for_peer(
+        &self,
+        peer_id: &hydra_core::ReplicaId,
+    ) -> Vec<&hydra_core::ReplicationRun> {
+        self.replication_store.runs_for_peer(peer_id)
+    }
+
+    pub fn replication_runs_with_status(
+        &self,
+        status: hydra_core::ReplicationRunStatus,
+    ) -> Vec<&hydra_core::ReplicationRun> {
+        self.replication_store.runs_with_status(status)
+    }
+
+    pub fn replication_runs_for_tenant(
+        &self,
+        tenant: &hydra_core::TenantId,
+    ) -> Vec<&hydra_core::ReplicationRun> {
+        self.replication_store.runs_for_tenant(tenant)
+    }
+
+    pub fn latest_replication_offset(
+        &self,
+        peer_id: &hydra_core::ReplicaId,
+    ) -> Option<&hydra_core::ReplicationOffset> {
+        self.replication_store.latest_offset(peer_id)
+    }
+
+    pub fn latest_replication_lag(
+        &self,
+        peer_id: &hydra_core::ReplicaId,
+    ) -> Option<&hydra_core::ReplicationLag> {
+        self.replication_store.latest_lag(peer_id)
     }
 
     // === Schema registry ===
@@ -1731,6 +1817,16 @@ impl Hydra {
             .all_schemas()
             .cloned()
             .collect::<Vec<_>>();
+        let replication_peers = self
+            .replication_store
+            .all_peers()
+            .cloned()
+            .collect::<Vec<_>>();
+        let replication_runs = self
+            .replication_store
+            .all_runs()
+            .cloned()
+            .collect::<Vec<_>>();
 
         let manifest = hydra_core::SnapshotManifest::committed(
             hydra_core::SnapshotId::new(),
@@ -1753,7 +1849,8 @@ impl Hydra {
             approval_requests.len(),
             sensor_checkpoints.len(),
             schemas.len(),
-        );
+        )
+        .with_replication_counts(replication_peers.len(), replication_runs.len());
         let body = hydra_core::SnapshotBody {
             manifest: manifest.clone(),
             nodes,
@@ -1770,6 +1867,8 @@ impl Hydra {
             sensor_runs,
             sensor_checkpoints,
             schemas,
+            replication_peers,
+            replication_runs,
             metadata: std::collections::HashMap::new(),
         };
         // Persist to the backend FIRST so a backend failure aborts the
@@ -5200,5 +5299,88 @@ mod sprint1_tests {
             names.iter().filter(|name| *name == "signal").count(),
             2
         );
+    }
+
+    // === V2 patch 2 — ReplicationStore integration ===
+
+    #[test]
+    fn replication_events_populate_store_through_ingest() {
+        use hydra_core::{
+            ActorId, EventKind, ReplicaId, ReplicationMode, ReplicationOffset, ReplicationPeer,
+            ReplicationPeerStatus, ReplicationRole,
+        };
+        let mut hydra = Hydra::new();
+        let peer = ReplicationPeer::registered(
+            ReplicaId::from_str("replica_acme"),
+            ReplicationRole::Follower,
+            ReplicationMode::SnapshotThenTail,
+            ActorId::from_str("actor_replication"),
+        );
+        let peer_id = peer.id.clone();
+        hydra
+            .ingest(EventKind::ReplicaRegistered { peer })
+            .unwrap();
+        hydra
+            .ingest(EventKind::ReplicaHeartbeatRecorded {
+                peer_id: peer_id.clone(),
+                offset: ReplicationOffset::from_sequence(42),
+                lag: None,
+            })
+            .unwrap();
+        assert!(hydra.replication_peer(&peer_id).is_some());
+        assert_eq!(
+            hydra.latest_replication_offset(&peer_id).map(|o| o.sequence),
+            Some(42)
+        );
+        assert_eq!(
+            hydra
+                .replication_peers_with_status(ReplicationPeerStatus::Registered)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_replication_state() {
+        use hydra_core::{
+            ActorId, EventKind, ReplicaId, ReplicationMode, ReplicationOffset, ReplicationPeer,
+            ReplicationRole, ReplicationRun,
+        };
+
+        let mut source = Hydra::new();
+        let peer = ReplicationPeer::registered(
+            ReplicaId::from_str("replica_acme"),
+            ReplicationRole::Follower,
+            ReplicationMode::CommitLogStreaming,
+            ActorId::from_str("actor_replication"),
+        );
+        let peer_id = peer.id.clone();
+        source
+            .ingest(EventKind::ReplicaRegistered { peer })
+            .unwrap();
+        let run = ReplicationRun::started(
+            peer_id.clone(),
+            ReplicationMode::CommitLogStreaming,
+            Some(ReplicationOffset::from_sequence(100)),
+        );
+        let run_id = run.id.clone();
+        source
+            .ingest(EventKind::ReplicationRunStarted { run })
+            .unwrap();
+
+        let manifest = source
+            .snapshot(ActorId::from_str("actor_snapshot"))
+            .unwrap();
+        // Manifest carries the new counts.
+        assert_eq!(manifest.total_replication_peers, 1);
+        assert_eq!(manifest.total_replication_runs, 1);
+
+        // Restore into a fresh Hydra; the store must rebuild from replay.
+        let mut target = Hydra::new();
+        target
+            .recover_from_events(source.events().into_iter().cloned().collect())
+            .unwrap();
+        assert!(target.replication_peer(&peer_id).is_some());
+        assert!(target.replication_run(&run_id).is_some());
     }
 }

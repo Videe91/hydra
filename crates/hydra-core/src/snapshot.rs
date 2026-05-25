@@ -5,6 +5,7 @@ use crate::event::Value;
 use crate::id::{ActorId, SnapshotId, TenantId};
 use crate::node::Node;
 use crate::policy::{ApprovalRequest, PolicyDecision};
+use crate::replication::{ReplicationPeer, ReplicationRun};
 use crate::{
     Action, CommitHash, CommitId, CommitRecord, Event, Policy, SchemaDefinition, SensorCheckpoint,
     SensorRun,
@@ -55,6 +56,12 @@ pub struct SnapshotManifest {
     pub total_approval_requests: usize,
     pub total_sensor_checkpoints: usize,
     pub total_schemas: usize,
+    /// V2 patch 2 — replication control-plane counts. `#[serde(default)]`
+    /// so manifests written before V2 deserialize as zero.
+    #[serde(default)]
+    pub total_replication_peers: usize,
+    #[serde(default)]
+    pub total_replication_runs: usize,
     pub metadata: HashMap<String, Value>,
 }
 
@@ -87,6 +94,12 @@ pub struct SnapshotBody {
     pub sensor_checkpoints: Vec<SensorCheckpoint>,
     /// Schema registry state.
     pub schemas: Vec<SchemaDefinition>,
+    /// V2 patch 2 — replication control-plane state. `#[serde(default)]`
+    /// so bodies written before V2 deserialize with empty vectors.
+    #[serde(default)]
+    pub replication_peers: Vec<ReplicationPeer>,
+    #[serde(default)]
+    pub replication_runs: Vec<ReplicationRun>,
     pub metadata: HashMap<String, Value>,
 }
 
@@ -136,8 +149,23 @@ impl SnapshotManifest {
             total_approval_requests,
             total_sensor_checkpoints,
             total_schemas,
+            // V2 patch 2: new fields default to zero. `committed(...)`
+            // stays at 19 args; producers that include replication state
+            // attach counts via `with_replication_counts(peers, runs)`.
+            total_replication_peers: 0,
+            total_replication_runs: 0,
             metadata: HashMap::new(),
         }
+    }
+
+    /// Attach replication control-plane counts to a manifest.
+    ///
+    /// Chainable so `SnapshotManifest::committed(...).with_replication_counts(...)`
+    /// reads naturally in the engine's snapshot path.
+    pub fn with_replication_counts(mut self, peers: usize, runs: usize) -> Self {
+        self.total_replication_peers = peers;
+        self.total_replication_runs = runs;
+        self
     }
 
     pub fn is_committed(&self) -> bool {
@@ -207,6 +235,62 @@ mod tests {
     }
 
     #[test]
+    fn with_replication_counts_attaches_counts() {
+        let manifest = SnapshotManifest::committed(
+            SnapshotId::new(),
+            None,
+            42,
+            None,
+            None,
+            actor(),
+            Utc::now(),
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        // Default to zero for back-compat.
+        assert_eq!(manifest.total_replication_peers, 0);
+        assert_eq!(manifest.total_replication_runs, 0);
+        let with_repl = manifest.clone().with_replication_counts(3, 7);
+        assert_eq!(with_repl.total_replication_peers, 3);
+        assert_eq!(with_repl.total_replication_runs, 7);
+        // Other fields untouched.
+        assert_eq!(with_repl.sequence, manifest.sequence);
+    }
+
+    #[test]
+    fn snapshot_manifest_back_compat_deserializes_without_replication_fields() {
+        // Manifest written before V2 patch 2 will not include the
+        // replication count fields. `#[serde(default)]` must fill them
+        // with zero.
+        let json = r#"{
+            "id": "snap_legacy",
+            "tenant_id": null,
+            "sequence": 1,
+            "head_commit_id": null,
+            "head_commit_hash": null,
+            "status": "Committed",
+            "created_by": "actor_legacy",
+            "created_at": "2026-01-01T00:00:00Z",
+            "total_events": 0,
+            "total_commits": 0,
+            "total_nodes": 0,
+            "total_edges": 0,
+            "total_claims": 0,
+            "total_evidence": 0,
+            "total_actions": 0,
+            "total_outcomes": 0,
+            "total_policies": 0,
+            "total_policy_decisions": 0,
+            "total_approval_requests": 0,
+            "total_sensor_checkpoints": 0,
+            "total_schemas": 0,
+            "metadata": {}
+        }"#;
+        let manifest: SnapshotManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.total_replication_peers, 0);
+        assert_eq!(manifest.total_replication_runs, 0);
+    }
+
+    #[test]
     fn snapshot_manifest_serde_roundtrip() {
         let manifest = SnapshotManifest::committed(
             SnapshotId::new(),
@@ -251,6 +335,8 @@ mod tests {
             sensor_runs: vec![],
             sensor_checkpoints: vec![],
             schemas: vec![],
+            replication_peers: vec![],
+            replication_runs: vec![],
             metadata: HashMap::new(),
         };
         let json = serde_json::to_string(&body).unwrap();

@@ -151,6 +151,8 @@ mod tests {
             sensor_runs: vec![],
             sensor_checkpoints: vec![],
             schemas: vec![],
+            replication_peers: vec![],
+            replication_runs: vec![],
             metadata: HashMap::new(),
         }
     }
