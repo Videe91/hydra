@@ -413,7 +413,15 @@ impl TemporalIndex {
             | EventKind::SchemaDisabled { .. }
             | EventKind::SchemaArchived { .. }
             | EventKind::SnapshotTaken { .. }
-            | EventKind::SnapshotRestored { .. } => false,
+            | EventKind::SnapshotRestored { .. }
+            | EventKind::ReplicaRegistered { .. }
+            | EventKind::ReplicaHeartbeatRecorded { .. }
+            | EventKind::ReplicationRunStarted { .. }
+            | EventKind::ReplicationRunCompleted { .. }
+            | EventKind::ReplicationRunFailed { .. }
+            | EventKind::ReplicaStatusChanged { .. }
+            | EventKind::ReplicaPromoted { .. }
+            | EventKind::ReplicaDemoted { .. } => false,
         }
     }
 

@@ -12,11 +12,12 @@ pub mod edge;
 pub mod graph;
 pub mod snapshot;
 pub mod subscription;
+pub mod replication;
 
 pub use id::{
     ActionId, ActorId, ApprovalId, CascadeId, ClaimId, CommitId, EdgeId, EventId, EvidenceId,
-    NodeId, OutcomeId, PolicyDecisionId, PolicyId, SchemaId, SensorCheckpointId, SensorId,
-    SensorRunId, SnapshotId, SubscriptionId, TenantId, TypeId,
+    NodeId, OutcomeId, PolicyDecisionId, PolicyId, ReplicaId, ReplicationRunId, SchemaId,
+    SensorCheckpointId, SensorId, SensorRunId, SnapshotId, SubscriptionId, TenantId, TypeId,
 };
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
@@ -77,13 +78,17 @@ pub use schema::{
     ValueType,
 };
 pub use snapshot::{SnapshotBody, SnapshotManifest, SnapshotStatus};
+pub use replication::{
+    ReplicationLag, ReplicationMode, ReplicationOffset, ReplicationPeer, ReplicationPeerStatus,
+    ReplicationRole, ReplicationRun, ReplicationRunStatus,
+};
 
 /// Convenience re-exports for common types
 pub mod prelude {
     pub use crate::id::{
         ActionId, ActorId, ApprovalId, CascadeId, ClaimId, CommitId, EdgeId, EventId, EvidenceId,
-        NodeId, OutcomeId, PolicyDecisionId, PolicyId, SchemaId, SensorCheckpointId, SensorId,
-        SensorRunId, SnapshotId, SubscriptionId, TenantId, TypeId,
+        NodeId, OutcomeId, PolicyDecisionId, PolicyId, ReplicaId, ReplicationRunId, SchemaId,
+        SensorCheckpointId, SensorId, SensorRunId, SnapshotId, SubscriptionId, TenantId, TypeId,
     };
     pub use crate::error::{HydraError, Result};
     pub use crate::event::{Event, EventKind, Value};
@@ -111,6 +116,10 @@ pub mod prelude {
         ValueType,
     };
     pub use crate::snapshot::{SnapshotBody, SnapshotManifest, SnapshotStatus};
+    pub use crate::replication::{
+        ReplicationLag, ReplicationMode, ReplicationOffset, ReplicationPeer,
+        ReplicationPeerStatus, ReplicationRole, ReplicationRun, ReplicationRunStatus,
+    };
     pub use crate::node::{Node, NodeMeta, NodeValidator};
     pub use crate::edge::{Edge, EdgeMeta};
     pub use crate::graph::{GraphReader, TraversalDirection, bfs, bfs_dyn, topological_sort};

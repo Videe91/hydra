@@ -187,6 +187,9 @@ define_id!(ApprovalId, "appr");
 // Agentic action loop IDs
 define_id!(ActionId, "act");
 define_id!(OutcomeId, "out");
+// Replication IDs (V2 patch 1 — vocabulary only)
+define_id!(ReplicaId, "replica");
+define_id!(ReplicationRunId, "replrun");
 
 #[cfg(test)]
 mod tests {

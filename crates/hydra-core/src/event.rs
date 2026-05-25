@@ -2,9 +2,12 @@ use crate::action::{Action, Outcome};
 use crate::epistemic::{Claim, Evidence};
 use crate::id::{
     ActionId, ActorId, ApprovalId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId,
-    PolicyId, SchemaId, SensorCheckpointId, SensorRunId, TenantId,
+    PolicyId, ReplicaId, ReplicationRunId, SchemaId, SensorCheckpointId, SensorRunId, TenantId,
 };
 use crate::policy::{ApprovalRequest, Policy, PolicyDecision};
+use crate::replication::{
+    ReplicationLag, ReplicationOffset, ReplicationPeer, ReplicationPeerStatus, ReplicationRun,
+};
 use crate::schema::SchemaDefinition;
 use crate::sensor::{SensorCheckpoint, SensorRun};
 use chrono::{DateTime, Utc};
@@ -252,6 +255,45 @@ pub enum EventKind {
         manifest: crate::snapshot::SnapshotManifest,
         replayed_commit_count: usize,
     },
+
+    // Replication lifecycle (V2 patch 1 — vocabulary only; no engine
+    // behavior, no network, no workers). Variants are durable so the
+    // event log can record replication topology changes once later
+    // patches start emitting them.
+    ReplicaRegistered {
+        peer: ReplicationPeer,
+    },
+    ReplicaHeartbeatRecorded {
+        peer_id: ReplicaId,
+        offset: ReplicationOffset,
+        lag: Option<ReplicationLag>,
+    },
+    ReplicationRunStarted {
+        run: ReplicationRun,
+    },
+    ReplicationRunCompleted {
+        run_id: ReplicationRunId,
+        completed_offset: ReplicationOffset,
+    },
+    ReplicationRunFailed {
+        run_id: ReplicationRunId,
+        error: String,
+    },
+    ReplicaStatusChanged {
+        peer_id: ReplicaId,
+        status: ReplicationPeerStatus,
+        reason: Option<String>,
+    },
+    ReplicaPromoted {
+        peer_id: ReplicaId,
+        promoted_by: ActorId,
+        reason: Option<String>,
+    },
+    ReplicaDemoted {
+        peer_id: ReplicaId,
+        demoted_by: ActorId,
+        reason: Option<String>,
+    },
 }
 
 impl EventKind {
@@ -302,7 +344,15 @@ impl EventKind {
             | EventKind::SchemaDisabled { .. }
             | EventKind::SchemaArchived { .. }
             | EventKind::SnapshotTaken { .. }
-            | EventKind::SnapshotRestored { .. } => None,
+            | EventKind::SnapshotRestored { .. }
+            | EventKind::ReplicaRegistered { .. }
+            | EventKind::ReplicaHeartbeatRecorded { .. }
+            | EventKind::ReplicationRunStarted { .. }
+            | EventKind::ReplicationRunCompleted { .. }
+            | EventKind::ReplicationRunFailed { .. }
+            | EventKind::ReplicaStatusChanged { .. }
+            | EventKind::ReplicaPromoted { .. }
+            | EventKind::ReplicaDemoted { .. } => None,
         }
     }
 
@@ -350,6 +400,14 @@ impl EventKind {
             EventKind::SchemaArchived { .. } => "schema_archived",
             EventKind::SnapshotTaken { .. } => "snapshot_taken",
             EventKind::SnapshotRestored { .. } => "snapshot_restored",
+            EventKind::ReplicaRegistered { .. } => "replica_registered",
+            EventKind::ReplicaHeartbeatRecorded { .. } => "replica_heartbeat_recorded",
+            EventKind::ReplicationRunStarted { .. } => "replication_run_started",
+            EventKind::ReplicationRunCompleted { .. } => "replication_run_completed",
+            EventKind::ReplicationRunFailed { .. } => "replication_run_failed",
+            EventKind::ReplicaStatusChanged { .. } => "replica_status_changed",
+            EventKind::ReplicaPromoted { .. } => "replica_promoted",
+            EventKind::ReplicaDemoted { .. } => "replica_demoted",
         }
     }
 }
@@ -1031,5 +1089,104 @@ mod tests {
             .kind_name(),
             "snapshot_restored"
         );
+    }
+
+    #[test]
+    fn replication_event_kind_names() {
+        use crate::id::{ActorId, ReplicaId, ReplicationRunId};
+        use crate::replication::{
+            ReplicationLag, ReplicationMode, ReplicationOffset, ReplicationPeer,
+            ReplicationPeerStatus, ReplicationRole, ReplicationRun,
+        };
+
+        let actor = ActorId::from_str("actor_replication");
+        let peer = ReplicationPeer::registered(
+            ReplicaId::from_str("replica_acme"),
+            ReplicationRole::Follower,
+            ReplicationMode::SnapshotThenTail,
+            actor.clone(),
+        );
+        assert_eq!(
+            EventKind::ReplicaRegistered { peer }.kind_name(),
+            "replica_registered"
+        );
+
+        assert_eq!(
+            EventKind::ReplicaHeartbeatRecorded {
+                peer_id: ReplicaId::from_str("replica_acme"),
+                offset: ReplicationOffset::from_sequence(42),
+                lag: Some(ReplicationLag::observe(100, 75, Utc::now())),
+            }
+            .kind_name(),
+            "replica_heartbeat_recorded"
+        );
+
+        let run = ReplicationRun::started(
+            ReplicaId::from_str("replica_acme"),
+            ReplicationMode::CommitLogStreaming,
+            None,
+        );
+        let run_id = run.id.clone();
+        assert_eq!(
+            EventKind::ReplicationRunStarted { run }.kind_name(),
+            "replication_run_started"
+        );
+
+        assert_eq!(
+            EventKind::ReplicationRunCompleted {
+                run_id: run_id.clone(),
+                completed_offset: ReplicationOffset::from_sequence(999),
+            }
+            .kind_name(),
+            "replication_run_completed"
+        );
+
+        assert_eq!(
+            EventKind::ReplicationRunFailed {
+                run_id,
+                error: "stream closed".to_string()
+            }
+            .kind_name(),
+            "replication_run_failed"
+        );
+
+        assert_eq!(
+            EventKind::ReplicaStatusChanged {
+                peer_id: ReplicaId::from_str("replica_acme"),
+                status: ReplicationPeerStatus::Lagging,
+                reason: Some("lag > threshold".to_string())
+            }
+            .kind_name(),
+            "replica_status_changed"
+        );
+
+        assert_eq!(
+            EventKind::ReplicaPromoted {
+                peer_id: ReplicaId::from_str("replica_acme"),
+                promoted_by: actor.clone(),
+                reason: None,
+            }
+            .kind_name(),
+            "replica_promoted"
+        );
+
+        assert_eq!(
+            EventKind::ReplicaDemoted {
+                peer_id: ReplicaId::from_str("replica_acme"),
+                demoted_by: actor,
+                reason: Some("manual demote".to_string()),
+            }
+            .kind_name(),
+            "replica_demoted"
+        );
+
+        // Sanity: replication events have no target node.
+        assert!(EventKind::ReplicaPromoted {
+            peer_id: ReplicaId::from_str("replica_acme"),
+            promoted_by: ActorId::from_str("actor_replication"),
+            reason: None,
+        }
+        .target_node()
+        .is_none());
     }
 }
