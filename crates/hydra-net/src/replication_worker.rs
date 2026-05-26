@@ -29,6 +29,7 @@ use crate::http::replication::{
 use crate::runtime::RuntimeHandle;
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use hydra_core::error::{HydraError, Result};
 use hydra_core::{
     ActorId, CommitBatch, ReplicaId, ReplicationLag, ReplicationOffset, SnapshotId,
@@ -367,6 +368,58 @@ impl Default for CursorFile {
     }
 }
 
+/// V2 polish — sentinel-file path for a given data file. Used by
+/// both `CursorPersistence::save` and `HeartbeatPersistence::save`
+/// to prevent two pullers racing on the read-modify-write + atomic
+/// rename pattern.
+///
+/// Pattern: `<data>.json.lock` next to the data file. Created
+/// on first lock attempt, never deleted (zero-byte sentinel; the
+/// flock state is FD-scoped, not file-content-scoped).
+fn lock_path_for(data_path: &Path) -> PathBuf {
+    let mut s = data_path.as_os_str().to_owned();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
+/// V2 polish — open and try-lock-exclusive on the sentinel lock
+/// file for `data_path`. Lock is released when the returned
+/// `std::fs::File` is dropped.
+///
+/// Returns:
+///   - `Ok(lock_file)` — caller holds exclusive lock; perform the
+///     write, then drop the `File` to release.
+///   - `Err(io::Error{ kind: WouldBlock })` — another writer holds
+///     the lock. Caller logs `tracing::warn` and skips the write.
+///   - Any other `Err` — file-open failure (permission, missing
+///     parent dir, etc.). Caller treats as a normal IO failure.
+fn acquire_lock_or_wouldblock(data_path: &Path) -> std::io::Result<std::fs::File> {
+    // Ensure parent dir exists so the lock file can be created. The
+    // data file's save path does this too, but we need it BEFORE
+    // opening the lock file, not after.
+    if let Some(parent) = data_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let lock_path = lock_path_for(data_path);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => Ok(lock_file),
+        Err(err) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "another writer holds the replication lock at {}: {err}",
+                lock_path.display()
+            ),
+        )),
+    }
+}
+
 /// V2 patch 4F — atomic-rename helpers for reading/writing the cursor
 /// file. All errors here are surfaced as `std::io::Error`; callers
 /// translate to either `Ok(None)` (read path) or `tracing::warn`
@@ -404,6 +457,12 @@ impl CursorPersistence {
         peer_id: ReplicaId,
         offset: ReplicationOffset,
     ) -> std::io::Result<()> {
+        // V2 polish — acquire the sentinel lock BEFORE the read so
+        // the entire read-modify-write is serialized against
+        // concurrent writers. WouldBlock → caller logs warn + skips.
+        // Lock released on drop of `_lock_file` at function end.
+        let _lock_file = acquire_lock_or_wouldblock(path)?;
+
         // Read-modify-write. Treat missing OR corrupt as "start
         // fresh" — the in-memory cursor is the source of truth for
         // correctness, and overwriting a corrupt file with a valid
@@ -416,12 +475,7 @@ impl CursorPersistence {
         file.cursors.insert(peer_id, offset);
         let serialized = serde_json::to_string_pretty(&file)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-        // Ensure parent dir exists so callers don't have to.
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
+        // Parent dir already ensured by acquire_lock_or_wouldblock.
         let temp_path = path.with_extension("json.tmp");
         std::fs::write(&temp_path, serialized)?;
         std::fs::rename(&temp_path, path)?;
@@ -496,6 +550,11 @@ impl HeartbeatPersistence {
         peer_id: ReplicaId,
         record: ReplicationHeartbeatRecord,
     ) -> std::io::Result<()> {
+        // V2 polish — acquire the sentinel lock BEFORE read-modify-write.
+        // Also surfaces "parent path is a regular file" the same way the
+        // pre-locking code did (via create_dir_all inside the helper).
+        let _lock_file = acquire_lock_or_wouldblock(path)?;
+
         let mut file = match std::fs::read_to_string(path) {
             Ok(raw) => serde_json::from_str::<HeartbeatFile>(&raw).unwrap_or_default(),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => HeartbeatFile::default(),
@@ -504,15 +563,7 @@ impl HeartbeatPersistence {
         file.heartbeats.insert(peer_id, record);
         let serialized = serde_json::to_string_pretty(&file)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                // create_dir_all errors if parent already exists as a
-                // regular file — this surfaces "unwritable path"
-                // configurations as a save failure (correctly logged
-                // via tracing::warn at the call site).
-                std::fs::create_dir_all(parent)?;
-            }
-        }
+        // Parent dir already ensured by acquire_lock_or_wouldblock.
         let temp_path = path.with_extension("json.tmp");
         std::fs::write(&temp_path, serialized)?;
         std::fs::rename(&temp_path, path)?;
@@ -3291,5 +3342,157 @@ mod tests {
         assert_eq!(persisted.last_observed_lag.leader_sequence, 1);
 
         let _ = std::fs::remove_file(&heartbeat_path);
+    }
+
+    // === V2 polish — file locking (sentinel `.lock` files) ===
+
+    fn temp_lock_path(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hydra_replication_lock_{label}_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("replication-cursors.json")
+    }
+
+    #[test]
+    fn cursor_save_creates_lock_file_alongside_data() {
+        let data_path = temp_lock_path("happy");
+        let lock_path = lock_path_for(&data_path);
+
+        CursorPersistence::save(
+            &data_path,
+            follower_peer_id(),
+            hydra_core::ReplicationOffset::from_sequence(42),
+        )
+        .expect("uncontended save must succeed");
+
+        // Both files exist after the save.
+        assert!(data_path.exists(), "data file must exist after save");
+        assert!(lock_path.exists(), "lock file must exist alongside data");
+        // Sanity: the data file is well-formed JSON with our entry.
+        let entry = read_cursor_file_for(&data_path, &follower_peer_id())
+            .expect("cursor file readable");
+        assert_eq!(entry.sequence, 42);
+
+        let _ = std::fs::remove_file(&data_path);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn cursor_save_returns_wouldblock_when_lock_held_by_another_writer() {
+        // Background thread holds the sentinel lock for the duration
+        // of the test. Main thread calls CursorPersistence::save and
+        // expects WouldBlock immediately (try_lock_exclusive is
+        // nonblocking).
+        let data_path = temp_lock_path("contention");
+        let lock_path = lock_path_for(&data_path);
+
+        // Ensure the parent dir exists before the background thread
+        // opens the lock file (mirrors what acquire_lock_or_wouldblock
+        // does for the main thread).
+        if let Some(parent) = data_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        // Signal channels: lock_acquired_tx fires when the background
+        // thread has the lock; release_rx unblocks the thread so the
+        // lock is released.
+        let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let lock_path_clone = lock_path.clone();
+        let bg = std::thread::spawn(move || {
+            let bg_lock = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path_clone)
+                .unwrap();
+            bg_lock.lock_exclusive().unwrap();
+            lock_acquired_tx.send(()).unwrap();
+            // Hold the lock until the main thread says release.
+            let _ = release_rx.recv();
+            drop(bg_lock); // explicit release on drop
+        });
+
+        // Wait for the background to take the lock.
+        lock_acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("background must acquire lock within 2s");
+
+        // Main thread attempts save — must hit WouldBlock.
+        let err = CursorPersistence::save(
+            &data_path,
+            follower_peer_id(),
+            hydra_core::ReplicationOffset::from_sequence(1),
+        )
+        .expect_err("save must fail while another writer holds the lock");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "expected WouldBlock, got {err:?}"
+        );
+
+        // Release the background lock + join cleanly.
+        release_tx.send(()).unwrap();
+        bg.join().unwrap();
+
+        let _ = std::fs::remove_file(&data_path);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[test]
+    fn heartbeat_save_returns_wouldblock_when_lock_held() {
+        let data_path = temp_lock_path("heartbeat_contention")
+            .with_file_name("replication-heartbeats.json");
+        let lock_path = lock_path_for(&data_path);
+
+        if let Some(parent) = data_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let lock_path_clone = lock_path.clone();
+        let bg = std::thread::spawn(move || {
+            let bg_lock = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path_clone)
+                .unwrap();
+            bg_lock.lock_exclusive().unwrap();
+            lock_acquired_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            drop(bg_lock);
+        });
+
+        lock_acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("background must acquire lock within 2s");
+
+        let record = ReplicationHeartbeatRecord {
+            peer_id: follower_peer_id(),
+            last_observed_lag: ReplicationLag::observe(0, 0, chrono::Utc::now()),
+            last_heartbeat_at: chrono::Utc::now(),
+            total_transient_failures: 0,
+            last_fatal_error_kind: None,
+        };
+        let err = HeartbeatPersistence::save(&data_path, follower_peer_id(), record)
+            .expect_err("save must fail while another writer holds the lock");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "expected WouldBlock, got {err:?}"
+        );
+
+        release_tx.send(()).unwrap();
+        bg.join().unwrap();
+
+        let _ = std::fs::remove_file(&data_path);
+        let _ = std::fs::remove_file(&lock_path);
     }
 }

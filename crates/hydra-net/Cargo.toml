@@ -35,6 +35,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # feature flags needed for the loop driver. `select!` waits on the
 # token alongside the poll-interval sleep.
 tokio-util = "0.7"
+# V2 polish — file locking on the replication cursor/heartbeat
+# sentinel files (`<data>.json.lock`). Defense against two pullers
+# pointing at the same paths racing on read-modify-write + atomic
+# rename. fs2 wraps `flock` on Unix and `LockFileEx` on Windows.
+fs2 = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
