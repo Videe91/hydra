@@ -27,3 +27,11 @@ tower_governor = "0.4"
 tower = { version = "0.5", features = ["util"] }
 hydra-storage = { path = "../hydra-storage" }
 rcgen = "0.13"
+# rustls 0.23 with multiple crypto providers reachable (ring via rcgen,
+# aws-lc-rs via rustls default features pulled through reqwest's chain)
+# refuses to auto-pick at runtime. The TLS test calls
+# `CryptoProvider::install_default(ring::default_provider())` once to
+# pin the provider deterministically. Brought in only as a dev-dep so
+# production binaries aren't locked to a specific provider — operators
+# can swap by installing a different one before serve.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

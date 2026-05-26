@@ -1977,6 +1977,17 @@ mod tests {
 
     #[tokio::test]
     async fn tls_config_loads_valid_pem_files() {
+        // rustls 0.23 panics at runtime if more than one CryptoProvider
+        // is reachable from the dep graph (currently: `ring` via rcgen
+        // and `aws-lc-rs` via rustls default features pulled through
+        // reqwest's chain in hydra-net). Pin to `ring` once per process
+        // before any rustls-using code runs. `install_default` returns
+        // Err if a provider is already installed — ignored idempotently.
+        static INSTALL_PROVIDER: std::sync::Once = std::sync::Once::new();
+        INSTALL_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
         // Generate a self-signed cert in a temp dir, write cert.pem
         // + key.pem, and confirm `RustlsConfig::from_pem_file` loads
         // both. This is the integration-light path — we don't run a

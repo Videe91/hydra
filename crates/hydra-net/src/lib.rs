@@ -2,6 +2,7 @@ pub mod sensor;
 pub mod bus;
 pub mod http;
 pub mod query;
+pub mod replication_worker;
 pub mod schema_admin_service;
 pub mod schema_service;
 pub mod runtime;
@@ -18,6 +19,9 @@ pub mod prelude {
         SchemaHttpState, SensorHttpState, SnapshotsHttpState,
     };
     pub use crate::query::{QueryService, QueryStats};
+    pub use crate::replication_worker::{
+        ReplicationPuller, ReplicationPullerConfig, ReplicationPullReport,
+    };
     pub use crate::schema_admin_service::{SchemaAdminService, SchemaFields};
     pub use crate::schema_service::SchemaService;
     pub use crate::runtime::{RuntimeBuilder, RuntimeConfig, RuntimeHandle, RuntimeProcessor};
