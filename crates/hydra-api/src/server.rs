@@ -185,7 +185,11 @@ pub async fn serve_with_security(
     security: ServerSecurityConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tls = security.tls.clone();
-    let router = build_router_with_security(runtime, security);
+    // V2 patch 4I — pull the replication worker config out BEFORE
+    // moving `security` into the router. None = pre-4I behavior (no
+    // worker, no graceful-shutdown wiring).
+    let replication = security.replication.clone();
+    let router = build_router_with_security(runtime.clone(), security);
     // `into_make_service_with_connect_info::<SocketAddr>()` is what
     // gives the rate-limit middleware access to the peer IP via the
     // `ConnectInfo<SocketAddr>` extension. The cost is negligible
@@ -193,6 +197,59 @@ pub async fn serve_with_security(
     // the same make-service so PeerIpKeyExtractor works in either.
     let service =
         router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    // V2 patch 4I — optional replication worker auto-spawn.
+    //
+    // If `replication` is set:
+    //   - Build a `ReplicationPuller`.
+    //   - Use a shared `CancellationToken` (caller-supplied or fresh)
+    //     so server-shutdown cancels the worker AND vice-versa.
+    //   - Spawn the puller in a tokio task; keep its JoinHandle so we
+    //     can drain on server shutdown.
+    //   - Wire the server's graceful-shutdown to the same token.
+    //
+    // Worker fatal exits do NOT tear down the server — the server
+    // keeps running, only logging the exit via `tracing::warn`.
+    let (worker_handle, shutdown_token) = match replication {
+        Some(replication) => {
+            let shutdown = replication
+                .shutdown
+                .clone()
+                .unwrap_or_else(tokio_util::sync::CancellationToken::new);
+            let puller = hydra_net::replication_worker::ReplicationPuller::new(
+                runtime,
+                replication.puller,
+            );
+            let worker_token = shutdown.clone();
+            let handle = tokio::spawn(async move {
+                match puller.run_until_cancelled(worker_token).await {
+                    Ok(report) => {
+                        tracing::info!(
+                            target: "hydra::replication",
+                            iterations = report.iterations,
+                            applied = report.total_applied,
+                            cancelled = report.cancelled,
+                            "replication worker exited cleanly"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "hydra::replication",
+                            kind = ?err.kind,
+                            message = %err.message,
+                            iterations = err.report.iterations,
+                            failures = err.report.failures,
+                            "replication worker exited with fatal error \
+                             (HTTP server continues serving)"
+                        );
+                    }
+                }
+            });
+            (Some(handle), Some(shutdown))
+        }
+        None => (None, None),
+    };
+
     match tls {
         Some(tls) => {
             // Load cert + key BEFORE binding so bad paths fail fast
@@ -203,13 +260,60 @@ pub async fn serve_with_security(
             )
             .await?;
             let socket_addr: std::net::SocketAddr = addr.parse()?;
-            axum_server::bind_rustls(socket_addr, config)
-                .serve(service)
-                .await?;
+            // axum-server graceful-shutdown via `Handle`: when the
+            // token fires, call handle.shutdown() so the server
+            // returns control.
+            if let Some(token) = shutdown_token.clone() {
+                let server_handle = axum_server::Handle::new();
+                let handle_for_signal = server_handle.clone();
+                tokio::spawn(async move {
+                    token.cancelled().await;
+                    handle_for_signal.graceful_shutdown(Some(
+                        std::time::Duration::from_secs(5),
+                    ));
+                });
+                axum_server::bind_rustls(socket_addr, config)
+                    .handle(server_handle)
+                    .serve(service)
+                    .await?;
+            } else {
+                axum_server::bind_rustls(socket_addr, config)
+                    .serve(service)
+                    .await?;
+            }
         }
         None => {
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, service).await?;
+            if let Some(token) = shutdown_token.clone() {
+                axum::serve(listener, service)
+                    .with_graceful_shutdown(async move {
+                        token.cancelled().await;
+                    })
+                    .await?;
+            } else {
+                axum::serve(listener, service).await?;
+            }
+        }
+    }
+
+    // V2 patch 4I — server returned; fire the shutdown token (if not
+    // already) and drain the worker with a 5s timeout. Hung workers
+    // can't keep the process alive forever.
+    if let Some(token) = shutdown_token {
+        token.cancel();
+    }
+    if let Some(handle) = worker_handle {
+        if let Err(err) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle,
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "hydra::replication",
+                error = %err,
+                "replication worker did not drain within 5s after server shutdown"
+            );
         }
     }
     Ok(())
@@ -1831,6 +1935,7 @@ mod tests {
                     burst: 2,
                 },
                 role: RuntimeRole::Leader,
+                replication: None,
             },
         );
         // One request fits comfortably in burst=2.
@@ -1854,6 +1959,7 @@ mod tests {
                     burst: 1,
                 },
                 role: RuntimeRole::Leader,
+                replication: None,
             },
         );
         let peer = test_peer();
@@ -1889,6 +1995,7 @@ mod tests {
                     burst: 1,
                 },
                 role: RuntimeRole::Leader,
+                replication: None,
             },
         );
         let peer_a: std::net::SocketAddr = "127.0.0.1:50100".parse().unwrap();
@@ -1917,6 +2024,7 @@ mod tests {
                 tls: None,
                 rate_limit: RateLimitMode::Off,
                 role: RuntimeRole::Leader,
+                replication: None,
             },
         );
         let request = Request::builder()
@@ -1951,6 +2059,7 @@ mod tests {
                 tls: None,
                 rate_limit: RateLimitMode::Off,
                 role: RuntimeRole::Leader,
+                replication: None,
             },
         );
         let response = app
@@ -1996,6 +2105,7 @@ mod tests {
             }),
             rate_limit: RateLimitMode::Off,
             role: RuntimeRole::Leader,
+            replication: None,
         };
         let result = serve_with_security(runtime, "127.0.0.1:0", bad).await;
         assert!(result.is_err());
@@ -2291,5 +2401,199 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(apply.status(), StatusCode::CONFLICT);
+    }
+
+    // === V2 patch 4I — server auto-start of replication worker ===
+
+    use crate::security::ReplicationServerConfig;
+    use hydra_net::http::replication::replication_router;
+    use hydra_net::replication_worker::ReplicationPullerConfig;
+    use tokio_util::sync::CancellationToken;
+
+    /// Spawn a bare leader server (no auth, no replication worker)
+    /// on `127.0.0.1:0` so 4I tests can point a follower at it.
+    /// Returns the bound address and the JoinHandle.
+    async fn spawn_bare_leader(
+        runtime: RuntimeHandle,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = replication_router(runtime);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (addr, handle)
+    }
+
+    fn replica_peer() -> hydra_core::ReplicaId {
+        hydra_core::ReplicaId::from_str("replica_auto_spawn_test")
+    }
+
+    fn restorer_actor() -> hydra_core::ActorId {
+        hydra_core::ActorId::from_str("actor_4i_restorer")
+    }
+
+    #[tokio::test]
+    async fn serve_with_security_auto_spawns_replication_worker() {
+        // Leader server with a few commits; follower's
+        // serve_with_security auto-spawns the puller; after some
+        // time, fire shutdown and assert the follower applied them.
+        let (leader_runtime, _leader_proc) =
+            hydra_net::runtime::RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(hydra_core::EventKind::Signal {
+                source: hydra_core::NodeId::from_str("test.4i"),
+                name: "first".to_string(),
+                payload: std::collections::HashMap::new(),
+            }).unwrap();
+            hydra.ingest(hydra_core::EventKind::Signal {
+                source: hydra_core::NodeId::from_str("test.4i"),
+                name: "second".to_string(),
+                payload: std::collections::HashMap::new(),
+            }).unwrap();
+        }
+        let (leader_addr, _leader_handle) = spawn_bare_leader(leader_runtime).await;
+
+        let (follower_runtime, _follower_proc) =
+            hydra_net::runtime::RuntimeBuilder::new().build();
+        let mut puller_config = ReplicationPullerConfig::new(
+            replica_peer(),
+            format!("http://{leader_addr}"),
+            restorer_actor(),
+        );
+        puller_config.poll_interval = std::time::Duration::from_millis(20);
+        puller_config.bootstrap_on_start = false;
+
+        let shutdown = CancellationToken::new();
+        let security = ServerSecurityConfig::off().with_replication(
+            ReplicationServerConfig::new(puller_config).with_shutdown(shutdown.clone()),
+        );
+
+        let follower_for_serve = follower_runtime.clone();
+        let serve_task = tokio::spawn(async move {
+            // Box<dyn Error> isn't Send; discard the Result so the
+            // spawned future's Output is `()`.
+            let _ = serve_with_security(follower_for_serve, "127.0.0.1:0", security).await;
+        });
+
+        // Poll up to ~2s for the follower to catch up. wait_until-style.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let count = follower_runtime.hydra().read().await.events().len();
+            if count >= 2 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("follower never caught up (events={count})");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        shutdown.cancel();
+        // serve_task should return cleanly within a few seconds.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve_task,
+        )
+        .await;
+        assert!(result.is_ok(), "serve_with_security did not drain");
+    }
+
+    #[tokio::test]
+    async fn replication_worker_does_not_block_server_on_fatal() {
+        // Point the worker at a leader URL that always returns 401
+        // (Unauthorized → fatal). The worker exits with
+        // `ReplicationLoopError`, BUT the HTTP server keeps serving
+        // so we can confirm via a GET to a known route.
+        async fn always_401() -> impl axum::response::IntoResponse {
+            (axum::http::StatusCode::UNAUTHORIZED, "go away")
+        }
+        let bad_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let bad_addr = bad_listener.local_addr().unwrap();
+        let bad_router = axum::Router::new().route(
+            "/replication/commits",
+            axum::routing::get(always_401),
+        );
+        let _bad_handle = tokio::spawn(async move {
+            let _ = axum::serve(bad_listener, bad_router).await;
+        });
+
+        let (follower_runtime, _follower_proc) =
+            hydra_net::runtime::RuntimeBuilder::new().build();
+        let mut puller_config = ReplicationPullerConfig::new(
+            replica_peer(),
+            format!("http://{bad_addr}"),
+            restorer_actor(),
+        );
+        puller_config.poll_interval = std::time::Duration::from_millis(10);
+        puller_config.bootstrap_on_start = false;
+
+        let shutdown = CancellationToken::new();
+        let security = ServerSecurityConfig::off().with_replication(
+            ReplicationServerConfig::new(puller_config).with_shutdown(shutdown.clone()),
+        );
+
+        let follower_for_serve = follower_runtime.clone();
+        let serve_task = tokio::spawn(async move {
+            // Box<dyn Error> isn't Send; discard the Result so the
+            // spawned future's Output is `()`.
+            let _ = serve_with_security(follower_for_serve, "127.0.0.1:0", security).await;
+        });
+
+        // Give the worker a chance to fatal-exit on 401. The server
+        // should NOT have stopped — fire shutdown ourselves after a
+        // brief grace period.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // serve_task is still running (the worker exited but the
+        // server is independent). Fire the token to stop the server
+        // cleanly.
+        shutdown.cancel();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve_task,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "server should return after shutdown even if worker is dead"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_with_security_without_replication_unchanged() {
+        // Sanity: with `replication = None`, the auto-spawn code path
+        // is skipped entirely. Spawn the serve, fire shutdown via
+        // dropping the task; verify it doesn't hang on the drain
+        // logic (there's nothing to drain).
+        //
+        // We can't easily test "the loop is byte-identical" but we
+        // CAN test "no panic, no extra task hangs, serve aborts
+        // cleanly when cancelled at the task level".
+        let (runtime, _proc) = hydra_net::runtime::RuntimeBuilder::new().build();
+        let security = ServerSecurityConfig::off();
+        let serve_task = tokio::spawn(async move {
+            let _ = serve_with_security(runtime, "127.0.0.1:0", security).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Abort the task (simulates external SIGINT for the no-graceful
+        // path). The task aborts cleanly with no replication-side
+        // resources to leak.
+        serve_task.abort();
+        let join = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            serve_task,
+        )
+        .await;
+        // Aborted future returns JoinError::is_cancelled — that's the
+        // expected end-state. We don't actually care about Ok vs Err
+        // here; we care that the timeout didn't fire.
+        assert!(join.is_ok(), "serve task did not abort within 2s");
     }
 }

@@ -20,6 +20,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 axum = "0.7"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+# V2 patch 4I — CancellationToken for the auto-spawned replication
+# worker's lifecycle. Same dep hydra-net pulls; here we use it from
+# the server side to coordinate graceful shutdown.
+tokio-util = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 tower_governor = "0.4"
 

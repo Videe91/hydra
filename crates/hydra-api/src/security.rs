@@ -15,7 +15,9 @@
 //! thin wrappers over the unified config.
 
 use crate::auth::AuthConfig;
+use hydra_net::replication_worker::ReplicationPullerConfig;
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 
 /// File-backed TLS configuration. PEM-encoded cert + key paths.
 ///
@@ -79,6 +81,50 @@ impl Default for RuntimeRole {
     }
 }
 
+/// V2 patch 4I — server-side replication worker config.
+///
+/// Wraps a `ReplicationPullerConfig` plus an optional shutdown
+/// `CancellationToken`. When attached to `ServerSecurityConfig` via
+/// `with_replication`, `serve_with_security` auto-spawns the puller
+/// loop and cancels it on server shutdown.
+///
+/// **Role coupling is intentional NOT-automatic**: a Leader may
+/// configure replication (upstream-chained node), and a Follower
+/// without replication is technically valid (read-only mirror with
+/// no replication source). Operators decide.
+///
+/// **Worker fatal does NOT kill the server**: if the puller exits
+/// with a `ReplicationLoopError`, the HTTP server keeps serving so
+/// operators can fix the upstream and restart. The exit is logged
+/// via `tracing::warn`.
+#[derive(Debug, Clone)]
+pub struct ReplicationServerConfig {
+    pub puller: ReplicationPullerConfig,
+    /// Operator-supplied shutdown token. `None` means
+    /// `serve_with_security` creates an internal token tied to the
+    /// server's lifecycle. `Some(token)` lets operators coordinate
+    /// multi-worker shutdown.
+    pub shutdown: Option<CancellationToken>,
+}
+
+impl ReplicationServerConfig {
+    pub fn new(puller: ReplicationPullerConfig) -> Self {
+        Self {
+            puller,
+            shutdown: None,
+        }
+    }
+
+    /// Attach a caller-supplied cancellation token. When the operator
+    /// fires it, the worker drains; when `serve_with_security`
+    /// returns, the server fires its own internal token too — both
+    /// paths trigger the same shutdown handler.
+    pub fn with_shutdown(mut self, token: CancellationToken) -> Self {
+        self.shutdown = Some(token);
+        self
+    }
+}
+
 /// Unified server-security bundle. Construct via [`Self::off`],
 /// [`Self::with_auth`], or by building the struct directly when more
 /// than one knob needs to be set.
@@ -90,6 +136,10 @@ pub struct ServerSecurityConfig {
     /// V2 patch 4H — runtime role gate. Defaults to `Leader`
     /// (pre-4H behavior).
     pub role: RuntimeRole,
+    /// V2 patch 4I — optional replication worker. When `Some`,
+    /// `serve_with_security` spawns the puller and drains it on
+    /// shutdown. Default `None` for back-compat.
+    pub replication: Option<ReplicationServerConfig>,
 }
 
 impl ServerSecurityConfig {
@@ -101,6 +151,7 @@ impl ServerSecurityConfig {
             tls: None,
             rate_limit: RateLimitMode::Off,
             role: RuntimeRole::Leader,
+            replication: None,
         }
     }
 
@@ -113,6 +164,7 @@ impl ServerSecurityConfig {
             tls: None,
             rate_limit: RateLimitMode::Off,
             role: RuntimeRole::Leader,
+            replication: None,
         }
     }
 
@@ -141,6 +193,14 @@ impl ServerSecurityConfig {
     /// routes with `409 Conflict`. See [`RuntimeRole`].
     pub fn with_role(mut self, role: RuntimeRole) -> Self {
         self.role = role;
+        self
+    }
+
+    /// V2 patch 4I — attach a replication worker config. When set,
+    /// `serve_with_security` spawns the puller and drains it on
+    /// server shutdown. Worker fatal does NOT tear down the server.
+    pub fn with_replication(mut self, replication: ReplicationServerConfig) -> Self {
+        self.replication = Some(replication);
         self
     }
 }
