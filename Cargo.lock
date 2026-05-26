@@ -852,6 +852,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+ "tracing",
 ]
 
 [[package]]

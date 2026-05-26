@@ -29,9 +29,11 @@ use crate::http::replication::{
 use crate::runtime::RuntimeHandle;
 use axum::http::StatusCode;
 use hydra_core::error::{HydraError, Result};
-use hydra_core::{ActorId, CommitBatch, ReplicaId, SnapshotId};
+use hydra_core::{ActorId, CommitBatch, ReplicaId, ReplicationOffset, SnapshotId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -234,10 +236,38 @@ pub struct ReplicationPullerConfig {
     pub page_limit: usize,
     pub restored_by: ActorId,
     pub poll_interval: Duration,
+    /// `true` runs `bootstrap_from_latest_snapshot` as the first
+    /// action of `run_until_cancelled`. **Interaction with
+    /// `cursor_path` (V2 P4F)**: when both are set, startup
+    /// restores the cursor AND still performs a bootstrap. The
+    /// bootstrap path resets the follower's commit_ledger (see
+    /// `recover_from_snapshot_body_and_replay` doc-comment) and
+    /// then the cursor takes over for subsequent pulls. Operators
+    /// who want warm cursor-only restart should set
+    /// `bootstrap_on_start = false`. A future patch may skip
+    /// bootstrap when the restored cursor is already at or past
+    /// the leader's latest snapshot — that requires a leader call
+    /// before deciding, so it is deferred.
     pub bootstrap_on_start: bool,
     /// V2 patch 4E — exponential-backoff retry policy applied inside
     /// `run_until_cancelled` for transient pull failures.
     pub retry: ReplicationRetryConfig,
+    /// V2 patch 4F — optional path to a JSON file that persists
+    /// replication cursors across process restarts. `None` keeps
+    /// the cursor in-memory only (V2 P4C-E behavior).
+    ///
+    /// File shape: `{ "version": 1, "cursors": { "<peer_id>": ... }}`.
+    /// Written via tempfile + atomic `fs::rename` after every
+    /// successful apply / bootstrap. Read by `restore_cursor()`,
+    /// which `run_until_cancelled` calls automatically as its
+    /// first action.
+    ///
+    /// Persistence is **best-effort durability**: read failures
+    /// (missing / corrupt / no entry for this peer) fall back to
+    /// fresh-follower behavior silently; write failures emit a
+    /// `tracing::warn` and the loop keeps running on in-memory
+    /// state. The in-memory cursor stays the source of correctness.
+    pub cursor_path: Option<PathBuf>,
 }
 
 impl ReplicationPullerConfig {
@@ -267,7 +297,94 @@ impl ReplicationPullerConfig {
             poll_interval: Duration::from_secs(1),
             bootstrap_on_start: true,
             retry: ReplicationRetryConfig::default(),
+            cursor_path: None,
         }
+    }
+}
+
+/// V2 patch 4F — on-disk shape of the replication cursor file.
+///
+/// One JSON file, keyed by peer_id, so a single follower process
+/// could in principle track cursors for multiple leaders without
+/// changing the schema. Today every puller has exactly one peer_id
+/// so the map carries at most one entry — but the shape is
+/// forward-compat.
+///
+/// `version: 1` for future format migrations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CursorFile {
+    version: u32,
+    cursors: HashMap<ReplicaId, ReplicationOffset>,
+}
+
+impl Default for CursorFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            cursors: HashMap::new(),
+        }
+    }
+}
+
+/// V2 patch 4F — atomic-rename helpers for reading/writing the cursor
+/// file. All errors here are surfaced as `std::io::Error`; callers
+/// translate to either `Ok(None)` (read path) or `tracing::warn`
+/// (write path).
+struct CursorPersistence;
+
+impl CursorPersistence {
+    /// Load the cursor entry for a specific peer. Missing file or
+    /// missing peer entry both return `Ok(None)`. Corrupt JSON
+    /// returns an `io::Error` — the public `restore_cursor` then
+    /// downgrades that to `tracing::warn` + `Ok(None)`.
+    fn load_for_peer(
+        path: &Path,
+        peer_id: &ReplicaId,
+    ) -> std::io::Result<Option<ReplicationOffset>> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+        let parsed: CursorFile = serde_json::from_str(&raw)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        Ok(parsed.cursors.get(peer_id).cloned())
+    }
+
+    /// Atomically write the offset for `peer_id`. Preserves entries
+    /// for any other peers already in the file (read-modify-write).
+    /// Uses tempfile + `fs::rename` so a crash mid-write never
+    /// leaves a half-serialized file at the canonical path —
+    /// same pattern as `FileSnapshotStore`.
+    fn save(
+        path: &Path,
+        peer_id: ReplicaId,
+        offset: ReplicationOffset,
+    ) -> std::io::Result<()> {
+        // Read-modify-write. Treat missing OR corrupt as "start
+        // fresh" — the in-memory cursor is the source of truth for
+        // correctness, and overwriting a corrupt file with a valid
+        // single-entry file is the right repair.
+        let mut file = match std::fs::read_to_string(path) {
+            Ok(raw) => serde_json::from_str::<CursorFile>(&raw).unwrap_or_default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => CursorFile::default(),
+            Err(err) => return Err(err),
+        };
+        file.cursors.insert(peer_id, offset);
+        let serialized = serde_json::to_string_pretty(&file)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        // Ensure parent dir exists so callers don't have to.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let temp_path = path.with_extension("json.tmp");
+        std::fs::write(&temp_path, serialized)?;
+        std::fs::rename(&temp_path, path)?;
+        Ok(())
     }
 }
 
@@ -400,6 +517,10 @@ impl ReplicationPuller {
                 .map_err(classify_engine_error)?
         };
 
+        // V2 patch 4F — persist the cursor after every successful apply.
+        // Best-effort; failures log via tracing but don't crash.
+        self.persist_cursor_best_effort().await;
+
         Ok(ReplicationPullReport {
             peer_id: report.peer_id,
             requested_after_sequence: local_head,
@@ -413,6 +534,96 @@ impl ReplicationPuller {
     /// Echo the configured `peer_id` — handy for tests and loggers.
     pub fn peer_id(&self) -> &ReplicaId {
         &self.config.peer_id
+    }
+
+    /// V2 patch 4F — hydrate the in-memory replication cursor for
+    /// this peer from `config.cursor_path`.
+    ///
+    /// Returns:
+    ///   - `Ok(None)` when `cursor_path` is unset, the file is
+    ///     missing, the file is corrupt, or the file is valid but
+    ///     doesn't carry an entry for `config.peer_id`. Corrupt
+    ///     files emit a `tracing::warn` but still return Ok — the
+    ///     in-memory cursor stays empty and the loop falls back to
+    ///     fresh-follower behavior.
+    ///   - `Ok(Some(offset))` when a valid entry was loaded and
+    ///     stamped into Hydra via `record_replication_apply_offset`.
+    ///
+    /// `run_until_cancelled` calls this automatically as its first
+    /// action (after the pre-cancel check). Operators using
+    /// `pull_once` / `bootstrap_from_latest_snapshot` directly can
+    /// call it explicitly before their first operation.
+    pub async fn restore_cursor(&self) -> Result<Option<ReplicationOffset>> {
+        let Some(path) = self.config.cursor_path.as_ref() else {
+            return Ok(None);
+        };
+        let loaded = match CursorPersistence::load_for_peer(path, &self.config.peer_id) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    target: "hydra::replication",
+                    path = %path.display(),
+                    peer_id = %self.config.peer_id,
+                    error = %err,
+                    "replication cursor load failed; falling back to fresh-follower behavior"
+                );
+                return Ok(None);
+            }
+        };
+        let Some(offset) = loaded else {
+            return Ok(None);
+        };
+        // Stamp the in-memory cursor under the write lock.
+        let hydra = self.runtime.hydra();
+        let mut hydra = hydra.write().await;
+        hydra.record_replication_apply_offset(
+            self.config.peer_id.clone(),
+            offset.clone(),
+        );
+        Ok(Some(offset))
+    }
+
+    /// V2 patch 4F — best-effort write of the current in-memory
+    /// cursor for this peer to `config.cursor_path`. Called by
+    /// `try_pull_once` and `try_bootstrap_from_latest_snapshot`
+    /// after a successful apply. Failures emit `tracing::warn` but
+    /// do NOT bubble — replication keeps running on in-memory
+    /// state.
+    async fn persist_cursor_best_effort(&self) {
+        let Some(path) = self.config.cursor_path.as_ref() else {
+            return;
+        };
+        // Read the just-stamped cursor back out of Hydra.
+        let offset = {
+            let hydra = self.runtime.hydra();
+            let hydra = hydra.read().await;
+            hydra
+                .latest_replication_offset(&self.config.peer_id)
+                .cloned()
+        };
+        let Some(offset) = offset else {
+            // Nothing to persist — apply path didn't stamp a cursor
+            // (e.g. empty page). Silent no-op.
+            return;
+        };
+        let path = path.clone();
+        let peer_id = self.config.peer_id.clone();
+        // Do the disk IO on a blocking pool so we don't stall the
+        // async runtime. Bound by a small spawn_blocking call.
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            CursorPersistence::save(&path, peer_id, offset)
+        })
+        .await
+        .unwrap_or_else(|join_err| {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, join_err))
+        }) {
+            tracing::warn!(
+                target: "hydra::replication",
+                peer_id = %self.config.peer_id,
+                error = %err,
+                "replication cursor persist failed; in-memory cursor still consistent"
+            );
+        }
     }
 
     /// V2 patch 4D + 4E — drive the puller in a loop until `shutdown`
@@ -464,6 +675,13 @@ impl ReplicationPuller {
             report.cancelled = true;
             return Ok(report);
         }
+
+        // V2 patch 4F — restore the persisted cursor before the first
+        // operation, so the first pull queries from the resumed
+        // leader position instead of the cold-start fallback. Errors
+        // are swallowed (restore_cursor downgrades them to Ok(None));
+        // unreachable here unless the runtime itself is broken.
+        let _ = self.restore_cursor().await;
 
         // State machine: either the bootstrap step (if requested) or
         // the pull loop. `bootstrap_pending` flips to false after a
@@ -682,6 +900,9 @@ impl ReplicationPuller {
             let hydra = hydra.read().await;
             hydra.latest_commit().map(|r| r.sequence)
         };
+
+        // V2 patch 4F — persist cursor after bootstrap success too.
+        self.persist_cursor_best_effort().await;
 
         Ok(ReplicationBootstrapReport {
             peer_id: self.config.peer_id.clone(),
@@ -927,6 +1148,7 @@ mod tests {
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
+                cursor_path: None,
             },
         );
 
@@ -968,6 +1190,7 @@ mod tests {
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
+                cursor_path: None,
             },
         );
 
@@ -1030,6 +1253,7 @@ mod tests {
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
+                cursor_path: None,
             },
         );
         let report = puller.pull_once().await.unwrap();
@@ -1081,6 +1305,7 @@ mod tests {
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
+                cursor_path: None,
             },
         );
         // Follower's head is at seq=1 (its own local commit). It asks
@@ -1129,6 +1354,7 @@ mod tests {
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
+                cursor_path: None,
             },
         );
 
@@ -1174,6 +1400,7 @@ mod tests {
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
+                cursor_path: None,
             },
         );
 
@@ -1248,6 +1475,7 @@ mod tests {
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
+                cursor_path: None,
             },
         );
 
@@ -1344,6 +1572,7 @@ mod tests {
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
+                cursor_path: None,
             },
         );
         let err = puller.bootstrap_from_latest_snapshot().await.unwrap_err();
@@ -1396,6 +1625,7 @@ mod tests {
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
+                cursor_path: None,
             },
         );
 
@@ -1847,5 +2077,230 @@ mod tests {
         assert_eq!(report.failures, 1);
         // The loop continued past the failure rather than fataling.
         assert!(report.iterations >= 1);
+    }
+
+    // === V2 patch 4F — persistent replication cursor ===
+
+    fn temp_cursor_path(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hydra_replication_cursor_{label}_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("replication-cursors.json")
+    }
+
+    /// Write a pre-populated cursor file with one peer entry.
+    fn write_cursor_file(path: &Path, peer_id: ReplicaId, offset: ReplicationOffset) {
+        let mut file = CursorFile::default();
+        file.cursors.insert(peer_id, offset);
+        let raw = serde_json::to_string_pretty(&file).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, raw).unwrap();
+    }
+
+    fn read_cursor_file_for(
+        path: &Path,
+        peer_id: &ReplicaId,
+    ) -> Option<ReplicationOffset> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let parsed: CursorFile = serde_json::from_str(&raw).ok()?;
+        parsed.cursors.get(peer_id).cloned()
+    }
+
+    #[tokio::test]
+    async fn restore_cursor_loads_from_disk_into_hydra() {
+        let cursor_path = temp_cursor_path("restore");
+        let persisted = ReplicationOffset::from_sequence(42);
+        write_cursor_file(&cursor_path, follower_peer_id(), persisted.clone());
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            "http://127.0.0.1:1".to_string(),
+            restorer(),
+        );
+        config.cursor_path = Some(cursor_path.clone());
+
+        let puller = ReplicationPuller::new(follower_runtime.clone(), config);
+        let loaded = puller.restore_cursor().await.unwrap();
+        assert_eq!(loaded, Some(persisted.clone()));
+        // Stamped into Hydra in-memory cursor.
+        let hydra_cursor = follower_runtime
+            .hydra()
+            .read()
+            .await
+            .latest_replication_offset(&follower_peer_id())
+            .cloned();
+        assert_eq!(hydra_cursor, Some(persisted));
+
+        let _ = std::fs::remove_file(&cursor_path);
+    }
+
+    #[tokio::test]
+    async fn apply_persists_cursor_to_disk() {
+        // Leader ingests 2 commits, follower pull_once applies them,
+        // cursor file should now reflect the last applied offset.
+        let cursor_path = temp_cursor_path("apply");
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("one")).unwrap();
+            hydra.ingest(signal("two")).unwrap();
+        }
+        let leader_head = leader_runtime
+            .hydra()
+            .read()
+            .await
+            .latest_commit()
+            .unwrap()
+            .id
+            .clone();
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            format!("http://{addr}"),
+            restorer(),
+        );
+        config.cursor_path = Some(cursor_path.clone());
+
+        let puller = ReplicationPuller::new(follower_runtime, config);
+        let report = puller.pull_once().await.unwrap();
+        assert_eq!(report.applied_count, 2);
+
+        let persisted = read_cursor_file_for(&cursor_path, &follower_peer_id())
+            .expect("cursor file must exist with our peer entry");
+        assert_eq!(persisted.sequence, 2);
+        assert_eq!(persisted.commit_id.as_ref(), Some(&leader_head));
+
+        let _ = std::fs::remove_file(&cursor_path);
+    }
+
+    #[tokio::test]
+    async fn run_until_cancelled_auto_restores_cursor_on_start() {
+        // Pre-stamp the cursor file to leader's head. The loop's first
+        // pull should request `after_sequence = 2` (the persisted
+        // value) and find nothing new — i.e. fetched_count = 0.
+        let cursor_path = temp_cursor_path("auto_restore");
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("one")).unwrap();
+            hydra.ingest(signal("two")).unwrap();
+        }
+        let leader_head_record = leader_runtime
+            .hydra()
+            .read()
+            .await
+            .latest_commit()
+            .cloned()
+            .unwrap();
+        let persisted = ReplicationOffset {
+            sequence: leader_head_record.sequence,
+            commit_id: Some(leader_head_record.id.clone()),
+            commit_hash: Some(leader_head_record.commit_hash.clone()),
+        };
+        write_cursor_file(&cursor_path, follower_peer_id(), persisted);
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = loop_config(format!("http://{addr}"), Duration::from_millis(10), false);
+        config.cursor_path = Some(cursor_path.clone());
+        let puller = ReplicationPuller::new(follower_runtime.clone(), config);
+        let token = CancellationToken::new();
+
+        let token_clone = token.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            token_clone.cancel();
+        });
+
+        let report = puller.run_until_cancelled(token).await.unwrap();
+        canceller.await.unwrap();
+        assert!(report.cancelled);
+        // Loop ran, applied nothing — restored cursor said "we're
+        // already at leader head".
+        assert_eq!(report.total_applied, 0);
+        // Follower's local commit_ledger stayed empty (no apply
+        // happened); the cursor came from disk, not from apply.
+        assert_eq!(follower_runtime.hydra().read().await.commit_count(), 0);
+
+        let _ = std::fs::remove_file(&cursor_path);
+    }
+
+    #[tokio::test]
+    async fn corrupt_cursor_file_falls_back_to_fresh_follower_behavior() {
+        let cursor_path = temp_cursor_path("corrupt");
+        // Write garbage that's not valid JSON.
+        std::fs::write(&cursor_path, b"not-json-at-all{").unwrap();
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            "http://127.0.0.1:1".to_string(),
+            restorer(),
+        );
+        config.cursor_path = Some(cursor_path.clone());
+
+        let puller = ReplicationPuller::new(follower_runtime.clone(), config);
+        let loaded = puller.restore_cursor().await.unwrap();
+        // Ok(None) — corruption is logged via tracing::warn but not
+        // surfaced as an error.
+        assert!(loaded.is_none());
+        // Hydra cursor stays empty.
+        assert!(follower_runtime
+            .hydra()
+            .read()
+            .await
+            .latest_replication_offset(&follower_peer_id())
+            .is_none());
+
+        let _ = std::fs::remove_file(&cursor_path);
+    }
+
+    #[tokio::test]
+    async fn missing_cursor_file_is_not_an_error_and_first_apply_creates_it() {
+        let cursor_path = temp_cursor_path("create");
+        // Make sure the file does NOT exist (parent dir does).
+        let _ = std::fs::remove_file(&cursor_path);
+        assert!(!cursor_path.exists());
+
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("first")).unwrap();
+        }
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            format!("http://{addr}"),
+            restorer(),
+        );
+        config.cursor_path = Some(cursor_path.clone());
+
+        let puller = ReplicationPuller::new(follower_runtime, config);
+        // restore_cursor: missing file → Ok(None), no error.
+        let loaded = puller.restore_cursor().await.unwrap();
+        assert!(loaded.is_none());
+
+        // First successful apply creates the file.
+        let report = puller.pull_once().await.unwrap();
+        assert_eq!(report.applied_count, 1);
+        assert!(cursor_path.exists());
+        let entry = read_cursor_file_for(&cursor_path, &follower_peer_id())
+            .expect("cursor file created with our peer entry");
+        assert_eq!(entry.sequence, 1);
+
+        let _ = std::fs::remove_file(&cursor_path);
     }
 }

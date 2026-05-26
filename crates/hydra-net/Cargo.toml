@@ -14,6 +14,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 axum = "0.7"
 # V2 patch 4A — follower puller HTTP client. `default-features = false`
 # drops the openssl pull-in. `rustls-tls-no-provider` brings rustls
