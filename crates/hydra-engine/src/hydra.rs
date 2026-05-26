@@ -1335,6 +1335,26 @@ impl Hydra {
             .record_local_apply_offset(peer_id, offset);
     }
 
+    /// V2 patch 4G — stamp a runtime-local replication lag observation
+    /// for the given peer. Direct in-memory update, **not event-sourced**
+    /// — emitting a heartbeat event would diverge the follower's
+    /// commit chain from the leader's (same constraint as patch 4C
+    /// cursor).
+    ///
+    /// Called by the puller after every page fetch (including empty
+    /// pages — lag tracking matters most when the follower is caught
+    /// up). `latest_replication_lag` (already public from V2 P2) reads
+    /// the in-memory value back. Side-channel file persistence is
+    /// configured at the puller level via `heartbeat_path`.
+    pub fn record_replication_heartbeat(
+        &mut self,
+        peer_id: hydra_core::ReplicaId,
+        lag: hydra_core::ReplicationLag,
+    ) {
+        self.replication_store
+            .record_local_heartbeat(peer_id, lag);
+    }
+
     /// V2 patch 3B — apply a leader-supplied page of committed batches to
     /// this follower.
     ///

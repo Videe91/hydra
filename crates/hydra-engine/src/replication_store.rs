@@ -143,6 +143,26 @@ impl ReplicationStore {
         self.latest_lag_by_peer.get(peer_id)
     }
 
+    /// V2 patch 4G — record a follower's observed lag against a leader
+    /// peer.
+    ///
+    /// Direct in-memory update, **not event-sourced** (same reasoning as
+    /// `record_local_apply_offset`: a follower-emitted heartbeat event
+    /// would diverge the follower's commit chain from the leader's).
+    /// Does NOT require the peer to be registered — the puller's
+    /// `peer_id` is config identity.
+    ///
+    /// Survives in-process. The puller persists the heartbeat to a
+    /// side-channel file when configured, so observations can outlive
+    /// process restarts.
+    pub fn record_local_heartbeat(&mut self, peer_id: ReplicaId, lag: ReplicationLag) {
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.last_lag = Some(lag.clone());
+            peer.updated_at = chrono::Utc::now();
+        }
+        self.latest_lag_by_peer.insert(peer_id, lag);
+    }
+
     /// V2 patch 4C — record a follower's local replication cursor after
     /// applying or bootstrapping from a leader peer.
     ///

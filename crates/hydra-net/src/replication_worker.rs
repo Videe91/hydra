@@ -28,8 +28,11 @@ use crate::http::replication::{
 };
 use crate::runtime::RuntimeHandle;
 use axum::http::StatusCode;
+use chrono::{DateTime, Utc};
 use hydra_core::error::{HydraError, Result};
-use hydra_core::{ActorId, CommitBatch, ReplicaId, ReplicationOffset, SnapshotId};
+use hydra_core::{
+    ActorId, CommitBatch, ReplicaId, ReplicationLag, ReplicationOffset, SnapshotId,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -268,6 +271,17 @@ pub struct ReplicationPullerConfig {
     /// `tracing::warn` and the loop keeps running on in-memory
     /// state. The in-memory cursor stays the source of correctness.
     pub cursor_path: Option<PathBuf>,
+    /// V2 patch 4G — optional path to the side-channel heartbeat
+    /// file. Records observed lag + last heartbeat timestamp +
+    /// cumulative transient-failure counter + last fatal error kind
+    /// per peer. Same best-effort durability model as `cursor_path`.
+    /// `None` keeps heartbeat state in-memory only.
+    ///
+    /// **Cadence**: heartbeats update on EVERY pull (including
+    /// empty pages), so caught-up followers also tick. This is why
+    /// it's a separate file from `cursor_path` (which writes only
+    /// on apply / bootstrap).
+    pub heartbeat_path: Option<PathBuf>,
 }
 
 impl ReplicationPullerConfig {
@@ -298,6 +312,7 @@ impl ReplicationPullerConfig {
             bootstrap_on_start: true,
             retry: ReplicationRetryConfig::default(),
             cursor_path: None,
+            heartbeat_path: None,
         }
     }
 }
@@ -388,6 +403,97 @@ impl CursorPersistence {
     }
 }
 
+/// V2 patch 4G — per-peer heartbeat / lag record. Non-replicated
+/// follower-local state.
+///
+///   - `last_observed_lag` — lag computed on the most recent pull
+///     (including empty pages, so caught-up followers also tick).
+///   - `last_heartbeat_at` — follower-side wall clock at observation.
+///     `Utc::now()` for v0; a future patch may surface a leader-side
+///     timestamp on `ReplicationCommitPage` for clock-skew-aware lag.
+///   - `total_transient_failures` — cumulative across process restarts
+///     (when `heartbeat_path` is configured). Different timescale from
+///     the per-loop `ReplicationLoopReport.failures` counter.
+///   - `last_fatal_error_kind` — stamped on every fatal loop exit;
+///     cleared on the next successful apply / heartbeat update.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplicationHeartbeatRecord {
+    pub peer_id: ReplicaId,
+    pub last_observed_lag: ReplicationLag,
+    pub last_heartbeat_at: DateTime<Utc>,
+    pub total_transient_failures: u64,
+    pub last_fatal_error_kind: Option<ReplicationPullErrorKind>,
+}
+
+/// V2 patch 4G — side-channel heartbeat file shape.
+///
+/// Separate file from the cursor (`replication-cursors.json`) because
+/// heartbeats update on every pull while cursors only update on
+/// apply — different write cadences, and operator tools may want to
+/// read one without parsing the other. Same atomic-rename pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HeartbeatFile {
+    version: u32,
+    heartbeats: HashMap<ReplicaId, ReplicationHeartbeatRecord>,
+}
+
+impl Default for HeartbeatFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            heartbeats: HashMap::new(),
+        }
+    }
+}
+
+struct HeartbeatPersistence;
+
+impl HeartbeatPersistence {
+    fn load_for_peer(
+        path: &Path,
+        peer_id: &ReplicaId,
+    ) -> std::io::Result<Option<ReplicationHeartbeatRecord>> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+        let parsed: HeartbeatFile = serde_json::from_str(&raw)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        Ok(parsed.heartbeats.get(peer_id).cloned())
+    }
+
+    fn save(
+        path: &Path,
+        peer_id: ReplicaId,
+        record: ReplicationHeartbeatRecord,
+    ) -> std::io::Result<()> {
+        let mut file = match std::fs::read_to_string(path) {
+            Ok(raw) => serde_json::from_str::<HeartbeatFile>(&raw).unwrap_or_default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => HeartbeatFile::default(),
+            Err(err) => return Err(err),
+        };
+        file.heartbeats.insert(peer_id, record);
+        let serialized = serde_json::to_string_pretty(&file)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                // create_dir_all errors if parent already exists as a
+                // regular file — this surfaces "unwritable path"
+                // configurations as a save failure (correctly logged
+                // via tracing::warn at the call site).
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let temp_path = path.with_extension("json.tmp");
+        std::fs::write(&temp_path, serialized)?;
+        std::fs::rename(&temp_path, path)?;
+        Ok(())
+    }
+}
+
 /// Follower-side replication puller. Owns a clone of `RuntimeHandle`
 /// (RuntimeHandle is `Clone`) so 4B/4C can hold it in a long-lived
 /// struct without lifetime juggling.
@@ -395,6 +501,17 @@ pub struct ReplicationPuller {
     runtime: RuntimeHandle,
     config: ReplicationPullerConfig,
     client: reqwest::Client,
+    /// V2 patch 4G — interior-mutability shim for cumulative
+    /// heartbeat state (transient failure counter, last fatal error
+    /// kind). `std::sync::Mutex` is fine here because we never hold
+    /// the lock across an `.await`.
+    heartbeat_state: std::sync::Mutex<HeartbeatState>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HeartbeatState {
+    total_transient_failures: u64,
+    last_fatal_error_kind: Option<ReplicationPullErrorKind>,
 }
 
 /// Outcome of a single `pull_once` call.
@@ -438,6 +555,7 @@ impl ReplicationPuller {
             runtime,
             config,
             client: reqwest::Client::new(),
+            heartbeat_state: std::sync::Mutex::new(HeartbeatState::default()),
         }
     }
 
@@ -457,6 +575,7 @@ impl ReplicationPuller {
             runtime,
             config,
             client,
+            heartbeat_state: std::sync::Mutex::new(HeartbeatState::default()),
         }
     }
 
@@ -491,16 +610,19 @@ impl ReplicationPuller {
         // 2. Single page from the leader.
         let page = self.try_fetch_commit_page(local_head).await?;
         let fetched_count = page.commits.len();
+        let leader_head_sequence = page.leader_head_sequence;
 
-        // 3. Empty page → no-op. Still carry leader's head info forward
-        //    so callers see the follower's lag in one round trip.
+        // 3. Empty page → no-op for apply but lag MUST still be
+        //    recorded (V2 P4G — caught-up followers tick too).
         if page.commits.is_empty() {
+            let lag = self.observe_lag(leader_head_sequence).await;
+            self.record_heartbeat_with_lag(lag).await;
             return Ok(ReplicationPullReport {
                 peer_id: self.config.peer_id.clone(),
                 requested_after_sequence: local_head,
                 fetched_count,
                 applied_count: 0,
-                latest_sequence: Some(page.leader_head_sequence),
+                latest_sequence: Some(leader_head_sequence),
                 next_after_sequence: page.next_after_sequence,
             });
         }
@@ -518,15 +640,19 @@ impl ReplicationPuller {
         };
 
         // V2 patch 4F — persist the cursor after every successful apply.
-        // Best-effort; failures log via tracing but don't crash.
         self.persist_cursor_best_effort().await;
+
+        // V2 patch 4G — record heartbeat AFTER the apply so the lag
+        // reflects post-apply state (follower's cursor has advanced).
+        let lag = self.observe_lag(leader_head_sequence).await;
+        self.record_heartbeat_with_lag(lag).await;
 
         Ok(ReplicationPullReport {
             peer_id: report.peer_id,
             requested_after_sequence: local_head,
             fetched_count,
             applied_count: report.applied_count,
-            latest_sequence: Some(page.leader_head_sequence),
+            latest_sequence: Some(leader_head_sequence),
             next_after_sequence: page.next_after_sequence,
         })
     }
@@ -626,6 +752,201 @@ impl ReplicationPuller {
         }
     }
 
+    /// V2 patch 4G — hydrate the in-memory heartbeat / lag for this
+    /// peer from `config.heartbeat_path`, AND seed the puller's
+    /// cumulative failure counters from the persisted record. All
+    /// the same failure-mode semantics as `restore_cursor` (None
+    /// path / missing file / corrupt JSON / no peer entry →
+    /// `Ok(None)`, with corrupt JSON additionally warned).
+    ///
+    /// `run_until_cancelled` calls this automatically after
+    /// `restore_cursor` and before the bootstrap/pull state machine.
+    pub async fn restore_heartbeat(
+        &self,
+    ) -> Result<Option<ReplicationHeartbeatRecord>> {
+        let Some(path) = self.config.heartbeat_path.as_ref() else {
+            return Ok(None);
+        };
+        let loaded =
+            match HeartbeatPersistence::load_for_peer(path, &self.config.peer_id) {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "hydra::replication",
+                        path = %path.display(),
+                        peer_id = %self.config.peer_id,
+                        error = %err,
+                        "replication heartbeat load failed; falling back to fresh state"
+                    );
+                    return Ok(None);
+                }
+            };
+        let Some(record) = loaded else {
+            return Ok(None);
+        };
+        // Seed puller-local counters.
+        {
+            let mut state = self.heartbeat_state.lock().unwrap();
+            state.total_transient_failures = record.total_transient_failures;
+            state.last_fatal_error_kind = record.last_fatal_error_kind;
+        }
+        // Stamp Hydra's in-memory lag.
+        {
+            let hydra = self.runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.record_replication_heartbeat(
+                self.config.peer_id.clone(),
+                record.last_observed_lag.clone(),
+            );
+        }
+        Ok(Some(record))
+    }
+
+    /// V2 patch 4G — record an observed lag in Hydra's in-memory
+    /// store AND (if `heartbeat_path` is configured) persist a full
+    /// `ReplicationHeartbeatRecord` to disk. Best-effort durability:
+    /// disk failures log via `tracing::warn` and don't bubble.
+    async fn record_heartbeat_with_lag(&self, lag: ReplicationLag) {
+        // In-memory update always (V2 P2 surface).
+        {
+            let hydra = self.runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.record_replication_heartbeat(
+                self.config.peer_id.clone(),
+                lag.clone(),
+            );
+        }
+        let Some(path) = self.config.heartbeat_path.as_ref() else {
+            return;
+        };
+        let state = { self.heartbeat_state.lock().unwrap().clone() };
+        let record = ReplicationHeartbeatRecord {
+            peer_id: self.config.peer_id.clone(),
+            last_observed_lag: lag,
+            last_heartbeat_at: Utc::now(),
+            total_transient_failures: state.total_transient_failures,
+            last_fatal_error_kind: state.last_fatal_error_kind,
+        };
+        self.write_heartbeat_to_disk(path.clone(), record).await;
+    }
+
+    /// V2 patch 4G — bump the cumulative transient-failure counter
+    /// in the puller-local state, then persist if a prior heartbeat
+    /// has been observed (we need a `last_observed_lag` to attach;
+    /// a never-pulled puller defers persistence to the first
+    /// successful heartbeat).
+    async fn bump_transient_failure_and_persist(&self) {
+        {
+            let mut state = self.heartbeat_state.lock().unwrap();
+            state.total_transient_failures += 1;
+        }
+        self.persist_heartbeat_state_if_lagged().await;
+    }
+
+    /// V2 patch 4G — stamp the most recent fatal error kind into the
+    /// puller-local state, then persist if a prior heartbeat exists.
+    async fn stamp_fatal_and_persist(&self, kind: ReplicationPullErrorKind) {
+        {
+            let mut state = self.heartbeat_state.lock().unwrap();
+            state.last_fatal_error_kind = Some(kind);
+        }
+        self.persist_heartbeat_state_if_lagged().await;
+    }
+
+    /// Internal — persist the current `HeartbeatState` to disk,
+    /// attaching the last-known lag from Hydra. Silently skips if
+    /// `heartbeat_path` is unset OR no lag has been observed yet.
+    async fn persist_heartbeat_state_if_lagged(&self) {
+        let Some(path) = self.config.heartbeat_path.as_ref() else {
+            return;
+        };
+        let last_lag = {
+            let hydra = self.runtime.hydra();
+            let hydra = hydra.read().await;
+            hydra
+                .latest_replication_lag(&self.config.peer_id)
+                .cloned()
+        };
+        let Some(lag) = last_lag else {
+            return;
+        };
+        let state = { self.heartbeat_state.lock().unwrap().clone() };
+        let record = ReplicationHeartbeatRecord {
+            peer_id: self.config.peer_id.clone(),
+            last_observed_lag: lag,
+            last_heartbeat_at: Utc::now(),
+            total_transient_failures: state.total_transient_failures,
+            last_fatal_error_kind: state.last_fatal_error_kind,
+        };
+        self.write_heartbeat_to_disk(path.clone(), record).await;
+    }
+
+    async fn write_heartbeat_to_disk(
+        &self,
+        path: PathBuf,
+        record: ReplicationHeartbeatRecord,
+    ) {
+        let peer_id = self.config.peer_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            HeartbeatPersistence::save(&path, peer_id, record)
+        })
+        .await
+        .unwrap_or_else(|join_err| {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, join_err))
+        });
+        if let Err(err) = result {
+            tracing::warn!(
+                target: "hydra::replication",
+                peer_id = %self.config.peer_id,
+                error = %err,
+                "replication heartbeat persist failed; in-memory state still consistent"
+            );
+        }
+    }
+
+    /// V2 patch 4G — operator-facing read for the current observed
+    /// lag. Thin shim over `Hydra::latest_replication_lag`.
+    pub async fn latest_lag(&self) -> Option<ReplicationLag> {
+        let hydra = self.runtime.hydra();
+        let hydra = hydra.read().await;
+        hydra
+            .latest_replication_lag(&self.config.peer_id)
+            .cloned()
+    }
+
+    /// V2 patch 4G — operator-facing read for the full heartbeat
+    /// record (lag + counters). Composes Hydra's in-memory lag with
+    /// the puller-local failure counters. Returns `None` if no
+    /// heartbeat has been recorded yet.
+    pub async fn latest_heartbeat_record(
+        &self,
+    ) -> Option<ReplicationHeartbeatRecord> {
+        let lag = self.latest_lag().await?;
+        let state = { self.heartbeat_state.lock().unwrap().clone() };
+        Some(ReplicationHeartbeatRecord {
+            peer_id: self.config.peer_id.clone(),
+            last_observed_lag: lag,
+            last_heartbeat_at: Utc::now(),
+            total_transient_failures: state.total_transient_failures,
+            last_fatal_error_kind: state.last_fatal_error_kind,
+        })
+    }
+
+    /// Compute the current lag against a known leader head sequence.
+    /// Reads the follower's cursor (if any) to fill `follower_sequence`;
+    /// missing cursor means a fresh follower with seq=0.
+    async fn observe_lag(&self, leader_head_sequence: u64) -> ReplicationLag {
+        let follower_sequence = {
+            let hydra = self.runtime.hydra();
+            let hydra = hydra.read().await;
+            hydra
+                .latest_replication_offset(&self.config.peer_id)
+                .map(|o| o.sequence)
+                .unwrap_or(0)
+        };
+        ReplicationLag::observe(leader_head_sequence, follower_sequence, Utc::now())
+    }
+
     /// V2 patch 4D + 4E — drive the puller in a loop until `shutdown`
     /// fires.
     ///
@@ -678,10 +999,12 @@ impl ReplicationPuller {
 
         // V2 patch 4F — restore the persisted cursor before the first
         // operation, so the first pull queries from the resumed
-        // leader position instead of the cold-start fallback. Errors
-        // are swallowed (restore_cursor downgrades them to Ok(None));
-        // unreachable here unless the runtime itself is broken.
+        // leader position instead of the cold-start fallback.
         let _ = self.restore_cursor().await;
+        // V2 patch 4G — restore the persisted heartbeat (lag +
+        // cumulative failure counters) so observability survives
+        // process restarts.
+        let _ = self.restore_heartbeat().await;
 
         // State machine: either the bootstrap step (if requested) or
         // the pull loop. `bootstrap_pending` flips to false after a
@@ -733,7 +1056,13 @@ impl ReplicationPuller {
                     report.failures += 1;
                     report.last_error = Some(err.message.clone());
                     report.last_error_kind = Some(err.kind);
+                    // V2 patch 4G — bump the cumulative cross-restart
+                    // failure counter AND best-effort persist.
+                    self.bump_transient_failure_and_persist().await;
                     if consecutive_failures > self.config.retry.max_attempts {
+                        // Exceeded the retry budget — terminal. Treat
+                        // as fatal for reporting purposes.
+                        self.stamp_fatal_and_persist(err.kind).await;
                         return Err(ReplicationLoopError {
                             report,
                             kind: err.kind,
@@ -760,6 +1089,9 @@ impl ReplicationPuller {
                     // ReplicationLoopError with the partial report.
                     report.last_error = Some(err.message.clone());
                     report.last_error_kind = Some(err.kind);
+                    // V2 patch 4G — record fatal kind to the side
+                    // channel before bailing.
+                    self.stamp_fatal_and_persist(err.kind).await;
                     return Err(ReplicationLoopError {
                         report,
                         kind: err.kind,
@@ -1149,6 +1481,7 @@ mod tests {
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
                 cursor_path: None,
+                heartbeat_path: None,
             },
         );
 
@@ -1191,6 +1524,7 @@ mod tests {
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
                 cursor_path: None,
+                heartbeat_path: None,
             },
         );
 
@@ -1254,6 +1588,7 @@ mod tests {
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
                 cursor_path: None,
+                heartbeat_path: None,
             },
         );
         let report = puller.pull_once().await.unwrap();
@@ -1306,6 +1641,7 @@ mod tests {
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
                 cursor_path: None,
+                heartbeat_path: None,
             },
         );
         // Follower's head is at seq=1 (its own local commit). It asks
@@ -1355,6 +1691,7 @@ mod tests {
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
                 cursor_path: None,
+                heartbeat_path: None,
             },
         );
 
@@ -1401,6 +1738,7 @@ mod tests {
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
                 cursor_path: None,
+                heartbeat_path: None,
             },
         );
 
@@ -1476,6 +1814,7 @@ mod tests {
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
                 cursor_path: None,
+                heartbeat_path: None,
             },
         );
 
@@ -1573,6 +1912,7 @@ mod tests {
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
                 cursor_path: None,
+                heartbeat_path: None,
             },
         );
         let err = puller.bootstrap_from_latest_snapshot().await.unwrap_err();
@@ -1626,6 +1966,7 @@ mod tests {
                 bootstrap_on_start: false,
                 retry: ReplicationRetryConfig::default(),
                 cursor_path: None,
+                heartbeat_path: None,
             },
         );
 
@@ -2302,5 +2643,235 @@ mod tests {
         assert_eq!(entry.sequence, 1);
 
         let _ = std::fs::remove_file(&cursor_path);
+    }
+
+    // === V2 patch 4G — heartbeat / lag side channel ===
+
+    fn temp_heartbeat_path(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hydra_replication_hb_{label}_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("replication-heartbeats.json")
+    }
+
+    fn write_heartbeat_file(path: &Path, record: ReplicationHeartbeatRecord) {
+        let mut file = HeartbeatFile::default();
+        file.heartbeats.insert(record.peer_id.clone(), record);
+        let raw = serde_json::to_string_pretty(&file).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, raw).unwrap();
+    }
+
+    fn read_heartbeat_file_for(
+        path: &Path,
+        peer_id: &ReplicaId,
+    ) -> Option<ReplicationHeartbeatRecord> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let parsed: HeartbeatFile = serde_json::from_str(&raw).ok()?;
+        parsed.heartbeats.get(peer_id).cloned()
+    }
+
+    #[tokio::test]
+    async fn pull_once_records_lag_in_replication_store() {
+        // Leader has 3 commits, follower starts fresh (cursor at 0).
+        // After pull, Hydra's in-memory lag should report
+        // `lag_commits = 0` because the follower caught up to head.
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("one")).unwrap();
+            hydra.ingest(signal("two")).unwrap();
+            hydra.ingest(signal("three")).unwrap();
+        }
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            format!("http://{addr}"),
+            restorer(),
+        );
+        // No heartbeat_path — just in-memory.
+        let puller = ReplicationPuller::new(follower_runtime.clone(), config.clone());
+        puller.pull_once().await.unwrap();
+
+        let lag = follower_runtime
+            .hydra()
+            .read()
+            .await
+            .latest_replication_lag(&follower_peer_id())
+            .cloned()
+            .expect("lag must be recorded after pull");
+        // Followed all 3 — caught up.
+        assert_eq!(lag.leader_sequence, 3);
+        assert_eq!(lag.follower_sequence, 3);
+        assert_eq!(lag.lag_commits, 0);
+        let _ = config; // suppress unused
+    }
+
+    #[tokio::test]
+    async fn empty_page_pull_still_records_lag() {
+        // Both runtimes empty → empty page response. Lag is still
+        // recorded with leader_sequence=0 / follower_sequence=0.
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            format!("http://{addr}"),
+            restorer(),
+        );
+        let puller = ReplicationPuller::new(follower_runtime.clone(), config);
+        let report = puller.pull_once().await.unwrap();
+        assert_eq!(report.fetched_count, 0);
+        assert_eq!(report.applied_count, 0);
+
+        // Lag still tracked.
+        let lag = follower_runtime
+            .hydra()
+            .read()
+            .await
+            .latest_replication_lag(&follower_peer_id())
+            .cloned()
+            .expect("empty pulls must still tick the heartbeat");
+        assert_eq!(lag.lag_commits, 0);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_persists_to_disk_when_configured() {
+        let heartbeat_path = temp_heartbeat_path("persist");
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("first")).unwrap();
+            hydra.ingest(signal("second")).unwrap();
+        }
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            format!("http://{addr}"),
+            restorer(),
+        );
+        config.heartbeat_path = Some(heartbeat_path.clone());
+
+        let puller = ReplicationPuller::new(follower_runtime, config);
+        puller.pull_once().await.unwrap();
+
+        let persisted = read_heartbeat_file_for(&heartbeat_path, &follower_peer_id())
+            .expect("heartbeat file must exist with our peer entry");
+        assert_eq!(persisted.peer_id, follower_peer_id());
+        assert_eq!(persisted.last_observed_lag.leader_sequence, 2);
+        assert_eq!(persisted.last_observed_lag.follower_sequence, 2);
+        assert_eq!(persisted.last_observed_lag.lag_commits, 0);
+        // No transient failures triggered.
+        assert_eq!(persisted.total_transient_failures, 0);
+        assert!(persisted.last_fatal_error_kind.is_none());
+
+        let _ = std::fs::remove_file(&heartbeat_path);
+    }
+
+    #[tokio::test]
+    async fn restore_heartbeat_loads_from_disk_into_hydra() {
+        let heartbeat_path = temp_heartbeat_path("restore");
+        let lag = ReplicationLag::observe(10, 7, chrono::Utc::now());
+        let record = ReplicationHeartbeatRecord {
+            peer_id: follower_peer_id(),
+            last_observed_lag: lag.clone(),
+            last_heartbeat_at: chrono::Utc::now(),
+            total_transient_failures: 4,
+            last_fatal_error_kind: Some(ReplicationPullErrorKind::LeaderUnavailable),
+        };
+        write_heartbeat_file(&heartbeat_path, record);
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            "http://127.0.0.1:1".to_string(),
+            restorer(),
+        );
+        config.heartbeat_path = Some(heartbeat_path.clone());
+
+        let puller = ReplicationPuller::new(follower_runtime.clone(), config);
+        let loaded = puller.restore_heartbeat().await.unwrap();
+        let loaded = loaded.expect("restore_heartbeat must return Some");
+        assert_eq!(loaded.total_transient_failures, 4);
+        assert_eq!(
+            loaded.last_fatal_error_kind,
+            Some(ReplicationPullErrorKind::LeaderUnavailable)
+        );
+
+        // Hydra's in-memory lag stamped.
+        let hydra_lag = follower_runtime
+            .hydra()
+            .read()
+            .await
+            .latest_replication_lag(&follower_peer_id())
+            .cloned()
+            .expect("lag must be stamped in Hydra after restore");
+        assert_eq!(hydra_lag.leader_sequence, lag.leader_sequence);
+        assert_eq!(hydra_lag.follower_sequence, lag.follower_sequence);
+
+        // Operator-facing helper returns the same data composed with
+        // the puller's seeded state.
+        let observable = puller.latest_heartbeat_record().await.expect("present");
+        assert_eq!(observable.total_transient_failures, 4);
+
+        let _ = std::fs::remove_file(&heartbeat_path);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_file_failure_does_not_crash_loop() {
+        // "parent is a regular file, not a directory" trick: create
+        // a temp file, then point heartbeat_path at <that>/sub/file.json
+        // — `create_dir_all` fails because the parent is a file. The
+        // pull continues anyway; the heartbeat update logs via
+        // tracing::warn and falls through.
+        let parent_as_file = std::env::temp_dir().join(format!(
+            "hydra_replication_hb_block_{}_{}.file",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&parent_as_file, b"placeholder").unwrap();
+        let heartbeat_path = parent_as_file.join("sub").join("heartbeats.json");
+
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("survive")).unwrap();
+        }
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            format!("http://{addr}"),
+            restorer(),
+        );
+        config.heartbeat_path = Some(heartbeat_path);
+
+        let puller = ReplicationPuller::new(follower_runtime.clone(), config);
+        // Pull must succeed even though the disk write inside fails.
+        let report = puller.pull_once().await.unwrap();
+        assert_eq!(report.applied_count, 1);
+        // In-memory lag still recorded — disk failure is best-effort.
+        assert!(follower_runtime
+            .hydra()
+            .read()
+            .await
+            .latest_replication_lag(&follower_peer_id())
+            .is_some());
+
+        let _ = std::fs::remove_file(&parent_as_file);
     }
 }
