@@ -13,6 +13,11 @@
 //! - `GET  /replication/commits`              — paged commit export
 //! - `GET  /replication/peers`                — all registered peers
 //! - `GET  /replication/peers/:peer_id`       — single peer, 404 on miss
+//! - `GET  /replication/peers/:peer_id/lag`   — V2 polish: observed
+//!   lag for the peer. Returns `200 {peer_id, lag: null}` when no
+//!   observation has been recorded yet (or the peer is unknown to
+//!   the in-memory ReplicationStore). This route never 404s — a
+//!   non-recorded peer is a valid "no data yet" state, not an error.
 //! - `POST /replication/apply`                — V2 patch 3B: follower
 //!   applies a leader-supplied page of committed batches. Body is
 //!   `ApplyReplicationRequest`. Validation failures map to 400 with
@@ -49,7 +54,7 @@ use axum::{
     Json, Router,
 };
 use hydra_core::{
-    CommitBatch, CommitId, ReplicaId, ReplicationPeer, ReplicationRole, SnapshotBody,
+    CommitBatch, CommitId, ReplicaId, ReplicationLag, ReplicationPeer, ReplicationRole, SnapshotBody,
     SnapshotId, SnapshotManifest,
 };
 use serde::{Deserialize, Serialize};
@@ -73,6 +78,10 @@ pub fn replication_router(runtime: RuntimeHandle) -> Router {
         .route("/replication/commits", get(get_replication_commits))
         .route("/replication/peers", get(list_replication_peers))
         .route("/replication/peers/:peer_id", get(get_replication_peer))
+        .route(
+            "/replication/peers/:peer_id/lag",
+            get(get_replication_peer_lag),
+        )
         .route("/replication/apply", post(post_replication_apply))
         .route(
             "/replication/snapshot/latest",
@@ -138,6 +147,16 @@ pub struct ReplicationPeersResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationPeerResponse {
     pub peer: ReplicationPeer,
+}
+
+/// V2 polish — observed lag for a peer. `lag: None` when no
+/// observation has been recorded yet (or the peer_id is unknown
+/// to the in-memory ReplicationStore). The route always returns
+/// `200`; "no data yet" is `lag: null`, not 404.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationLagResponse {
+    pub peer_id: ReplicaId,
+    pub lag: Option<ReplicationLag>,
 }
 
 /// V2 patch 3B — follower apply request body.
@@ -293,6 +312,22 @@ async fn get_replication_peer(
             format!("replication peer not found: {peer_id}"),
         ),
     }
+}
+
+async fn get_replication_peer_lag(
+    State(state): State<ReplicationHttpState>,
+    Path(peer_id): Path<String>,
+) -> Response {
+    let peer_id = ReplicaId::from_str(&peer_id);
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
+    let lag = hydra.latest_replication_lag(&peer_id).cloned();
+    // Always 200 — no observation yet is `lag: null`, not 404. The
+    // puller writes a heartbeat on every pull (including empty
+    // pages), so absent lag here means either nothing has pulled
+    // yet, or the peer_id doesn't match the puller's configured
+    // identity. Both are legitimate "no data" states.
+    Json(ReplicationLagResponse { peer_id, lag }).into_response()
 }
 
 async fn post_replication_apply(
@@ -712,5 +747,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // === V2 polish — GET /replication/peers/:peer_id/lag ===
+
+    #[tokio::test]
+    async fn replication_peer_lag_returns_null_when_absent() {
+        // No puller has run yet, no peer has been observed. The
+        // route still returns 200 with `lag: null` rather than 404.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = replication_router(runtime);
+        let response = app
+            .oneshot(empty_get("/replication/peers/replica_never_seen/lag"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationLagResponse = read_json(response).await;
+        assert_eq!(decoded.peer_id.as_str(), "replica_never_seen");
+        assert!(decoded.lag.is_none());
+    }
+
+    #[tokio::test]
+    async fn replication_peer_lag_returns_recorded_lag() {
+        // Stamp a lag observation directly into Hydra (simulates
+        // what the puller does after each pull). HTTP route reads
+        // it back.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let peer = ReplicaId::from_str("replica_observed");
+        let lag = ReplicationLag::observe(100, 75, chrono::Utc::now());
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.record_replication_heartbeat(peer.clone(), lag.clone());
+        }
+        let app = replication_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/replication/peers/{peer}/lag"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationLagResponse = read_json(response).await;
+        assert_eq!(decoded.peer_id, peer);
+        let returned = decoded.lag.expect("lag must be Some after record");
+        assert_eq!(returned.leader_sequence, 100);
+        assert_eq!(returned.follower_sequence, 75);
+        assert_eq!(returned.lag_commits, 25);
     }
 }
