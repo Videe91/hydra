@@ -76,6 +76,43 @@ pub struct Hydra {
     limits: ResourceLimits,
     /// Optional WAL for crash recovery
     wal: Option<Box<dyn WalWriter>>,
+    /// V2 polish #5 — engine-level role. Defaults to `Leader`.
+    /// When set to `Follower`, in-process ingest paths return
+    /// `HydraError::ReadOnlyFollower`. Replication apply and
+    /// recovery paths are exempt — see [`EngineRole`].
+    role: EngineRole,
+}
+
+/// V2 polish #5 — engine-level role guard.
+///
+/// Mirrors the HTTP-layer `hydra_api::security::RuntimeRole` from V2
+/// P4H but lives in `hydra-engine` so it covers in-process write
+/// paths (sensor bus, SDK, embedded callers) that don't traverse the
+/// HTTP middleware.
+///
+/// `Leader` (default) accepts every write. `Follower` rejects engine
+/// mutating entry points with `HydraError::ReadOnlyFollower`. The
+/// follower path still accepts:
+///   - `apply_replication_commits` (the receive path)
+///   - `recover_from_*` (bootstrap / replay)
+///   - `record_replication_apply_offset`, `record_replication_heartbeat`
+///   - subscription / schema-gate / reflex / sensor-checkpoint config
+///
+/// `RuntimeRole` (hydra-api) and `EngineRole` (hydra-engine) are
+/// deliberately separate types — the engine crate doesn't depend on
+/// hydra-api. Operators set both for follower deployments:
+///   - `Hydra::set_role(EngineRole::Follower)`
+///   - `ServerSecurityConfig::with_role(RuntimeRole::Follower)`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineRole {
+    Leader,
+    Follower,
+}
+
+impl Default for EngineRole {
+    fn default() -> Self {
+        Self::Leader
+    }
 }
 
 /// Configurable resource limits to prevent unbounded growth.
@@ -169,7 +206,17 @@ impl Hydra {
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
+            role: EngineRole::Leader,
         }
+    }
+
+    /// V2 polish #5 — construct a Hydra with a specific role.
+    /// Ergonomic shortcut for follower deployments; equivalent to
+    /// `Hydra::new()` followed by `.set_role(role)`.
+    pub fn new_with_role(role: EngineRole) -> Self {
+        let mut hydra = Self::new();
+        hydra.role = role;
+        hydra
     }
 
     pub fn with_config(config: CascadeConfig) -> Self {
@@ -206,7 +253,32 @@ impl Hydra {
             reflex_registry: ReflexRegistry::new(),
             limits: ResourceLimits::default(),
             wal: None,
+            role: EngineRole::Leader,
         }
+    }
+
+    /// V2 polish #5 — current engine role. `Copy`, so returned by
+    /// value.
+    pub fn role(&self) -> EngineRole {
+        self.role
+    }
+
+    /// V2 polish #5 — set the engine role at runtime. Used by
+    /// operator boot code (typically once at startup) and the
+    /// future role-flip admin route (polish #6).
+    pub fn set_role(&mut self, role: EngineRole) {
+        self.role = role;
+    }
+
+    /// V2 polish #5 — engine-level role guard. Returns
+    /// `HydraError::ReadOnlyFollower { method }` when the role is
+    /// `Follower`. Mutating entry points that should be available
+    /// to followers (replication apply, recovery) do not call this.
+    fn ensure_leader_for_write(&self, method: &'static str) -> hydra_core::error::Result<()> {
+        if self.role == EngineRole::Follower {
+            return Err(hydra_core::error::HydraError::ReadOnlyFollower { method });
+        }
+        Ok(())
     }
 
     /// Attach a WAL writer for crash recovery.
@@ -320,6 +392,29 @@ impl Hydra {
     /// `CascadeResult` without running the cascade, mutating state, appending
     /// a commit, or writing to the durable sink.
     fn ingest_event_internal(
+        &mut self,
+        event: Event,
+        idempotency_key: Option<hydra_core::IdempotencyKey>,
+    ) -> hydra_core::error::Result<CascadeResult> {
+        // V2 polish #5 — engine-level role guard. All 5 public
+        // `ingest*` methods funnel into the *_unguarded body below
+        // through this method, so a single check covers every
+        // external ingest variant. Recovery audit paths (which need
+        // to emit a SnapshotRestored event even on a follower)
+        // bypass the guard by calling `ingest_event_internal_unguarded`
+        // directly. `apply_replication_commits` is exempt by virtue
+        // of not routing through this method at all.
+        self.ensure_leader_for_write("ingest")?;
+        self.ingest_event_internal_unguarded(event, idempotency_key)
+    }
+
+    /// V2 polish #5 — guard-free body of `ingest_event_internal`.
+    /// Used by recovery audit paths (`recover_from_snapshot_*` and
+    /// `restore_from_snapshot`) to emit the `SnapshotRestored`
+    /// audit event without tripping the follower role guard.
+    /// External callers must go through `ingest_event_internal`
+    /// (or one of the public `ingest*` methods) so the guard fires.
+    fn ingest_event_internal_unguarded(
         &mut self,
         event: Event,
         idempotency_key: Option<hydra_core::IdempotencyKey>,
@@ -643,11 +738,16 @@ impl Hydra {
         self.snapshot_store.insert(body);
 
         // Audit the restore. The SnapshotRestored event commits on top
-        // of the now-fresh commit_ledger.
-        self.ingest(hydra_core::EventKind::SnapshotRestored {
-            manifest: manifest.clone(),
-            replayed_commit_count,
-        })?;
+        // of the now-fresh commit_ledger. V2 polish #5 — route through
+        // the unguarded body so a follower (which is the typical
+        // bootstrap caller) can still record the audit commit.
+        self.ingest_event_internal_unguarded(
+            Event::trigger(hydra_core::EventKind::SnapshotRestored {
+                manifest: manifest.clone(),
+                replayed_commit_count,
+            }),
+            None,
+        )?;
 
         // restored_by is captured for future SnapshotRestored audit
         // metadata; the current variant doesn't yet carry an actor field.
@@ -2182,10 +2282,16 @@ impl Hydra {
         // restored_by is captured for future audit metadata; the current
         // SnapshotRestored event variant doesn't yet carry an actor field.
         let _ = restored_by;
-        self.ingest(hydra_core::EventKind::SnapshotRestored {
-            manifest: manifest.clone(),
-            replayed_commit_count: 0,
-        })?;
+        // V2 polish #5 — restore is a follower-legitimate path; bypass
+        // the role guard for the audit commit (see
+        // `ingest_event_internal_unguarded`).
+        self.ingest_event_internal_unguarded(
+            Event::trigger(hydra_core::EventKind::SnapshotRestored {
+                manifest: manifest.clone(),
+                replayed_commit_count: 0,
+            }),
+            None,
+        )?;
         Ok(manifest)
     }
 
@@ -5907,5 +6013,105 @@ mod sprint1_tests {
             .latest_replication_offset(&peer)
             .expect("cursor preserved after empty apply");
         assert_eq!(&pre, post);
+    }
+
+    // === V2 polish #5 — engine-level role guard ===
+
+    #[test]
+    fn ingest_rejected_on_follower() {
+        use hydra_core::error::HydraError;
+
+        // new_with_role(Follower) builds a follower-mode engine.
+        let mut follower = Hydra::new_with_role(EngineRole::Follower);
+        assert_eq!(follower.role(), EngineRole::Follower);
+
+        let err = follower.ingest(replication_signal("blocked")).unwrap_err();
+        match err {
+            HydraError::ReadOnlyFollower { method } => {
+                assert_eq!(method, "ingest");
+            }
+            other => panic!("expected ReadOnlyFollower, got {other:?}"),
+        }
+
+        // No state mutation — the rejected ingest must leave the
+        // engine completely untouched.
+        assert_eq!(follower.commit_count(), 0);
+        assert_eq!(follower.events().len(), 0);
+    }
+
+    #[test]
+    fn apply_replication_commits_succeeds_on_follower() {
+        // The receive path must work even when role=Follower —
+        // that's the whole point of a follower.
+        let leader = leader_with_signals(2);
+        let commits = batches_from(&leader);
+
+        let mut follower = Hydra::new_with_role(EngineRole::Follower);
+        let report = follower
+            .apply_replication_commits(peer_id(), commits)
+            .unwrap();
+        assert_eq!(report.applied_count, 2);
+        assert_eq!(follower.commit_count(), 2);
+    }
+
+    #[test]
+    fn bootstrap_recovery_succeeds_on_follower() {
+        use hydra_core::ActorId;
+
+        // recover_from_snapshot_body_and_replay must work on a
+        // follower — bootstrap is how a fresh follower catches up.
+        let mut source = Hydra::new();
+        source.ingest(replication_signal("before")).unwrap();
+        let manifest = source
+            .snapshot(ActorId::from_str("actor_snapshot"))
+            .unwrap();
+        source.ingest(replication_signal("after")).unwrap();
+        let commits = source
+            .commit_ledger()
+            .batches_in_sequence()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let body = source.snapshot_body(&manifest.id).unwrap().clone();
+
+        let mut follower = Hydra::new_with_role(EngineRole::Follower);
+        follower
+            .recover_from_snapshot_body_and_replay(
+                body,
+                commits,
+                ActorId::from_str("actor_restore"),
+            )
+            .expect("follower bootstrap must succeed");
+
+        // Two "signal" events made it through (one from body, one
+        // from replay tail). Plus a SnapshotRestored audit commit.
+        let kinds: Vec<String> = follower
+            .events()
+            .into_iter()
+            .map(|event| event.kind.kind_name().to_string())
+            .collect();
+        assert_eq!(kinds.iter().filter(|k| *k == "signal").count(), 2);
+        assert!(kinds.contains(&"snapshot_restored".to_string()));
+    }
+
+    #[test]
+    fn set_role_back_to_leader_re_enables_ingest() {
+        use hydra_core::error::HydraError;
+
+        let mut hydra = Hydra::new_with_role(EngineRole::Follower);
+        // Confirm follower rejects.
+        assert!(matches!(
+            hydra.ingest(replication_signal("blocked")).unwrap_err(),
+            HydraError::ReadOnlyFollower { method: "ingest" }
+        ));
+
+        // Flip back to leader at runtime (the future role-flip
+        // admin route uses this same setter).
+        hydra.set_role(EngineRole::Leader);
+        assert_eq!(hydra.role(), EngineRole::Leader);
+
+        // Ingest now succeeds.
+        hydra.ingest(replication_signal("allowed")).unwrap();
+        assert_eq!(hydra.commit_count(), 1);
     }
 }

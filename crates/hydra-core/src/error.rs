@@ -33,6 +33,19 @@ pub enum HydraError {
 
     // Resource limit errors
     ResourceExhausted { resource: String, limit: usize, current: usize },
+
+    /// V2 polish #5 — engine-level role guard.
+    ///
+    /// Returned by `Hydra` mutating entry points when the engine's
+    /// `EngineRole` is `Follower`. The HTTP layer (V2 P4H) catches
+    /// most external writes before they reach the engine; this
+    /// variant is the defense-in-depth tier for in-process callers
+    /// (sensor bus, SDK, embedded use) that don't traverse the HTTP
+    /// middleware.
+    ///
+    /// `method` names the engine entry point that rejected, useful
+    /// in log lines and error responses (e.g. `"ingest"`).
+    ReadOnlyFollower { method: &'static str },
 }
 
 impl fmt::Display for HydraError {
@@ -73,6 +86,9 @@ impl fmt::Display for HydraError {
             Self::StorageError(msg) => write!(f, "storage error: {}", msg),
             Self::ResourceExhausted { resource, limit, current } => {
                 write!(f, "resource exhausted: {} limit is {}, currently at {}", resource, limit, current)
+            }
+            Self::ReadOnlyFollower { method } => {
+                write!(f, "follower is read-only: {}", method)
             }
         }
     }
@@ -125,6 +141,12 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("node_A"));
         assert!(msg.contains("node_B"));
+    }
+
+    #[test]
+    fn read_only_follower_error_displays_method() {
+        let err = HydraError::ReadOnlyFollower { method: "ingest" };
+        assert_eq!(err.to_string(), "follower is read-only: ingest");
     }
 
     #[test]

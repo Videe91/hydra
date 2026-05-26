@@ -585,4 +585,43 @@ mod tests {
         drop(handle);
         proc_handle.await.unwrap();
     }
+
+    /// V2 polish #5 — closes the non-HTTP write gap that motivated
+    /// the engine-level role guard. Sensor-bus emit → process_batch →
+    /// `hydra.ingest()` must be rejected on a follower-mode engine,
+    /// counted as a cascade_error, and leave the follower's graph
+    /// state untouched.
+    #[tokio::test]
+    async fn sensor_batch_rejected_on_follower() {
+        use hydra_engine::prelude::EngineRole;
+
+        let follower = Hydra::new_with_role(EngineRole::Follower);
+        let (handle, processor) = RuntimeBuilder::from_hydra(follower)
+            .persist(false)
+            .build();
+        let proc_handle = tokio::spawn(processor.run());
+
+        let emitter = handle.sensor_emitter("test_sensor_follower");
+        emitter
+            .emit(vec![make_event("ec2"), make_event("rds")])
+            .await
+            .unwrap();
+
+        // Let the processor pick up the batch.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Follower graph state must be empty — the ingest calls
+        // returned ReadOnlyFollower and were dropped.
+        assert_eq!(handle.query().node_count().await, 0);
+        assert_eq!(handle.query().total_events().await, 0);
+
+        drop(emitter);
+        drop(handle);
+        let metrics = proc_handle.await.unwrap();
+        assert_eq!(metrics.batches_received, 1);
+        assert_eq!(metrics.events_ingested, 2);
+        // Both events were rejected — zero processed, two errored.
+        assert_eq!(metrics.cascades_processed, 0);
+        assert_eq!(metrics.cascade_errors, 2);
+    }
 }
