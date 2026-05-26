@@ -20,8 +20,9 @@ pub mod prelude {
     };
     pub use crate::query::{QueryService, QueryStats};
     pub use crate::replication_worker::{
-        ReplicationBootstrapReport, ReplicationLoopReport, ReplicationPuller,
-        ReplicationPullReport, ReplicationPullerConfig,
+        ReplicationBootstrapReport, ReplicationLoopError, ReplicationLoopReport,
+        ReplicationPullError, ReplicationPullErrorKind, ReplicationPuller, ReplicationPullReport,
+        ReplicationPullerConfig, ReplicationRetryConfig,
     };
     pub use crate::schema_admin_service::{SchemaAdminService, SchemaFields};
     pub use crate::schema_service::SchemaService;

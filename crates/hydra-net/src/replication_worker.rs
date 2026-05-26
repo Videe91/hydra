@@ -27,10 +27,180 @@ use crate::http::replication::{
     ReplicationSnapshotManifestResponse,
 };
 use crate::runtime::RuntimeHandle;
+use axum::http::StatusCode;
 use hydra_core::error::{HydraError, Result};
 use hydra_core::{ActorId, CommitBatch, ReplicaId, SnapshotId};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+/// V2 patch 4E — classified replication failure modes.
+///
+/// Transient kinds (`Network`, `LeaderUnavailable`, `RateLimited`) are
+/// retried with exponential backoff by `run_until_cancelled`. Fatal
+/// kinds (everything else) cause the loop to surface
+/// `Err(ReplicationLoopError { report, .. })` so the caller sees both
+/// the partial report and the precise failure kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplicationPullErrorKind {
+    /// reqwest connect / timeout / unreachable. Transient.
+    Network,
+    /// HTTP 5xx from the leader. Transient — the leader is up but
+    /// transiently unable to serve.
+    LeaderUnavailable,
+    /// HTTP 401 — auth token missing / invalid / expired. Fatal:
+    /// retrying without operator intervention won't fix it.
+    Unauthorized,
+    /// HTTP 403 — token authenticated but missing
+    /// `read:replication`. Fatal.
+    Forbidden,
+    /// HTTP 429 — rate-limited. Transient.
+    RateLimited,
+    /// HTTP 4xx (other) or JSON decode failure. Fatal: leader is
+    /// emitting something we can't parse, and retrying without a
+    /// leader fix is pointless.
+    BadLeaderResponse,
+    /// Engine rejected a batch because the leader's chain doesn't
+    /// continue from where we expected: sequence gap, previous_hash
+    /// mismatch, hash recompute disagreement. Fatal — likely needs
+    /// re-bootstrap.
+    ChainDivergence,
+    /// Engine rejected for any other reason (uncommitted batch,
+    /// missing commit_hash, validation outside the chain-continuity
+    /// shape). Fatal.
+    EngineRejected,
+}
+
+impl ReplicationPullErrorKind {
+    /// `true` if the loop driver should back off and retry.
+    pub fn is_transient(self) -> bool {
+        matches!(
+            self,
+            ReplicationPullErrorKind::Network
+                | ReplicationPullErrorKind::LeaderUnavailable
+                | ReplicationPullErrorKind::RateLimited
+        )
+    }
+}
+
+/// V2 patch 4E — replication failure carrying a classified kind and a
+/// human-readable message. Internal `try_*` helpers return this; the
+/// public `pull_once` / `bootstrap_from_latest_snapshot` wrappers
+/// convert it to `HydraError` so the engine-facing error type stays
+/// stable.
+#[derive(Debug, Clone)]
+pub struct ReplicationPullError {
+    pub kind: ReplicationPullErrorKind,
+    pub message: String,
+}
+
+impl ReplicationPullError {
+    pub fn new(kind: ReplicationPullErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn is_transient(&self) -> bool {
+        self.kind.is_transient()
+    }
+}
+
+impl std::fmt::Display for ReplicationPullError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "replication {:?}: {}", self.kind, self.message)
+    }
+}
+
+impl std::error::Error for ReplicationPullError {}
+
+impl From<ReplicationPullError> for HydraError {
+    fn from(err: ReplicationPullError) -> Self {
+        HydraError::QueryError(format!("{err}"))
+    }
+}
+
+/// Classify a reqwest send-side error. Anything network-shaped maps
+/// to `Network` (transient). reqwest's classification methods
+/// (`is_connect`, `is_timeout`, `is_request`) all funnel here.
+fn classify_reqwest_error(err: &reqwest::Error) -> ReplicationPullError {
+    ReplicationPullError::new(
+        ReplicationPullErrorKind::Network,
+        format!("leader request failed: {err}"),
+    )
+}
+
+/// Classify an HTTP status code from the leader. 401/403/429/5xx have
+/// specific kinds; other 4xx is `BadLeaderResponse`.
+fn classify_http_status(status: StatusCode) -> ReplicationPullError {
+    let kind = match status.as_u16() {
+        401 => ReplicationPullErrorKind::Unauthorized,
+        403 => ReplicationPullErrorKind::Forbidden,
+        429 => ReplicationPullErrorKind::RateLimited,
+        500..=599 => ReplicationPullErrorKind::LeaderUnavailable,
+        _ => ReplicationPullErrorKind::BadLeaderResponse,
+    };
+    ReplicationPullError::new(kind, format!("leader request failed: HTTP {status}"))
+}
+
+/// Classify a JSON decode failure as `BadLeaderResponse`.
+fn classify_decode_error(err: &reqwest::Error) -> ReplicationPullError {
+    ReplicationPullError::new(
+        ReplicationPullErrorKind::BadLeaderResponse,
+        format!("leader request failed: decode {err}"),
+    )
+}
+
+/// Classify an engine-side error from `apply_replication_commits` /
+/// `recover_from_snapshot_body_and_replay`. The engine returns
+/// `HydraError::QueryError` with one of a known set of message shapes;
+/// "sequence", "previous_hash", or "commit_hash does not match" all
+/// indicate chain-continuity issues (`ChainDivergence`), while
+/// "is not committed" / "missing commit_hash" / etc. are
+/// `EngineRejected`. Message-sniffing is fragile in general, but the
+/// engine-side messages are owned by this workspace and stable.
+fn classify_engine_error(err: HydraError) -> ReplicationPullError {
+    let message = err.to_string();
+    let kind = if message.contains("sequence")
+        || message.contains("previous_hash")
+        || message.contains("commit_hash does not match")
+    {
+        ReplicationPullErrorKind::ChainDivergence
+    } else {
+        ReplicationPullErrorKind::EngineRejected
+    };
+    ReplicationPullError::new(kind, message)
+}
+
+/// V2 patch 4E — exponential-backoff retry policy for the loop driver.
+///
+/// `max_attempts` is the cap on **consecutive transient failures**
+/// before the loop surfaces `Err`. Default `usize::MAX` (effectively
+/// unlimited — the loop is resilient by default). Tests use small
+/// values to assert eventual give-up.
+///
+/// `initial_backoff` is the wait after the first transient failure.
+/// Doubles on each subsequent failure, capped at `max_backoff`. A
+/// successful operation resets the backoff to `initial_backoff` and
+/// clears the consecutive-failure counter.
+#[derive(Debug, Clone)]
+pub struct ReplicationRetryConfig {
+    pub max_attempts: usize,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for ReplicationRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: usize::MAX,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+}
 
 /// Configuration for a single-shot replication pull.
 ///
@@ -65,18 +235,23 @@ pub struct ReplicationPullerConfig {
     pub restored_by: ActorId,
     pub poll_interval: Duration,
     pub bootstrap_on_start: bool,
+    /// V2 patch 4E — exponential-backoff retry policy applied inside
+    /// `run_until_cancelled` for transient pull failures.
+    pub retry: ReplicationRetryConfig,
 }
 
 impl ReplicationPullerConfig {
     /// Ergonomic constructor with sensible defaults:
     /// `auth_token = None`, `page_limit = 100`,
-    /// `poll_interval = 1s`, `bootstrap_on_start = true`.
+    /// `poll_interval = 1s`, `bootstrap_on_start = true`,
+    /// `retry = ReplicationRetryConfig::default()`.
     ///
     /// Override individual fields after construction:
     ///
     /// ```ignore
     /// let mut config = ReplicationPullerConfig::new(peer, url, restorer);
     /// config.poll_interval = Duration::from_millis(250);
+    /// config.retry.max_attempts = 5;
     /// ```
     pub fn new(
         peer_id: ReplicaId,
@@ -91,6 +266,7 @@ impl ReplicationPullerConfig {
             restored_by,
             poll_interval: Duration::from_secs(1),
             bootstrap_on_start: true,
+            retry: ReplicationRetryConfig::default(),
         }
     }
 }
@@ -169,6 +345,15 @@ impl ReplicationPuller {
 
     /// Single-shot pull. See module-level docs for the algorithm.
     pub async fn pull_once(&self) -> Result<ReplicationPullReport> {
+        self.try_pull_once().await.map_err(Into::into)
+    }
+
+    /// Typed-error variant of `pull_once`. Used internally by
+    /// `run_until_cancelled` for retry classification. Public callers
+    /// should use `pull_once` (HydraError-returning).
+    async fn try_pull_once(
+        &self,
+    ) -> std::result::Result<ReplicationPullReport, ReplicationPullError> {
         // 1. Read this peer's replication cursor (V2 patch 4C). The
         //    cursor is stamped by `apply_replication_commits` and by
         //    `bootstrap_from_latest_snapshot` — it tracks the LEADER's
@@ -186,8 +371,8 @@ impl ReplicationPuller {
                 .unwrap_or(0)
         };
 
-        // 2. Single page from the leader (shared with bootstrap tail loop).
-        let page = self.fetch_commit_page(local_head).await?;
+        // 2. Single page from the leader.
+        let page = self.try_fetch_commit_page(local_head).await?;
         let fetched_count = page.commits.len();
 
         // 3. Empty page → no-op. Still carry leader's head info forward
@@ -204,16 +389,15 @@ impl ReplicationPuller {
         }
 
         // 4. Acquire write lock and apply directly via the engine.
-        //    Engine errors (sequence gap, wrong prev_hash, leader
-        //    compacted past us) bubble unchanged — failure
-        //    classification is the looping worker's responsibility.
+        //    Engine errors are classified as `ChainDivergence` or
+        //    `EngineRejected` so the loop driver picks the right
+        //    retry policy (both are fatal).
         let report = {
             let hydra = self.runtime.hydra();
             let mut hydra = hydra.write().await;
-            hydra.apply_replication_commits(
-                self.config.peer_id.clone(),
-                page.commits,
-            )?
+            hydra
+                .apply_replication_commits(self.config.peer_id.clone(), page.commits)
+                .map_err(classify_engine_error)?
         };
 
         Ok(ReplicationPullReport {
@@ -231,30 +415,39 @@ impl ReplicationPuller {
         &self.config.peer_id
     }
 
-    /// V2 patch 4D — drive the puller in a loop until `shutdown` fires.
+    /// V2 patch 4D + 4E — drive the puller in a loop until `shutdown`
+    /// fires.
     ///
     /// Behavior:
-    ///   1. **Pre-cancel short-circuit** — if `shutdown.is_cancelled()`
-    ///      already, return immediately with `iterations: 0,
-    ///      cancelled: true`. Useful when the shutdown signal raced
-    ///      construction.
-    ///   2. **Bootstrap** — if `config.bootstrap_on_start` is true,
-    ///      call `bootstrap_from_latest_snapshot` first and fold its
-    ///      `replayed_commits` into `total_applied`. Counts as one
-    ///      iteration. Bootstrap errors fail-fast (no retry yet).
-    ///   3. **Poll loop** — `select!` on `shutdown.cancelled()` versus
-    ///      `tokio::time::sleep(config.poll_interval)`. On a tick, run
-    ///      `pull_once` and fold its `fetched_count` / `applied_count`
-    ///      into running totals.
-    ///   4. **Cancellation** wins via `select!` — the report carries
+    ///   1. **Pre-cancel short-circuit** — `shutdown.is_cancelled()`
+    ///      before any IO → immediate Ok(report) with iterations=0,
+    ///      cancelled=true.
+    ///   2. **Bootstrap on start** — if `config.bootstrap_on_start`,
+    ///      bootstrap first. Counts as a successful iteration on
+    ///      success.
+    ///   3. **Poll loop** — `select!` over `shutdown.cancelled()` vs
+    ///      `sleep(poll_interval)`. On tick, `pull_once` + fold.
+    ///   4. **Retry policy (V2 patch 4E)** — every operation classifies
+    ///      its error:
+    ///        - Transient (Network / LeaderUnavailable / RateLimited)
+    ///          → record on `report.failures`, sleep exponential
+    ///          backoff (initial → doubled per failure, capped at
+    ///          `max_backoff`), retry the SAME operation. The
+    ///          backoff sleep is also preemptible via the shutdown
+    ///          token. Resets on success.
+    ///        - Fatal (Unauthorized / Forbidden / BadLeaderResponse /
+    ///          ChainDivergence / EngineRejected) → return
+    ///          `Err(ReplicationLoopError { report, kind, message })`.
+    ///        - Transient that exceeds `retry.max_attempts`
+    ///          consecutive failures → same: return Err with the
+    ///          last transient kind.
+    ///   5. **Cancellation** wins via `select!` at every wait point
+    ///      (poll sleep, backoff sleep). Returns Ok with
     ///      `cancelled: true`.
-    ///   5. **Errors fail-fast.** Any `pull_once` / bootstrap error
-    ///      surfaces as `Err(HydraError::QueryError(...))`. Retry,
-    ///      backoff, and transient-error classification are deferred.
     pub async fn run_until_cancelled(
         &self,
         shutdown: CancellationToken,
-    ) -> Result<ReplicationLoopReport> {
+    ) -> std::result::Result<ReplicationLoopReport, ReplicationLoopError> {
         let mut report = ReplicationLoopReport {
             peer_id: self.config.peer_id.clone(),
             iterations: 0,
@@ -262,42 +455,98 @@ impl ReplicationPuller {
             total_applied: 0,
             last_sequence: None,
             cancelled: false,
+            failures: 0,
+            last_error: None,
+            last_error_kind: None,
         };
 
-        // Pre-cancel — return without doing any IO. Operators using a
-        // graceful-shutdown path expect this when the shutdown signal
-        // arrives before the loop ever ticks.
         if shutdown.is_cancelled() {
             report.cancelled = true;
             return Ok(report);
         }
 
-        // Optional startup bootstrap.
-        if self.config.bootstrap_on_start {
-            let boot = self.bootstrap_from_latest_snapshot().await?;
-            report.iterations += 1;
-            report.total_applied += boot.replayed_commits;
-            if boot.latest_sequence.is_some() {
-                report.last_sequence = boot.latest_sequence;
-            }
-        }
+        // State machine: either the bootstrap step (if requested) or
+        // the pull loop. `bootstrap_pending` flips to false after a
+        // successful bootstrap; transient retries leave it true so
+        // the retry path keeps targeting bootstrap.
+        let mut bootstrap_pending = self.config.bootstrap_on_start;
+        let mut consecutive_failures: usize = 0;
+        let mut current_backoff = self.config.retry.initial_backoff;
 
-        // Poll loop. `select!` lets the shutdown token preempt the
-        // sleep without waiting for the full interval.
         loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    report.cancelled = true;
-                    return Ok(report);
-                }
-                _ = tokio::time::sleep(self.config.poll_interval) => {
-                    let pull = self.pull_once().await?;
+            // Run the next operation: bootstrap (if pending) or pull.
+            let op_result = if bootstrap_pending {
+                self.try_bootstrap_from_latest_snapshot().await.map(|boot| {
+                    bootstrap_pending = false;
+                    report.iterations += 1;
+                    report.total_applied += boot.replayed_commits;
+                    if boot.latest_sequence.is_some() {
+                        report.last_sequence = boot.latest_sequence;
+                    }
+                })
+            } else {
+                self.try_pull_once().await.map(|pull| {
                     report.iterations += 1;
                     report.total_fetched += pull.fetched_count;
                     report.total_applied += pull.applied_count;
                     if pull.latest_sequence.is_some() {
                         report.last_sequence = pull.latest_sequence;
                     }
+                })
+            };
+
+            match op_result {
+                Ok(()) => {
+                    // Success — reset retry state. Sleep poll_interval
+                    // before next tick. Cancel wins.
+                    consecutive_failures = 0;
+                    current_backoff = self.config.retry.initial_backoff;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            report.cancelled = true;
+                            return Ok(report);
+                        }
+                        _ = tokio::time::sleep(self.config.poll_interval) => {}
+                    }
+                }
+                Err(err) if err.is_transient() => {
+                    // Transient — record, check attempt budget, back off.
+                    consecutive_failures += 1;
+                    report.failures += 1;
+                    report.last_error = Some(err.message.clone());
+                    report.last_error_kind = Some(err.kind);
+                    if consecutive_failures > self.config.retry.max_attempts {
+                        return Err(ReplicationLoopError {
+                            report,
+                            kind: err.kind,
+                            message: err.message,
+                        });
+                    }
+                    // Sleep current_backoff with shutdown preempting,
+                    // then double the backoff (capped). Hold on to the
+                    // pre-double value so the FIRST failure waits
+                    // exactly `initial_backoff` ms.
+                    let to_sleep = current_backoff;
+                    current_backoff = (current_backoff * 2).min(self.config.retry.max_backoff);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            report.cancelled = true;
+                            return Ok(report);
+                        }
+                        _ = tokio::time::sleep(to_sleep) => {}
+                    }
+                    // Loop again — same operation retried.
+                }
+                Err(err) => {
+                    // Fatal — stamp last_error fields and surface as
+                    // ReplicationLoopError with the partial report.
+                    report.last_error = Some(err.message.clone());
+                    report.last_error_kind = Some(err.kind);
+                    return Err(ReplicationLoopError {
+                        report,
+                        kind: err.kind,
+                        message: err.message,
+                    });
                 }
             }
         }
@@ -342,13 +591,22 @@ impl ReplicationPuller {
     pub async fn bootstrap_from_latest_snapshot(
         &self,
     ) -> Result<ReplicationBootstrapReport> {
+        self.try_bootstrap_from_latest_snapshot()
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Typed-error variant of `bootstrap_from_latest_snapshot`. Used
+    /// internally by `run_until_cancelled` for retry classification.
+    async fn try_bootstrap_from_latest_snapshot(
+        &self,
+    ) -> std::result::Result<ReplicationBootstrapReport, ReplicationPullError> {
         // 1. Fetch the latest manifest.
-        let manifest_response: ReplicationSnapshotManifestResponse =
-            self.fetch_snapshot_latest().await?;
+        let manifest_response = self.try_fetch_snapshot_latest().await?;
 
         // 2. No snapshot on leader → pull_once fallback.
         let Some(manifest) = manifest_response.manifest else {
-            let pull = self.pull_once().await?;
+            let pull = self.try_pull_once().await?;
             return Ok(ReplicationBootstrapReport {
                 peer_id: pull.peer_id,
                 snapshot_id: None,
@@ -359,9 +617,9 @@ impl ReplicationPuller {
         };
 
         // 3. Fetch the body. Leader returning 404 here is a bug
-        //    (manifest claimed the body existed) — surface as error.
-        let body_response: ReplicationSnapshotBodyResponse =
-            self.fetch_snapshot_body(&manifest.id).await?;
+        //    (manifest claimed the body existed). The 404 surfaces as
+        //    `BadLeaderResponse` via `classify_http_status`.
+        let body_response = self.try_fetch_snapshot_body(&manifest.id).await?;
         let body = body_response.body;
         let snapshot_sequence = manifest.sequence;
 
@@ -371,12 +629,10 @@ impl ReplicationPuller {
         let mut tail: Vec<CommitBatch> = Vec::new();
         let mut cursor = snapshot_sequence;
         loop {
-            let page = self.fetch_commit_page(cursor).await?;
+            let page = self.try_fetch_commit_page(cursor).await?;
             if page.commits.is_empty() {
                 break;
             }
-            // Update cursor BEFORE moving the commits out, so we use
-            // the leader's response to decide the next request.
             let next = page.next_after_sequence;
             tail.extend(page.commits);
             match next {
@@ -388,10 +644,7 @@ impl ReplicationPuller {
         // 5. Acquire write lock, recover, and stamp the replication
         //    cursor in one critical section. Cursor is the LAST tail
         //    batch's offset when the tail is non-empty; falls back to
-        //    the snapshot manifest head when the tail is empty. This
-        //    is the patch 4C post-bootstrap chain-handshake — `pull_once`
-        //    will read this cursor instead of the follower's
-        //    SnapshotRestored audit-commit head.
+        //    the snapshot manifest head when the tail is empty.
         let cursor_offset = if let Some(last) = tail.last() {
             hydra_core::ReplicationOffset {
                 sequence: last.sequence,
@@ -409,11 +662,13 @@ impl ReplicationPuller {
         let manifest_applied = {
             let hydra = self.runtime.hydra();
             let mut hydra = hydra.write().await;
-            let manifest = hydra.recover_from_snapshot_body_and_replay(
-                body,
-                tail.clone(),
-                self.config.restored_by.clone(),
-            )?;
+            let manifest = hydra
+                .recover_from_snapshot_body_and_replay(
+                    body,
+                    tail.clone(),
+                    self.config.restored_by.clone(),
+                )
+                .map_err(classify_engine_error)?;
             hydra.record_replication_apply_offset(
                 self.config.peer_id.clone(),
                 cursor_offset,
@@ -437,81 +692,87 @@ impl ReplicationPuller {
         })
     }
 
-    /// Shared paging helper used by both `pull_once` and the bootstrap
-    /// tail loop. Builds the URL, attaches the Bearer token, decodes a
-    /// `ReplicationCommitPage`. All errors surface as `QueryError`.
+    /// Shared GET-and-decode helper. Builds the URL, attaches the
+    /// Bearer token (if configured), optionally appends a `query`,
+    /// classifies any error into `ReplicationPullError` so the loop
+    /// driver can pick the right retry policy.
+    ///
+    /// All three fetch helpers (commits, snapshot/latest, snapshot/:id)
+    /// funnel through this one path so error classification stays
+    /// uniform.
+    async fn send_and_decode<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        query: Option<&[(&str, String)]>,
+    ) -> std::result::Result<T, ReplicationPullError> {
+        let mut request = self.client.get(url);
+        if let Some(query) = query {
+            request = request.query(query);
+        }
+        if let Some(token) = &self.config.auth_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|err| classify_reqwest_error(&err))?;
+        let status = response.status();
+        // axum's StatusCode is the same crate as reqwest's via http.
+        let axum_status =
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if !status.is_success() {
+            return Err(classify_http_status(axum_status));
+        }
+        response
+            .json::<T>()
+            .await
+            .map_err(|err| classify_decode_error(&err))
+    }
+
+    async fn try_fetch_commit_page(
+        &self,
+        after_sequence: u64,
+    ) -> std::result::Result<ReplicationCommitPage, ReplicationPullError> {
+        let base = self.config.leader_base_url.trim_end_matches('/');
+        let url = format!("{base}/replication/commits");
+        self.send_and_decode(
+            &url,
+            Some(&[
+                ("after_sequence", after_sequence.to_string()),
+                ("limit", self.config.page_limit.to_string()),
+            ]),
+        )
+        .await
+    }
+
+    async fn try_fetch_snapshot_latest(
+        &self,
+    ) -> std::result::Result<ReplicationSnapshotManifestResponse, ReplicationPullError> {
+        let base = self.config.leader_base_url.trim_end_matches('/');
+        let url = format!("{base}/replication/snapshot/latest");
+        self.send_and_decode(&url, None).await
+    }
+
+    async fn try_fetch_snapshot_body(
+        &self,
+        id: &SnapshotId,
+    ) -> std::result::Result<ReplicationSnapshotBodyResponse, ReplicationPullError> {
+        let base = self.config.leader_base_url.trim_end_matches('/');
+        let url = format!("{base}/replication/snapshot/{id}");
+        self.send_and_decode(&url, None).await
+    }
+
+    /// Backwards-compatible HydraError-returning fetch — unused now
+    /// that callers use the `try_*` typed variants, but kept private
+    /// in case external callers want a HydraError-returning helper.
+    #[allow(dead_code)]
     async fn fetch_commit_page(
         &self,
         after_sequence: u64,
     ) -> Result<ReplicationCommitPage> {
-        let base = self.config.leader_base_url.trim_end_matches('/');
-        let url = format!("{base}/replication/commits");
-        let mut request = self.client.get(&url).query(&[
-            ("after_sequence", after_sequence.to_string()),
-            ("limit", self.config.page_limit.to_string()),
-        ]);
-        if let Some(token) = &self.config.auth_token {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await.map_err(|err| {
-            HydraError::QueryError(format!("leader request failed: {err}"))
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(HydraError::QueryError(format!(
-                "leader request failed: HTTP {status}"
-            )));
-        }
-        response.json().await.map_err(|err| {
-            HydraError::QueryError(format!("leader request failed: decode {err}"))
-        })
-    }
-
-    async fn fetch_snapshot_latest(
-        &self,
-    ) -> Result<ReplicationSnapshotManifestResponse> {
-        let base = self.config.leader_base_url.trim_end_matches('/');
-        let url = format!("{base}/replication/snapshot/latest");
-        let mut request = self.client.get(&url);
-        if let Some(token) = &self.config.auth_token {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await.map_err(|err| {
-            HydraError::QueryError(format!("leader request failed: {err}"))
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(HydraError::QueryError(format!(
-                "leader request failed: HTTP {status}"
-            )));
-        }
-        response.json().await.map_err(|err| {
-            HydraError::QueryError(format!("leader request failed: decode {err}"))
-        })
-    }
-
-    async fn fetch_snapshot_body(
-        &self,
-        id: &SnapshotId,
-    ) -> Result<ReplicationSnapshotBodyResponse> {
-        let base = self.config.leader_base_url.trim_end_matches('/');
-        let url = format!("{base}/replication/snapshot/{id}");
-        let mut request = self.client.get(&url);
-        if let Some(token) = &self.config.auth_token {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await.map_err(|err| {
-            HydraError::QueryError(format!("leader request failed: {err}"))
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(HydraError::QueryError(format!(
-                "leader request failed: HTTP {status}"
-            )));
-        }
-        response.json().await.map_err(|err| {
-            HydraError::QueryError(format!("leader request failed: decode {err}"))
-        })
+        self.try_fetch_commit_page(after_sequence)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -532,15 +793,21 @@ pub struct ReplicationBootstrapReport {
 
 /// V2 patch 4D — outcome of `ReplicationPuller::run_until_cancelled`.
 ///
-/// `iterations` counts both the startup-bootstrap (when enabled) AND
-/// each completed poll-tick. `total_fetched` and `total_applied`
-/// accumulate across the whole loop. `last_sequence` is the most
-/// recent value returned by the leader (head sequence on pull, or
-/// follower head after bootstrap). `cancelled = true` means the
-/// shutdown token fired; `cancelled = false` cannot currently happen
-/// because the loop is otherwise infinite — but it is left as a
-/// field so a future "max iterations" exit condition has a place to
-/// land.
+/// `iterations` counts SUCCESSFUL operations (startup-bootstrap when
+/// enabled + each successful poll-tick). Failed retries do NOT count
+/// as iterations; they bump `failures` instead.
+///
+/// `total_fetched` and `total_applied` accumulate across the whole
+/// loop. `last_sequence` is the most recent value returned by the
+/// leader (head sequence on pull, or follower head after bootstrap).
+///
+/// V2 patch 4E:
+///   - `failures` counts transient errors the loop recovered from
+///     (retried with backoff and continued). Fatal failures
+///     surface as `Err(ReplicationLoopError { report, .. })`.
+///   - `last_error` / `last_error_kind` carry the most recent
+///     failure (transient or fatal) for diagnostics.
+///   - `cancelled = true` means the shutdown token fired.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplicationLoopReport {
     pub peer_id: ReplicaId,
@@ -549,6 +816,38 @@ pub struct ReplicationLoopReport {
     pub total_applied: usize,
     pub last_sequence: Option<u64>,
     pub cancelled: bool,
+    pub failures: u64,
+    pub last_error: Option<String>,
+    pub last_error_kind: Option<ReplicationPullErrorKind>,
+}
+
+/// V2 patch 4E — fatal-exit error from `run_until_cancelled`. Carries
+/// the partial report so the caller can see how far the loop got
+/// (successful iterations, recovered transient failures, last seen
+/// leader head) before the fatal kind ended things.
+#[derive(Debug, Clone)]
+pub struct ReplicationLoopError {
+    pub report: ReplicationLoopReport,
+    pub kind: ReplicationPullErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for ReplicationLoopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "replication loop {:?}: {} (iterations={}, failures={})",
+            self.kind, self.message, self.report.iterations, self.report.failures
+        )
+    }
+}
+
+impl std::error::Error for ReplicationLoopError {}
+
+impl From<ReplicationLoopError> for HydraError {
+    fn from(err: ReplicationLoopError) -> Self {
+        HydraError::QueryError(format!("{err}"))
+    }
 }
 
 /// Helper builder for the `ApplyReplicationRequest` shape — exposed so
@@ -627,6 +926,7 @@ mod tests {
                 restored_by: restorer(),
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
+                retry: ReplicationRetryConfig::default(),
             },
         );
 
@@ -667,6 +967,7 @@ mod tests {
                 restored_by: restorer(),
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
+                retry: ReplicationRetryConfig::default(),
             },
         );
 
@@ -728,6 +1029,7 @@ mod tests {
                 restored_by: restorer(),
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
+                retry: ReplicationRetryConfig::default(),
             },
         );
         let report = puller.pull_once().await.unwrap();
@@ -778,6 +1080,7 @@ mod tests {
                 restored_by: restorer(),
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
+                retry: ReplicationRetryConfig::default(),
             },
         );
         // Follower's head is at seq=1 (its own local commit). It asks
@@ -825,6 +1128,7 @@ mod tests {
                 restored_by: restorer(),
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
+                retry: ReplicationRetryConfig::default(),
             },
         );
 
@@ -869,6 +1173,7 @@ mod tests {
                 restored_by: restorer(),
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
+                retry: ReplicationRetryConfig::default(),
             },
         );
 
@@ -942,6 +1247,7 @@ mod tests {
                 restored_by: restorer(),
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
+                retry: ReplicationRetryConfig::default(),
             },
         );
 
@@ -1037,6 +1343,7 @@ mod tests {
                 restored_by: restorer(),
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
+                retry: ReplicationRetryConfig::default(),
             },
         );
         let err = puller.bootstrap_from_latest_snapshot().await.unwrap_err();
@@ -1088,6 +1395,7 @@ mod tests {
                 restored_by: restorer(),
                 poll_interval: Duration::from_millis(10),
                 bootstrap_on_start: false,
+                retry: ReplicationRetryConfig::default(),
             },
         );
 
@@ -1326,25 +1634,218 @@ mod tests {
 
     #[tokio::test]
     async fn run_until_cancelled_returns_error_on_bad_leader() {
-        // Point the puller at an unreachable URL. bootstrap_on_start
-        // is false so the first iteration is a pull_once; that fails
-        // immediately. The loop returns Err — no retry yet.
+        // Port 1 — reserved, refuses TCP connect. With V2 patch 4E,
+        // this surfaces as `Network` (transient). Override
+        // `retry.max_attempts = 1` so the loop gives up after one
+        // failed attempt instead of retrying forever (the default).
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
-        let puller = ReplicationPuller::new(
-            follower_runtime,
-            loop_config(
-                // Use port 1 — reserved, will reject TCP connect.
-                "http://127.0.0.1:1".to_string(),
-                Duration::from_millis(10),
-                false,
-            ),
+        let mut config = loop_config(
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(10),
+            false,
         );
+        config.retry.max_attempts = 1;
+        config.retry.initial_backoff = Duration::from_millis(1);
+        let puller = ReplicationPuller::new(follower_runtime, config);
         let token = CancellationToken::new();
-        let result = puller.run_until_cancelled(token).await;
+        let err = puller.run_until_cancelled(token).await.unwrap_err();
+        assert_eq!(err.kind, ReplicationPullErrorKind::Network);
+        // Partial report carries the transient failure count.
+        assert!(err.report.failures >= 1, "got {:?}", err.report);
+    }
+
+    // === V2 patch 4E — retry / backoff / failure classification ===
+
+    /// Flaky leader fixture: returns 503 for the first N hits to
+    /// `/replication/commits`, then returns a valid empty
+    /// `ReplicationCommitPage`. Lets the test prove the loop retries
+    /// and eventually converges without needing a real upstream leader.
+    #[derive(Clone)]
+    struct FlakyLeaderState {
+        // AtomicI32 (signed) so once the counter hits 0 and decrements
+        // further it goes negative — `prev > 0` keeps being false.
+        // AtomicU32 would wrap around to u32::MAX and re-enter the
+        // 503-emitting branch.
+        remaining_503: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    }
+
+    async fn flaky_commits_handler(
+        State(state): State<FlakyLeaderState>,
+    ) -> impl IntoResponse {
+        let prev = state
+            .remaining_503
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if prev > 0 {
+            return (StatusCode::SERVICE_UNAVAILABLE, "leader unavailable")
+                .into_response();
+        }
+        Json(ReplicationCommitPage {
+            commits: vec![],
+            next_after_sequence: None,
+            leader_head_sequence: 0,
+            leader_head_commit_id: None,
+        })
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn run_until_cancelled_retries_transient_network_error() {
+        // Flaky leader returns 503 on the first 2 requests, then a
+        // valid empty page. The loop must retry transient failures
+        // (LeaderUnavailable kind) and converge to a clean state.
+        let flaky = FlakyLeaderState {
+            remaining_503: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(2)),
+        };
+        let router = Router::new()
+            .route("/replication/commits", get(flaky_commits_handler))
+            .with_state(flaky);
+        let (addr, _server) = spawn_leader(router).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = loop_config(format!("http://{addr}"), Duration::from_millis(20), false);
+        config.retry.max_attempts = 5;
+        config.retry.initial_backoff = Duration::from_millis(1);
+        config.retry.max_backoff = Duration::from_millis(5);
+        let puller = ReplicationPuller::new(follower_runtime, config);
+        let token = CancellationToken::new();
+
+        // Cancel after the loop has reported at least one success.
+        let token_clone = token.clone();
+        // We can't easily observe a successful pull from outside
+        // (empty page is a no-op on follower state), so cancel after
+        // a generous timeout. The retry behavior is asserted via the
+        // failures counter.
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            token_clone.cancel();
+        });
+
+        let report = puller.run_until_cancelled(token).await.unwrap();
+        canceller.await.unwrap();
+        assert!(report.cancelled);
+        // Two 503s → at least 2 transient failures recorded.
         assert!(
-            matches!(result, Err(HydraError::QueryError(_))),
-            "expected QueryError, got {:?}",
-            result
+            report.failures >= 2,
+            "expected >=2 transient failures, got {:?}",
+            report
         );
+        // Most recent error kind was transient (loop kept going).
+        assert_eq!(
+            report.last_error_kind,
+            Some(ReplicationPullErrorKind::LeaderUnavailable)
+        );
+    }
+
+    #[derive(Clone)]
+    struct AlwaysStatusState {
+        status: StatusCode,
+    }
+
+    async fn always_status_handler(
+        State(state): State<AlwaysStatusState>,
+    ) -> impl IntoResponse {
+        (state.status, "rejected").into_response()
+    }
+
+    #[tokio::test]
+    async fn run_until_cancelled_stops_on_unauthorized() {
+        // Leader returns 401 unconditionally. The loop classifies as
+        // Unauthorized (fatal) and returns Err immediately — no retry.
+        let router = Router::new()
+            .route("/replication/commits", get(always_status_handler))
+            .route("/replication/snapshot/latest", get(always_status_handler))
+            .with_state(AlwaysStatusState {
+                status: StatusCode::UNAUTHORIZED,
+            });
+        let (addr, _server) = spawn_leader(router).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = loop_config(format!("http://{addr}"), Duration::from_millis(10), false);
+        config.retry.max_attempts = 100; // doesn't matter — fatal short-circuits
+        let puller = ReplicationPuller::new(follower_runtime, config);
+        let token = CancellationToken::new();
+        let err = puller.run_until_cancelled(token).await.unwrap_err();
+        assert_eq!(err.kind, ReplicationPullErrorKind::Unauthorized);
+        // Fatal short-circuit — no transient retries before exit.
+        assert_eq!(err.report.failures, 0);
+    }
+
+    #[tokio::test]
+    async fn run_until_cancelled_stops_on_chain_divergence() {
+        // Follower's local cursor is already at sequence 5 (manually
+        // stamped). Leader's actual chain head is at seq=2. Pull
+        // requests `after_sequence=5`, leader returns nothing, no
+        // error — that's actually success (just a no-op page). To
+        // genuinely trigger ChainDivergence we need the FOLLOWER's
+        // state to disagree with the leader's chain on a real apply.
+        //
+        // Setup: follower has its OWN local commit at seq=1 with a
+        // different hash. Cursor unstamped, so ledger mode applies
+        // and the engine sees the leader's seq=2 chain continuing
+        // from a DIFFERENT previous_hash than the follower's seq=1.
+        // → ChainDivergence (fatal).
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("leader_one")).unwrap();
+            hydra.ingest(signal("leader_two")).unwrap();
+        }
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = follower_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("follower_local")).unwrap();
+        }
+
+        let mut config = loop_config(format!("http://{addr}"), Duration::from_millis(10), false);
+        config.retry.max_attempts = 100;
+        let puller = ReplicationPuller::new(follower_runtime, config);
+        let token = CancellationToken::new();
+        let err = puller.run_until_cancelled(token).await.unwrap_err();
+        assert_eq!(err.kind, ReplicationPullErrorKind::ChainDivergence);
+        // Fatal — no transient retries.
+        assert_eq!(err.report.failures, 0);
+    }
+
+    #[tokio::test]
+    async fn run_until_cancelled_retry_backoff_capped_and_loop_keeps_running() {
+        // One 503 then valid empty pages. Test confirms:
+        //   - backoff is capped via `max_backoff` (set to initial)
+        //   - after success, the loop keeps polling instead of
+        //     exiting with the prior transient as a fatal
+        //   - failures counter shows exactly one transient failure
+        let flaky = FlakyLeaderState {
+            remaining_503: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(1)),
+        };
+        let router = Router::new()
+            .route("/replication/commits", get(flaky_commits_handler))
+            .with_state(flaky);
+        let (addr, _server) = spawn_leader(router).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = loop_config(format!("http://{addr}"), Duration::from_millis(10), false);
+        config.retry.max_attempts = 5;
+        config.retry.initial_backoff = Duration::from_millis(1);
+        // Cap = initial — confirms the doubling-then-min() works.
+        config.retry.max_backoff = Duration::from_millis(1);
+        let puller = ReplicationPuller::new(follower_runtime, config);
+        let token = CancellationToken::new();
+
+        let token_clone = token.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            token_clone.cancel();
+        });
+
+        let report = puller.run_until_cancelled(token).await.unwrap();
+        canceller.await.unwrap();
+        assert!(report.cancelled);
+        // Exactly one transient failure (the single 503).
+        assert_eq!(report.failures, 1);
+        // The loop continued past the failure rather than fataling.
+        assert!(report.iterations >= 1);
     }
 }
