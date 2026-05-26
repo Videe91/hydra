@@ -130,13 +130,20 @@ impl ReplicationPuller {
 
     /// Single-shot pull. See module-level docs for the algorithm.
     pub async fn pull_once(&self) -> Result<ReplicationPullReport> {
-        // 1. Read local head (drop the read lock before doing network IO).
+        // 1. Read this peer's replication cursor (V2 patch 4C). The
+        //    cursor is stamped by `apply_replication_commits` and by
+        //    `bootstrap_from_latest_snapshot` — it tracks the LEADER's
+        //    chain position we've applied, not the follower's local
+        //    commit_ledger head. Falling back to `latest_commit` covers
+        //    the fresh-follower case where no apply has happened yet.
+        //    Drop the read lock before doing network IO.
         let local_head = {
             let hydra = self.runtime.hydra();
             let hydra = hydra.read().await;
             hydra
-                .latest_commit()
-                .map(|record| record.sequence)
+                .latest_replication_offset(&self.config.peer_id)
+                .map(|o| o.sequence)
+                .or_else(|| hydra.latest_commit().map(|r| r.sequence))
                 .unwrap_or(0)
         };
 
@@ -267,15 +274,40 @@ impl ReplicationPuller {
             }
         }
 
-        // 5. Acquire write lock and recover. Engine filters/sorts internally.
+        // 5. Acquire write lock, recover, and stamp the replication
+        //    cursor in one critical section. Cursor is the LAST tail
+        //    batch's offset when the tail is non-empty; falls back to
+        //    the snapshot manifest head when the tail is empty. This
+        //    is the patch 4C post-bootstrap chain-handshake — `pull_once`
+        //    will read this cursor instead of the follower's
+        //    SnapshotRestored audit-commit head.
+        let cursor_offset = if let Some(last) = tail.last() {
+            hydra_core::ReplicationOffset {
+                sequence: last.sequence,
+                commit_id: Some(last.id.clone()),
+                commit_hash: last.commit_hash.clone(),
+            }
+        } else {
+            hydra_core::ReplicationOffset {
+                sequence: snapshot_sequence,
+                commit_id: manifest.head_commit_id.clone(),
+                commit_hash: manifest.head_commit_hash.clone(),
+            }
+        };
+
         let manifest_applied = {
             let hydra = self.runtime.hydra();
             let mut hydra = hydra.write().await;
-            hydra.recover_from_snapshot_body_and_replay(
+            let manifest = hydra.recover_from_snapshot_body_and_replay(
                 body,
                 tail.clone(),
                 self.config.restored_by.clone(),
-            )?
+            )?;
+            hydra.record_replication_apply_offset(
+                self.config.peer_id.clone(),
+                cursor_offset,
+            );
+            manifest
         };
 
         let replayed_commits = tail.len();
@@ -867,5 +899,108 @@ mod tests {
         );
         // Follower untouched.
         assert_eq!(follower_runtime.hydra().read().await.commit_count(), 0);
+    }
+
+    // === V2 patch 4C — post-bootstrap chain-handshake ===
+
+    #[tokio::test]
+    async fn bootstrap_then_pull_once_continues_from_leader_cursor() {
+        // Full V2 P4C composition proof:
+        //   leader: ingest "before" → snapshot → ingest "after1"
+        //   follower: bootstrap_from_latest_snapshot
+        //   leader: ingest "after2"
+        //   follower: pull_once   ← must succeed, NOT previous_hash mismatch
+        //
+        // Without the patch 4C cursor, pull_once would request
+        // `after_sequence=1` (the follower's SnapshotRestored audit
+        // head) and the engine would reject the leader's continuation
+        // batch on previous_hash mismatch. With the cursor, it requests
+        // `after_sequence=<last leader head we applied>` and gets only
+        // the genuinely-new "after2" batch.
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("before")).unwrap();
+            hydra
+                .snapshot(ActorId::from_str("actor_snapshot"))
+                .unwrap();
+            hydra.ingest(signal("after1")).unwrap();
+        }
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime.clone())).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let puller = ReplicationPuller::new(
+            follower_runtime.clone(),
+            ReplicationPullerConfig {
+                peer_id: follower_peer_id(),
+                leader_base_url: format!("http://{addr}"),
+                auth_token: None,
+                page_limit: 100,
+                restored_by: restorer(),
+            },
+        );
+
+        // Bootstrap: pulls snapshot + tail. Follower now has the
+        // restored state AND a replication cursor pointing at the
+        // leader's chain head at bootstrap time.
+        let bootstrap_report = puller.bootstrap_from_latest_snapshot().await.unwrap();
+        assert!(bootstrap_report.snapshot_id.is_some());
+
+        // Cursor must be stamped — that's the patch 4C guarantee.
+        let cursor_after_bootstrap = {
+            let hydra = follower_runtime.hydra();
+            let hydra = hydra.read().await;
+            hydra
+                .latest_replication_offset(&follower_peer_id())
+                .cloned()
+                .expect("cursor must be stamped after bootstrap")
+        };
+
+        // Leader continues with another signal AFTER bootstrap.
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("after2")).unwrap();
+        }
+
+        // Follower pulls. This is the test that fails pre-4C: without
+        // the cursor, pull_once would use follower.latest_commit() (1)
+        // as `after_sequence`, the leader would return its full chain
+        // from seq=2, and apply_replication_commits would reject on
+        // previous_hash mismatch (follower's head_hash is the
+        // SnapshotRestored audit commit's hash, not the leader's
+        // chain hash).
+        //
+        // With the cursor, pull_once uses cursor.sequence
+        // (= leader's head at bootstrap time) → leader returns ONLY
+        // the new "after2" batch → engine appends it cleanly.
+        let pull_report = puller.pull_once().await.unwrap();
+        assert_eq!(
+            pull_report.requested_after_sequence,
+            cursor_after_bootstrap.sequence,
+            "pull_once must request from the replication cursor, not local head"
+        );
+        assert_eq!(pull_report.fetched_count, 1);
+        assert_eq!(pull_report.applied_count, 1);
+
+        // The follower's event log now contains all three signals.
+        let follower = follower_runtime.hydra();
+        let follower = follower.read().await;
+        let names: Vec<String> = follower
+            .events()
+            .into_iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::Signal { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        for name in ["before", "after1", "after2"] {
+            assert!(
+                names.contains(&name.to_string()),
+                "follower missing {name}: got {:?}",
+                names
+            );
+        }
     }
 }

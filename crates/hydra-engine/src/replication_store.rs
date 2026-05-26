@@ -143,6 +143,34 @@ impl ReplicationStore {
         self.latest_lag_by_peer.get(peer_id)
     }
 
+    /// V2 patch 4C — record a follower's local replication cursor after
+    /// applying or bootstrapping from a leader peer.
+    ///
+    /// Direct in-memory update, **not event-sourced**, and intentionally
+    /// **does not require the peer to be registered**. The puller carries
+    /// its own `peer_id` as config identity (the local leader's logical
+    /// id), and we don't want a follower to synthesize a local
+    /// `ReplicaRegistered` event for the leader — that would diverge the
+    /// follower's commit chain from the leader's.
+    ///
+    /// If `peer.last_offset` exists (the peer IS registered, e.g. on the
+    /// leader where the puller is talking back to its own state), keep
+    /// the registered peer in sync too. Otherwise just stamp the cursor.
+    ///
+    /// Survives in-process. Lost on restart — operators currently
+    /// re-bootstrap. Persistent cursor is a later patch.
+    pub fn record_local_apply_offset(
+        &mut self,
+        peer_id: ReplicaId,
+        offset: ReplicationOffset,
+    ) {
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.last_offset = Some(offset.clone());
+            peer.updated_at = chrono::Utc::now();
+        }
+        self.latest_offset_by_peer.insert(peer_id, offset);
+    }
+
     // === Event application ===
 
     /// Apply one Hydra event to the replication store.

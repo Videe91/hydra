@@ -1312,6 +1312,29 @@ impl Hydra {
         self.replication_store.latest_lag(peer_id)
     }
 
+    /// V2 patch 4C — stamp a runtime-local replication cursor for the
+    /// given peer. Direct in-memory update, not event-sourced — keeps
+    /// the follower's commit ledger byte-identical to the leader's.
+    ///
+    /// Called automatically by `apply_replication_commits` (with the
+    /// last applied batch) and by the worker's bootstrap path (with
+    /// either the last tail batch or the snapshot manifest head if the
+    /// tail was empty). Surviving in-memory only — operators
+    /// re-bootstrap on restart for now.
+    ///
+    /// `pull_once` and other puller flows read this cursor in
+    /// preference to `latest_commit().sequence` to decide
+    /// `after_sequence` on the next fetch — that's the patch 4C
+    /// post-bootstrap chain-handshake.
+    pub fn record_replication_apply_offset(
+        &mut self,
+        peer_id: hydra_core::ReplicaId,
+        offset: hydra_core::ReplicationOffset,
+    ) {
+        self.replication_store
+            .record_local_apply_offset(peer_id, offset);
+    }
+
     /// V2 patch 3B — apply a leader-supplied page of committed batches to
     /// this follower.
     ///
@@ -1371,11 +1394,43 @@ impl Hydra {
             }
         }
 
-        // Dry pass: walk a projected (next_sequence, head_hash) through
-        // the incoming list. Catches gaps + chain mismatches + status +
-        // hash-present BEFORE we touch the ledger.
-        let mut projected_seq = self.commit_ledger.next_sequence();
-        let mut projected_head = self.commit_ledger.head_hash().cloned();
+        // V2 patch 4C: dual-mode dry-pass. The follower's commit_ledger
+        // and the follower's replication CURSOR for this peer can either
+        // be aligned (clean append: fresh follower, or follower-as-leader
+        // chain replay) or diverged (post-bootstrap: follower's ledger
+        // has a SnapshotRestored audit commit, but the cursor tracks the
+        // leader's chain head at bootstrap time).
+        //
+        // - **Ledger mode**: cursor matches ledger head (or no cursor) →
+        //   use ledger.next_sequence + ledger.head_hash as the expected
+        //   chain head. Append batches to commit_ledger as usual (3B
+        //   behavior).
+        // - **Cursor mode**: cursor diverges from ledger → use the
+        //   cursor's sequence + commit_hash as the expected chain head.
+        //   Skip ledger append; follower's local commit_ledger stays
+        //   the local audit chain. The cursor advances on each batch.
+        //
+        // Either way the cursor is stamped at the last applied batch's
+        // offset on success — so subsequent `pull_once` calls read the
+        // cursor as `after_sequence` and the chain stays consistent.
+        let cursor_for_peer = self
+            .replication_store
+            .latest_offset(&peer_id)
+            .cloned();
+        let cursor_mode = match &cursor_for_peer {
+            Some(cursor) => cursor.commit_hash != self.commit_ledger.head_hash().cloned(),
+            None => false,
+        };
+        let mut projected_seq = if cursor_mode {
+            cursor_for_peer.as_ref().unwrap().sequence + 1
+        } else {
+            self.commit_ledger.next_sequence()
+        };
+        let mut projected_head = if cursor_mode {
+            cursor_for_peer.as_ref().unwrap().commit_hash.clone()
+        } else {
+            self.commit_ledger.head_hash().cloned()
+        };
         for batch in &commits {
             if batch.sequence != projected_seq {
                 return Err(hydra_core::error::HydraError::QueryError(format!(
@@ -1405,17 +1460,44 @@ impl Hydra {
             projected_head = batch.commit_hash.clone();
         }
 
-        // Apply. `append_committed_batch` re-validates atomically at the
-        // ledger boundary (including hash recompute) so any divergence
-        // between dry pass and final apply still aborts cleanly.
+        // Apply. In **ledger mode**, `append_committed_batch` re-validates
+        // atomically at the ledger boundary (including hash recompute) so
+        // any divergence between dry pass and final apply still aborts
+        // cleanly. In **cursor mode** the follower's commit_ledger is NOT
+        // touched — the leader's chain lives in the cursor only, and the
+        // follower's ledger stays local-audit-only. Events are replayed
+        // into materialized stores in both modes via `apply_replayed_event`.
+        //
+        // V2 patch 4C: track the last applied batch's (sequence, id,
+        // hash) so we can stamp it into the replication store as the
+        // follower's local cursor for this peer. The cursor is what
+        // `pull_once` reads on the next fetch — NOT the follower's
+        // commit_ledger head — so post-bootstrap pull stays composable.
         let mut applied_count = 0usize;
+        let mut last_applied_offset: Option<hydra_core::ReplicationOffset> = None;
         for batch in commits {
             let events = batch.events.clone();
-            self.commit_ledger.append_committed_batch(batch)?;
+            let batch_id = batch.id.clone();
+            let batch_sequence = batch.sequence;
+            let batch_commit_hash = batch.commit_hash.clone();
+            if cursor_mode {
+                // Skip ledger append — the cursor is the source of truth.
+            } else {
+                self.commit_ledger.append_committed_batch(batch)?;
+            }
             for event in &events {
                 self.apply_replayed_event(event)?;
             }
+            last_applied_offset = Some(hydra_core::ReplicationOffset {
+                sequence: batch_sequence,
+                commit_id: Some(batch_id),
+                commit_hash: batch_commit_hash,
+            });
             applied_count += 1;
+        }
+
+        if let Some(offset) = last_applied_offset {
+            self.record_replication_apply_offset(peer_id.clone(), offset);
         }
 
         Ok(ReplicationApplyReport {
@@ -5763,5 +5845,47 @@ mod sprint1_tests {
             node.properties.get("follow_up"),
             Some(&hydra_core::Value::Bool(true))
         );
+    }
+
+    // === V2 patch 4C — replication cursor / chain-handshake ===
+
+    #[test]
+    fn apply_replication_commits_records_latest_offset() {
+        use hydra_core::ReplicaId;
+
+        let leader = leader_with_signals(3);
+        let commits = batches_from(&leader);
+        let last_leader_batch = commits.last().cloned().unwrap();
+        let peer = ReplicaId::from_str("replica_cursor_test");
+
+        let mut follower = Hydra::new();
+        follower
+            .apply_replication_commits(peer.clone(), commits)
+            .unwrap();
+
+        // The cursor must match the LAST applied batch — the leader's
+        // chain head, NOT the follower's local commit ledger head.
+        let cursor = follower
+            .latest_replication_offset(&peer)
+            .expect("replication cursor must be recorded after apply");
+        assert_eq!(cursor.sequence, last_leader_batch.sequence);
+        assert_eq!(cursor.commit_id.as_ref(), Some(&last_leader_batch.id));
+        assert_eq!(cursor.commit_hash, last_leader_batch.commit_hash);
+        // Sanity: cursor and local head sequence agree here (no
+        // bootstrap in this path; both are the leader's chain).
+        assert_eq!(
+            Some(cursor.sequence),
+            follower.latest_commit().map(|r| r.sequence)
+        );
+
+        // Empty apply does NOT stamp a cursor on top of an existing one.
+        let pre = follower.latest_replication_offset(&peer).cloned().unwrap();
+        follower
+            .apply_replication_commits(peer.clone(), vec![])
+            .unwrap();
+        let post = follower
+            .latest_replication_offset(&peer)
+            .expect("cursor preserved after empty apply");
+        assert_eq!(&pre, post);
     }
 }
