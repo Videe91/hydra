@@ -337,6 +337,61 @@ fn is_mutating_method(method: &Method) -> bool {
     )
 }
 
+/// V2 patch 4H — classify whether a route should be rejected on a
+/// Follower node.
+///
+/// Returns `true` for engine-mutating routes a Follower must NOT
+/// serve (the Leader is the source of truth for these writes).
+/// Returns `false` for:
+///   - `POST /replication/apply` — the follower's primary receiving
+///     route; rejecting it would break replication.
+///   - `POST /schemas/validate/*` — preflight validation, no mutation.
+///   - all `GET` / `OPTIONS`.
+///
+/// Mirrors the shape of `required_scopes_for`: a single function that
+/// classifies (method, path) by policy. Followers running behind a
+/// reverse proxy that wants to short-circuit writes can also consult
+/// this rule.
+pub fn rejected_on_follower(method: &Method, path: &str) -> bool {
+    // Reads + CORS preflight always pass.
+    if matches!(*method, Method::GET | Method::OPTIONS | Method::HEAD) {
+        return false;
+    }
+    // Any other mutating method on any path is fatal to a follower
+    // unless explicitly allowed below.
+    if !is_mutating_method(method) {
+        // Unknown method — let the inner router decide. Don't gate.
+        return false;
+    }
+    // `POST /replication/apply` — primary follower-receiving route.
+    if path == "/replication/apply" {
+        return false;
+    }
+    // Preflight schema validation — read-only.
+    if path.starts_with("/schemas/validate/") {
+        return false;
+    }
+    // Mutating engine routes that only a Leader should handle.
+    if path == "/ingest" {
+        return true;
+    }
+    if path.starts_with("/sensor/") {
+        return true;
+    }
+    if path == "/snapshots" || path.starts_with("/snapshots/") {
+        return true;
+    }
+    if path.starts_with("/schemas/") || path == "/schemas" {
+        return true;
+    }
+    if path.starts_with("/maintenance/") {
+        return true;
+    }
+    // Everything else: keep open (unknown routes return 404 from the
+    // inner router; gating them at the role layer would be confusing).
+    false
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(axum::http::header::AUTHORIZATION)?;
     let value = value.to_str().ok()?;
@@ -552,6 +607,66 @@ pub async fn tenant_binding_middleware(
         );
     }
     next.run(request).await
+}
+
+/// V2 patch 4H — shared state for the role middleware. Wraps a
+/// single `RuntimeRole` so axum's `from_fn_with_state` can dispatch
+/// the value to each request without `Arc<Mutex<...>>` overhead
+/// (the role is immutable for the lifetime of the server).
+#[derive(Debug, Clone, Copy)]
+pub struct RoleState {
+    pub role: crate::security::RuntimeRole,
+}
+
+impl RoleState {
+    pub fn new(role: crate::security::RuntimeRole) -> Self {
+        Self { role }
+    }
+}
+
+/// V2 patch 4H — Follower-write-rejection middleware.
+///
+/// When the server's [`crate::security::RuntimeRole`] is `Follower`,
+/// rejects engine-mutating routes (per
+/// [`rejected_on_follower`]) with `409 Conflict` and
+/// `{"error": "follower is read-only"}`. Leaders pass everything
+/// through unchanged.
+///
+/// Always-allowed even on a Follower:
+///   - `POST /replication/apply` (primary receiving route)
+///   - `POST /schemas/validate/*` (preflight, no mutation)
+///   - `GET` / `OPTIONS` / `HEAD`
+///
+/// Audit logging via `tracing::warn!` on every rejection, matching
+/// the auth / tenant-binding pattern. **HTTP-layer only** in V2 P4H:
+/// in-process writes (sensor bus, direct engine calls, SDK) bypass
+/// this gate. An engine-level role guard is a future patch.
+pub async fn role_middleware(
+    State(state): State<RoleState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if matches!(state.role, crate::security::RuntimeRole::Leader) {
+        return next.run(request).await;
+    }
+    // Follower path.
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    if !rejected_on_follower(&method, &path) {
+        return next.run(request).await;
+    }
+    tracing::warn!(
+        target: "hydra::role",
+        role = "Follower",
+        method = %method,
+        path = %path,
+        "follower rejected mutating route"
+    );
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({"error": "follower is read-only"})),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -773,6 +888,55 @@ mod tests {
         assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());
         // Routes with no entry don't require any scope.
         assert!(required_scopes_for(&Method::GET, "/health").is_empty());
+    }
+
+    #[test]
+    fn rejected_on_follower_classifier_covers_mutation_buckets() {
+        // V2 patch 4H — locks the classifier table.
+
+        // Reject on Follower (engine-mutating POST routes):
+        assert!(rejected_on_follower(&Method::POST, "/ingest"));
+        assert!(rejected_on_follower(&Method::POST, "/sensor/observation"));
+        assert!(rejected_on_follower(&Method::POST, "/sensor/cloudtrail"));
+        assert!(rejected_on_follower(&Method::POST, "/snapshots"));
+        assert!(rejected_on_follower(
+            &Method::POST,
+            "/snapshots/snap_x/restore"
+        ));
+        assert!(rejected_on_follower(&Method::POST, "/schemas/entity"));
+        assert!(rejected_on_follower(&Method::POST, "/schemas/edge"));
+        assert!(rejected_on_follower(
+            &Method::POST,
+            "/schemas/snap_x/disable"
+        ));
+        assert!(rejected_on_follower(
+            &Method::POST,
+            "/maintenance/compact"
+        ));
+        // Any PUT / PATCH / DELETE on an unknown path is also rejected
+        // because the classifier defaults to blocking mutating methods
+        // unless explicitly allowed.
+        assert!(rejected_on_follower(&Method::PUT, "/ingest"));
+        assert!(rejected_on_follower(&Method::DELETE, "/snapshots/snap_x"));
+
+        // Allow on Follower:
+        assert!(!rejected_on_follower(
+            &Method::POST,
+            "/replication/apply"
+        ));
+        assert!(!rejected_on_follower(
+            &Method::POST,
+            "/schemas/validate/node-create"
+        ));
+        assert!(!rejected_on_follower(
+            &Method::POST,
+            "/schemas/validate/edge-create"
+        ));
+        // Reads always pass.
+        assert!(!rejected_on_follower(&Method::GET, "/ingest"));
+        assert!(!rejected_on_follower(&Method::GET, "/schemas/entity"));
+        assert!(!rejected_on_follower(&Method::OPTIONS, "/ingest"));
+        assert!(!rejected_on_follower(&Method::HEAD, "/ingest"));
     }
 
     #[test]

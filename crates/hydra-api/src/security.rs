@@ -55,6 +55,30 @@ pub enum RateLimitMode {
     },
 }
 
+/// V2 patch 4H — node role in the replication cluster.
+///
+/// `Leader` (default) accepts every route — pre-4H behavior.
+/// `Follower` rejects engine-mutating POST/PUT/PATCH/DELETE routes
+/// with `409 Conflict` ({"error": "follower is read-only"}). The
+/// follower still accepts `POST /replication/apply` (its primary
+/// receiving route) and `POST /schemas/validate/*` (preflight, no
+/// mutation), plus all `GET`/`OPTIONS`.
+///
+/// Enforcement is **HTTP-layer only** in this patch. In-process
+/// writes (sensor bus, direct engine calls, SDK) bypass the role
+/// check; an engine-level role guard is a future hardening patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeRole {
+    Leader,
+    Follower,
+}
+
+impl Default for RuntimeRole {
+    fn default() -> Self {
+        Self::Leader
+    }
+}
+
 /// Unified server-security bundle. Construct via [`Self::off`],
 /// [`Self::with_auth`], or by building the struct directly when more
 /// than one knob needs to be set.
@@ -63,6 +87,9 @@ pub struct ServerSecurityConfig {
     pub auth: AuthConfig,
     pub tls: Option<TlsConfig>,
     pub rate_limit: RateLimitMode,
+    /// V2 patch 4H — runtime role gate. Defaults to `Leader`
+    /// (pre-4H behavior).
+    pub role: RuntimeRole,
 }
 
 impl ServerSecurityConfig {
@@ -73,6 +100,7 @@ impl ServerSecurityConfig {
             auth: AuthConfig::off(),
             tls: None,
             rate_limit: RateLimitMode::Off,
+            role: RuntimeRole::Leader,
         }
     }
 
@@ -84,6 +112,7 @@ impl ServerSecurityConfig {
             auth,
             tls: None,
             rate_limit: RateLimitMode::Off,
+            role: RuntimeRole::Leader,
         }
     }
 
@@ -104,6 +133,14 @@ impl ServerSecurityConfig {
     /// for the chaining pattern.
     pub fn with_rate_limit(mut self, rate_limit: RateLimitMode) -> Self {
         self.rate_limit = rate_limit;
+        self
+    }
+
+    /// V2 patch 4H — set the runtime role (Leader / Follower).
+    /// `Follower` gates engine-mutating POST/PUT/PATCH/DELETE
+    /// routes with `409 Conflict`. See [`RuntimeRole`].
+    pub fn with_role(mut self, role: RuntimeRole) -> Self {
+        self.role = role;
         self
     }
 }

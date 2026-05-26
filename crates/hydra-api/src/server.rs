@@ -2,9 +2,12 @@
 //!
 //! Axum server with all routes, CORS, security middleware.
 
-use crate::auth::{auth_middleware, tenant_binding_middleware, AuthConfig, AuthState};
+use crate::auth::{
+    auth_middleware, role_middleware, tenant_binding_middleware, AuthConfig, AuthState,
+    RoleState,
+};
 use crate::routes;
-use crate::security::{RateLimitMode, ServerSecurityConfig};
+use crate::security::{RateLimitMode, RuntimeRole, ServerSecurityConfig};
 use crate::state::AppState;
 use axum::http::{header, HeaderValue, Method};
 use axum::middleware;
@@ -79,8 +82,12 @@ pub fn build_router_with_auth(runtime: RuntimeHandle, auth: AuthConfig) -> Route
 /// **Layer order** for inbound requests:
 ///
 /// ```text
-///   request → rate-limit → auth → tenant-binding → CORS → handler
+///   request → rate-limit → auth → tenant-binding → role → CORS → handler
 /// ```
+///
+/// `role` (V2 patch 4H) rejects engine-mutating routes on Follower
+/// nodes with `409 Conflict`. Skipped entirely on Leader (the
+/// default).
 ///
 /// In axum, the LAST `.layer()` call is the outermost (wraps everything
 /// before it). To get the order above, layer CORS first (innermost),
@@ -103,6 +110,19 @@ pub fn build_router_with_security(
         .merge(replication_router(runtime.clone()))
         .merge(snapshots_router(runtime))
         .layer(cors_layer());
+
+    // V2 patch 4H — role layer. On Followers, rejects engine-mutating
+    // routes with 409. Layered AFTER CORS and BEFORE tenant_binding /
+    // auth so the request flow on a Follower is:
+    //   rate-limit → auth → tenant-binding → role → CORS → handler
+    // Skipped entirely on Leader (the default) to keep the existing
+    // hot path unchanged.
+    if matches!(security.role, RuntimeRole::Follower) {
+        app = app.layer(middleware::from_fn_with_state(
+            RoleState::new(security.role),
+            role_middleware,
+        ));
+    }
 
     if security.auth.is_enabled() {
         // auth → tenant_binding → handler (see the comment block at
@@ -1810,6 +1830,7 @@ mod tests {
                     per_second: 1,
                     burst: 2,
                 },
+                role: RuntimeRole::Leader,
             },
         );
         // One request fits comfortably in burst=2.
@@ -1832,6 +1853,7 @@ mod tests {
                     per_second: 1,
                     burst: 1,
                 },
+                role: RuntimeRole::Leader,
             },
         );
         let peer = test_peer();
@@ -1866,6 +1888,7 @@ mod tests {
                     per_second: 1,
                     burst: 1,
                 },
+                role: RuntimeRole::Leader,
             },
         );
         let peer_a: std::net::SocketAddr = "127.0.0.1:50100".parse().unwrap();
@@ -1893,6 +1916,7 @@ mod tests {
                 auth: AuthConfig::require_for_mutations(["secret-token"]),
                 tls: None,
                 rate_limit: RateLimitMode::Off,
+                role: RuntimeRole::Leader,
             },
         );
         let request = Request::builder()
@@ -1926,6 +1950,7 @@ mod tests {
                 )]),
                 tls: None,
                 rate_limit: RateLimitMode::Off,
+                role: RuntimeRole::Leader,
             },
         );
         let response = app
@@ -1970,6 +1995,7 @@ mod tests {
                 key_path: "/nowhere/key.pem".into(),
             }),
             rate_limit: RateLimitMode::Off,
+            role: RuntimeRole::Leader,
         };
         let result = serve_with_security(runtime, "127.0.0.1:0", bad).await;
         assert!(result.is_err());
@@ -2096,5 +2122,174 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // === V2 patch 4H — Follower write rejection ===
+
+    fn follower_router(runtime: RuntimeHandle) -> Router {
+        build_router_with_security(
+            runtime,
+            ServerSecurityConfig::off().with_role(RuntimeRole::Follower),
+        )
+    }
+
+    fn post(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    #[tokio::test]
+    async fn follower_rejects_post_ingest_with_409() {
+        let runtime = test_runtime();
+        let app = follower_router(runtime.clone());
+        let response = app
+            .oneshot(post(
+                "/ingest",
+                serde_json::json!({
+                    "kind": "Signal",
+                    "name": "test",
+                    "source": "node_x",
+                    "payload": {}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert_eq!(body, serde_json::json!({"error": "follower is read-only"}));
+        // Engine was never reached.
+        assert_eq!(runtime.hydra().read().await.commit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn follower_rejects_post_schemas_register() {
+        let runtime = test_runtime();
+        let app = follower_router(runtime);
+        let response = app
+            .oneshot(post(
+                "/schemas/entity",
+                serde_json::json!({
+                    "type_id": "type_invoice",
+                    "name": "Invoice",
+                    "fields": []
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert_eq!(body, serde_json::json!({"error": "follower is read-only"}));
+    }
+
+    #[tokio::test]
+    async fn follower_accepts_post_replication_apply() {
+        // POST /replication/apply must NOT be 409 on a Follower — this
+        // is the route the Follower receives data on. Empty commits
+        // returns 200 with applied_count=0; what we assert is "not 409".
+        let runtime = test_runtime();
+        let app = follower_router(runtime);
+        let response = app
+            .oneshot(post(
+                "/replication/apply",
+                serde_json::json!({
+                    "peer_id": "replica_some_leader",
+                    "commits": []
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "/replication/apply must NOT be 409-blocked on a follower"
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn follower_accepts_post_schemas_validate() {
+        // Preflight validation is read-only — must remain available
+        // on followers so SDKs can preflight against any node.
+        let runtime = test_runtime();
+        let app = follower_router(runtime);
+        let response = app
+            .oneshot(post(
+                "/schemas/validate/node-create",
+                serde_json::json!({
+                    "type_id": "type_unknown",
+                    "properties": {}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "preflight validate must not be 409-blocked on follower"
+        );
+        // The validator returns 200 with a `ValidationResponse`
+        // regardless of whether the type is known.
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn leader_accepts_all_post_routes() {
+        // Default config (role = Leader) — same POST routes return
+        // their normal codes, NEVER 409. Verifies the role layer is
+        // skipped on Leader so the existing hot path is untouched.
+        let runtime = test_runtime();
+        let app = build_router_with_security(runtime, ServerSecurityConfig::off());
+
+        let ingest = app
+            .clone()
+            .oneshot(post(
+                "/ingest",
+                serde_json::json!({
+                    "kind": "Signal",
+                    "name": "test",
+                    "source": "node_x",
+                    "payload": {}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(ingest.status(), StatusCode::CONFLICT);
+
+        let schemas = app
+            .clone()
+            .oneshot(post(
+                "/schemas/entity",
+                serde_json::json!({
+                    "type_id": "type_x",
+                    "name": "X",
+                    "fields": []
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(schemas.status(), StatusCode::CONFLICT);
+
+        let apply = app
+            .oneshot(post(
+                "/replication/apply",
+                serde_json::json!({
+                    "peer_id": "replica_x",
+                    "commits": []
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(apply.status(), StatusCode::CONFLICT);
     }
 }
