@@ -23,11 +23,12 @@
 //! unchanged. Failure classification is the looping worker's job.
 
 use crate::http::replication::{
-    ApplyReplicationRequest, ReplicationCommitPage,
+    ApplyReplicationRequest, ReplicationCommitPage, ReplicationSnapshotBodyResponse,
+    ReplicationSnapshotManifestResponse,
 };
 use crate::runtime::RuntimeHandle;
 use hydra_core::error::{HydraError, Result};
-use hydra_core::ReplicaId;
+use hydra_core::{ActorId, CommitBatch, ReplicaId, SnapshotId};
 
 /// Configuration for a single-shot replication pull.
 ///
@@ -40,13 +41,19 @@ use hydra_core::ReplicaId;
 /// leader's `pagination::normalized_limit` clamps to `MAX_LIMIT = 500`,
 /// so callers can pass any value safely.
 ///
-/// **No `poll_interval` yet.** It belongs with the loop driver in 4B/4C.
+/// **No `poll_interval` yet.** It belongs with the loop driver in 4C.
+///
+/// `restored_by` is the audit `ActorId` attached when bootstrap calls
+/// `Hydra::recover_from_snapshot_body_and_replay` — typically a stable
+/// per-deployment id like `actor_replica_acme_restorer`. Required at
+/// config construction so audit attribution is explicit (V2 patch 4B).
 #[derive(Debug, Clone)]
 pub struct ReplicationPullerConfig {
     pub peer_id: ReplicaId,
     pub leader_base_url: String,
     pub auth_token: Option<String>,
     pub page_limit: usize,
+    pub restored_by: ActorId,
 }
 
 /// Follower-side replication puller. Owns a clone of `RuntimeHandle`
@@ -133,32 +140,8 @@ impl ReplicationPuller {
                 .unwrap_or(0)
         };
 
-        // 2. GET leader /replication/commits with normalized base URL
-        //    (avoids `//replication` when the caller includes a trailing
-        //    slash on the base).
-        let base = self.config.leader_base_url.trim_end_matches('/');
-        let url = format!("{base}/replication/commits");
-        let mut request = self.client.get(&url).query(&[
-            ("after_sequence", local_head.to_string()),
-            ("limit", self.config.page_limit.to_string()),
-        ]);
-        if let Some(token) = &self.config.auth_token {
-            request = request.bearer_auth(token);
-        }
-
-        let response = request.send().await.map_err(|err| {
-            HydraError::QueryError(format!("leader request failed: {err}"))
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(HydraError::QueryError(format!(
-                "leader request failed: HTTP {status}"
-            )));
-        }
-        let page: ReplicationCommitPage = response.json().await.map_err(|err| {
-            HydraError::QueryError(format!("leader request failed: decode {err}"))
-        })?;
-
+        // 2. Single page from the leader (shared with bootstrap tail loop).
+        let page = self.fetch_commit_page(local_head).await?;
         let fetched_count = page.commits.len();
 
         // 3. Empty page → no-op. Still carry leader's head info forward
@@ -201,6 +184,207 @@ impl ReplicationPuller {
     pub fn peer_id(&self) -> &ReplicaId {
         &self.config.peer_id
     }
+
+    /// V2 patch 4B — bootstrap from the leader's latest snapshot, then
+    /// apply every commit page after the snapshot until caught up.
+    ///
+    /// Algorithm:
+    ///   1. `GET /replication/snapshot/latest` → manifest or `null`
+    ///   2. `None` → fall back to `pull_once()` (handles the
+    ///      "fresh leader with no snapshots" case cleanly)
+    ///   3. `GET /replication/snapshot/:id` → `SnapshotBody`. Manifest
+    ///      present but body missing is a leader bug — return error.
+    ///   4. Fetch ALL tail commit pages starting from
+    ///      `manifest.sequence`. Loop until `next_after_sequence` is
+    ///      `None`. Defensive: also break on an empty page even when
+    ///      `next_after_sequence == Some(_)`, so a misbehaving leader
+    ///      can't induce an infinite loop.
+    ///   5. `runtime.hydra().write()` → `recover_from_snapshot_body_and_replay`
+    ///      with the body + collected tail. The engine method filters
+    ///      `batch.sequence > snapshot_sequence` and sorts internally.
+    ///   6. Build report.
+    ///
+    /// Returns `ReplicationBootstrapReport`. Bootstrap leaves the
+    /// follower caught up to the leader's STATE (graph, event log,
+    /// stores) as of the final tail page. New commits that landed
+    /// during bootstrap require a subsequent `pull_once`.
+    ///
+    /// **Commit ledger note (engine behavior)**:
+    /// `Hydra::recover_from_snapshot_body_and_replay` resets the
+    /// follower's commit ledger before replaying events and then
+    /// commits a single `SnapshotRestored` audit event. So the
+    /// follower's local `latest_sequence` after bootstrap is `1` (the
+    /// audit commit), NOT the leader's head sequence. The event log
+    /// carries the full restored state; the commit chain effectively
+    /// restarts from the bootstrap moment. A naive `pull_once` after
+    /// bootstrap that requests `after_sequence=1` will hit a
+    /// `previous_hash` mismatch against the leader's chain — fixing
+    /// the chain-reset story is a follow-up (likely tied to runtime
+    /// role config or a leader/follower chain-handshake step).
+    pub async fn bootstrap_from_latest_snapshot(
+        &self,
+    ) -> Result<ReplicationBootstrapReport> {
+        // 1. Fetch the latest manifest.
+        let manifest_response: ReplicationSnapshotManifestResponse =
+            self.fetch_snapshot_latest().await?;
+
+        // 2. No snapshot on leader → pull_once fallback.
+        let Some(manifest) = manifest_response.manifest else {
+            let pull = self.pull_once().await?;
+            return Ok(ReplicationBootstrapReport {
+                peer_id: pull.peer_id,
+                snapshot_id: None,
+                snapshot_sequence: None,
+                replayed_commits: pull.applied_count,
+                latest_sequence: pull.latest_sequence,
+            });
+        };
+
+        // 3. Fetch the body. Leader returning 404 here is a bug
+        //    (manifest claimed the body existed) — surface as error.
+        let body_response: ReplicationSnapshotBodyResponse =
+            self.fetch_snapshot_body(&manifest.id).await?;
+        let body = body_response.body;
+        let snapshot_sequence = manifest.sequence;
+
+        // 4. Fetch all tail pages. Defensive: bail on empty page even
+        //    if `next_after_sequence` is Some, to guard against a
+        //    misbehaving leader.
+        let mut tail: Vec<CommitBatch> = Vec::new();
+        let mut cursor = snapshot_sequence;
+        loop {
+            let page = self.fetch_commit_page(cursor).await?;
+            if page.commits.is_empty() {
+                break;
+            }
+            // Update cursor BEFORE moving the commits out, so we use
+            // the leader's response to decide the next request.
+            let next = page.next_after_sequence;
+            tail.extend(page.commits);
+            match next {
+                Some(seq) => cursor = seq,
+                None => break,
+            }
+        }
+
+        // 5. Acquire write lock and recover. Engine filters/sorts internally.
+        let manifest_applied = {
+            let hydra = self.runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.recover_from_snapshot_body_and_replay(
+                body,
+                tail.clone(),
+                self.config.restored_by.clone(),
+            )?
+        };
+
+        let replayed_commits = tail.len();
+        let latest_sequence = {
+            let hydra = self.runtime.hydra();
+            let hydra = hydra.read().await;
+            hydra.latest_commit().map(|r| r.sequence)
+        };
+
+        Ok(ReplicationBootstrapReport {
+            peer_id: self.config.peer_id.clone(),
+            snapshot_id: Some(manifest_applied.id),
+            snapshot_sequence: Some(snapshot_sequence),
+            replayed_commits,
+            latest_sequence,
+        })
+    }
+
+    /// Shared paging helper used by both `pull_once` and the bootstrap
+    /// tail loop. Builds the URL, attaches the Bearer token, decodes a
+    /// `ReplicationCommitPage`. All errors surface as `QueryError`.
+    async fn fetch_commit_page(
+        &self,
+        after_sequence: u64,
+    ) -> Result<ReplicationCommitPage> {
+        let base = self.config.leader_base_url.trim_end_matches('/');
+        let url = format!("{base}/replication/commits");
+        let mut request = self.client.get(&url).query(&[
+            ("after_sequence", after_sequence.to_string()),
+            ("limit", self.config.page_limit.to_string()),
+        ]);
+        if let Some(token) = &self.config.auth_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|err| {
+            HydraError::QueryError(format!("leader request failed: {err}"))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(HydraError::QueryError(format!(
+                "leader request failed: HTTP {status}"
+            )));
+        }
+        response.json().await.map_err(|err| {
+            HydraError::QueryError(format!("leader request failed: decode {err}"))
+        })
+    }
+
+    async fn fetch_snapshot_latest(
+        &self,
+    ) -> Result<ReplicationSnapshotManifestResponse> {
+        let base = self.config.leader_base_url.trim_end_matches('/');
+        let url = format!("{base}/replication/snapshot/latest");
+        let mut request = self.client.get(&url);
+        if let Some(token) = &self.config.auth_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|err| {
+            HydraError::QueryError(format!("leader request failed: {err}"))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(HydraError::QueryError(format!(
+                "leader request failed: HTTP {status}"
+            )));
+        }
+        response.json().await.map_err(|err| {
+            HydraError::QueryError(format!("leader request failed: decode {err}"))
+        })
+    }
+
+    async fn fetch_snapshot_body(
+        &self,
+        id: &SnapshotId,
+    ) -> Result<ReplicationSnapshotBodyResponse> {
+        let base = self.config.leader_base_url.trim_end_matches('/');
+        let url = format!("{base}/replication/snapshot/{id}");
+        let mut request = self.client.get(&url);
+        if let Some(token) = &self.config.auth_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|err| {
+            HydraError::QueryError(format!("leader request failed: {err}"))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(HydraError::QueryError(format!(
+                "leader request failed: HTTP {status}"
+            )));
+        }
+        response.json().await.map_err(|err| {
+            HydraError::QueryError(format!("leader request failed: decode {err}"))
+        })
+    }
+}
+
+/// V2 patch 4B — outcome of `ReplicationPuller::bootstrap_from_latest_snapshot`.
+///
+/// `snapshot_id` and `snapshot_sequence` are `None` when the leader had
+/// no snapshot and the puller fell back to `pull_once`. In that case
+/// `replayed_commits` reflects the applied-count from the fallback
+/// pull. `latest_sequence` is the follower's local head after bootstrap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplicationBootstrapReport {
+    pub peer_id: ReplicaId,
+    pub snapshot_id: Option<SnapshotId>,
+    pub snapshot_sequence: Option<u64>,
+    pub replayed_commits: usize,
+    pub latest_sequence: Option<u64>,
 }
 
 /// Helper builder for the `ApplyReplicationRequest` shape — exposed so
@@ -246,6 +430,10 @@ mod tests {
         ReplicaId::from_str("replica_puller_test")
     }
 
+    fn restorer() -> ActorId {
+        ActorId::from_str("actor_test_restorer")
+    }
+
     /// Spawn `axum::serve(listener, router)` bound to 127.0.0.1:0 and
     /// return both the assigned address and the task handle. The
     /// handle is dropped at the end of each test, killing the server.
@@ -272,6 +460,7 @@ mod tests {
                 leader_base_url: format!("http://{addr}"),
                 auth_token: None,
                 page_limit: 100,
+                restored_by: restorer(),
             },
         );
 
@@ -309,6 +498,7 @@ mod tests {
                 leader_base_url: format!("http://{addr}/"), // intentional trailing slash
                 auth_token: None,
                 page_limit: 100,
+                restored_by: restorer(),
             },
         );
 
@@ -367,6 +557,7 @@ mod tests {
                 leader_base_url: format!("http://{addr}"),
                 auth_token: Some("alpha".to_string()),
                 page_limit: 100,
+                restored_by: restorer(),
             },
         );
         let report = puller.pull_once().await.unwrap();
@@ -414,6 +605,7 @@ mod tests {
                 leader_base_url: format!("http://{addr}"),
                 auth_token: None,
                 page_limit: 100,
+                restored_by: restorer(),
             },
         );
         // Follower's head is at seq=1 (its own local commit). It asks
@@ -432,5 +624,248 @@ mod tests {
             follower_runtime.hydra().read().await.commit_count(),
             1
         );
+    }
+
+    // === V2 patch 4B — bootstrap_from_latest_snapshot ===
+
+    #[tokio::test]
+    async fn bootstrap_no_snapshot_falls_back_to_pull_once() {
+        // Leader has commits but no snapshot. Bootstrap must fall back
+        // to `pull_once` and apply the commits to the follower.
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("one")).unwrap();
+            hydra.ingest(signal("two")).unwrap();
+        }
+        let leader_commit_count = leader_runtime.hydra().read().await.commit_count();
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let puller = ReplicationPuller::new(
+            follower_runtime.clone(),
+            ReplicationPullerConfig {
+                peer_id: follower_peer_id(),
+                leader_base_url: format!("http://{addr}"),
+                auth_token: None,
+                page_limit: 100,
+                restored_by: restorer(),
+            },
+        );
+
+        let report = puller.bootstrap_from_latest_snapshot().await.unwrap();
+        assert!(report.snapshot_id.is_none());
+        assert!(report.snapshot_sequence.is_none());
+        assert_eq!(report.replayed_commits, leader_commit_count);
+        assert_eq!(report.latest_sequence, Some(leader_commit_count as u64));
+        // Follower mirrors the leader.
+        assert_eq!(
+            follower_runtime.hydra().read().await.commit_count(),
+            leader_commit_count
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_from_snapshot_restores_follower() {
+        // Leader: ingest "before", snapshot, ingest "after". The
+        // follower bootstraps from the snapshot and replays the tail.
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        let leader_commit_count;
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("before")).unwrap();
+            hydra
+                .snapshot(ActorId::from_str("actor_snapshot"))
+                .unwrap();
+            hydra.ingest(signal("after")).unwrap();
+            leader_commit_count = hydra.commit_count();
+        }
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let puller = ReplicationPuller::new(
+            follower_runtime.clone(),
+            ReplicationPullerConfig {
+                peer_id: follower_peer_id(),
+                leader_base_url: format!("http://{addr}"),
+                auth_token: None,
+                page_limit: 100,
+                restored_by: restorer(),
+            },
+        );
+
+        let report = puller.bootstrap_from_latest_snapshot().await.unwrap();
+        assert!(report.snapshot_id.is_some());
+        assert!(report.snapshot_sequence.is_some());
+        // NOTE: `recover_from_snapshot_body_and_replay` resets the
+        // follower's commit ledger before replaying events, then
+        // commits a `SnapshotRestored` audit event. So the follower's
+        // local `latest_sequence` after bootstrap is 1 (the audit
+        // commit), NOT the leader's head. The event log carries the
+        // full restored state. This is honest engine behavior;
+        // documented on `bootstrap_from_latest_snapshot` itself.
+        assert_eq!(report.latest_sequence, Some(1));
+        let _ = leader_commit_count;
+
+        // The follower's events include BOTH "before" (replayed
+        // from the snapshot body) and "after" (replayed from the tail).
+        let follower = follower_runtime.hydra();
+        let follower = follower.read().await;
+        let signal_names: Vec<String> = follower
+            .events()
+            .into_iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::Signal { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            signal_names.contains(&"before".to_string()),
+            "follower must replay before-snapshot events: {:?}",
+            signal_names
+        );
+        assert!(
+            signal_names.contains(&"after".to_string()),
+            "follower must replay post-snapshot tail events: {:?}",
+            signal_names
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_fetches_all_tail_pages() {
+        // Leader: ingest "before" → snapshot → ingest 3 more signals.
+        // page_limit=2 means the tail must be fetched in at least 2
+        // pages. The bootstrap should still arrive at a fully caught
+        // up follower.
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        let leader_commit_count;
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("before")).unwrap();
+            hydra
+                .snapshot(ActorId::from_str("actor_snapshot"))
+                .unwrap();
+            hydra.ingest(signal("after_one")).unwrap();
+            hydra.ingest(signal("after_two")).unwrap();
+            hydra.ingest(signal("after_three")).unwrap();
+            leader_commit_count = hydra.commit_count();
+        }
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let puller = ReplicationPuller::new(
+            follower_runtime.clone(),
+            ReplicationPullerConfig {
+                peer_id: follower_peer_id(),
+                leader_base_url: format!("http://{addr}"),
+                auth_token: None,
+                page_limit: 2, // force multi-page pagination
+                restored_by: restorer(),
+            },
+        );
+
+        let report = puller.bootstrap_from_latest_snapshot().await.unwrap();
+        // The exact replayed_commits count depends on engine internals
+        // (snapshot() itself ingests a SnapshotTaken commit), but the
+        // follower MUST have replayed more commits than fit in a single
+        // page_limit=2 page — that's the multi-page proof.
+        assert!(
+            report.replayed_commits > 2,
+            "expected >2 tail commits for multi-page test, got {}",
+            report.replayed_commits
+        );
+        let _ = leader_commit_count;
+
+        // All three post-snapshot signals are visible on the follower.
+        let follower = follower_runtime.hydra();
+        let follower = follower.read().await;
+        let signal_names: Vec<String> = follower
+            .events()
+            .into_iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::Signal { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        for name in ["after_one", "after_two", "after_three"] {
+            assert!(
+                signal_names.contains(&name.to_string()),
+                "follower missing {name}: got {:?}",
+                signal_names
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct BrokenLeaderState {
+        manifest: hydra_core::SnapshotManifest,
+    }
+
+    async fn broken_leader_latest(
+        State(state): State<BrokenLeaderState>,
+    ) -> impl IntoResponse {
+        Json(ReplicationSnapshotManifestResponse {
+            manifest: Some(state.manifest.clone()),
+        })
+    }
+
+    async fn broken_leader_body() -> impl IntoResponse {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(crate::http::replication::ErrorResponse {
+                error: "snapshot body lost".to_string(),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn bootstrap_errors_on_missing_snapshot_body() {
+        // Fabricated leader: /latest returns a real manifest, /:id
+        // returns 404. Proves the puller surfaces the inconsistency
+        // as an error rather than silently swallowing.
+        let manifest = hydra_core::SnapshotManifest::committed(
+            hydra_core::SnapshotId::new(),
+            None,
+            5,
+            None,
+            None,
+            ActorId::from_str("actor_fake_snapshot"),
+            chrono::Utc::now(),
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        let router = Router::new()
+            .route(
+                "/replication/snapshot/latest",
+                get(broken_leader_latest),
+            )
+            .route(
+                "/replication/snapshot/:snapshot_id",
+                get(broken_leader_body),
+            )
+            .with_state(BrokenLeaderState { manifest });
+        let (addr, _server) = spawn_leader(router).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let puller = ReplicationPuller::new(
+            follower_runtime.clone(),
+            ReplicationPullerConfig {
+                peer_id: follower_peer_id(),
+                leader_base_url: format!("http://{addr}"),
+                auth_token: None,
+                page_limit: 100,
+                restored_by: restorer(),
+            },
+        );
+        let err = puller.bootstrap_from_latest_snapshot().await.unwrap_err();
+        assert!(
+            matches!(err, HydraError::QueryError(_)),
+            "expected QueryError, got {:?}",
+            err
+        );
+        // Follower untouched.
+        assert_eq!(follower_runtime.hydra().read().await.commit_count(), 0);
     }
 }

@@ -9,15 +9,23 @@
 //!
 //! Routes:
 //!
-//! - `GET  /replication/status`             — head + role + peers
-//! - `GET  /replication/commits`            — paged commit export
-//! - `GET  /replication/peers`              — all registered peers
-//! - `GET  /replication/peers/:peer_id`     — single peer, 404 on miss
-//! - `POST /replication/apply`              — V2 patch 3B: follower
+//! - `GET  /replication/status`               — head + role + peers
+//! - `GET  /replication/commits`              — paged commit export
+//! - `GET  /replication/peers`                — all registered peers
+//! - `GET  /replication/peers/:peer_id`       — single peer, 404 on miss
+//! - `POST /replication/apply`                — V2 patch 3B: follower
 //!   applies a leader-supplied page of committed batches. Body is
 //!   `ApplyReplicationRequest`. Validation failures map to 400 with
 //!   `{error: "..."}`. See `Hydra::apply_replication_commits` for
 //!   the validation contract.
+//! - `GET  /replication/snapshot/latest`      — V2 patch 4B: latest
+//!   snapshot manifest. Returns `{"manifest": null}` (200) when the
+//!   leader has no snapshots yet, so followers don't have to treat
+//!   "fresh leader" as an error.
+//! - `GET  /replication/snapshot/:snapshot_id` — V2 patch 4B: full
+//!   `SnapshotBody` for bootstrap. 404 on miss. These are
+//!   **replication-specific exports** — the admin `/snapshots/*`
+//!   surface stays separate so the two can evolve independently.
 //!
 //! Auth / tenant policy:
 //!
@@ -41,7 +49,8 @@ use axum::{
     Json, Router,
 };
 use hydra_core::{
-    CommitBatch, CommitId, ReplicaId, ReplicationPeer, ReplicationRole,
+    CommitBatch, CommitId, ReplicaId, ReplicationPeer, ReplicationRole, SnapshotBody,
+    SnapshotId, SnapshotManifest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +74,14 @@ pub fn replication_router(runtime: RuntimeHandle) -> Router {
         .route("/replication/peers", get(list_replication_peers))
         .route("/replication/peers/:peer_id", get(get_replication_peer))
         .route("/replication/apply", post(post_replication_apply))
+        .route(
+            "/replication/snapshot/latest",
+            get(get_replication_snapshot_latest),
+        )
+        .route(
+            "/replication/snapshot/:snapshot_id",
+            get(get_replication_snapshot_body),
+        )
         .with_state(ReplicationHttpState::new(runtime))
 }
 
@@ -146,6 +163,24 @@ pub struct ApplyReplicationResponse {
     pub applied_count: usize,
     pub latest_sequence: Option<u64>,
     pub latest_commit_id: Option<CommitId>,
+}
+
+/// V2 patch 4B — leader's latest snapshot manifest, used by follower
+/// bootstrap to decide whether to restore-then-tail-pull or fall back
+/// to commits-only.
+///
+/// `manifest` is `Option` so an empty leader returns 200 with
+/// `{"manifest": null}`, not 404 — "fresh leader" isn't an error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationSnapshotManifestResponse {
+    pub manifest: Option<SnapshotManifest>,
+}
+
+/// V2 patch 4B — full snapshot body for bootstrap. Returned only when
+/// the snapshot id resolves; missing ids → 404.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationSnapshotBodyResponse {
+    pub body: SnapshotBody,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +314,34 @@ async fn post_replication_apply(
         // as HydraError::QueryError; map uniformly to 400. Engine doesn't
         // need a dedicated error variant for replication-input failures.
         Err(err) => error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+async fn get_replication_snapshot_latest(
+    State(state): State<ReplicationHttpState>,
+) -> Response {
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
+    let manifest = hydra.latest_snapshot_manifest().cloned();
+    Json(ReplicationSnapshotManifestResponse { manifest }).into_response()
+}
+
+async fn get_replication_snapshot_body(
+    State(state): State<ReplicationHttpState>,
+    Path(snapshot_id): Path<String>,
+) -> Response {
+    let snapshot_id = SnapshotId::from_str(&snapshot_id);
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
+    match hydra.snapshot_body(&snapshot_id) {
+        Some(body) => Json(ReplicationSnapshotBodyResponse {
+            body: body.clone(),
+        })
+        .into_response(),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            format!("replication snapshot not found: {snapshot_id}"),
+        ),
     }
 }
 
@@ -574,5 +637,80 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let err: ErrorResponse = read_json(response).await;
         assert!(err.error.contains("sequence"), "got {}", err.error);
+    }
+
+    // === V2 patch 4B — snapshot bootstrap routes ===
+
+    #[tokio::test]
+    async fn replication_latest_snapshot_returns_none_when_empty() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = replication_router(runtime);
+        let response = app
+            .oneshot(empty_get("/replication/snapshot/latest"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationSnapshotManifestResponse = read_json(response).await;
+        assert!(decoded.manifest.is_none());
+    }
+
+    #[tokio::test]
+    async fn replication_latest_snapshot_returns_manifest_after_snapshot() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let snapshot_id;
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("seed")).unwrap();
+            let manifest = hydra
+                .snapshot(ActorId::from_str("actor_test_snapshot"))
+                .unwrap();
+            snapshot_id = manifest.id.clone();
+        }
+        let app = replication_router(runtime);
+        let response = app
+            .oneshot(empty_get("/replication/snapshot/latest"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationSnapshotManifestResponse = read_json(response).await;
+        let manifest = decoded.manifest.expect("manifest must be Some");
+        assert_eq!(manifest.id, snapshot_id);
+    }
+
+    #[tokio::test]
+    async fn replication_snapshot_body_returns_body() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let snapshot_id;
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("seed")).unwrap();
+            let manifest = hydra
+                .snapshot(ActorId::from_str("actor_test_snapshot"))
+                .unwrap();
+            snapshot_id = manifest.id.clone();
+        }
+        let app = replication_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!("/replication/snapshot/{snapshot_id}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationSnapshotBodyResponse = read_json(response).await;
+        assert_eq!(decoded.body.manifest.id, snapshot_id);
+        // Seed signal lives in the body events.
+        assert!(!decoded.body.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replication_snapshot_body_missing_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = replication_router(runtime);
+        let response = app
+            .oneshot(empty_get("/replication/snapshot/snap_does_not_exist"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
