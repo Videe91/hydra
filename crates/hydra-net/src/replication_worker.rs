@@ -29,6 +29,8 @@ use crate::http::replication::{
 use crate::runtime::RuntimeHandle;
 use hydra_core::error::{HydraError, Result};
 use hydra_core::{ActorId, CommitBatch, ReplicaId, SnapshotId};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Configuration for a single-shot replication pull.
 ///
@@ -41,12 +43,19 @@ use hydra_core::{ActorId, CommitBatch, ReplicaId, SnapshotId};
 /// leader's `pagination::normalized_limit` clamps to `MAX_LIMIT = 500`,
 /// so callers can pass any value safely.
 ///
-/// **No `poll_interval` yet.** It belongs with the loop driver in 4C.
-///
 /// `restored_by` is the audit `ActorId` attached when bootstrap calls
 /// `Hydra::recover_from_snapshot_body_and_replay` — typically a stable
 /// per-deployment id like `actor_replica_acme_restorer`. Required at
 /// config construction so audit attribution is explicit (V2 patch 4B).
+///
+/// `poll_interval` controls how often `run_until_cancelled` ticks
+/// between `pull_once` calls (V2 patch 4D). Defaults to 1s via `new`.
+///
+/// `bootstrap_on_start` decides whether `run_until_cancelled` does an
+/// initial `bootstrap_from_latest_snapshot` before entering the poll
+/// loop (V2 patch 4D). Default `true` — safe for fresh followers and
+/// for followers behind a compacted leader. Operators who know they
+/// are already caught up set it to `false` for cheaper startup.
 #[derive(Debug, Clone)]
 pub struct ReplicationPullerConfig {
     pub peer_id: ReplicaId,
@@ -54,6 +63,36 @@ pub struct ReplicationPullerConfig {
     pub auth_token: Option<String>,
     pub page_limit: usize,
     pub restored_by: ActorId,
+    pub poll_interval: Duration,
+    pub bootstrap_on_start: bool,
+}
+
+impl ReplicationPullerConfig {
+    /// Ergonomic constructor with sensible defaults:
+    /// `auth_token = None`, `page_limit = 100`,
+    /// `poll_interval = 1s`, `bootstrap_on_start = true`.
+    ///
+    /// Override individual fields after construction:
+    ///
+    /// ```ignore
+    /// let mut config = ReplicationPullerConfig::new(peer, url, restorer);
+    /// config.poll_interval = Duration::from_millis(250);
+    /// ```
+    pub fn new(
+        peer_id: ReplicaId,
+        leader_base_url: impl Into<String>,
+        restored_by: ActorId,
+    ) -> Self {
+        Self {
+            peer_id,
+            leader_base_url: leader_base_url.into(),
+            auth_token: None,
+            page_limit: 100,
+            restored_by,
+            poll_interval: Duration::from_secs(1),
+            bootstrap_on_start: true,
+        }
+    }
 }
 
 /// Follower-side replication puller. Owns a clone of `RuntimeHandle`
@@ -190,6 +229,78 @@ impl ReplicationPuller {
     /// Echo the configured `peer_id` — handy for tests and loggers.
     pub fn peer_id(&self) -> &ReplicaId {
         &self.config.peer_id
+    }
+
+    /// V2 patch 4D — drive the puller in a loop until `shutdown` fires.
+    ///
+    /// Behavior:
+    ///   1. **Pre-cancel short-circuit** — if `shutdown.is_cancelled()`
+    ///      already, return immediately with `iterations: 0,
+    ///      cancelled: true`. Useful when the shutdown signal raced
+    ///      construction.
+    ///   2. **Bootstrap** — if `config.bootstrap_on_start` is true,
+    ///      call `bootstrap_from_latest_snapshot` first and fold its
+    ///      `replayed_commits` into `total_applied`. Counts as one
+    ///      iteration. Bootstrap errors fail-fast (no retry yet).
+    ///   3. **Poll loop** — `select!` on `shutdown.cancelled()` versus
+    ///      `tokio::time::sleep(config.poll_interval)`. On a tick, run
+    ///      `pull_once` and fold its `fetched_count` / `applied_count`
+    ///      into running totals.
+    ///   4. **Cancellation** wins via `select!` — the report carries
+    ///      `cancelled: true`.
+    ///   5. **Errors fail-fast.** Any `pull_once` / bootstrap error
+    ///      surfaces as `Err(HydraError::QueryError(...))`. Retry,
+    ///      backoff, and transient-error classification are deferred.
+    pub async fn run_until_cancelled(
+        &self,
+        shutdown: CancellationToken,
+    ) -> Result<ReplicationLoopReport> {
+        let mut report = ReplicationLoopReport {
+            peer_id: self.config.peer_id.clone(),
+            iterations: 0,
+            total_fetched: 0,
+            total_applied: 0,
+            last_sequence: None,
+            cancelled: false,
+        };
+
+        // Pre-cancel — return without doing any IO. Operators using a
+        // graceful-shutdown path expect this when the shutdown signal
+        // arrives before the loop ever ticks.
+        if shutdown.is_cancelled() {
+            report.cancelled = true;
+            return Ok(report);
+        }
+
+        // Optional startup bootstrap.
+        if self.config.bootstrap_on_start {
+            let boot = self.bootstrap_from_latest_snapshot().await?;
+            report.iterations += 1;
+            report.total_applied += boot.replayed_commits;
+            if boot.latest_sequence.is_some() {
+                report.last_sequence = boot.latest_sequence;
+            }
+        }
+
+        // Poll loop. `select!` lets the shutdown token preempt the
+        // sleep without waiting for the full interval.
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    report.cancelled = true;
+                    return Ok(report);
+                }
+                _ = tokio::time::sleep(self.config.poll_interval) => {
+                    let pull = self.pull_once().await?;
+                    report.iterations += 1;
+                    report.total_fetched += pull.fetched_count;
+                    report.total_applied += pull.applied_count;
+                    if pull.latest_sequence.is_some() {
+                        report.last_sequence = pull.latest_sequence;
+                    }
+                }
+            }
+        }
     }
 
     /// V2 patch 4B — bootstrap from the leader's latest snapshot, then
@@ -419,6 +530,27 @@ pub struct ReplicationBootstrapReport {
     pub latest_sequence: Option<u64>,
 }
 
+/// V2 patch 4D — outcome of `ReplicationPuller::run_until_cancelled`.
+///
+/// `iterations` counts both the startup-bootstrap (when enabled) AND
+/// each completed poll-tick. `total_fetched` and `total_applied`
+/// accumulate across the whole loop. `last_sequence` is the most
+/// recent value returned by the leader (head sequence on pull, or
+/// follower head after bootstrap). `cancelled = true` means the
+/// shutdown token fired; `cancelled = false` cannot currently happen
+/// because the loop is otherwise infinite — but it is left as a
+/// field so a future "max iterations" exit condition has a place to
+/// land.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplicationLoopReport {
+    pub peer_id: ReplicaId,
+    pub iterations: u64,
+    pub total_fetched: usize,
+    pub total_applied: usize,
+    pub last_sequence: Option<u64>,
+    pub cancelled: bool,
+}
+
 /// Helper builder for the `ApplyReplicationRequest` shape — exposed so
 /// custom callers can hand-roll a one-off apply without instantiating
 /// the full puller. The puller itself doesn't use it (it goes engine-
@@ -493,6 +625,8 @@ mod tests {
                 auth_token: None,
                 page_limit: 100,
                 restored_by: restorer(),
+                poll_interval: Duration::from_millis(10),
+                bootstrap_on_start: false,
             },
         );
 
@@ -531,6 +665,8 @@ mod tests {
                 auth_token: None,
                 page_limit: 100,
                 restored_by: restorer(),
+                poll_interval: Duration::from_millis(10),
+                bootstrap_on_start: false,
             },
         );
 
@@ -590,6 +726,8 @@ mod tests {
                 auth_token: Some("alpha".to_string()),
                 page_limit: 100,
                 restored_by: restorer(),
+                poll_interval: Duration::from_millis(10),
+                bootstrap_on_start: false,
             },
         );
         let report = puller.pull_once().await.unwrap();
@@ -638,6 +776,8 @@ mod tests {
                 auth_token: None,
                 page_limit: 100,
                 restored_by: restorer(),
+                poll_interval: Duration::from_millis(10),
+                bootstrap_on_start: false,
             },
         );
         // Follower's head is at seq=1 (its own local commit). It asks
@@ -683,6 +823,8 @@ mod tests {
                 auth_token: None,
                 page_limit: 100,
                 restored_by: restorer(),
+                poll_interval: Duration::from_millis(10),
+                bootstrap_on_start: false,
             },
         );
 
@@ -725,6 +867,8 @@ mod tests {
                 auth_token: None,
                 page_limit: 100,
                 restored_by: restorer(),
+                poll_interval: Duration::from_millis(10),
+                bootstrap_on_start: false,
             },
         );
 
@@ -796,6 +940,8 @@ mod tests {
                 auth_token: None,
                 page_limit: 2, // force multi-page pagination
                 restored_by: restorer(),
+                poll_interval: Duration::from_millis(10),
+                bootstrap_on_start: false,
             },
         );
 
@@ -889,6 +1035,8 @@ mod tests {
                 auth_token: None,
                 page_limit: 100,
                 restored_by: restorer(),
+                poll_interval: Duration::from_millis(10),
+                bootstrap_on_start: false,
             },
         );
         let err = puller.bootstrap_from_latest_snapshot().await.unwrap_err();
@@ -938,6 +1086,8 @@ mod tests {
                 auth_token: None,
                 page_limit: 100,
                 restored_by: restorer(),
+                poll_interval: Duration::from_millis(10),
+                bootstrap_on_start: false,
             },
         );
 
@@ -1002,5 +1152,199 @@ mod tests {
                 names
             );
         }
+    }
+
+    // === V2 patch 4D — run_until_cancelled loop driver ===
+
+    /// Poll `condition` every 5ms up to `timeout`. Returns when the
+    /// condition is true; panics if it never is. Avoids both fixed
+    /// sleeps (flaky on slow CI) and tokio-util `time::timeout`
+    /// boilerplate.
+    async fn wait_until<F, Fut>(timeout: Duration, mut condition: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if condition().await {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("wait_until: condition never became true within {:?}", timeout);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn loop_config(
+        leader_base_url: String,
+        poll_interval: Duration,
+        bootstrap_on_start: bool,
+    ) -> ReplicationPullerConfig {
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            leader_base_url,
+            restorer(),
+        );
+        config.poll_interval = poll_interval;
+        config.bootstrap_on_start = bootstrap_on_start;
+        config
+    }
+
+    async fn follower_signal_count(runtime: &RuntimeHandle) -> usize {
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        hydra
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event.kind, EventKind::Signal { .. }))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn run_until_cancelled_stops_without_iterations_when_cancelled_before_start() {
+        // Pre-cancel — the loop must return immediately without any
+        // bootstrap or pull IO. No leader server needed.
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let puller = ReplicationPuller::new(
+            follower_runtime.clone(),
+            loop_config(
+                "http://127.0.0.1:1".to_string(), // unreachable, won't matter
+                Duration::from_millis(10),
+                true,
+            ),
+        );
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let report = puller.run_until_cancelled(token).await.unwrap();
+        assert!(report.cancelled);
+        assert_eq!(report.iterations, 0);
+        assert_eq!(report.total_fetched, 0);
+        assert_eq!(report.total_applied, 0);
+        // Follower untouched.
+        assert_eq!(follower_runtime.hydra().read().await.commit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_until_cancelled_bootstraps_on_start() {
+        // Leader has a snapshot to bootstrap from. Loop must run the
+        // bootstrap as its first iteration.
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("before")).unwrap();
+            hydra
+                .snapshot(ActorId::from_str("actor_snapshot"))
+                .unwrap();
+            hydra.ingest(signal("after")).unwrap();
+        }
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let puller = ReplicationPuller::new(
+            follower_runtime.clone(),
+            loop_config(format!("http://{addr}"), Duration::from_millis(50), true),
+        );
+        let token = CancellationToken::new();
+
+        // Cancel as soon as the follower has applied the bootstrap.
+        let token_clone = token.clone();
+        let runtime_clone = follower_runtime.clone();
+        let canceller = tokio::spawn(async move {
+            wait_until(Duration::from_secs(2), || async {
+                follower_signal_count(&runtime_clone).await >= 2
+            })
+            .await;
+            token_clone.cancel();
+        });
+
+        let report = puller.run_until_cancelled(token).await.unwrap();
+        canceller.await.unwrap();
+        assert!(report.cancelled);
+        assert!(report.iterations >= 1);
+        // Bootstrap brings BOTH "before" (snapshot body) and "after"
+        // (tail). Visible via the follower's event log.
+        assert_eq!(follower_signal_count(&follower_runtime).await, 2);
+    }
+
+    #[tokio::test]
+    async fn run_until_cancelled_polls_new_commits_until_cancelled() {
+        // bootstrap_on_start: false so the first iteration is a pull.
+        // Leader has one commit at start; mid-loop we ingest another;
+        // the loop must catch both before cancel.
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("one")).unwrap();
+        }
+        let leader_for_ingest = leader_runtime.clone();
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let puller = ReplicationPuller::new(
+            follower_runtime.clone(),
+            loop_config(format!("http://{addr}"), Duration::from_millis(10), false),
+        );
+        let token = CancellationToken::new();
+
+        let token_clone = token.clone();
+        let follower_clone = follower_runtime.clone();
+        let driver = tokio::spawn(async move {
+            // Wait for the first commit to land on follower.
+            wait_until(Duration::from_secs(2), || async {
+                follower_signal_count(&follower_clone).await >= 1
+            })
+            .await;
+            // Leader ingests a second.
+            {
+                let hydra = leader_for_ingest.hydra();
+                let mut hydra = hydra.write().await;
+                hydra.ingest(signal("two")).unwrap();
+            }
+            // Wait for the second to propagate.
+            wait_until(Duration::from_secs(2), || async {
+                follower_signal_count(&follower_clone).await >= 2
+            })
+            .await;
+            token_clone.cancel();
+        });
+
+        let report = puller.run_until_cancelled(token).await.unwrap();
+        driver.await.unwrap();
+        assert!(report.cancelled);
+        assert!(
+            report.total_applied >= 2,
+            "loop must have applied at least 2 commits; got {}",
+            report.total_applied
+        );
+        assert_eq!(follower_signal_count(&follower_runtime).await, 2);
+    }
+
+    #[tokio::test]
+    async fn run_until_cancelled_returns_error_on_bad_leader() {
+        // Point the puller at an unreachable URL. bootstrap_on_start
+        // is false so the first iteration is a pull_once; that fails
+        // immediately. The loop returns Err — no retry yet.
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let puller = ReplicationPuller::new(
+            follower_runtime,
+            loop_config(
+                // Use port 1 — reserved, will reject TCP connect.
+                "http://127.0.0.1:1".to_string(),
+                Duration::from_millis(10),
+                false,
+            ),
+        );
+        let token = CancellationToken::new();
+        let result = puller.run_until_cancelled(token).await;
+        assert!(
+            matches!(result, Err(HydraError::QueryError(_))),
+            "expected QueryError, got {:?}",
+            result
+        );
     }
 }

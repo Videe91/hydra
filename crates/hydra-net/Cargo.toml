@@ -29,6 +29,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # `ReplicationPuller`; the puller's `Once` only fires if no provider
 # is already installed.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# V2 patch 4D — `CancellationToken` for `run_until_cancelled`.
+# Default features include `sync::CancellationToken`; no extra
+# feature flags needed for the loop driver. `select!` waits on the
+# token alongside the poll-interval sleep.
+tokio-util = "0.7"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
