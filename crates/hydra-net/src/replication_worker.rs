@@ -26,6 +26,7 @@ use crate::http::replication::{
     ApplyReplicationRequest, ReplicationCommitPage, ReplicationSnapshotBodyResponse,
     ReplicationSnapshotManifestResponse,
 };
+use crate::metrics::MetricsRecorder;
 use crate::runtime::RuntimeHandle;
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
@@ -38,6 +39,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -308,6 +310,13 @@ pub struct ReplicationPullerConfig {
     /// `Duration::ZERO` disables debouncing — write on every pull
     /// (pre-polish behavior).
     pub heartbeat_debounce_interval: Duration,
+    /// V2 polish — optional metrics recorder. When set, the puller
+    /// emits counters and gauges on pull / bootstrap / failure
+    /// events via the [`MetricsRecorder`] trait. `None` means
+    /// no-op (zero overhead, no behavior change). See
+    /// `crate::metrics` for the trait + a built-in Prometheus text
+    /// recorder.
+    pub metrics: Option<Arc<dyn MetricsRecorder>>,
 }
 
 impl ReplicationPullerConfig {
@@ -340,6 +349,7 @@ impl ReplicationPullerConfig {
             cursor_path: None,
             heartbeat_path: None,
             heartbeat_debounce_interval: Duration::from_secs(30),
+            metrics: None,
         }
     }
 }
@@ -708,7 +718,17 @@ impl ReplicationPuller {
         //    recorded (V2 P4G — caught-up followers tick too).
         if page.commits.is_empty() {
             let lag = self.observe_lag(leader_head_sequence).await;
+            let follower_cursor = lag.follower_sequence;
+            let lag_commits = lag.lag_commits;
             self.record_heartbeat_with_lag(lag).await;
+            // V2 polish — metrics on the empty-page success branch.
+            self.record_pull_success(
+                fetched_count,
+                0,
+                leader_head_sequence,
+                follower_cursor,
+                lag_commits,
+            );
             return Ok(ReplicationPullReport {
                 peer_id: self.config.peer_id.clone(),
                 requested_after_sequence: local_head,
@@ -737,13 +757,24 @@ impl ReplicationPuller {
         // V2 patch 4G — record heartbeat AFTER the apply so the lag
         // reflects post-apply state (follower's cursor has advanced).
         let lag = self.observe_lag(leader_head_sequence).await;
+        let follower_cursor = lag.follower_sequence;
+        let lag_commits = lag.lag_commits;
+        let applied_count = report.applied_count;
         self.record_heartbeat_with_lag(lag).await;
+        // V2 polish — metrics on the successful-apply branch.
+        self.record_pull_success(
+            fetched_count,
+            applied_count,
+            leader_head_sequence,
+            follower_cursor,
+            lag_commits,
+        );
 
         Ok(ReplicationPullReport {
             peer_id: report.peer_id,
             requested_after_sequence: local_head,
             fetched_count,
-            applied_count: report.applied_count,
+            applied_count,
             latest_sequence: Some(leader_head_sequence),
             next_after_sequence: page.next_after_sequence,
         })
@@ -936,10 +967,16 @@ impl ReplicationPuller {
     /// in the puller-local state, then persist if a prior heartbeat
     /// has been observed.
     async fn bump_transient_failure_and_persist(&self) {
-        {
+        let total_after_bump = {
             let mut state = self.heartbeat_state.lock().unwrap();
             state.total_transient_failures += 1;
-        }
+            state.total_transient_failures
+        };
+        // V2 polish — emit the transient-pull metric using the
+        // just-bumped cumulative counter as the consecutive_failures
+        // gauge value. The gauge resets to 0 on the next successful
+        // pull (see `record_pull_success`).
+        self.record_pull_transient_failure(total_after_bump);
         // Counter change is material — debounce check will let this
         // through immediately; `force_flush=false` is correct.
         self.persist_heartbeat_state_if_lagged(/* force_flush */ false)
@@ -954,6 +991,9 @@ impl ReplicationPuller {
             let mut state = self.heartbeat_state.lock().unwrap();
             state.last_fatal_error_kind = Some(kind);
         }
+        // V2 polish — emit the fatal-pull metric. The classification
+        // already happened upstream; this just records the outcome.
+        self.record_pull_fatal_failure();
         self.persist_heartbeat_state_if_lagged(/* force_flush */ true)
             .await;
     }
@@ -1139,6 +1179,147 @@ impl ReplicationPuller {
                 .unwrap_or(0)
         };
         ReplicationLag::observe(leader_head_sequence, follower_sequence, Utc::now())
+    }
+
+    // ===== V2 polish — metrics emission helpers =====
+    //
+    // Centralize raw metric names here so call sites stay clean.
+    // Each helper short-circuits when `config.metrics` is None
+    // (zero overhead when metrics are off).
+
+    /// Emit a successful-pull observation: counters for the attempt
+    /// outcome, fetched/applied bulk increments, and gauges for the
+    /// latest sequence values + lag.
+    fn record_pull_success(
+        &self,
+        fetched: usize,
+        applied: usize,
+        leader_head_sequence: u64,
+        follower_cursor_sequence: u64,
+        lag_commits: u64,
+    ) {
+        let Some(metrics) = &self.config.metrics else {
+            return;
+        };
+        let peer = self.config.peer_id.as_str();
+        metrics.increment_counter(
+            "hydra_replication_pull_attempts_total",
+            &[("peer_id", peer), ("outcome", "ok")],
+        );
+        for _ in 0..fetched {
+            metrics.increment_counter(
+                "hydra_replication_commits_fetched_total",
+                &[("peer_id", peer)],
+            );
+        }
+        for _ in 0..applied {
+            metrics.increment_counter(
+                "hydra_replication_commits_applied_total",
+                &[("peer_id", peer)],
+            );
+        }
+        Self::set_replication_gauges_with_recorder(
+            metrics.as_ref(),
+            peer,
+            leader_head_sequence,
+            follower_cursor_sequence,
+            lag_commits,
+        );
+        // Successful pull → reset consecutive_failures gauge.
+        metrics.set_gauge(
+            "hydra_replication_consecutive_failures",
+            &[("peer_id", peer)],
+            0.0,
+        );
+    }
+
+    /// Emit a transient-failure observation: counter for the
+    /// outcome + current consecutive_failures gauge.
+    fn record_pull_transient_failure(&self, consecutive_failures: u64) {
+        let Some(metrics) = &self.config.metrics else {
+            return;
+        };
+        let peer = self.config.peer_id.as_str();
+        metrics.increment_counter(
+            "hydra_replication_pull_attempts_total",
+            &[("peer_id", peer), ("outcome", "transient")],
+        );
+        metrics.set_gauge(
+            "hydra_replication_consecutive_failures",
+            &[("peer_id", peer)],
+            consecutive_failures as f64,
+        );
+    }
+
+    /// Emit a fatal-failure observation: counter for the outcome.
+    fn record_pull_fatal_failure(&self) {
+        let Some(metrics) = &self.config.metrics else {
+            return;
+        };
+        let peer = self.config.peer_id.as_str();
+        metrics.increment_counter(
+            "hydra_replication_pull_attempts_total",
+            &[("peer_id", peer), ("outcome", "fatal")],
+        );
+    }
+
+    /// Emit a successful-bootstrap observation: counter for the
+    /// outcome + applied bulk increment + gauges.
+    fn record_bootstrap_success(
+        &self,
+        applied: usize,
+        leader_head_sequence: u64,
+        follower_cursor_sequence: u64,
+        lag_commits: u64,
+    ) {
+        let Some(metrics) = &self.config.metrics else {
+            return;
+        };
+        let peer = self.config.peer_id.as_str();
+        metrics.increment_counter(
+            "hydra_replication_bootstraps_total",
+            &[("peer_id", peer), ("outcome", "ok")],
+        );
+        for _ in 0..applied {
+            metrics.increment_counter(
+                "hydra_replication_commits_applied_total",
+                &[("peer_id", peer)],
+            );
+        }
+        Self::set_replication_gauges_with_recorder(
+            metrics.as_ref(),
+            peer,
+            leader_head_sequence,
+            follower_cursor_sequence,
+            lag_commits,
+        );
+    }
+
+    /// Static gauge-setting helper used from the recorder-aware
+    /// helpers above. Centralizes the three gauge names so they
+    /// don't get scattered across success/bootstrap paths.
+    fn set_replication_gauges_with_recorder(
+        metrics: &dyn MetricsRecorder,
+        peer_id: &str,
+        leader_head_sequence: u64,
+        follower_cursor_sequence: u64,
+        lag_commits: u64,
+    ) {
+        metrics.set_gauge(
+            "hydra_replication_leader_head_sequence",
+            &[("peer_id", peer_id)],
+            leader_head_sequence as f64,
+        );
+        metrics.set_gauge(
+            "hydra_replication_follower_cursor_sequence",
+            &[("peer_id", peer_id)],
+            follower_cursor_sequence as f64,
+        );
+        metrics.set_gauge(
+            "hydra_replication_lag_commits",
+            &[("peer_id", peer_id)],
+            lag_commits as f64,
+        );
     }
 
     /// V2 patch 4D + 4E — drive the puller in a loop until `shutdown`
@@ -1438,6 +1619,21 @@ impl ReplicationPuller {
         // V2 patch 4F — persist cursor after bootstrap success too.
         self.persist_cursor_best_effort().await;
 
+        // V2 polish — bootstrap success metrics. Leader head and
+        // follower cursor are both at the stamped cursor offset; lag
+        // is therefore 0 (we just caught up).
+        let leader_head = tail
+            .last()
+            .map(|b| b.sequence)
+            .unwrap_or(snapshot_sequence);
+        let follower_cursor = leader_head;
+        self.record_bootstrap_success(
+            replayed_commits,
+            leader_head,
+            follower_cursor,
+            0,
+        );
+
         Ok(ReplicationBootstrapReport {
             peer_id: self.config.peer_id.clone(),
             snapshot_id: Some(manifest_applied.id),
@@ -1685,6 +1881,7 @@ mod tests {
                 cursor_path: None,
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
+                metrics: None,
             },
         );
 
@@ -1729,6 +1926,7 @@ mod tests {
                 cursor_path: None,
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
+                metrics: None,
             },
         );
 
@@ -1794,6 +1992,7 @@ mod tests {
                 cursor_path: None,
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
+                metrics: None,
             },
         );
         let report = puller.pull_once().await.unwrap();
@@ -1848,6 +2047,7 @@ mod tests {
                 cursor_path: None,
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
+                metrics: None,
             },
         );
         // Follower's head is at seq=1 (its own local commit). It asks
@@ -1899,6 +2099,7 @@ mod tests {
                 cursor_path: None,
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
+                metrics: None,
             },
         );
 
@@ -1947,6 +2148,7 @@ mod tests {
                 cursor_path: None,
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
+                metrics: None,
             },
         );
 
@@ -2024,6 +2226,7 @@ mod tests {
                 cursor_path: None,
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
+                metrics: None,
             },
         );
 
@@ -2123,6 +2326,7 @@ mod tests {
                 cursor_path: None,
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
+                metrics: None,
             },
         );
         let err = puller.bootstrap_from_latest_snapshot().await.unwrap_err();
@@ -2178,6 +2382,7 @@ mod tests {
                 cursor_path: None,
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
+                metrics: None,
             },
         );
 
@@ -3494,5 +3699,100 @@ mod tests {
 
         let _ = std::fs::remove_file(&data_path);
         let _ = std::fs::remove_file(&lock_path);
+    }
+
+    /// V2 polish — end-to-end: a `PrometheusTextRecorder` wired into
+    /// `ReplicationPullerConfig.metrics` must capture counters /
+    /// gauges from a real `pull_once` against a real leader, and the
+    /// rendered Prometheus text must reflect both the empty-page and
+    /// the non-empty-page outcomes.
+    #[tokio::test]
+    async fn metrics_recorder_captures_pull_outcomes() {
+        use crate::metrics::PrometheusTextRecorder;
+
+        // Leader starts empty.
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        let (addr, _server) =
+            spawn_leader(replication_router(leader_runtime.clone())).await;
+
+        let recorder = Arc::new(PrometheusTextRecorder::new());
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            format!("http://{addr}"),
+            restorer(),
+        );
+        config.poll_interval = Duration::from_millis(10);
+        config.bootstrap_on_start = false;
+        config.heartbeat_debounce_interval = Duration::ZERO;
+        config.metrics = Some(recorder.clone());
+        let puller = ReplicationPuller::new(follower_runtime, config);
+
+        // First pull — empty page. Counters bump, gauges land at 0.
+        let report = puller.pull_once().await.unwrap();
+        assert_eq!(report.fetched_count, 0);
+
+        let after_empty = recorder.render();
+        assert!(
+            after_empty.contains(
+                "hydra_replication_pull_attempts_total{outcome=\"ok\",peer_id=\"replica_puller_test\"} 1"
+            ),
+            "expected ok-outcome counter at 1, got:\n{after_empty}"
+        );
+        assert!(
+            after_empty
+                .contains("hydra_replication_lag_commits{peer_id=\"replica_puller_test\"} 0"),
+            "expected lag gauge at 0, got:\n{after_empty}"
+        );
+        assert!(
+            after_empty.contains(
+                "hydra_replication_leader_head_sequence{peer_id=\"replica_puller_test\"} 0"
+            ),
+            "expected leader head gauge at 0, got:\n{after_empty}"
+        );
+
+        // Now write two commits on the leader and pull again.
+        {
+            let hydra = leader_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.ingest(signal("one")).unwrap();
+            hydra.ingest(signal("two")).unwrap();
+        }
+        let report = puller.pull_once().await.unwrap();
+        assert_eq!(report.fetched_count, 2);
+        assert_eq!(report.applied_count, 2);
+
+        let after_apply = recorder.render();
+        assert!(
+            after_apply.contains(
+                "hydra_replication_pull_attempts_total{outcome=\"ok\",peer_id=\"replica_puller_test\"} 2"
+            ),
+            "expected ok-outcome counter at 2, got:\n{after_apply}"
+        );
+        assert!(
+            after_apply.contains(
+                "hydra_replication_commits_fetched_total{peer_id=\"replica_puller_test\"} 2"
+            ),
+            "expected fetched counter at 2, got:\n{after_apply}"
+        );
+        assert!(
+            after_apply.contains(
+                "hydra_replication_commits_applied_total{peer_id=\"replica_puller_test\"} 2"
+            ),
+            "expected applied counter at 2, got:\n{after_apply}"
+        );
+        assert!(
+            after_apply.contains(
+                "hydra_replication_follower_cursor_sequence{peer_id=\"replica_puller_test\"} 2"
+            ),
+            "expected follower cursor gauge at 2, got:\n{after_apply}"
+        );
+        assert!(
+            after_apply.contains(
+                "hydra_replication_consecutive_failures{peer_id=\"replica_puller_test\"} 0"
+            ),
+            "expected consecutive_failures gauge at 0 (successful pull resets), got:\n{after_apply}"
+        );
     }
 }

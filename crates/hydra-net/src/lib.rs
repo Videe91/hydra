@@ -1,6 +1,7 @@
 pub mod sensor;
 pub mod bus;
 pub mod http;
+pub mod metrics;
 pub mod query;
 pub mod replication_worker;
 pub mod schema_admin_service;
@@ -17,6 +18,9 @@ pub mod prelude {
         commits_router, events_router, ingest_router, query_router, schema_router, sensor_router,
         snapshots_router, CommitsHttpState, EventsHttpState, IngestHttpState, QueryHttpState,
         SchemaHttpState, SensorHttpState, SnapshotsHttpState,
+    };
+    pub use crate::metrics::{
+        metrics_router, MetricsRecorder, NoopRecorder, PrometheusTextRecorder,
     };
     pub use crate::query::{QueryService, QueryStats};
     pub use crate::replication_worker::{
