@@ -7,6 +7,9 @@ use hydra_core::event::Value;
 use hydra_core::graph::GraphReader;
 use hydra_core::id::{EventId, NodeId};
 use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 // ============================================================================
 // Anomaly Types
@@ -15,7 +18,7 @@ use chrono::{DateTime, Duration, Utc};
 /// A detected anomaly — the output of the detection engine.
 /// Anomalies are reports, not events. The caller decides whether to
 /// inject them as Signal events into the cascade.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Anomaly {
     /// What kind of anomaly was detected
     pub kind: AnomalyKind,
@@ -31,8 +34,53 @@ pub struct Anomaly {
     pub detected_at: DateTime<Utc>,
 }
 
+impl AnomalyKind {
+    /// Stable snake_case discriminant string. Matches the serde
+    /// `rename_all = "snake_case"` wire form, so query strings like
+    /// `?kind=topology_degree` round-trip cleanly to a single arm.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            AnomalyKind::TopologyDegree { .. } => "topology_degree",
+            AnomalyKind::CascadeAmplification { .. } => "cascade_amplification",
+            AnomalyKind::TemporalDrift { .. } => "temporal_drift",
+            AnomalyKind::ChangeRateAnomaly { .. } => "change_rate_anomaly",
+            AnomalyKind::StructuralOrphan { .. } => "structural_orphan",
+            AnomalyKind::TimeWindowViolation { .. } => "time_window_violation",
+            AnomalyKind::CounterfactualOutlier { .. } => "counterfactual_outlier",
+            AnomalyKind::ForbiddenPattern { .. } => "forbidden_pattern",
+        }
+    }
+}
+
+impl Anomaly {
+    /// Deterministic stable id for this anomaly, derived from its
+    /// content (kind discriminant + affected_nodes + description).
+    /// The same logical anomaly recomputed in a later batch returns
+    /// the same id — so operators can acknowledge / mute / track /
+    /// correlate by id even though anomalies themselves are
+    /// ephemeral (no persistence in v0). Prefixed `anom_` so it
+    /// sorts/groups visually alongside the other id types.
+    pub fn stable_id(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        // Use the kind's Debug rendering as a stable discriminator —
+        // includes the variant name AND its inner field values, so
+        // two anomalies on the same node with different rule outputs
+        // get different ids. Plus affected_nodes (sorted via the
+        // Vec's order, which the engine produces deterministically)
+        // and description.
+        format!("{:?}", self.kind).hash(&mut hasher);
+        for node in &self.affected_nodes {
+            node.as_str().hash(&mut hasher);
+        }
+        self.description.hash(&mut hasher);
+        let h = hasher.finish();
+        format!("anom_{h:016x}")
+    }
+}
+
 /// Categories of anomaly
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub enum AnomalyKind {
     /// A node's edge count violates expected topology
     TopologyDegree {
@@ -110,7 +158,8 @@ pub enum AnomalyKind {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DriftDirection {
     Increasing,
     Decreasing,

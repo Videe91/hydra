@@ -324,6 +324,14 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
     if path.starts_with("/lineage/") {
         return vec!["read:audit"];
     }
+    // Living-database phase — diagnostics is current-state
+    // introspection (anomaly detection, coverage, counterfactual,
+    // evolution metrics). Operators with `read:query` for
+    // monitoring dashboards should poll diagnostics without
+    // escalating to `read:audit`.
+    if path.starts_with("/diagnostics/") {
+        return vec!["read:query"];
+    }
     if path == "/snapshots" || path.starts_with("/snapshots/") {
         return vec!["read:ops"];
     }

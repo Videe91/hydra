@@ -1,4 +1,5 @@
 pub mod commits;
+pub mod diagnostics;
 pub mod events;
 pub mod ingest;
 pub mod lineage;
@@ -11,6 +12,9 @@ pub mod snapshots;
 pub mod tenant;
 
 pub use commits::{commits_router, CommitsHttpState};
+pub use diagnostics::{
+    diagnostics_router, AnomalyEntry, AnomalyQuery, AnomalyResponse, DiagnosticsHttpState,
+};
 pub use events::{events_router, EventsHttpState};
 pub use ingest::{ingest_router, IngestHttpState};
 pub use lineage::{
