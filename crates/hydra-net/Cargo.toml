@@ -40,6 +40,12 @@ tokio-util = "0.7"
 # pointing at the same paths racing on read-modify-write + atomic
 # rename. fs2 wraps `flock` on Unix and `LockFileEx` on Windows.
 fs2 = "0.4"
+# V2 polish #7 — equal jitter on retry/backoff. `thread_rng` is a
+# fast per-thread CSPRNG; per-failure call cost is negligible. Used
+# only in `apply_jitter` inside `run_until_cancelled`. rand 0.8 is
+# already in the workspace dep tree transitively, so this is zero
+# new build cost.
+rand = "0.8"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

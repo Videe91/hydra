@@ -193,11 +193,21 @@ fn classify_engine_error(err: HydraError) -> ReplicationPullError {
 /// Doubles on each subsequent failure, capped at `max_backoff`. A
 /// successful operation resets the backoff to `initial_backoff` and
 /// clears the consecutive-failure counter.
+///
+/// V2 polish #7 — `jitter` decorrelates the retry schedules of
+/// multiple followers that all transient-fail at the same instant.
+/// Default `JitterMode::Equal` — the sleep between transient
+/// retries falls in `[backoff/2, backoff]`, so the operator's
+/// "exponential, capped at max_backoff" mental model still holds,
+/// but two followers picking the same `current_backoff` will (with
+/// high probability) wait different amounts and stop hammering the
+/// leader in lockstep.
 #[derive(Debug, Clone)]
 pub struct ReplicationRetryConfig {
     pub max_attempts: usize,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    pub jitter: JitterMode,
 }
 
 impl Default for ReplicationRetryConfig {
@@ -206,6 +216,62 @@ impl Default for ReplicationRetryConfig {
             max_attempts: usize::MAX,
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
+            jitter: JitterMode::default(),
+        }
+    }
+}
+
+/// V2 polish #7 — jitter algorithm applied to retry-backoff sleeps.
+///
+/// Variants:
+///   - `Off`   — exact `current_backoff` (pre-#7 behavior).
+///   - `Equal` — sleep in `[current_backoff / 2, current_backoff]`.
+///     Half deterministic, half random. No "occasional zero"
+///     anomaly that full jitter has. Upper bound is unchanged from
+///     pre-#7, so `max_backoff` semantics still hold.
+///
+/// Only applies to the **transient-retry** sleep in
+/// `run_until_cancelled`. `poll_interval` (between successful
+/// pulls), startup spawn delay, and any other sleep paths are NOT
+/// jittered — those have different motivations and are out of
+/// scope for #7.
+///
+/// Future variants (`Full`, `Decorrelated`) can be added as new
+/// arms without touching existing callers; matching is exhaustive
+/// only in `apply_jitter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitterMode {
+    Off,
+    Equal,
+}
+
+impl Default for JitterMode {
+    fn default() -> Self {
+        Self::Equal
+    }
+}
+
+/// V2 polish #7 — apply the configured jitter mode to a single
+/// backoff `Duration`. Pure function; uses `rand::thread_rng()` for
+/// `Equal`. `Duration::ZERO` round-trips to `ZERO` under any mode.
+fn apply_jitter(backoff: Duration, mode: JitterMode) -> Duration {
+    match mode {
+        JitterMode::Off => backoff,
+        JitterMode::Equal => {
+            if backoff.is_zero() {
+                return backoff;
+            }
+            let half = backoff / 2;
+            let extra_ms = half.as_millis() as u64;
+            // gen_range with an inclusive upper bound; extra_ms == 0
+            // (sub-ms backoff) collapses to half + 0 == half, which
+            // is still in `[backoff/2, backoff]` as documented.
+            let extra = if extra_ms == 0 {
+                0
+            } else {
+                rand::Rng::gen_range(&mut rand::thread_rng(), 0..=extra_ms)
+            };
+            half + Duration::from_millis(extra)
         }
     }
 }
@@ -1452,8 +1518,15 @@ impl ReplicationPuller {
                     // Sleep current_backoff with shutdown preempting,
                     // then double the backoff (capped). Hold on to the
                     // pre-double value so the FIRST failure waits
-                    // exactly `initial_backoff` ms.
-                    let to_sleep = current_backoff;
+                    // exactly `initial_backoff` ms (modulo jitter).
+                    //
+                    // V2 polish #7 — apply equal jitter so two
+                    // followers picking the same `current_backoff`
+                    // don't retry in lockstep. The underlying schedule
+                    // (`current_backoff` doubles) is untouched — jitter
+                    // only reshapes the actual sleep into
+                    // `[backoff/2, backoff]`.
+                    let to_sleep = apply_jitter(current_backoff, self.config.retry.jitter);
                     current_backoff = (current_backoff * 2).min(self.config.retry.max_backoff);
                     tokio::select! {
                         _ = shutdown.cancelled() => {
@@ -2639,6 +2712,70 @@ mod tests {
         assert_eq!(err.kind, ReplicationPullErrorKind::Network);
         // Partial report carries the transient failure count.
         assert!(err.report.failures >= 1, "got {:?}", err.report);
+    }
+
+    // === V2 polish #7 — jitter on retry/backoff (pure-fn tests) ===
+
+    #[test]
+    fn apply_jitter_off_is_identity() {
+        // Off mode returns the input backoff unchanged across a
+        // wide range of inputs (zero, sub-ms, multi-second).
+        for &ms in &[0u64, 1, 7, 250, 500, 1_500, 30_000] {
+            let d = Duration::from_millis(ms);
+            assert_eq!(apply_jitter(d, JitterMode::Off), d);
+        }
+    }
+
+    #[test]
+    fn apply_jitter_equal_stays_in_bounds() {
+        // 1000 trials at backoff=1s: every result must fall in
+        // [500ms, 1000ms]. This is the core invariant — equal jitter
+        // never returns values outside [backoff/2, backoff].
+        let backoff = Duration::from_millis(1000);
+        let lo = backoff / 2;
+        let hi = backoff;
+        let mut any_below_hi = false;
+        let mut any_above_lo = false;
+        for _ in 0..1000 {
+            let got = apply_jitter(backoff, JitterMode::Equal);
+            assert!(
+                got >= lo && got <= hi,
+                "apply_jitter(1s, Equal) = {got:?} out of [{lo:?}, {hi:?}]"
+            );
+            if got < hi {
+                any_below_hi = true;
+            }
+            if got > lo {
+                any_above_lo = true;
+            }
+        }
+        // Sanity: with 1000 trials we should see at least one
+        // result strictly below hi and at least one strictly above
+        // lo. (Probability of all-equal-to-bound is ~0.) This
+        // proves the RNG is actually firing, not stuck at a corner.
+        assert!(any_below_hi, "all 1000 trials returned exactly backoff");
+        assert!(any_above_lo, "all 1000 trials returned exactly backoff/2");
+    }
+
+    #[test]
+    fn apply_jitter_equal_zero_input_returns_zero() {
+        assert_eq!(apply_jitter(Duration::ZERO, JitterMode::Equal), Duration::ZERO);
+    }
+
+    #[test]
+    fn apply_jitter_equal_sub_ms_backoff_does_not_panic() {
+        // Sub-millisecond backoff: `half.as_millis()` is 0, which
+        // would panic on `gen_range(0..=0)` if we didn't guard it.
+        // Confirm the helper returns a value <= backoff.
+        let backoff = Duration::from_nanos(500);
+        let got = apply_jitter(backoff, JitterMode::Equal);
+        assert!(got <= backoff);
+    }
+
+    #[test]
+    fn jitter_mode_default_is_equal() {
+        assert_eq!(JitterMode::default(), JitterMode::Equal);
+        assert_eq!(ReplicationRetryConfig::default().jitter, JitterMode::Equal);
     }
 
     // === V2 patch 4E — retry / backoff / failure classification ===
