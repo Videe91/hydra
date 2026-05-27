@@ -852,12 +852,14 @@ name = "hydra-net"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "axum-server",
  "chrono",
  "fs2",
  "hydra-core",
  "hydra-engine",
  "hydra-storage",
  "rand",
+ "rcgen",
  "reqwest",
  "rustls",
  "serde",

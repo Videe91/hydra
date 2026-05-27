@@ -383,6 +383,30 @@ pub struct ReplicationPullerConfig {
     /// `crate::metrics` for the trait + a built-in Prometheus text
     /// recorder.
     pub metrics: Option<Arc<dyn MetricsRecorder>>,
+    /// V2 polish #8 — leader cert pinning. PEM file paths whose
+    /// certificates form the **only** trust roots for the puller's
+    /// outbound TLS handshake with the leader.
+    ///
+    /// `None` (default) — `reqwest::Client::new()`, OS WebPKI roots
+    /// (pre-#8 behavior).
+    /// `Some(paths)` — `tls_built_in_root_certs(false)` plus one
+    /// `add_root_certificate` per supplied PEM. Pinning means
+    /// "trust ONLY these roots" — operators who want OS+private
+    /// trust should install the private cert into the OS store.
+    ///
+    /// `Vec<PathBuf>` (not `PathBuf`) is the right shape for CA
+    /// rotation: load both the active root and a rotation
+    /// candidate during the overlap window.
+    ///
+    /// Read eagerly at `ReplicationPuller::new`. Bad paths or
+    /// invalid PEM **panic** with a clear message — TLS config is
+    /// boot-time infrastructure, not a runtime error path.
+    ///
+    /// If a caller-supplied client is provided via
+    /// `ReplicationPuller::with_client`, that client takes
+    /// precedence and `leader_roots` is ignored with a
+    /// `tracing::warn!`.
+    pub leader_roots: Option<Vec<PathBuf>>,
 }
 
 impl ReplicationPullerConfig {
@@ -416,6 +440,7 @@ impl ReplicationPullerConfig {
             heartbeat_path: None,
             heartbeat_debounce_interval: Duration::from_secs(30),
             metrics: None,
+            leader_roots: None,
         }
     }
 }
@@ -716,13 +741,63 @@ fn ensure_crypto_provider_installed() {
     });
 }
 
+/// V2 polish #8 — build a `reqwest::Client` that trusts ONLY the
+/// PEM-encoded roots at the supplied paths.
+///
+/// - `tls_built_in_root_certs(false)` — OS WebPKI roots are
+///   disabled. Pinning means "trust only these."
+/// - One `add_root_certificate` per PEM (so callers can pass both
+///   the active CA and a rotation candidate during an overlap
+///   window).
+///
+/// Panics with a clear message on bad path or invalid PEM. TLS
+/// config is boot-time infrastructure; failing fast at startup is
+/// preferable to a cascading `Result` through every existing
+/// `ReplicationPuller::new` call site.
+fn build_pinned_client(roots: &[PathBuf]) -> reqwest::Client {
+    if roots.is_empty() {
+        panic!(
+            "ReplicationPullerConfig.leader_roots was Some(vec![]) — at least one PEM path required when pinning is enabled"
+        );
+    }
+    let mut builder = reqwest::ClientBuilder::new().tls_built_in_root_certs(false);
+    for path in roots {
+        let pem = std::fs::read(path).unwrap_or_else(|err| {
+            panic!(
+                "ReplicationPullerConfig.leader_roots: failed to read PEM at {}: {err}",
+                path.display()
+            )
+        });
+        let cert = reqwest::Certificate::from_pem(&pem).unwrap_or_else(|err| {
+            panic!(
+                "ReplicationPullerConfig.leader_roots: failed to parse PEM at {}: {err}",
+                path.display()
+            )
+        });
+        builder = builder.add_root_certificate(cert);
+    }
+    builder.build().unwrap_or_else(|err| {
+        panic!(
+            "ReplicationPullerConfig.leader_roots: failed to build pinned client: {err}"
+        )
+    })
+}
+
 impl ReplicationPuller {
     pub fn new(runtime: RuntimeHandle, config: ReplicationPullerConfig) -> Self {
         ensure_crypto_provider_installed();
+        // V2 polish #8 — if `leader_roots` is configured, build a
+        // pinned client (OS WebPKI roots disabled, only these PEMs
+        // trusted). Otherwise fall through to `reqwest::Client::new()`
+        // for pre-#8 behavior.
+        let client = match &config.leader_roots {
+            Some(roots) => build_pinned_client(roots),
+            None => reqwest::Client::new(),
+        };
         Self {
             runtime,
             config,
-            client: reqwest::Client::new(),
+            client,
             heartbeat_state: std::sync::Mutex::new(HeartbeatState::default()),
         }
     }
@@ -730,6 +805,12 @@ impl ReplicationPuller {
     /// Construct with a caller-supplied `reqwest::Client`. Useful when
     /// the caller wants to configure timeouts, custom roots, or share
     /// connection pools across multiple pullers.
+    ///
+    /// V2 polish #8 — if `config.leader_roots` is also `Some(...)`,
+    /// the caller-supplied client wins and `leader_roots` is ignored
+    /// with a `tracing::warn!`. `with_client` is the explicit "I
+    /// know what I'm doing" escape hatch; pinning via config is the
+    /// convenience path. Don't conflate the two.
     pub fn with_client(
         runtime: RuntimeHandle,
         config: ReplicationPullerConfig,
@@ -739,6 +820,12 @@ impl ReplicationPuller {
         // already installed a provider — but if not, this keeps us
         // consistent with `new`.
         ensure_crypto_provider_installed();
+        if config.leader_roots.is_some() {
+            tracing::warn!(
+                target: "hydra::replication",
+                "ReplicationPullerConfig.leader_roots is set, but ReplicationPuller::with_client received a caller-supplied client — leader_roots will be ignored"
+            );
+        }
         Self {
             runtime,
             config,
@@ -1955,6 +2042,7 @@ mod tests {
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
                 metrics: None,
+                leader_roots: None,
             },
         );
 
@@ -2000,6 +2088,7 @@ mod tests {
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
                 metrics: None,
+                leader_roots: None,
             },
         );
 
@@ -2066,6 +2155,7 @@ mod tests {
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
                 metrics: None,
+                leader_roots: None,
             },
         );
         let report = puller.pull_once().await.unwrap();
@@ -2121,6 +2211,7 @@ mod tests {
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
                 metrics: None,
+                leader_roots: None,
             },
         );
         // Follower's head is at seq=1 (its own local commit). It asks
@@ -2173,6 +2264,7 @@ mod tests {
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
                 metrics: None,
+                leader_roots: None,
             },
         );
 
@@ -2222,6 +2314,7 @@ mod tests {
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
                 metrics: None,
+                leader_roots: None,
             },
         );
 
@@ -2300,6 +2393,7 @@ mod tests {
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
                 metrics: None,
+                leader_roots: None,
             },
         );
 
@@ -2400,6 +2494,7 @@ mod tests {
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
                 metrics: None,
+                leader_roots: None,
             },
         );
         let err = puller.bootstrap_from_latest_snapshot().await.unwrap_err();
@@ -2456,6 +2551,7 @@ mod tests {
                 heartbeat_path: None,
                 heartbeat_debounce_interval: Duration::ZERO,
                 metrics: None,
+                leader_roots: None,
             },
         );
 
@@ -3931,5 +4027,237 @@ mod tests {
             ),
             "expected consecutive_failures gauge at 0 (successful pull resets), got:\n{after_apply}"
         );
+    }
+
+    // === V2 polish #8 — leader cert pinning ===
+
+    /// Mint a self-signed cert valid for `localhost`. Returns the
+    /// PEM bytes of the certificate (for pinning) and the rcgen
+    /// `CertifiedKey` (for stand-up of the TLS leader).
+    fn mint_localhost_cert() -> (String, String, rcgen::CertifiedKey) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen generates a self-signed cert");
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+        (cert_pem, key_pem, cert)
+    }
+
+    /// Stand up a TLS-terminating axum_server on 127.0.0.1:0 with
+    /// the supplied cert + key. Returns the bound address and the
+    /// `JoinHandle` (dropped at test end to tear down the server).
+    async fn spawn_tls_leader(
+        router: Router,
+        cert_pem: &str,
+        key_pem: &str,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        // Pin the rustls crypto provider once per process (same
+        // rationale as the puller's `ensure_crypto_provider_installed`
+        // and hydra-api's TLS test path).
+        static INSTALL_PROVIDER: std::sync::Once = std::sync::Once::new();
+        INSTALL_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
+            cert_pem.as_bytes().to_vec(),
+            key_pem.as_bytes().to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let handle = tokio::spawn(async move {
+            let _ = axum_server::from_tcp_rustls(listener, tls_config)
+                .serve(router.into_make_service())
+                .await;
+        });
+        // Give axum_server a moment to start accepting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (addr, handle)
+    }
+
+    /// Write a PEM string to a unique temp file; returns the path.
+    fn write_pem_to_tempfile(pem: &str, tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hydra_pin_{tag}_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cert.pem");
+        std::fs::write(&path, pem).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn puller_uses_pinned_roots_when_configured() {
+        // Positive path: leader serves cert_A, follower pins cert_A,
+        // pull succeeds against the real TLS handshake.
+        let (cert_pem, key_pem, _) = mint_localhost_cert();
+        let cert_path = write_pem_to_tempfile(&cert_pem, "ok");
+
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        let (addr, _server) = spawn_tls_leader(
+            replication_router(leader_runtime),
+            &cert_pem,
+            &key_pem,
+        )
+        .await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            // localhost resolves to 127.0.0.1; the cert SAN matches.
+            format!("https://localhost:{}", addr.port()),
+            restorer(),
+        );
+        config.poll_interval = Duration::from_millis(10);
+        config.bootstrap_on_start = false;
+        config.heartbeat_debounce_interval = Duration::ZERO;
+        config.leader_roots = Some(vec![cert_path.clone()]);
+        let puller = ReplicationPuller::new(follower_runtime, config);
+
+        let report = puller.pull_once().await.expect("pull must succeed under pinning");
+        assert_eq!(report.fetched_count, 0);
+        assert_eq!(report.latest_sequence, Some(0));
+
+        let _ = std::fs::remove_file(&cert_path);
+    }
+
+    #[tokio::test]
+    async fn puller_rejects_leader_with_unknown_cert() {
+        // Negative path: leader serves cert_A, follower pins cert_B
+        // (a different self-signed cert). TLS handshake must fail.
+        let (server_cert_pem, server_key_pem, _) = mint_localhost_cert();
+        let (other_cert_pem, _, _) = mint_localhost_cert();
+        let pinned_other = write_pem_to_tempfile(&other_cert_pem, "wrong");
+
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        let (addr, _server) = spawn_tls_leader(
+            replication_router(leader_runtime),
+            &server_cert_pem,
+            &server_key_pem,
+        )
+        .await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            format!("https://localhost:{}", addr.port()),
+            restorer(),
+        );
+        config.poll_interval = Duration::from_millis(10);
+        config.bootstrap_on_start = false;
+        config.heartbeat_debounce_interval = Duration::ZERO;
+        config.leader_roots = Some(vec![pinned_other.clone()]);
+        let puller = ReplicationPuller::new(follower_runtime, config);
+
+        let err = puller
+            .pull_once()
+            .await
+            .expect_err("pull must fail when leader cert is not in pinned roots");
+        // Classifier maps connection/TLS errors to Network.
+        let message = format!("{err}");
+        assert!(
+            message.to_lowercase().contains("network")
+                || message.to_lowercase().contains("tls")
+                || message.to_lowercase().contains("certificate"),
+            "expected TLS-flavored error, got: {message}"
+        );
+
+        let _ = std::fs::remove_file(&pinned_other);
+    }
+
+    #[tokio::test]
+    async fn puller_with_no_pinning_falls_back_to_os_roots() {
+        // Sanity: `leader_roots = None` keeps existing behavior.
+        // Builds the puller against a plain-HTTP leader (no TLS at
+        // all) — proves the no-pinning code path is the same one
+        // the existing 250+ tests already cover.
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let _ = axum::serve(listener, replication_router(leader_runtime)).await;
+        });
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            format!("http://{addr}"),
+            restorer(),
+        );
+        config.poll_interval = Duration::from_millis(10);
+        config.bootstrap_on_start = false;
+        config.heartbeat_debounce_interval = Duration::ZERO;
+        // Explicitly None — the default, but assert the intent.
+        assert!(config.leader_roots.is_none());
+        let puller = ReplicationPuller::new(follower_runtime, config);
+        let report = puller.pull_once().await.unwrap();
+        assert_eq!(report.fetched_count, 0);
+    }
+
+    #[tokio::test]
+    async fn puller_with_multiple_pinned_roots_accepts_either() {
+        // The `Vec<PathBuf>` shape exists for CA rotation overlap
+        // windows. Pin both cert_A and cert_B; the leader serves
+        // cert_B; pull must succeed.
+        let (other_cert_pem, _, _) = mint_localhost_cert();
+        let (server_cert_pem, server_key_pem, _) = mint_localhost_cert();
+        let pinned_other = write_pem_to_tempfile(&other_cert_pem, "rotate_old");
+        let pinned_server = write_pem_to_tempfile(&server_cert_pem, "rotate_new");
+
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        let (addr, _server) = spawn_tls_leader(
+            replication_router(leader_runtime),
+            &server_cert_pem,
+            &server_key_pem,
+        )
+        .await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            format!("https://localhost:{}", addr.port()),
+            restorer(),
+        );
+        config.poll_interval = Duration::from_millis(10);
+        config.bootstrap_on_start = false;
+        config.heartbeat_debounce_interval = Duration::ZERO;
+        // Order: rotation_old first, current second — leader serves
+        // the second one; pin set accepts it.
+        config.leader_roots = Some(vec![pinned_other.clone(), pinned_server.clone()]);
+        let puller = ReplicationPuller::new(follower_runtime, config);
+
+        let report = puller
+            .pull_once()
+            .await
+            .expect("multi-root pinning must accept any pinned cert");
+        assert_eq!(report.fetched_count, 0);
+
+        let _ = std::fs::remove_file(&pinned_other);
+        let _ = std::fs::remove_file(&pinned_server);
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to read PEM")]
+    fn bad_pinned_cert_path_panics_in_new() {
+        // Fail-fast: bad PEM path → panic in `ReplicationPuller::new`,
+        // NOT a runtime error on first pull. TLS config is boot-time
+        // infrastructure.
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        let mut config = ReplicationPullerConfig::new(
+            follower_peer_id(),
+            "https://localhost:1".to_string(),
+            restorer(),
+        );
+        config.leader_roots = Some(vec![PathBuf::from(
+            "/this/path/definitely/does/not/exist/cert.pem",
+        )]);
+        // `new` panics; the puller is never constructed.
+        let _puller = ReplicationPuller::new(follower_runtime, config);
     }
 }

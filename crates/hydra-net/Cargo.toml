@@ -49,3 +49,11 @@ rand = "0.8"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# V2 polish #8 — self-signed certs for the leader-cert-pinning tests
+# (TLS-terminating axum_server fixture + pinned reqwest client). Same
+# version hydra-api dev-deps to keep the workspace dep graph tight.
+rcgen = "0.13"
+# V2 polish #8 — axum-server with rustls so the pinning tests can
+# stand up a real TLS-terminated leader on 127.0.0.1:0. Same feature
+# flags as hydra-api uses for its TLS path.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
