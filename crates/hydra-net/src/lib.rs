@@ -18,8 +18,9 @@ pub mod prelude {
     pub use crate::http::{
         commits_router, diagnostics_router, events_router, ingest_router, lineage_router,
         query_router, schema_router, sensor_router, snapshots_router, AnomalyResponse,
-        CommitsHttpState, DiagnosticsHttpState, EventsHttpState, IngestHttpState, LineageHttpState,
-        LineageResponse, QueryHttpState, SchemaHttpState, SensorHttpState, SnapshotsHttpState,
+        CommitsHttpState, CoverageDiagnosticsResponse, DiagnosticsHttpState, EventsHttpState,
+        IngestHttpState, LineageHttpState, LineageResponse, QueryHttpState, SchemaHttpState,
+        SensorHttpState, SnapshotsHttpState,
     };
     pub use crate::metrics::{
         metrics_router, MetricsRecorder, NoopRecorder, PrometheusTextRecorder,

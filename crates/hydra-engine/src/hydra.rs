@@ -1006,6 +1006,12 @@ impl Hydra {
         &mut self.coverage_engine
     }
 
+    /// Read-only access to the coverage engine (for `model_count`
+    /// and similar introspection from outside the engine crate).
+    pub fn coverage_engine(&self) -> &CoverageEngine {
+        &self.coverage_engine
+    }
+
     /// Evaluate all coverage models against the current graph state.
     pub fn evaluate_coverage(&self) -> Vec<CoverageReport> {
         self.coverage_engine.evaluate_all(&self.projection)

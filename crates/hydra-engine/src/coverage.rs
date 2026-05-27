@@ -1,6 +1,7 @@
 use hydra_core::graph::GraphReader;
 use hydra_core::id::NodeId;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Coverage Expectations — what the graph SHOULD contain
@@ -53,7 +54,7 @@ pub struct CoverageModel {
 // ============================================================================
 
 /// A gap: one expectation that was not met
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoverageGap {
     /// Which expectation failed
     pub expectation_index: usize,
@@ -66,7 +67,7 @@ pub struct CoverageGap {
 }
 
 /// The result of evaluating a coverage model against the graph
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoverageReport {
     /// Which model was evaluated
     pub model_name: String,

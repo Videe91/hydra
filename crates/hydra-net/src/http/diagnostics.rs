@@ -51,6 +51,7 @@ use axum::{
     Json, Router,
 };
 use hydra_engine::anomaly::Anomaly;
+use hydra_engine::coverage::CoverageReport;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
@@ -68,12 +69,13 @@ impl DiagnosticsHttpState {
     }
 }
 
-/// Build the diagnostics router. Currently exposes
-/// `GET /diagnostics/anomaly`; future patches add `/coverage`,
-/// `/counterfactual`, `/evolution` to the same router.
+/// Build the diagnostics router. Exposes the reasoning surfaces
+/// of the engine as HTTP. Future patches add `/counterfactual`
+/// and `/evolution` here.
 pub fn diagnostics_router(runtime: RuntimeHandle) -> Router {
     Router::new()
         .route("/diagnostics/anomaly", get(get_anomaly))
+        .route("/diagnostics/coverage", get(get_coverage))
         .with_state(DiagnosticsHttpState::new(runtime))
 }
 
@@ -293,6 +295,149 @@ fn render_anomaly_summary(
             "Most severe: '{desc}' (severity {:.2}).",
             most_severe.severity
         ));
+    }
+
+    parts.join(" ")
+}
+
+// === GET /diagnostics/coverage ===
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CoverageQuery {
+    /// Filter: only return the report for this model_name. Unknown
+    /// names return 200 with `reports: []` (not 404) — matches the
+    /// `/replication/peers/:peer_id/lag` convention so monitoring
+    /// loops don't have to special-case missing models.
+    pub model: Option<String>,
+    /// Filter: only return reports where `score < 1.0` (the
+    /// "what's broken" view). Default false (return all reports).
+    pub failing_only: Option<bool>,
+    /// Cap on the number of reports returned. Default 100, max 1000.
+    pub limit: Option<usize>,
+}
+
+/// `GET /diagnostics/coverage` response.
+///
+/// Fields parallel the anomaly response. `reports[]` is the
+/// filtered + capped list of `CoverageReport`s from
+/// `Hydra::evaluate_coverage`. `report_count` is the count BEFORE
+/// `limit` was applied; compare with `reports.len()` to detect
+/// truncation. `model_count` is the number of models registered
+/// in the engine (signal to operators that the engine is actually
+/// instrumented). `analysis_scope: "global"` future-proofs for
+/// tenant-scoped coverage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageDiagnosticsResponse {
+    pub reports: Vec<CoverageReport>,
+    pub model_count: usize,
+    pub report_count: usize,
+    pub truncated: bool,
+    pub summary: String,
+    pub engine_duration_ms: u64,
+    pub analysis_scope: String,
+}
+
+async fn get_coverage(
+    State(state): State<DiagnosticsHttpState>,
+    headers: HeaderMap,
+    Query(query): Query<CoverageQuery>,
+) -> Response {
+    if let Err(e) = extract_tenant(&headers) {
+        return tenant_error_response(e);
+    }
+
+    let model_filter = query.model.as_deref();
+    let failing_only = query.failing_only.unwrap_or(false);
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+
+    let hydra_arc = state.runtime.hydra();
+    let hydra = hydra_arc.read().await;
+
+    let start = Instant::now();
+    let all_reports = hydra.evaluate_coverage();
+    let engine_duration_ms = start.elapsed().as_millis() as u64;
+
+    let model_count = hydra.coverage_engine().model_count();
+
+    let filtered: Vec<CoverageReport> = all_reports
+        .into_iter()
+        .filter(|r| match model_filter {
+            Some(name) => r.model_name == name,
+            None => true,
+        })
+        .filter(|r| !failing_only || r.score < 1.0)
+        .collect();
+
+    let report_count = filtered.len();
+    let truncated = report_count > limit;
+
+    let summary = render_coverage_summary(&filtered, model_filter, failing_only);
+
+    let reports: Vec<CoverageReport> = filtered.into_iter().take(limit).collect();
+
+    Json(CoverageDiagnosticsResponse {
+        reports,
+        model_count,
+        report_count,
+        truncated,
+        summary,
+        engine_duration_ms,
+        analysis_scope: "global".to_string(),
+    })
+    .into_response()
+}
+
+/// Deterministic narrative of the filtered coverage set. Same
+/// pattern as `render_anomaly_summary`: agents can ignore; humans
+/// get an instant gist without scanning `reports[]`.
+fn render_coverage_summary(
+    reports: &[CoverageReport],
+    model_filter: Option<&str>,
+    failing_only: bool,
+) -> String {
+    if reports.is_empty() {
+        if let Some(name) = model_filter {
+            return format!("Coverage evaluated 0 reports for model '{name}'.");
+        }
+        return "Coverage evaluated 0 models.".to_string();
+    }
+
+    let mut parts: Vec<String> = vec![format!(
+        "Coverage evaluated {} model(s).",
+        reports.len()
+    )];
+
+    // Per-model summary line for the first few — keep bounded so
+    // the summary string doesn't explode on big deployments.
+    for report in reports.iter().take(3) {
+        let pct = (report.score * 100.0).round() as u32;
+        parts.push(format!(
+            "{}: {pct}% complete ({} of {} expectations met).",
+            report.model_name, report.met, report.total_expectations
+        ));
+    }
+    if reports.len() > 3 {
+        parts.push(format!("(+{} more report(s))", reports.len() - 3));
+    }
+
+    // Highlight the top gap from the lowest-scoring report — the
+    // operator's first investigative target.
+    if let Some(worst) = reports
+        .iter()
+        .min_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        if let Some(top_gap) = worst.gaps.first() {
+            let desc = if top_gap.description.len() > 120 {
+                format!("{}…", &top_gap.description[..120])
+            } else {
+                top_gap.description.clone()
+            };
+            parts.push(format!("Top gap: '{desc}'."));
+        }
+    }
+
+    if failing_only {
+        parts.push("(failing_only=true)".to_string());
     }
 
     parts.join(" ")
@@ -619,5 +764,203 @@ mod tests {
         assert!(raw.get("engine_duration_ms").is_some());
         assert!(raw.get("analysis_scope").is_some());
         assert!(raw.get("rule_count").is_some());
+    }
+
+    // === GET /diagnostics/coverage ===
+
+    use hydra_engine::coverage::{CoverageExpectation, CoverageModel};
+
+    fn min_node_model(name: &str, node_type: &str, min: usize) -> CoverageModel {
+        CoverageModel {
+            name: name.to_string(),
+            expectations: vec![CoverageExpectation::MinNodeCount {
+                node_type: node_type.to_string(),
+                min_count: min,
+            }],
+            scope_node_type: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn coverage_returns_empty_when_no_models() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/coverage"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: CoverageDiagnosticsResponse = read_json(response).await;
+        assert!(decoded.reports.is_empty());
+        assert_eq!(decoded.model_count, 0);
+        assert_eq!(decoded.report_count, 0);
+        assert!(!decoded.truncated);
+        assert_eq!(decoded.analysis_scope, "global");
+        assert_eq!(decoded.summary, "Coverage evaluated 0 models.");
+    }
+
+    #[tokio::test]
+    async fn coverage_returns_complete_score_when_all_met() {
+        // MinNodeCount(0) is trivially met by any graph state. Score
+        // should be 1.0, gaps empty, met == total.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .coverage_engine_mut()
+                .add_model(min_node_model("trivially_complete", "dataset", 0));
+        }
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/coverage"))
+            .await
+            .unwrap();
+        let decoded: CoverageDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.reports.len(), 1);
+        let report = &decoded.reports[0];
+        assert_eq!(report.model_name, "trivially_complete");
+        assert_eq!(report.score, 1.0);
+        assert_eq!(report.met, 1);
+        assert!(report.gaps.is_empty());
+        assert!(decoded.summary.contains("100% complete"));
+    }
+
+    #[tokio::test]
+    async fn coverage_returns_gaps_when_unmet() {
+        // MinNodeCount(5) on `dataset` with 0 dataset nodes → score
+        // 0.0, one gap with a non-empty description.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .coverage_engine_mut()
+                .add_model(min_node_model("needs_5_datasets", "dataset", 5));
+        }
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/coverage"))
+            .await
+            .unwrap();
+        let decoded: CoverageDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.reports.len(), 1);
+        let report = &decoded.reports[0];
+        assert_eq!(report.model_name, "needs_5_datasets");
+        assert!(report.score < 1.0);
+        assert_eq!(report.gaps.len(), 1);
+        assert!(!report.gaps[0].description.is_empty());
+    }
+
+    #[tokio::test]
+    async fn coverage_filters_by_model_name() {
+        // Register two models; `?model=alpha` returns only alpha's
+        // report. Unknown name returns empty (200, not 404).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .coverage_engine_mut()
+                .add_model(min_node_model("alpha", "type_a", 0));
+            hydra
+                .coverage_engine_mut()
+                .add_model(min_node_model("beta", "type_b", 0));
+        }
+        let app = diagnostics_router(runtime);
+
+        let response = app
+            .clone()
+            .oneshot(empty_get("/diagnostics/coverage?model=alpha"))
+            .await
+            .unwrap();
+        let decoded: CoverageDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.reports.len(), 1);
+        assert_eq!(decoded.reports[0].model_name, "alpha");
+        // model_count is the engine-wide count (2), unaffected by filter
+        assert_eq!(decoded.model_count, 2);
+
+        // Unknown model name → empty reports, 200 OK, summary
+        // mentions the name so operators can see why they got
+        // zero results.
+        let response = app
+            .oneshot(empty_get("/diagnostics/coverage?model=nonexistent"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: CoverageDiagnosticsResponse = read_json(response).await;
+        assert!(decoded.reports.is_empty());
+        assert!(decoded.summary.contains("nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn coverage_filters_failing_only() {
+        // Register one complete model (MinNodeCount 0) + one failing
+        // model (MinNodeCount 5 with 0 nodes). ?failing_only=true
+        // returns only the failing one.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .coverage_engine_mut()
+                .add_model(min_node_model("complete_one", "type_a", 0));
+            hydra
+                .coverage_engine_mut()
+                .add_model(min_node_model("failing_one", "type_b", 5));
+        }
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/coverage?failing_only=true"))
+            .await
+            .unwrap();
+        let decoded: CoverageDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.reports.len(), 1);
+        assert_eq!(decoded.reports[0].model_name, "failing_one");
+        assert!(decoded.reports[0].score < 1.0);
+    }
+
+    #[tokio::test]
+    async fn coverage_respects_limit_with_truncated_flag() {
+        // Register 3 models, ?limit=2 → 2 reports + truncated=true,
+        // report_count reflects the pre-limit count.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            for name in ["m1", "m2", "m3"] {
+                hydra
+                    .coverage_engine_mut()
+                    .add_model(min_node_model(name, "any", 0));
+            }
+        }
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/coverage?limit=2"))
+            .await
+            .unwrap();
+        let decoded: CoverageDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.reports.len(), 2);
+        assert_eq!(decoded.report_count, 3);
+        assert!(decoded.truncated);
+        assert_eq!(decoded.model_count, 3);
+    }
+
+    #[tokio::test]
+    async fn coverage_response_carries_metadata_fields() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/coverage"))
+            .await
+            .unwrap();
+        let decoded: CoverageDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.analysis_scope, "global");
+        let raw = serde_json::to_value(&decoded).unwrap();
+        assert!(raw.get("engine_duration_ms").is_some());
+        assert!(raw.get("analysis_scope").is_some());
+        assert!(raw.get("model_count").is_some());
+        assert!(raw.get("report_count").is_some());
+        assert!(raw.get("summary").is_some());
     }
 }
