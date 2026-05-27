@@ -14,7 +14,8 @@ pub mod tenant;
 pub use commits::{commits_router, CommitsHttpState};
 pub use diagnostics::{
     diagnostics_router, AnomalyEntry, AnomalyQuery, AnomalyResponse,
-    CoverageDiagnosticsResponse, CoverageQuery, DiagnosticsHttpState,
+    CounterfactualDiagnosticsResponse, CounterfactualQuery, CoverageDiagnosticsResponse,
+    CoverageQuery, DiagnosticsHttpState,
 };
 pub use events::{events_router, EventsHttpState};
 pub use ingest::{ingest_router, IngestHttpState};

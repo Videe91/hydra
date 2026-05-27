@@ -44,15 +44,18 @@
 use crate::http::tenant::{extract_tenant, tenant_error_response};
 use crate::runtime::RuntimeHandle;
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+use hydra_core::EventId;
 use hydra_engine::anomaly::Anomaly;
+use hydra_engine::counterfactual::GraphDiff;
 use hydra_engine::coverage::CoverageReport;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Instant;
 
 const DEFAULT_LIMIT: usize = 100;
@@ -76,6 +79,10 @@ pub fn diagnostics_router(runtime: RuntimeHandle) -> Router {
     Router::new()
         .route("/diagnostics/anomaly", get(get_anomaly))
         .route("/diagnostics/coverage", get(get_coverage))
+        .route(
+            "/diagnostics/counterfactual/:event_id",
+            get(get_counterfactual),
+        )
         .with_state(DiagnosticsHttpState::new(runtime))
 }
 
@@ -438,6 +445,191 @@ fn render_coverage_summary(
 
     if failing_only {
         parts.push("(failing_only=true)".to_string());
+    }
+
+    parts.join(" ")
+}
+
+// === GET /diagnostics/counterfactual/:event_id ===
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CounterfactualQuery {
+    /// When false, the response sets `diff: null` rather than
+    /// returning the full GraphDiff body. Aggregate counters
+    /// (nodes_affected / edges_affected / etc.) are always
+    /// returned. Default true (include diff).
+    ///
+    /// **Semantic note**: `diff: null` (omitted) is DIFFERENT
+    /// from `diff: { all-empty-arrays }` (zero-impact event).
+    /// Agents must distinguish these — see DTO doc-comments.
+    pub include_diff: Option<bool>,
+}
+
+/// `GET /diagnostics/counterfactual/:event_id` response.
+///
+/// Explicit transport DTO — does NOT `#[serde(flatten)]` the
+/// engine's `ImpactScore`. This separation lets the diagnostics
+/// contract evolve independently of the engine type (e.g., V3
+/// might add `confidence`, `simulation_depth`, `cascade_frontier`,
+/// `causal_clusters` to ImpactScore without forcing every
+/// diagnostics client to handle them).
+///
+/// **`diff` semantics**:
+///   - `Some(GraphDiff { all-empty-vecs })` → removing this event
+///     would change NOTHING. The event had zero observable graph
+///     impact. Meaningful answer.
+///   - `Some(GraphDiff { non-empty })` → here's the delta.
+///   - `None` → client asked for `?include_diff=false`. The diff
+///     was NOT computed for transport. Transport-level omission,
+///     not zero impact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CounterfactualDiagnosticsResponse {
+    /// Echoes the path-param event_id, in the same shape every
+    /// other diagnostics surface uses for identification.
+    pub event_id: EventId,
+    /// Always true for the single-event endpoint (200 path).
+    /// Reserved for future batch-counterfactual APIs where each
+    /// requested event may or may not exist; clients keeping a
+    /// uniform parse path across single and batch shapes benefit.
+    pub event_found: bool,
+    /// Mode discriminant. Today: only `"single_event_removal"`.
+    /// Future modes (`"multi_event_removal"`,
+    /// `"constraint_based"`, `"policy_filtered"`, etc.) MUST get
+    /// distinct discriminants so clients don't silently
+    /// reinterpret semantics.
+    pub counterfactual_mode: String,
+    /// How many events were in the removed causal subtree
+    /// (target event + its descendants).
+    pub causal_subtree_size: usize,
+    /// Aggregate counters from the diff.
+    pub nodes_affected: usize,
+    pub edges_affected: usize,
+    pub properties_changed: usize,
+    /// Per-type breakdown — `type_id -> count_of_affected_nodes`.
+    /// Useful for "which kinds of things did this event touch?"
+    /// queries without iterating the full diff.
+    pub affected_types: HashMap<String, usize>,
+    /// Deterministic magnitude heuristic from the engine:
+    /// `10 * nodes + 5 * edges + 1 * properties`. Stable so
+    /// agents/dashboards can rank events by impact.
+    pub magnitude: f64,
+    /// See struct doc-comment for the three-state semantics
+    /// (some-non-empty / some-empty / none).
+    pub diff: Option<GraphDiff>,
+    /// Server-rendered natural-language gist. Same convention as
+    /// anomaly + coverage summaries.
+    pub summary: String,
+    pub engine_duration_ms: u64,
+    pub analysis_scope: String,
+}
+
+async fn get_counterfactual(
+    State(state): State<DiagnosticsHttpState>,
+    headers: HeaderMap,
+    Path(event_id_str): Path<String>,
+    Query(query): Query<CounterfactualQuery>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(e) => return tenant_error_response(e),
+    };
+    let include_diff = query.include_diff.unwrap_or(true);
+    let event_id = EventId::from_str(&event_id_str);
+
+    let hydra_arc = state.runtime.hydra();
+    let hydra = hydra_arc.read().await;
+
+    // Tenant check on the seed event (matches lineage /
+    // /query/events/:event_id/counterfactual existing semantics).
+    let seed = match hydra.event(&event_id) {
+        Some(e) => e,
+        None => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("event not found: {event_id_str}"),
+            );
+        }
+    };
+    if let Some(seed_tenant) = &seed.tenant_id {
+        if *seed_tenant != tenant {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("event not found: {event_id_str}"),
+            );
+        }
+    }
+
+    let start = Instant::now();
+    let impact = match hydra.impact_score(&event_id) {
+        Ok(s) => s,
+        Err(err) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("counterfactual failed for {event_id_str}: {err}"),
+            );
+        }
+    };
+    let engine_duration_ms = start.elapsed().as_millis() as u64;
+
+    let magnitude = impact.magnitude();
+    let summary = render_counterfactual_summary(&impact, include_diff);
+
+    let diff = if include_diff { Some(impact.diff) } else { None };
+
+    Json(CounterfactualDiagnosticsResponse {
+        event_id: impact.event_id,
+        event_found: true,
+        counterfactual_mode: "single_event_removal".to_string(),
+        causal_subtree_size: impact.causal_subtree_size,
+        nodes_affected: impact.nodes_affected,
+        edges_affected: impact.edges_affected,
+        properties_changed: impact.properties_changed,
+        affected_types: impact.affected_types,
+        magnitude,
+        diff,
+        summary,
+        engine_duration_ms,
+        analysis_scope: "global".to_string(),
+    })
+    .into_response()
+}
+
+fn render_counterfactual_summary(
+    impact: &hydra_engine::counterfactual::ImpactScore,
+    include_diff: bool,
+) -> String {
+    let mut parts: Vec<String> = vec![format!(
+        "Removing event {} would undo {} cascaded event(s).",
+        impact.event_id, impact.causal_subtree_size
+    )];
+
+    parts.push(format!(
+        "Graph impact: {} node(s) affected, {} edge(s) affected, {} property change(s) (magnitude {:.1}).",
+        impact.nodes_affected,
+        impact.edges_affected,
+        impact.properties_changed,
+        impact.magnitude()
+    ));
+
+    // Top 3 affected types by count.
+    if !impact.affected_types.is_empty() {
+        let mut pairs: Vec<(&String, &usize)> = impact.affected_types.iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(a.1));
+        let top: Vec<String> = pairs
+            .iter()
+            .take(3)
+            .map(|(t, c)| format!("{t} ({c})"))
+            .collect();
+        parts.push(format!("Affected types: {}.", top.join(", ")));
+    }
+
+    if !include_diff {
+        parts.push("(diff omitted via include_diff=false)".to_string());
+    } else if impact.nodes_affected == 0
+        && impact.edges_affected == 0
+        && impact.properties_changed == 0
+    {
+        parts.push("Zero-impact event: removing it changes nothing.".to_string());
     }
 
     parts.join(" ")
@@ -962,5 +1154,157 @@ mod tests {
         assert!(raw.get("model_count").is_some());
         assert!(raw.get("report_count").is_some());
         assert!(raw.get("summary").is_some());
+    }
+
+    // === GET /diagnostics/counterfactual/:event_id ===
+
+    /// Ingest a NodeCreated event; return (runtime_handle, event_id).
+    /// A NodeCreated has a measurable graph impact (the node exists
+    /// only because of this event), so counterfactual analysis
+    /// returns a non-empty diff.
+    async fn ingest_node_created(name: &str, type_id: &str) -> (crate::runtime::RuntimeHandle, EventId) {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let event_id;
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            let result = hydra
+                .ingest_for_tenant(
+                    EventKind::NodeCreated {
+                        node_id: NodeId::from_str(name),
+                        type_id: type_id.to_string(),
+                        properties: HashMap::new(),
+                    },
+                    tenant(),
+                )
+                .unwrap();
+            event_id = result.events[0].id.clone();
+        }
+        // Leak the processor so the runtime stays alive across the test
+        // body (matches other tests in this module).
+        std::mem::forget(_processor);
+        (runtime, event_id)
+    }
+
+    #[tokio::test]
+    async fn counterfactual_returns_404_for_unknown_event() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/counterfactual/evt_missing"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn counterfactual_returns_full_impact_for_known_event() {
+        let (runtime, event_id) = ingest_node_created("node_cf", "type_cf").await;
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!("/diagnostics/counterfactual/{event_id}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: CounterfactualDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.event_id, event_id);
+        assert!(decoded.event_found);
+        assert_eq!(decoded.counterfactual_mode, "single_event_removal");
+        // Removing a NodeCreated event with no descendants → subtree
+        // size of 1.
+        assert!(decoded.causal_subtree_size >= 1);
+        // The diff should report node_cf as only-in-actual.
+        assert_eq!(decoded.nodes_affected, 1);
+        assert!(decoded.diff.is_some());
+        let diff = decoded.diff.unwrap();
+        assert_eq!(diff.nodes_only_in_actual.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn counterfactual_magnitude_matches_heuristic() {
+        // magnitude = 10 * nodes + 5 * edges + 1 * properties.
+        // For our NodeCreated (1 node, 0 edges, 0 properties),
+        // magnitude must be 10.0.
+        let (runtime, event_id) = ingest_node_created("node_mag", "type_mag").await;
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!("/diagnostics/counterfactual/{event_id}")))
+            .await
+            .unwrap();
+        let decoded: CounterfactualDiagnosticsResponse = read_json(response).await;
+        let expected = (decoded.nodes_affected as f64) * 10.0
+            + (decoded.edges_affected as f64) * 5.0
+            + (decoded.properties_changed as f64) * 1.0;
+        assert!(
+            (decoded.magnitude - expected).abs() < f64::EPSILON,
+            "magnitude {} != expected {expected}",
+            decoded.magnitude
+        );
+    }
+
+    #[tokio::test]
+    async fn counterfactual_include_diff_false_returns_null_diff() {
+        // Critical semantic test: `diff: null` is DIFFERENT from
+        // `diff: { all-empty-arrays }`. With include_diff=false the
+        // server returns null (transport-level omission), NOT zero
+        // impact (which would be Some with empty vecs).
+        let (runtime, event_id) = ingest_node_created("node_nodiff", "type_nodiff").await;
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/diagnostics/counterfactual/{event_id}?include_diff=false"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: CounterfactualDiagnosticsResponse = read_json(response).await;
+        assert!(decoded.diff.is_none(), "include_diff=false must null the diff");
+        // Aggregates are still populated.
+        assert_eq!(decoded.nodes_affected, 1);
+        assert!(decoded.summary.contains("include_diff=false"));
+        // Confirm the wire form is `null`, not `{}` — re-decode raw.
+        let raw = serde_json::to_value(&decoded).unwrap();
+        assert!(
+            raw.get("diff").map(|v| v.is_null()).unwrap_or(false),
+            "diff field must serialize as JSON null, got: {:?}",
+            raw.get("diff")
+        );
+    }
+
+    #[tokio::test]
+    async fn counterfactual_summary_renders_facts() {
+        let (runtime, event_id) = ingest_node_created("node_sum", "type_sum").await;
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!("/diagnostics/counterfactual/{event_id}")))
+            .await
+            .unwrap();
+        let decoded: CounterfactualDiagnosticsResponse = read_json(response).await;
+        let s = &decoded.summary;
+        // Narrative covers each major axis.
+        assert!(s.contains("node"), "summary must mention nodes: {s}");
+        assert!(s.contains("magnitude"), "summary must mention magnitude: {s}");
+        assert!(s.contains("Removing event"), "summary must lead with the seed: {s}");
+    }
+
+    #[tokio::test]
+    async fn counterfactual_response_carries_metadata_fields() {
+        let (runtime, event_id) = ingest_node_created("node_meta", "type_meta").await;
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get(&format!("/diagnostics/counterfactual/{event_id}")))
+            .await
+            .unwrap();
+        let decoded: CounterfactualDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.analysis_scope, "global");
+        assert!(decoded.event_found);
+        assert_eq!(decoded.counterfactual_mode, "single_event_removal");
+        let raw = serde_json::to_value(&decoded).unwrap();
+        assert!(raw.get("engine_duration_ms").is_some());
+        assert!(raw.get("analysis_scope").is_some());
+        assert!(raw.get("counterfactual_mode").is_some());
+        assert!(raw.get("event_found").is_some());
+        assert!(raw.get("magnitude").is_some());
+        assert!(raw.get("affected_types").is_some());
     }
 }
