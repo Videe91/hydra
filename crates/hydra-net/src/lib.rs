@@ -16,9 +16,10 @@ pub mod prelude {
     };
     pub use crate::bus::{BusConfig, BusMetrics, CascadeNotification};
     pub use crate::http::{
-        commits_router, events_router, ingest_router, query_router, schema_router, sensor_router,
-        snapshots_router, CommitsHttpState, EventsHttpState, IngestHttpState, QueryHttpState,
-        SchemaHttpState, SensorHttpState, SnapshotsHttpState,
+        commits_router, events_router, ingest_router, lineage_router, query_router, schema_router,
+        sensor_router, snapshots_router, CommitsHttpState, EventsHttpState, IngestHttpState,
+        LineageHttpState, LineageResponse, QueryHttpState, SchemaHttpState, SensorHttpState,
+        SnapshotsHttpState,
     };
     pub use crate::metrics::{
         metrics_router, MetricsRecorder, NoopRecorder, PrometheusTextRecorder,

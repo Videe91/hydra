@@ -1,6 +1,7 @@
 pub mod commits;
 pub mod events;
 pub mod ingest;
+pub mod lineage;
 pub mod pagination;
 pub mod query;
 pub mod replication;
@@ -12,6 +13,11 @@ pub mod tenant;
 pub use commits::{commits_router, CommitsHttpState};
 pub use events::{events_router, EventsHttpState};
 pub use ingest::{ingest_router, IngestHttpState};
+pub use lineage::{
+    lineage_router, LineageAction, LineageApprovalRequest, LineageClaim, LineageEventSummary,
+    LineageEvidence, LineageHttpState, LineageOutcome, LineagePolicyDecision, LineageQuery,
+    LineageResponse,
+};
 pub use pagination::{Page, PaginationQuery};
 pub use query::{query_router, QueryHttpState};
 pub use replication::{

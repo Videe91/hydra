@@ -318,6 +318,12 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
     if path == "/commits" || path.starts_with("/commits/") {
         return vec!["read:audit"];
     }
+    // V2 next-level — lineage is fundamentally an audit/explain
+    // operation, not a graph query. Gate under read:audit alongside
+    // events and commits.
+    if path.starts_with("/lineage/") {
+        return vec!["read:audit"];
+    }
     if path == "/snapshots" || path.starts_with("/snapshots/") {
         return vec!["read:ops"];
     }
