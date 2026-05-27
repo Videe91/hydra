@@ -2665,6 +2665,48 @@ mod tests {
         assert!(promoted, "ReplicaPromoted audit commit must be present");
     }
 
+    #[tokio::test]
+    async fn promotion_status_requires_read_replication_scope() {
+        // GET /replication/promotion-status → `read:replication`.
+        // A token with only `write:ingest` must 403.
+        use crate::auth::AuthToken;
+        use crate::security::{ReplicationServerConfig, ServerSecurityConfig};
+        use hydra_core::{ActorId, ReplicaId};
+        use hydra_net::replication_worker::ReplicationPullerConfig;
+        use hydra_net::role::RuntimeRole;
+
+        let runtime = test_runtime();
+        let self_id = ReplicaId::from_str("replica_self_scope_test");
+        let leader_id = ReplicaId::from_str("replica_leader_scope_test");
+        let puller_config = ReplicationPullerConfig::new(
+            leader_id.clone(),
+            "http://127.0.0.1:1".to_string(),
+            ActorId::from_str("actor_scope_restorer"),
+        );
+        let security = ServerSecurityConfig::with_auth(
+            AuthConfig::require_for_all_with_tokens([
+                AuthToken::unbound("alpha").with_scopes(["write:ingest"]),
+            ]),
+        )
+        .with_role(RuntimeRole::Follower)
+        .with_replication(ReplicationServerConfig::new(puller_config))
+        .with_self_peer_id(self_id);
+        let app = build_router_with_security(runtime, security);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/replication/promotion-status")
+            .header("Authorization", "Bearer alpha")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "missing read:replication scope must 403"
+        );
+    }
+
     // === V2 patch 4I — server auto-start of replication worker ===
 
     use crate::security::ReplicationServerConfig;

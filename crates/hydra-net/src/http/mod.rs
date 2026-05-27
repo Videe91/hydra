@@ -15,10 +15,11 @@ pub use ingest::{ingest_router, IngestHttpState};
 pub use pagination::{Page, PaginationQuery};
 pub use query::{query_router, QueryHttpState};
 pub use replication::{
-    replication_promote_router, replication_role_router, replication_router,
+    replication_promote_router, replication_role_router, replication_router, LastPromotionInfo,
     ReplicationHttpState, ReplicationPromoteHttpState, ReplicationPromoteLagError,
-    ReplicationPromoteRequest, ReplicationPromoteResponse, ReplicationRoleGetResponse,
-    ReplicationRoleHttpState, ReplicationRoleSetRequest, ReplicationRoleSetResponse,
+    ReplicationPromoteRequest, ReplicationPromoteResponse, ReplicationPromotionStatusResponse,
+    ReplicationRoleGetResponse, ReplicationRoleHttpState, ReplicationRoleSetRequest,
+    ReplicationRoleSetResponse,
 };
 pub use schema::{schema_router, SchemaHttpState};
 pub use sensor::{sensor_router, SensorHttpState};

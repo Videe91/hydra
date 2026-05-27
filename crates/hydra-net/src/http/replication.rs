@@ -579,6 +579,10 @@ pub fn replication_promote_router(
 ) -> Router {
     Router::new()
         .route("/replication/promote", post(post_replication_promote))
+        .route(
+            "/replication/promotion-status",
+            get(get_replication_promotion_status),
+        )
         .with_state(ReplicationPromoteHttpState::new(
             runtime,
             role_state,
@@ -757,6 +761,89 @@ async fn post_replication_promote(
         lag_at_promotion: Some(lag_commits),
         forced: force,
         changed: true,
+    })
+    .into_response()
+}
+
+/// Audit detail for a single past promotion of this node. Returned
+/// as the `last_promotion` field of `ReplicationPromotionStatusResponse`
+/// when the local ledger contains at least one `ReplicaPromoted`
+/// event for `self_peer_id`. Sourced from the durable commit ledger
+/// (NOT the replication store), so the data survives any future
+/// status mutations.
+///
+/// `reason` carries the operator-supplied string. Forced promotions
+/// append a `(FORCED)` marker (set by the promote handler) — there
+/// is no separate `forced` boolean so callers can't bypass the
+/// audit trail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastPromotionInfo {
+    pub promoted_at: DateTime<Utc>,
+    pub promotion_sequence: u64,
+    pub promoted_by: ActorId,
+    pub reason: Option<String>,
+}
+
+/// `GET /replication/promotion-status` response.
+///
+/// `current_role` is live engine state; `last_promotion` is durable
+/// audit history. They don't have to agree — a node that was
+/// promoted then demoted via `POST /replication/role` reports
+/// `current_role: "follower"` AND a non-null `last_promotion`.
+///
+/// `last_promotion: null` when no `ReplicaPromoted` event for
+/// `self_peer_id` exists in the local ledger. Always 200 (matches
+/// the convention from `GET /replication/peers/:peer_id/lag` —
+/// monitoring loops don't have to special-case 404 for fresh
+/// deployments).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationPromotionStatusResponse {
+    pub self_peer_id: ReplicaId,
+    pub current_role: RuntimeRole,
+    pub last_promotion: Option<LastPromotionInfo>,
+}
+
+async fn get_replication_promotion_status(
+    State(state): State<ReplicationPromoteHttpState>,
+) -> Response {
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
+    let current_role = match hydra.role() {
+        EngineRole::Leader => RuntimeRole::Leader,
+        EngineRole::Follower => RuntimeRole::Follower,
+    };
+
+    // Walk the commit ledger in reverse and stop at the most recent
+    // batch carrying a `ReplicaPromoted` for `self_peer_id`. Gives
+    // us both the audit fields AND the commit sequence in one pass.
+    // O(events) worst case; usually finds a hit early or returns
+    // None quickly on never-promoted nodes.
+    let batches = hydra.commit_ledger().batches_in_sequence();
+    let last_promotion = batches.iter().rev().find_map(|batch| {
+        batch.events.iter().find_map(|event| {
+            if let hydra_core::EventKind::ReplicaPromoted {
+                peer_id,
+                promoted_by,
+                reason,
+            } = &event.kind
+            {
+                if peer_id == &state.self_peer_id {
+                    return Some(LastPromotionInfo {
+                        promoted_at: event.timestamp,
+                        promotion_sequence: batch.sequence,
+                        promoted_by: promoted_by.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+            }
+            None
+        })
+    });
+
+    Json(ReplicationPromotionStatusResponse {
+        self_peer_id: state.self_peer_id.clone(),
+        current_role,
+        last_promotion,
     })
     .into_response()
 }
@@ -1544,5 +1631,198 @@ mod tests {
             .expect("forced promotion must emit audit with reason");
         assert!(reason.contains("split-brain"));
         assert!(reason.contains("FORCED"));
+    }
+
+    // === V2 — GET /replication/promotion-status ===
+
+    #[tokio::test]
+    async fn promotion_status_returns_null_when_never_promoted() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        seed_follower_with_lag(&runtime, &promote_leader_id(), 0).await;
+        let role_state = RoleState::new(RuntimeRole::Follower);
+        let app = replication_promote_router(
+            runtime,
+            role_state,
+            promote_self_id(),
+            promote_leader_id(),
+        );
+        let response = app
+            .oneshot(empty_get("/replication/promotion-status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationPromotionStatusResponse = read_json(response).await;
+        assert_eq!(decoded.self_peer_id, promote_self_id());
+        assert_eq!(decoded.current_role, RuntimeRole::Follower);
+        assert!(
+            decoded.last_promotion.is_none(),
+            "fresh follower must report no promotion history"
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_status_returns_last_promotion_after_promote() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        seed_follower_with_lag(&runtime, &promote_leader_id(), 0).await;
+        let role_state = RoleState::new(RuntimeRole::Follower);
+        let app = replication_promote_router(
+            runtime.clone(),
+            role_state,
+            promote_self_id(),
+            promote_leader_id(),
+        );
+        // Promote.
+        let promote_resp = app
+            .clone()
+            .oneshot(json_post(
+                "/replication/promote",
+                &serde_json::json!({
+                    "promoted_by": promoter_actor().as_str(),
+                    "reason": "leader unreachable"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(promote_resp.status(), StatusCode::OK);
+        let promote_decoded: ReplicationPromoteResponse = read_json(promote_resp).await;
+        let expected_seq = promote_decoded.promotion_sequence.unwrap();
+
+        // GET status — last_promotion mirrors the audit fields.
+        let status_resp = app
+            .oneshot(empty_get("/replication/promotion-status"))
+            .await
+            .unwrap();
+        assert_eq!(status_resp.status(), StatusCode::OK);
+        let decoded: ReplicationPromotionStatusResponse = read_json(status_resp).await;
+        assert_eq!(decoded.current_role, RuntimeRole::Leader);
+        let last = decoded.last_promotion.expect("must carry last_promotion");
+        assert_eq!(last.promotion_sequence, expected_seq);
+        assert_eq!(last.promoted_by, promoter_actor());
+        assert_eq!(last.reason.as_deref(), Some("leader unreachable"));
+    }
+
+    #[tokio::test]
+    async fn promotion_status_preserves_history_after_demotion() {
+        // Promote → demote via the engine setter (the live operator
+        // path is `POST /replication/role`, but the engine flip is
+        // what the GET handler reads, so direct set_role here is
+        // equivalent for the test). last_promotion must remain
+        // populated; current_role must reflect the new Follower.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        seed_follower_with_lag(&runtime, &promote_leader_id(), 0).await;
+        let role_state = RoleState::new(RuntimeRole::Follower);
+        let app = replication_promote_router(
+            runtime.clone(),
+            role_state.clone(),
+            promote_self_id(),
+            promote_leader_id(),
+        );
+        // Promote.
+        let _ = app
+            .clone()
+            .oneshot(json_post(
+                "/replication/promote",
+                &serde_json::json!({
+                    "promoted_by": promoter_actor().as_str(),
+                    "reason": "leader unreachable"
+                }),
+            ))
+            .await
+            .unwrap();
+        // Demote the engine back to Follower (operator runbook step).
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.set_role(EngineRole::Follower);
+        }
+
+        let status_resp = app
+            .oneshot(empty_get("/replication/promotion-status"))
+            .await
+            .unwrap();
+        assert_eq!(status_resp.status(), StatusCode::OK);
+        let decoded: ReplicationPromotionStatusResponse = read_json(status_resp).await;
+        assert_eq!(
+            decoded.current_role,
+            RuntimeRole::Follower,
+            "current_role must follow engine state, not history"
+        );
+        assert!(
+            decoded.last_promotion.is_some(),
+            "demotion must NOT erase the durable promotion audit"
+        );
+        let last = decoded.last_promotion.unwrap();
+        assert_eq!(last.promoted_by, promoter_actor());
+    }
+
+    #[tokio::test]
+    async fn promotion_status_filters_by_self_peer_id() {
+        // The local ledger contains a ReplicaPromoted for SOME OTHER
+        // peer (e.g. replayed from the leader's commit log). The
+        // status route must NOT return it — only events whose
+        // peer_id matches `self_peer_id` count.
+        use hydra_core::EventKind;
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        // Seed manually so we control role-flip ordering: ingest
+        // ALL events first (as Leader, the default), then flip role
+        // to Follower last. The polish-#5 engine guard rejects
+        // ingest on Follower, so this ordering is required.
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            // self registration (so a future promote could target self)
+            hydra
+                .ingest(EventKind::ReplicaRegistered {
+                    peer: ReplicationPeer::registered(
+                        promote_self_id(),
+                        ReplicationRole::Follower,
+                        hydra_core::ReplicationMode::SnapshotThenTail,
+                        ActorId::from_str("actor_cluster_bootstrap"),
+                    ),
+                })
+                .unwrap();
+            // Other peer registration + ReplicaPromoted for them
+            let other_id = ReplicaId::from_str("replica_some_other_node");
+            hydra
+                .ingest(EventKind::ReplicaRegistered {
+                    peer: ReplicationPeer::registered(
+                        other_id.clone(),
+                        ReplicationRole::Follower,
+                        hydra_core::ReplicationMode::SnapshotThenTail,
+                        ActorId::from_str("actor_bootstrap"),
+                    ),
+                })
+                .unwrap();
+            hydra
+                .ingest(EventKind::ReplicaPromoted {
+                    peer_id: other_id,
+                    promoted_by: ActorId::from_str("actor_someone_else"),
+                    reason: Some("unrelated".to_string()),
+                })
+                .unwrap();
+            hydra.set_role(EngineRole::Follower);
+            hydra.record_replication_heartbeat(
+                promote_leader_id(),
+                ReplicationLag::observe(100, 100, chrono::Utc::now()),
+            );
+        }
+        let role_state = RoleState::new(RuntimeRole::Follower);
+        let app = replication_promote_router(
+            runtime,
+            role_state,
+            promote_self_id(),
+            promote_leader_id(),
+        );
+
+        let response = app
+            .oneshot(empty_get("/replication/promotion-status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationPromotionStatusResponse = read_json(response).await;
+        assert!(
+            decoded.last_promotion.is_none(),
+            "ReplicaPromoted for OTHER peers must not surface in self's status"
+        );
     }
 }
