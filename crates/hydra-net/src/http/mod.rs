@@ -14,7 +14,11 @@ pub use events::{events_router, EventsHttpState};
 pub use ingest::{ingest_router, IngestHttpState};
 pub use pagination::{Page, PaginationQuery};
 pub use query::{query_router, QueryHttpState};
-pub use replication::{replication_router, ReplicationHttpState};
+pub use replication::{
+    replication_role_router, replication_router, ReplicationHttpState,
+    ReplicationRoleGetResponse, ReplicationRoleHttpState, ReplicationRoleSetRequest,
+    ReplicationRoleSetResponse,
+};
 pub use schema::{schema_router, SchemaHttpState};
 pub use sensor::{sensor_router, SensorHttpState};
 pub use snapshots::{snapshots_router, SnapshotsHttpState};

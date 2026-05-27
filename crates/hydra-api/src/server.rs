@@ -7,7 +7,7 @@ use crate::auth::{
     RoleState,
 };
 use crate::routes;
-use crate::security::{RateLimitMode, RuntimeRole, ServerSecurityConfig};
+use crate::security::{RateLimitMode, ServerSecurityConfig};
 use crate::state::AppState;
 use axum::http::{header, HeaderValue, Method};
 use axum::middleware;
@@ -15,8 +15,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use hydra_core::ActorId;
 use hydra_net::http::{
-    commits_router, events_router, ingest_router, query_router, replication_router,
-    schema_router, sensor_router, snapshots_router,
+    commits_router, events_router, ingest_router, query_router, replication_role_router,
+    replication_router, schema_router, sensor_router, snapshots_router,
 };
 use hydra_net::runtime::{RuntimeBuilder, RuntimeHandle};
 use hydra_sdk::HydraRuntime;
@@ -99,6 +99,12 @@ pub fn build_router_with_security(
     runtime: RuntimeHandle,
     security: ServerSecurityConfig,
 ) -> Router {
+    // V2 polish #6 — build the shared RoleState once. The middleware
+    // layer reads it on every request, AND the `replication_role_router`
+    // mutates it on `POST /replication/role`. Sharing this Arc is what
+    // makes runtime role flipping take effect immediately.
+    let role_state = RoleState::new(security.role);
+
     let state = AppState::new(runtime.clone());
     let mut app = legacy_routes(state)
         .merge(schema_router(runtime.clone()))
@@ -108,21 +114,21 @@ pub fn build_router_with_security(
         .merge(events_router(runtime.clone()))
         .merge(query_router(runtime.clone()))
         .merge(replication_router(runtime.clone()))
+        .merge(replication_role_router(runtime.clone(), role_state.clone()))
         .merge(snapshots_router(runtime))
         .layer(cors_layer());
 
-    // V2 patch 4H — role layer. On Followers, rejects engine-mutating
-    // routes with 409. Layered AFTER CORS and BEFORE tenant_binding /
-    // auth so the request flow on a Follower is:
+    // V2 patch 4H + polish #6 — role layer. Always installed so the
+    // runtime role flip (`POST /replication/role`) takes effect
+    // immediately. On a Leader the layer is a single
+    // `Ordering::Acquire` atomic load + branch; cost is negligible
+    // against the rest of the middleware stack. Layered AFTER CORS
+    // and BEFORE tenant_binding / auth so the request flow is:
     //   rate-limit → auth → tenant-binding → role → CORS → handler
-    // Skipped entirely on Leader (the default) to keep the existing
-    // hot path unchanged.
-    if matches!(security.role, RuntimeRole::Follower) {
-        app = app.layer(middleware::from_fn_with_state(
-            RoleState::new(security.role),
-            role_middleware,
-        ));
-    }
+    app = app.layer(middleware::from_fn_with_state(
+        role_state,
+        role_middleware,
+    ));
 
     if security.auth.is_enabled() {
         // auth → tenant_binding → handler (see the comment block at
@@ -424,6 +430,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use crate::security::RuntimeRole;
     use hydra_engine::prelude::*;
     use tower::ServiceExt;
 
@@ -2401,6 +2408,152 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(apply.status(), StatusCode::CONFLICT);
+    }
+
+    // === V2 polish #6 — runtime role-flip admin route ===
+
+    /// Build a POST request with a Bearer token and a JSON body.
+    fn auth_post(uri: &str, token: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replication_role_requires_admin_replication_scope() {
+        // Token with only `read:replication` — POST /replication/role
+        // requires `admin:replication` per required_scopes_for. Must
+        // return 403, not flip the role.
+        use crate::auth::AuthToken;
+        let runtime = test_runtime();
+        let app = build_router_with_security(
+            runtime.clone(),
+            ServerSecurityConfig::with_auth(
+                AuthConfig::require_for_all_with_tokens([
+                    AuthToken::unbound("alpha").with_scopes(["read:replication"]),
+                ]),
+            ),
+        );
+        let response = app
+            .oneshot(auth_post(
+                "/replication/role",
+                "alpha",
+                serde_json::json!({"role": "follower"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        // Engine role unchanged — Leader (default).
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        assert_eq!(
+            hydra.role(),
+            hydra_engine::prelude::EngineRole::Leader,
+            "engine role must NOT flip when auth fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn follower_can_flip_itself_to_leader() {
+        // A Follower hits its OWN `/replication/role` to self-promote.
+        // `rejected_on_follower` must NOT block POST /replication/role
+        // (it falls through to "everything else: keep open"), so the
+        // request reaches the handler and the flip takes effect.
+        let runtime = test_runtime();
+        // Seed engine role as Follower too, so we can confirm both
+        // sides flip in lockstep.
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.set_role(hydra_engine::prelude::EngineRole::Follower);
+        }
+        let app = follower_router(runtime.clone());
+        let response = app
+            .oneshot(post(
+                "/replication/role",
+                serde_json::json!({"role": "leader"}),
+            ))
+            .await
+            .unwrap();
+        // NOT 409 — the follower CAN call this route on itself.
+        assert_ne!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "follower must be able to call /replication/role to self-promote"
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Engine role flipped to Leader.
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        assert_eq!(hydra.role(), hydra_engine::prelude::EngineRole::Leader);
+    }
+
+    #[tokio::test]
+    async fn follower_writes_rejected_before_flip_then_accepted_after() {
+        // End-to-end: same `/ingest` request is rejected with 409
+        // while in Follower mode, then accepted with 200 after
+        // POST /replication/role flips to Leader. Proves the
+        // always-on layer reads the shared atomic per request.
+        use hydra_net::http::ingest::IngestRequest;
+        let runtime = test_runtime();
+        let app = follower_router(runtime.clone());
+        // Engine must also start as Follower so post-flip ingest
+        // doesn't trip the engine-level guard (polish #5).
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.set_role(hydra_engine::prelude::EngineRole::Follower);
+        }
+
+        let ingest_body = IngestRequest {
+            event_kind: hydra_core::EventKind::Signal {
+                source: hydra_core::NodeId::from_str("node_x"),
+                name: "round-trip".to_string(),
+                payload: std::collections::HashMap::new(),
+            },
+        };
+        let ingest_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/ingest")
+                .header("content-type", "application/json")
+                .header("X-Hydra-Tenant", "tenant_any")
+                .body(Body::from(serde_json::to_vec(&ingest_body).unwrap()))
+                .unwrap()
+        };
+
+        let pre_flip = app.clone().oneshot(ingest_request()).await.unwrap();
+        assert_eq!(
+            pre_flip.status(),
+            StatusCode::CONFLICT,
+            "pre-flip ingest must be 409"
+        );
+        assert_eq!(runtime.hydra().read().await.commit_count(), 0);
+
+        let flip = app
+            .clone()
+            .oneshot(post(
+                "/replication/role",
+                serde_json::json!({"role": "leader"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(flip.status(), StatusCode::OK);
+
+        let post_flip = app.oneshot(ingest_request()).await.unwrap();
+        assert_ne!(
+            post_flip.status(),
+            StatusCode::CONFLICT,
+            "post-flip ingest must NOT be 409"
+        );
+        assert_eq!(post_flip.status(), StatusCode::OK);
+        // Engine recorded the post-flip commit.
+        assert_eq!(runtime.hydra().read().await.commit_count(), 1);
     }
 
     // === V2 patch 4I — server auto-start of replication worker ===

@@ -45,6 +45,7 @@
 //! follow-up.
 
 use crate::http::pagination::normalized_limit;
+use crate::role::{RoleState, RuntimeRole};
 use crate::runtime::RuntimeHandle;
 use axum::{
     extract::{Path, Query, State},
@@ -53,10 +54,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use hydra_core::{
     CommitBatch, CommitId, ReplicaId, ReplicationLag, ReplicationPeer, ReplicationRole, SnapshotBody,
     SnapshotId, SnapshotManifest,
 };
+use hydra_engine::prelude::EngineRole;
 use serde::{Deserialize, Serialize};
 
 /// Shared HTTP state for the replication read routes.
@@ -377,6 +380,139 @@ async fn get_replication_snapshot_body(
             StatusCode::NOT_FOUND,
             format!("replication snapshot not found: {snapshot_id}"),
         ),
+    }
+}
+
+// === V2 polish #6 — runtime role-flip admin route ===
+
+/// Shared state for the role-flip and role-inspection routes.
+///
+/// Bundles the same `RoleState` instance that hydra-api's
+/// `role_middleware` reads on every request, so the HTTP middleware
+/// sees a flip the instant the handler returns. Also carries the
+/// `RuntimeHandle` so the handler can acquire the engine write lock
+/// and call `Hydra::set_role` — keeping the HTTP role and the engine
+/// role (polish #5) in lockstep.
+#[derive(Clone)]
+pub struct ReplicationRoleHttpState {
+    pub runtime: RuntimeHandle,
+    pub role_state: RoleState,
+}
+
+impl ReplicationRoleHttpState {
+    pub fn new(runtime: RuntimeHandle, role_state: RoleState) -> Self {
+        Self { runtime, role_state }
+    }
+}
+
+/// V2 polish #6 — build the runtime role-flip + inspection router.
+///
+/// Routes (both gated by `admin:replication` / `read:replication`
+/// in hydra-api's `required_scopes_for`):
+///   - `GET  /replication/role` → 200 `{"role": "leader" | "follower"}`
+///   - `POST /replication/role` → body `{"role": "..."}`, returns
+///     `{previous_role, new_role, changed, at}`. Idempotent — a flip
+///     to the current role returns 200 with `changed: false`.
+///
+/// The POST handler is the source of truth for keeping the HTTP
+/// (`RoleState`) and engine (`Hydra::set_role`) roles in lockstep.
+/// Replication worker coordination (auto-start/stop on flip) is
+/// intentionally deferred — operators manage the puller lifecycle
+/// separately.
+pub fn replication_role_router(
+    runtime: RuntimeHandle,
+    role_state: RoleState,
+) -> Router {
+    Router::new()
+        .route(
+            "/replication/role",
+            get(get_replication_role).post(post_replication_role),
+        )
+        .with_state(ReplicationRoleHttpState::new(runtime, role_state))
+}
+
+/// `GET /replication/role` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationRoleGetResponse {
+    pub role: RuntimeRole,
+}
+
+/// `POST /replication/role` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationRoleSetRequest {
+    pub role: RuntimeRole,
+}
+
+/// `POST /replication/role` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationRoleSetResponse {
+    pub previous_role: RuntimeRole,
+    pub new_role: RuntimeRole,
+    pub changed: bool,
+    pub at: DateTime<Utc>,
+}
+
+async fn get_replication_role(
+    State(state): State<ReplicationRoleHttpState>,
+) -> Response {
+    Json(ReplicationRoleGetResponse {
+        role: state.role_state.get(),
+    })
+    .into_response()
+}
+
+async fn post_replication_role(
+    State(state): State<ReplicationRoleHttpState>,
+    Json(request): Json<ReplicationRoleSetRequest>,
+) -> Response {
+    let target = request.role;
+    let target_engine = engine_role_for(target);
+
+    // Source of truth: the HTTP RoleState. Read previous role from
+    // it BEFORE mutating, so the response reflects what the operator
+    // is replacing (not what the engine happened to have, which
+    // should match anyway after V2 P4H + polish #5 + this patch).
+    let previous = state.role_state.get();
+
+    // Engine-side flip first. If a future patch makes set_role
+    // fallible (it doesn't today), we want to short-circuit before
+    // committing the HTTP-side flip.
+    {
+        let hydra = state.runtime.hydra();
+        let mut hydra = hydra.write().await;
+        hydra.set_role(target_engine);
+    }
+
+    // HTTP-side flip. From this Release store onward, every
+    // middleware request load sees the new role.
+    state.role_state.set(target);
+
+    let changed = previous != target;
+    let at = Utc::now();
+    tracing::info!(
+        target: "hydra::role",
+        previous = ?previous,
+        new = ?target,
+        changed,
+        "runtime role flipped"
+    );
+
+    Json(ReplicationRoleSetResponse {
+        previous_role: previous,
+        new_role: target,
+        changed,
+        at,
+    })
+    .into_response()
+}
+
+/// Map `RuntimeRole` (HTTP) → `EngineRole` (engine). The two enums
+/// live in separate crates and are deliberately kept independent;
+/// this is the only place they get translated.
+fn engine_role_for(role: RuntimeRole) -> EngineRole {
+    match role {
+        RuntimeRole::Leader => EngineRole::Leader,
+        RuntimeRole::Follower => EngineRole::Follower,
     }
 }
 
@@ -794,5 +930,106 @@ mod tests {
         assert_eq!(returned.leader_sequence, 100);
         assert_eq!(returned.follower_sequence, 75);
         assert_eq!(returned.lag_commits, 25);
+    }
+
+    // === V2 polish #6 — runtime role-flip admin route ===
+
+    #[tokio::test]
+    async fn replication_role_get_returns_current_role() {
+        // RoleState seeded with Follower; GET must reflect that.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let role_state = RoleState::new(RuntimeRole::Follower);
+        let app = replication_role_router(runtime, role_state);
+        let response = app
+            .oneshot(empty_get("/replication/role"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationRoleGetResponse = read_json(response).await;
+        assert_eq!(decoded.role, RuntimeRole::Follower);
+    }
+
+    #[tokio::test]
+    async fn replication_role_flips_leader_to_follower() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        // Seed engine + HTTP role as Leader.
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.set_role(EngineRole::Leader);
+        }
+        let role_state = RoleState::new(RuntimeRole::Leader);
+        let app = replication_role_router(runtime.clone(), role_state.clone());
+
+        let response = app
+            .oneshot(json_post(
+                "/replication/role",
+                &serde_json::json!({"role": "follower"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationRoleSetResponse = read_json(response).await;
+        assert_eq!(decoded.previous_role, RuntimeRole::Leader);
+        assert_eq!(decoded.new_role, RuntimeRole::Follower);
+        assert!(decoded.changed);
+
+        // HTTP RoleState reflects the flip.
+        assert_eq!(role_state.get(), RuntimeRole::Follower);
+        // Engine role mirrors it.
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        assert_eq!(hydra.role(), EngineRole::Follower);
+    }
+
+    #[tokio::test]
+    async fn replication_role_flips_follower_to_leader() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.set_role(EngineRole::Follower);
+        }
+        let role_state = RoleState::new(RuntimeRole::Follower);
+        let app = replication_role_router(runtime.clone(), role_state.clone());
+
+        let response = app
+            .oneshot(json_post(
+                "/replication/role",
+                &serde_json::json!({"role": "leader"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationRoleSetResponse = read_json(response).await;
+        assert_eq!(decoded.previous_role, RuntimeRole::Follower);
+        assert_eq!(decoded.new_role, RuntimeRole::Leader);
+        assert!(decoded.changed);
+
+        assert_eq!(role_state.get(), RuntimeRole::Leader);
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        assert_eq!(hydra.role(), EngineRole::Leader);
+    }
+
+    #[tokio::test]
+    async fn replication_role_noop_returns_changed_false() {
+        // Same target as current role → 200 OK, changed=false.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let role_state = RoleState::new(RuntimeRole::Leader);
+        let app = replication_role_router(runtime, role_state);
+
+        let response = app
+            .oneshot(json_post(
+                "/replication/role",
+                &serde_json::json!({"role": "leader"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationRoleSetResponse = read_json(response).await;
+        assert_eq!(decoded.previous_role, RuntimeRole::Leader);
+        assert_eq!(decoded.new_role, RuntimeRole::Leader);
+        assert!(!decoded.changed);
     }
 }

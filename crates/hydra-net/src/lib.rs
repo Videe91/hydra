@@ -4,6 +4,7 @@ pub mod http;
 pub mod metrics;
 pub mod query;
 pub mod replication_worker;
+pub mod role;
 pub mod schema_admin_service;
 pub mod schema_service;
 pub mod runtime;
@@ -28,6 +29,7 @@ pub mod prelude {
         ReplicationLoopReport, ReplicationPullError, ReplicationPullErrorKind, ReplicationPuller,
         ReplicationPullReport, ReplicationPullerConfig, ReplicationRetryConfig,
     };
+    pub use crate::role::{RoleState, RuntimeRole};
     pub use crate::schema_admin_service::{SchemaAdminService, SchemaFields};
     pub use crate::schema_service::SchemaService;
     pub use crate::runtime::{RuntimeBuilder, RuntimeConfig, RuntimeHandle, RuntimeProcessor};

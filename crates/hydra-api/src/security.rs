@@ -66,20 +66,17 @@ pub enum RateLimitMode {
 /// receiving route) and `POST /schemas/validate/*` (preflight, no
 /// mutation), plus all `GET`/`OPTIONS`.
 ///
-/// Enforcement is **HTTP-layer only** in this patch. In-process
-/// writes (sensor bus, direct engine calls, SDK) bypass the role
-/// check; an engine-level role guard is a future hardening patch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeRole {
-    Leader,
-    Follower,
-}
-
-impl Default for RuntimeRole {
-    fn default() -> Self {
-        Self::Leader
-    }
-}
+/// Enforcement is HTTP-layer (4H) **and** engine-layer (polish #5).
+/// The two roles (`RuntimeRole` here, `hydra_engine::EngineRole`)
+/// are independent types in independent crates; polish #6's
+/// role-flip route keeps them in lockstep.
+///
+/// V2 polish #6 — the canonical definition moved to
+/// `hydra_net::role::RuntimeRole` so both the HTTP middleware
+/// (here in hydra-api) and the role-flip handler (in hydra-net)
+/// can share a single atomic. Re-exported for backward compat with
+/// pre-#6 callers that imported `hydra_api::security::RuntimeRole`.
+pub use hydra_net::role::RuntimeRole;
 
 /// V2 patch 4I — server-side replication worker config.
 ///

@@ -609,44 +609,46 @@ pub async fn tenant_binding_middleware(
     next.run(request).await
 }
 
-/// V2 patch 4H — shared state for the role middleware. Wraps a
-/// single `RuntimeRole` so axum's `from_fn_with_state` can dispatch
-/// the value to each request without `Arc<Mutex<...>>` overhead
-/// (the role is immutable for the lifetime of the server).
-#[derive(Debug, Clone, Copy)]
-pub struct RoleState {
-    pub role: crate::security::RuntimeRole,
-}
-
-impl RoleState {
-    pub fn new(role: crate::security::RuntimeRole) -> Self {
-        Self { role }
-    }
-}
+/// V2 patch 4H — shared state for the role middleware.
+///
+/// V2 polish #6 — the role is now runtime-mutable via the
+/// `POST /replication/role` admin route. `RoleState` is re-exported
+/// from `hydra_net::role` and wraps an `Arc<AtomicU8>` so the
+/// middleware and the role-flip handler share storage. The
+/// middleware reads via `state.get()` (single `Ordering::Acquire`
+/// load per request).
+pub use hydra_net::role::RoleState;
 
 /// V2 patch 4H — Follower-write-rejection middleware.
 ///
-/// When the server's [`crate::security::RuntimeRole`] is `Follower`,
-/// rejects engine-mutating routes (per
-/// [`rejected_on_follower`]) with `409 Conflict` and
-/// `{"error": "follower is read-only"}`. Leaders pass everything
-/// through unchanged.
+/// When the shared [`RoleState`] currently reads `Follower`,
+/// rejects engine-mutating routes (per [`rejected_on_follower`])
+/// with `409 Conflict` and `{"error": "follower is read-only"}`.
+/// Leaders pass everything through unchanged.
 ///
 /// Always-allowed even on a Follower:
 ///   - `POST /replication/apply` (primary receiving route)
+///   - `POST /replication/role` (self-promotion target — falls
+///     through to the role-flip handler)
 ///   - `POST /schemas/validate/*` (preflight, no mutation)
 ///   - `GET` / `OPTIONS` / `HEAD`
 ///
+/// V2 polish #6 — the layer is now **always installed**, not
+/// conditional on `role == Follower` at boot. The hot Leader path
+/// is a single `Ordering::Acquire` atomic load + branch. This is
+/// what makes runtime role flipping work: the middleware sees the
+/// flipped value immediately after the admin route returns.
+///
 /// Audit logging via `tracing::warn!` on every rejection, matching
-/// the auth / tenant-binding pattern. **HTTP-layer only** in V2 P4H:
-/// in-process writes (sensor bus, direct engine calls, SDK) bypass
-/// this gate. An engine-level role guard is a future patch.
+/// the auth / tenant-binding pattern. Combined with the engine-level
+/// role guard from polish #5, this closes both the HTTP and the
+/// in-process write paths.
 pub async fn role_middleware(
     State(state): State<RoleState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if matches!(state.role, crate::security::RuntimeRole::Leader) {
+    if matches!(state.get(), crate::security::RuntimeRole::Leader) {
         return next.run(request).await;
     }
     // Follower path.
