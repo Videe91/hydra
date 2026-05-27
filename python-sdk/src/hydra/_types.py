@@ -4,43 +4,51 @@ Design rule #2: transport DTOs mirror the wire format exactly. Field
 names, casing, optionality, and discriminator shape all match
 hydra-net's JSON output byte-for-byte.
 
-Patch 1 ships only a minimal set — just enough to prove the
-round-trip pattern works (IDs, confidence, enums with snake_case
-serde, one tagged union). Full type coverage arrives in later
-patches:
-  - Patch 2 (ingest + query): Event, EventKind tagged union, Claim,
-    Evidence, Action, Outcome
-  - Patch 3 (lineage + diagnostics): LineageResponse, AnomalyResponse,
-    CoverageReport, CounterfactualResponse, EvolutionResponse
-  - Patch 4 (schemas + replication): SchemaDefinition,
-    ReplicationStatus, ReplicationPeer, ReplicationLag
+## Wire-form conventions (sharp edges)
 
-Each new type added in a later patch follows the same round-trip
-test pattern established here.
+Most Hydra engine enums use Rust's serde default — externally-tagged
+unit variants in **PascalCase**:
+  - `ClaimStatus` → `"Proposed"`, `"Verified"`, ...
+  - `ClaimKind`   → `"Fact"`, `"AnomalyFinding"`, ...
+  - `ActionKind`  → `"Quarantine"`, `"PostLedgerEntry"`, ...
+  - `ActionStatus`, `OutcomeKind` — same.
 
-NOT public: this module is `hydra._types`, used by the public method
-layer. Public types are re-exported from `hydra.__init__` in later
-patches.
+A small number of newer engine types opted into
+`#[serde(rename_all = "snake_case")]`:
+  - `AnomalyKind`, `DriftDirection`, `SubscriptionOutcome`, `RuntimeRole`.
+
+The SDK Literal types below match each enum's actual wire form,
+verified against the engine.
+
+## Tagged unions
+
+`ClaimSubject`, `ClaimObject`, `EvidenceSource`, `ActionTarget` are
+externally-tagged Rust enums — JSON shape `{"Node": "..."}` or
+`{"Warehouse": {"system": "..."}}`. Pydantic v2's discriminated-union
+sugar wants internally-tagged JSON, which doesn't match. For Patch 2
+these surface as `dict[str, Any]` with static constructor helpers
+(`ClaimSubject.dataset("x")` → `{"Dataset": "x"}`). Patch X may
+promote them to proper Pydantic models if user feedback demands.
+
+## What's still receive-side-only
+
+`Event.kind` is `dict[str, Any]` for now. Ingest helpers in
+`client.py` construct the right shape; users never touch `EventKind`
+directly. A typed discriminated `EventKind` is a future patch.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 # === ID newtypes ===
 #
-# Hydra uses prefixed string IDs (`evt_...`, `node_...`, `claim_...`,
-# etc.) that ULID-sort. Python's type system doesn't need newtypes
-# for these — they ARE strings — but we expose typed aliases so
-# method signatures read clearly:
-#
-#   async def get_event(self, event_id: EventId) -> Event: ...
-#
-# At runtime they're identical to `str`; mypy treats them as distinct
-# enough to catch the common "passed a node_id where an event_id was
-# expected" bug.
+# Hydra uses prefixed ULID-sortable string IDs. We expose typed
+# aliases so method signatures read clearly; at runtime they're
+# plain `str`. mypy treats them as distinct enough to catch the
+# common "passed a node_id where an event_id was expected" bug.
 
 EventId = str
 NodeId = str
@@ -62,135 +70,403 @@ CommitId = str
 SnapshotId = str
 
 
-# === Confidence — newtype-ish wrapper ===
-#
-# Hydra's `Confidence` is `f64` clamped to [0.0, 1.0]. On the wire
-# it's a bare number. We expose a Pydantic model so users get a
-# typed handle plus the clamp validation; serialization uses the
-# bare-number form via `model_serializer` if needed in later patches.
-#
-# For Patch 1 we just demonstrate the pattern with a simple type
-# alias; a richer wrapper can come later without breaking callers
-# that use `float`.
+# === Confidence — [0.0, 1.0] clamp ===
 
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 
 
-# === Enums — snake_case wire form ===
-#
-# All Hydra enums on the engine side use #[serde(rename_all =
-# "snake_case")], so the wire form is `"verified"`, `"proposed"`,
-# `"anomaly_finding"`, etc. Pydantic's `Literal[...]` matches this
-# exactly without needing a separate Enum class.
+# === Enums — PascalCase wire form (Rust serde default) ===
 
 ClaimStatus = Literal[
-    "proposed",
-    "supported",
-    "verified",
-    "operational",
-    "disputed",
-    "stale",
-    "retracted",
-    "archived",
+    "Proposed",
+    "Supported",
+    "Verified",
+    "Operational",
+    "Disputed",
+    "Stale",
+    "Retracted",
+    "Archived",
 ]
 
 ClaimKind = Literal[
-    "fact",
-    "inference",
-    "hypothesis",
-    "prediction",
-    "recommendation",
-    "policy_finding",
-    "anomaly_finding",
-    "lineage_finding",
+    "Fact",
+    "Inference",
+    "Hypothesis",
+    "Prediction",
+    "Recommendation",
+    "PolicyFinding",
+    "AnomalyFinding",
+    "LineageFinding",
 ]
 
 ActionStatus = Literal[
-    "proposed",
-    "approved",
-    "rejected",
-    "executing",
-    "executed",
-    "failed",
-    "cancelled",
+    "Proposed",
+    "Approved",
+    "Rejected",
+    "Executing",
+    "Executed",
+    "Failed",
+    "Cancelled",
 ]
 
+OutcomeKind = Literal[
+    "Success",
+    "Failure",
+    "PartialSuccess",
+    "NoEffect",
+    "Regression",
+    "Unknown",
+]
+
+
+# === Enums — snake_case wire form (engines that opted in) ===
+
 DriftDirection = Literal["increasing", "decreasing"]
-
 SubscriptionOutcome = Literal["confirmed", "dismissed", "auto_accepted"]
-
 RuntimeRole = Literal["leader", "follower"]
 
 
-# === Tagged-union demo: EvidenceSource ===
+# === Tagged-union helpers — `dict` form + static constructors ===
 #
-# The engine's `EvidenceSource` enum uses Pydantic's serde tagged
-# representation — externally tagged ("Warehouse", "Api", etc. as
-# keys). On the wire it serializes as a struct with a single key.
-# Pydantic v2 handles this via Field(discriminator=...) once we have
-# the full tagged-union model in a later patch. For Patch 1 we ship
-# the simpler `"kind"+"details"` form used by `AnomalyKind` etc.,
-# which is the dominant convention going forward in newer engine
-# types.
+# Rust enums like `ClaimSubject::Node(NodeId)` serialize as
+# `{"Node": "node_..."}` — externally-tagged. For Patch 2 we expose
+# these as `dict[str, Any]` and provide ergonomic constructors so
+# users don't write the dict shape by hand:
 #
-# This is intentionally just one demo type — the goal is to prove
-# the round-trip pattern works against real Hydra JSON.
+#   ClaimSubject.dataset("revenue_daily")
+#     → {"Dataset": "revenue_daily"}
+#
+#   EvidenceSource.warehouse(system="snowflake", table="orders")
+#     → {"Warehouse": {"system": "snowflake", "table": "orders",
+#                      "database": None, "schema": None}}
 
 
-class EvidenceSourceWarehouse(BaseModel):
-    """Internal-tagged variant for `EvidenceSource::Warehouse`.
+class ClaimSubject:
+    """Constructor helpers for `EventKind::ClaimProposed.claim.subject`.
 
-    The actual engine `EvidenceSource` uses an externally-tagged
-    representation (Pydantic-incompatible without a Union-discriminator
-    setup); Patch 2 introduces the full Union model. This minimal
-    variant is included to exercise nested-model round-trip in tests.
+    Each method returns the externally-tagged dict shape that the
+    engine's serde expects. Users never compose this shape manually.
+    """
+
+    @staticmethod
+    def node(node_id: NodeId) -> dict[str, Any]:
+        return {"Node": node_id}
+
+    @staticmethod
+    def edge(edge_id: EdgeId) -> dict[str, Any]:
+        return {"Edge": edge_id}
+
+    @staticmethod
+    def external_ref(ref: str) -> dict[str, Any]:
+        return {"ExternalRef": ref}
+
+    @staticmethod
+    def dataset(name: str) -> dict[str, Any]:
+        return {"Dataset": name}
+
+    @staticmethod
+    def metric(name: str) -> dict[str, Any]:
+        return {"Metric": name}
+
+    @staticmethod
+    def system(name: str) -> dict[str, Any]:
+        return {"System": name}
+
+
+class ClaimObject:
+    """Constructor helpers for `Claim.object`."""
+
+    @staticmethod
+    def node(node_id: NodeId) -> dict[str, Any]:
+        return {"Node": node_id}
+
+    @staticmethod
+    def edge(edge_id: EdgeId) -> dict[str, Any]:
+        return {"Edge": edge_id}
+
+    @staticmethod
+    def value(value: Any) -> dict[str, Any]:
+        """The `Value` variant — a free JSON value (string, bool,
+        number, list, dict). The engine's `hydra_core::Value` is
+        polymorphic; we accept whatever the caller hands us."""
+        return {"Value": value}
+
+    @staticmethod
+    def external_ref(ref: str) -> dict[str, Any]:
+        return {"ExternalRef": ref}
+
+
+class EvidenceSource:
+    """Constructor helpers for `Evidence.source`. Each variant has
+    its own struct on the engine side; we mirror the named fields."""
+
+    @staticmethod
+    def warehouse(
+        *,
+        system: str,
+        database: str | None = None,
+        schema: str | None = None,
+        table: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "Warehouse": {
+                "system": system,
+                "database": database,
+                "schema": schema,
+                "table": table,
+            }
+        }
+
+    @staticmethod
+    def api(*, system: str, endpoint: str | None = None) -> dict[str, Any]:
+        return {"Api": {"system": system, "endpoint": endpoint}}
+
+    @staticmethod
+    def document(uri: str) -> dict[str, Any]:
+        return {"Document": {"uri": uri}}
+
+    @staticmethod
+    def human(actor_id: ActorId) -> dict[str, Any]:
+        return {"Human": {"actor_id": actor_id}}
+
+    @staticmethod
+    def agent(actor_id: ActorId) -> dict[str, Any]:
+        return {"Agent": {"actor_id": actor_id}}
+
+    @staticmethod
+    def system(name: str) -> dict[str, Any]:
+        return {"System": {"name": name}}
+
+
+class ActionTarget:
+    """Constructor helpers for `Action.targets[]`."""
+
+    @staticmethod
+    def node(node_id: NodeId) -> dict[str, Any]:
+        return {"Node": node_id}
+
+    @staticmethod
+    def edge(edge_id: EdgeId) -> dict[str, Any]:
+        return {"Edge": edge_id}
+
+    @staticmethod
+    def claim(claim_id: ClaimId) -> dict[str, Any]:
+        return {"Claim": claim_id}
+
+    @staticmethod
+    def evidence(evidence_id: EvidenceId) -> dict[str, Any]:
+        return {"Evidence": evidence_id}
+
+    @staticmethod
+    def external_ref(ref: str) -> dict[str, Any]:
+        return {"ExternalRef": ref}
+
+    @staticmethod
+    def dataset(name: str) -> dict[str, Any]:
+        return {"Dataset": name}
+
+    @staticmethod
+    def system(name: str) -> dict[str, Any]:
+        return {"System": name}
+
+
+# === Wire models — Patch 2 expansion ===
+
+
+class NodeMeta(BaseModel):
+    """Mirrors `hydra_core::NodeMeta`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: NodeId
+    type_id: str
+    created_at: str
+    updated_at: str
+    version: int
+    alive: bool
+    tenant_id: TenantId | None = None
+
+
+class Node(BaseModel):
+    """Mirrors `hydra_core::Node`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    meta: NodeMeta
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
+class EdgeMeta(BaseModel):
+    """Mirrors `hydra_core::EdgeMeta`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: EdgeId
+    type_id: str
+    source: NodeId
+    target: NodeId
+    created_at: str
+    updated_at: str
+    version: int
+    alive: bool
+    tenant_id: TenantId | None = None
+
+
+class Edge(BaseModel):
+    """Mirrors `hydra_core::Edge`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    meta: EdgeMeta
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
+class Event(BaseModel):
+    """Mirrors `hydra_core::Event`.
+
+    `kind` carries the externally-tagged `EventKind` variant body
+    as a `dict` in Patch 2. A typed discriminated union is a future
+    patch — users currently inspect `event.kind` by key.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    system: str
-    database: str | None = None
-    schema_: str | None = Field(default=None, alias="schema")
-    table: str | None = None
+    id: EventId
+    timestamp: str
+    kind: dict[str, Any] | str
+    caused_by: list[EventId] = Field(default_factory=list)
+    cascade_id: CascadeId
+    cascade_depth: int
+    cascade_breadth_index: int = 0
+    tenant_id: TenantId | None = None
 
 
-# === Polish #6 / V2 — RoleState GET response ===
+class EvidencePayload(BaseModel):
+    """Mirrors `hydra_core::EvidencePayload`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class Evidence(BaseModel):
+    """Mirrors `hydra_core::Evidence`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: EvidenceId
+    tenant_id: TenantId | None = None
+    source: dict[str, Any]  # externally-tagged EvidenceSource
+    payload: EvidencePayload
+    reliability: Confidence
+    observed_at: str
+    recorded_at: str
+    caused_by: EventId | None = None
+
+
+class Claim(BaseModel):
+    """Mirrors `hydra_core::Claim`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: ClaimId
+    tenant_id: TenantId | None = None
+    kind: ClaimKind
+    subject: dict[str, Any]  # externally-tagged ClaimSubject
+    predicate: str
+    object: dict[str, Any]  # externally-tagged ClaimObject
+    confidence: Confidence
+    status: ClaimStatus
+    evidence_for: list[EvidenceId] = Field(default_factory=list)
+    evidence_against: list[EvidenceId] = Field(default_factory=list)
+    valid_from: str
+    valid_until: str | None = None
+    created_by: ActorId
+    created_at: str
+    updated_at: str
+    caused_by: EventId | None = None
+
+
+class Action(BaseModel):
+    """Mirrors `hydra_core::Action`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: ActionId
+    tenant_id: TenantId | None = None
+    kind: dict[str, Any] | str  # ActionKind: variants OR `{"Custom": "..."}`
+    status: ActionStatus
+    targets: list[dict[str, Any]] = Field(default_factory=list)
+    related_claims: list[ClaimId] = Field(default_factory=list)
+    supporting_evidence: list[EvidenceId] = Field(default_factory=list)
+    proposed_by: ActorId
+    approved_by: ActorId | None = None
+    policy_id: PolicyId | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+    approved_at: str | None = None
+    executed_at: str | None = None
+    caused_by: EventId | None = None
+
+
+class Outcome(BaseModel):
+    """Mirrors `hydra_core::Outcome`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: OutcomeId
+    tenant_id: TenantId | None = None
+    action_id: ActionId
+    kind: OutcomeKind
+    observed_events: list[EventId] = Field(default_factory=list)
+    updated_claims: list[ClaimId] = Field(default_factory=list)
+    produced_evidence: list[EvidenceId] = Field(default_factory=list)
+    impact: dict[str, Any] = Field(default_factory=dict)
+    observed_at: str
+    recorded_at: str
+    recorded_by: ActorId
+    caused_by: EventId | None = None
+
+
+# === Ingest response ===
+
+
+class IngestResponse(BaseModel):
+    """Mirrors `hydra_net::http::ingest::IngestResponse`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cascade_id: CascadeId | None = None
+    event_ids: list[EventId] = Field(default_factory=list)
+    event_count: int
+    idempotent_hit: bool
+
+
+# === Patch 1 carryovers — promotion-status / role-get ===
 #
-# A real, currently-shipped Hydra wire type. We bring it in for Patch
-# 1's round-trip test because it's small (one field) and exercises
-# the lowercase-serde-rename pattern we'll reuse across the SDK.
+# Kept for the carry-over tests in test_types.py. The full living-
+# database surface (lineage, diagnostics) gets its types added in
+# Patches 3-4.
+
 
 class ReplicationRoleGetResponse(BaseModel):
-    """Mirrors hydra-net's `ReplicationRoleGetResponse`.
-
-    Wire form: `{"role": "leader"}` or `{"role": "follower"}`.
-    """
-
     model_config = ConfigDict(extra="forbid")
 
     role: RuntimeRole
 
 
-# === Promotion-status response ===
-#
-# Living-database surface, shipped in commit 26b3055. Used by Patch
-# 1's round-trip tests to demonstrate the SDK can parse an actual
-# response from the running engine without intermediate translation.
-
 class LastPromotionInfo(BaseModel):
-    """Mirrors hydra-net's `LastPromotionInfo`."""
-
     model_config = ConfigDict(extra="forbid")
 
-    promoted_at: str  # ISO 8601 string; Patch 2 introduces datetime conversion
+    promoted_at: str
     promotion_sequence: int
     promoted_by: ActorId
     reason: str | None = None
 
 
 class ReplicationPromotionStatusResponse(BaseModel):
-    """Mirrors hydra-net's `ReplicationPromotionStatusResponse`."""
-
     model_config = ConfigDict(extra="forbid")
 
     self_peer_id: ReplicaId
