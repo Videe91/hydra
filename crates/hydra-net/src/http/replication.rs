@@ -56,8 +56,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use hydra_core::{
-    CommitBatch, CommitId, ReplicaId, ReplicationLag, ReplicationPeer, ReplicationRole, SnapshotBody,
-    SnapshotId, SnapshotManifest,
+    ActorId, CommitBatch, CommitId, ReplicaId, ReplicationLag, ReplicationPeer, ReplicationRole,
+    SnapshotBody, SnapshotId, SnapshotManifest,
 };
 use hydra_engine::prelude::EngineRole;
 use serde::{Deserialize, Serialize};
@@ -514,6 +514,251 @@ fn engine_role_for(role: RuntimeRole) -> EngineRole {
         RuntimeRole::Leader => EngineRole::Leader,
         RuntimeRole::Follower => EngineRole::Follower,
     }
+}
+
+// === V2 next-level — failover / promotion admin route ===
+
+/// Shared state for `POST /replication/promote`.
+///
+/// Bundles:
+///   - `runtime` — for engine write lock + `Hydra::set_role` + audit
+///     event ingest + lag inspection
+///   - `role_state` — same shared atomic that hydra-api's
+///     `role_middleware` reads, so the HTTP role flips in lockstep
+///     with the engine role (polish #6 pattern)
+///   - `self_peer_id` — this node's `ReplicaId`, stamped into the
+///     `ReplicaPromoted` audit commit
+///   - `leader_peer_id` — the peer the follower is replicating from;
+///     used by the catch-up check (lag inspection)
+#[derive(Clone)]
+pub struct ReplicationPromoteHttpState {
+    pub runtime: RuntimeHandle,
+    pub role_state: RoleState,
+    pub self_peer_id: ReplicaId,
+    pub leader_peer_id: ReplicaId,
+}
+
+impl ReplicationPromoteHttpState {
+    pub fn new(
+        runtime: RuntimeHandle,
+        role_state: RoleState,
+        self_peer_id: ReplicaId,
+        leader_peer_id: ReplicaId,
+    ) -> Self {
+        Self {
+            runtime,
+            role_state,
+            self_peer_id,
+            leader_peer_id,
+        }
+    }
+}
+
+/// V2 next-level — build the failover/promotion router.
+///
+/// Single route: `POST /replication/promote` (auth gate
+/// `admin:replication`). Idempotent on already-Leader (returns
+/// `changed: false`). Catch-up enforced by default (rejected with
+/// 409 if `lag_commits > 0`); operator can override with
+/// `force: true`.
+///
+/// The handler is the source of truth for keeping all three
+/// state surfaces in lockstep:
+///   1. Engine role (`Hydra::set_role(EngineRole::Leader)`)
+///   2. HTTP role (`role_state.set(RuntimeRole::Leader)`)
+///   3. Cluster audit (`ReplicaPromoted` commit)
+///
+/// Replication worker self-exits on the next loop iteration via
+/// the engine-role check at the top of `run_until_cancelled`
+/// (added in this same patch).
+pub fn replication_promote_router(
+    runtime: RuntimeHandle,
+    role_state: RoleState,
+    self_peer_id: ReplicaId,
+    leader_peer_id: ReplicaId,
+) -> Router {
+    Router::new()
+        .route("/replication/promote", post(post_replication_promote))
+        .with_state(ReplicationPromoteHttpState::new(
+            runtime,
+            role_state,
+            self_peer_id,
+            leader_peer_id,
+        ))
+}
+
+/// `POST /replication/promote` request body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationPromoteRequest {
+    /// Required — actor responsible for the promotion (e.g.
+    /// `"actor_oncall_alice"`). Audit attribution.
+    pub promoted_by: ActorId,
+    /// Optional human-readable reason. Stamped into the
+    /// `ReplicaPromoted.reason` field. Forced promotions append
+    /// `" (FORCED)"`.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Optional — skip the catch-up check. Use only when the leader
+    /// is truly unreachable and accepting divergence is preferable
+    /// to staying degraded.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// `POST /replication/promote` response body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationPromoteResponse {
+    pub previous_role: RuntimeRole,
+    pub new_role: RuntimeRole,
+    pub promoted_at: Option<DateTime<Utc>>,
+    pub promotion_sequence: Option<u64>,
+    pub applied_sequence_before_promotion: Option<u64>,
+    pub lag_at_promotion: Option<u64>,
+    pub forced: bool,
+    pub changed: bool,
+}
+
+/// 409 response shape when the follower is not caught up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationPromoteLagError {
+    pub error: String,
+    pub applied_sequence: Option<u64>,
+    pub lag_commits: u64,
+    pub hint: String,
+}
+
+async fn post_replication_promote(
+    State(state): State<ReplicationPromoteHttpState>,
+    Json(request): Json<ReplicationPromoteRequest>,
+) -> Response {
+    let ReplicationPromoteRequest {
+        promoted_by,
+        reason,
+        force,
+    } = request;
+
+    // Acquire the engine write lock for the whole promotion
+    // sequence so role flip + audit commit are observed atomically
+    // by everything reading through the engine.
+    let hydra_arc = state.runtime.hydra();
+    let mut hydra = hydra_arc.write().await;
+
+    // Idempotent path — already Leader.
+    if hydra.role() == EngineRole::Leader {
+        // HTTP role may be stale (operator might have flipped engine
+        // role directly via set_role). Sync it on the way out.
+        drop(hydra);
+        state.role_state.set(RuntimeRole::Leader);
+        return Json(ReplicationPromoteResponse {
+            previous_role: RuntimeRole::Leader,
+            new_role: RuntimeRole::Leader,
+            promoted_at: None,
+            promotion_sequence: None,
+            applied_sequence_before_promotion: None,
+            lag_at_promotion: None,
+            forced: false,
+            changed: false,
+        })
+        .into_response();
+    }
+
+    // Catch-up check — observed lag must be 0 unless force=true.
+    let lag_observation = hydra
+        .latest_replication_lag(&state.leader_peer_id)
+        .cloned();
+    let lag_commits = lag_observation
+        .as_ref()
+        .map(|l| l.lag_commits)
+        .unwrap_or(0);
+    let follower_sequence = lag_observation.as_ref().map(|l| l.follower_sequence);
+
+    if !force && lag_commits > 0 {
+        drop(hydra);
+        return (
+            StatusCode::CONFLICT,
+            Json(ReplicationPromoteLagError {
+                error: "follower not caught up".to_string(),
+                applied_sequence: follower_sequence,
+                lag_commits,
+                hint: "wait until lag=0 or retry with force=true (accepts divergence risk)"
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Step 1: flip engine role to Leader FIRST. The audit ingest
+    // below would otherwise be rejected by the polish-#5 follower
+    // write guard. Semantically: by the time the audit commit
+    // lands, this node IS the Leader.
+    hydra.set_role(EngineRole::Leader);
+
+    // Step 2: emit the `ReplicaPromoted` audit commit through the
+    // standard ingest path. The engine's `ReplicationStore` handler
+    // updates the peer's status to `Promoted` as a side-effect.
+    let audit_reason = match (force, reason.as_deref()) {
+        (true, Some(r)) => Some(format!("{r} (FORCED)")),
+        (true, None) => Some("(FORCED)".to_string()),
+        (false, r) => r.map(str::to_string),
+    };
+    let audit_event = hydra_core::EventKind::ReplicaPromoted {
+        peer_id: state.self_peer_id.clone(),
+        promoted_by: promoted_by.clone(),
+        reason: audit_reason.clone(),
+    };
+    let ingest_result = hydra.ingest(audit_event);
+    let promotion_sequence = hydra.latest_commit().map(|c| c.sequence);
+    drop(hydra);
+
+    if let Err(err) = ingest_result {
+        // Failed to emit audit — leave the engine role flipped
+        // (operator can still write) but surface the audit failure.
+        tracing::warn!(
+            target: "hydra::promotion",
+            error = %err,
+            self_peer_id = %state.self_peer_id,
+            "ReplicaPromoted audit ingest failed; engine role still flipped to Leader"
+        );
+        // HTTP role flip still happens so subsequent requests align.
+        state.role_state.set(RuntimeRole::Leader);
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("ReplicaPromoted audit ingest failed: {err}"),
+        );
+    }
+
+    // Step 3: flip HTTP role (same Arc<AtomicU8> the middleware reads).
+    state.role_state.set(RuntimeRole::Leader);
+
+    if force {
+        tracing::warn!(
+            target: "hydra::promotion",
+            self_peer_id = %state.self_peer_id,
+            promoted_by = %promoted_by,
+            lag_commits,
+            "forced promotion — catch-up check bypassed (divergence accepted)"
+        );
+    } else {
+        tracing::info!(
+            target: "hydra::promotion",
+            self_peer_id = %state.self_peer_id,
+            promoted_by = %promoted_by,
+            promotion_sequence = ?promotion_sequence,
+            "node promoted to Leader"
+        );
+    }
+
+    Json(ReplicationPromoteResponse {
+        previous_role: RuntimeRole::Follower,
+        new_role: RuntimeRole::Leader,
+        promoted_at: Some(Utc::now()),
+        promotion_sequence,
+        applied_sequence_before_promotion: follower_sequence,
+        lag_at_promotion: Some(lag_commits),
+        forced: force,
+        changed: true,
+    })
+    .into_response()
 }
 
 #[cfg(test)]
@@ -1031,5 +1276,273 @@ mod tests {
         assert_eq!(decoded.previous_role, RuntimeRole::Leader);
         assert_eq!(decoded.new_role, RuntimeRole::Leader);
         assert!(!decoded.changed);
+    }
+
+    // === V2 next-level — failover / promotion admin route ===
+
+    fn promote_self_id() -> ReplicaId {
+        ReplicaId::from_str("replica_self_test")
+    }
+
+    fn promote_leader_id() -> ReplicaId {
+        ReplicaId::from_str("replica_leader_test")
+    }
+
+    fn promoter_actor() -> ActorId {
+        ActorId::from_str("actor_oncall_promote_test")
+    }
+
+    /// Seed a Hydra with:
+    ///   - `self_peer_id` registered as a `Follower` peer (matches
+    ///     what cluster bootstrap would do — every node ingests
+    ///     `ReplicaRegistered` events for every peer including
+    ///     itself before the cluster is operational)
+    ///   - observed lag against `leader_peer_id` set to the given
+    ///     value (this is what the promote handler reads for
+    ///     catch-up enforcement)
+    /// Engine role left as Follower.
+    async fn seed_follower_with_lag(
+        runtime: &RuntimeHandle,
+        leader_peer_id: &ReplicaId,
+        lag_commits: u64,
+    ) {
+        let hydra_arc = runtime.hydra();
+        let mut hydra = hydra_arc.write().await;
+        // Register self in the local replication store. Real-world
+        // deployments do this via the leader's commit log; tests do
+        // it directly.
+        let self_peer = ReplicationPeer::registered(
+            promote_self_id(),
+            ReplicationRole::Follower,
+            hydra_core::ReplicationMode::SnapshotThenTail,
+            ActorId::from_str("actor_cluster_bootstrap"),
+        );
+        hydra
+            .ingest(hydra_core::EventKind::ReplicaRegistered { peer: self_peer })
+            .unwrap();
+        hydra.set_role(EngineRole::Follower);
+        let leader_seq = 100u64;
+        let follower_seq = leader_seq.saturating_sub(lag_commits);
+        let lag = ReplicationLag::observe(leader_seq, follower_seq, chrono::Utc::now());
+        hydra.record_replication_heartbeat(leader_peer_id.clone(), lag);
+    }
+
+    #[tokio::test]
+    async fn promote_catch_up_blocks_with_409_when_lagging() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        seed_follower_with_lag(&runtime, &promote_leader_id(), 3).await;
+        let role_state = RoleState::new(RuntimeRole::Follower);
+        let app = replication_promote_router(
+            runtime.clone(),
+            role_state.clone(),
+            promote_self_id(),
+            promote_leader_id(),
+        );
+
+        let response = app
+            .oneshot(json_post(
+                "/replication/promote",
+                &serde_json::json!({
+                    "promoted_by": promoter_actor().as_str(),
+                    "reason": "test catch-up block"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let decoded: ReplicationPromoteLagError = read_json(response).await;
+        assert_eq!(decoded.lag_commits, 3);
+        assert!(decoded.error.contains("not caught up"));
+        // Engine role unchanged.
+        assert_eq!(
+            runtime.hydra().read().await.role(),
+            EngineRole::Follower,
+            "engine role must not flip on rejected promotion"
+        );
+        assert_eq!(role_state.get(), RuntimeRole::Follower);
+    }
+
+    #[tokio::test]
+    async fn promote_succeeds_when_caught_up() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        seed_follower_with_lag(&runtime, &promote_leader_id(), 0).await;
+        let role_state = RoleState::new(RuntimeRole::Follower);
+        let app = replication_promote_router(
+            runtime.clone(),
+            role_state.clone(),
+            promote_self_id(),
+            promote_leader_id(),
+        );
+
+        let response = app
+            .oneshot(json_post(
+                "/replication/promote",
+                &serde_json::json!({
+                    "promoted_by": promoter_actor().as_str(),
+                    "reason": "leader unreachable"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationPromoteResponse = read_json(response).await;
+        assert_eq!(decoded.previous_role, RuntimeRole::Follower);
+        assert_eq!(decoded.new_role, RuntimeRole::Leader);
+        assert!(decoded.changed);
+        assert!(!decoded.forced);
+        assert!(decoded.promotion_sequence.is_some());
+
+        // Engine + HTTP both flipped.
+        assert_eq!(runtime.hydra().read().await.role(), EngineRole::Leader);
+        assert_eq!(role_state.get(), RuntimeRole::Leader);
+    }
+
+    #[tokio::test]
+    async fn promote_with_force_skips_catch_up_check() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        seed_follower_with_lag(&runtime, &promote_leader_id(), 12).await;
+        let role_state = RoleState::new(RuntimeRole::Follower);
+        let app = replication_promote_router(
+            runtime.clone(),
+            role_state.clone(),
+            promote_self_id(),
+            promote_leader_id(),
+        );
+
+        let response = app
+            .oneshot(json_post(
+                "/replication/promote",
+                &serde_json::json!({
+                    "promoted_by": promoter_actor().as_str(),
+                    "reason": "split-brain accepted",
+                    "force": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationPromoteResponse = read_json(response).await;
+        assert_eq!(decoded.new_role, RuntimeRole::Leader);
+        assert!(decoded.forced);
+        assert_eq!(decoded.lag_at_promotion, Some(12));
+        assert_eq!(runtime.hydra().read().await.role(), EngineRole::Leader);
+    }
+
+    #[tokio::test]
+    async fn promote_is_idempotent_when_already_leader() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        // Already a Leader (engine + HTTP both Leader).
+        let role_state = RoleState::new(RuntimeRole::Leader);
+        let app = replication_promote_router(
+            runtime.clone(),
+            role_state.clone(),
+            promote_self_id(),
+            promote_leader_id(),
+        );
+        // Engine already starts as Leader (default for Hydra::new()).
+
+        let response = app
+            .oneshot(json_post(
+                "/replication/promote",
+                &serde_json::json!({
+                    "promoted_by": promoter_actor().as_str()
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: ReplicationPromoteResponse = read_json(response).await;
+        assert!(!decoded.changed);
+        assert_eq!(decoded.previous_role, RuntimeRole::Leader);
+        assert_eq!(decoded.new_role, RuntimeRole::Leader);
+        // No new audit commit emitted on the idempotent path.
+        assert!(decoded.promotion_sequence.is_none());
+    }
+
+    #[tokio::test]
+    async fn promote_emits_replica_promoted_audit_commit() {
+        use hydra_core::EventKind;
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        seed_follower_with_lag(&runtime, &promote_leader_id(), 0).await;
+        let role_state = RoleState::new(RuntimeRole::Follower);
+        let app = replication_promote_router(
+            runtime.clone(),
+            role_state.clone(),
+            promote_self_id(),
+            promote_leader_id(),
+        );
+
+        let response = app
+            .oneshot(json_post(
+                "/replication/promote",
+                &serde_json::json!({
+                    "promoted_by": promoter_actor().as_str(),
+                    "reason": "leader unreachable"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The engine's recent events contain a ReplicaPromoted with
+        // the right peer_id / promoted_by / reason.
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        let promoted = hydra
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                EventKind::ReplicaPromoted { peer_id, promoted_by, reason } => Some((
+                    peer_id.clone(),
+                    promoted_by.clone(),
+                    reason.clone(),
+                )),
+                _ => None,
+            })
+            .expect("a ReplicaPromoted event must exist after successful promotion");
+        assert_eq!(promoted.0, promote_self_id());
+        assert_eq!(promoted.1, promoter_actor());
+        assert_eq!(promoted.2.as_deref(), Some("leader unreachable"));
+    }
+
+    #[tokio::test]
+    async fn promote_forced_appends_forced_marker_in_audit_reason() {
+        use hydra_core::EventKind;
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        seed_follower_with_lag(&runtime, &promote_leader_id(), 7).await;
+        let role_state = RoleState::new(RuntimeRole::Follower);
+        let app = replication_promote_router(
+            runtime.clone(),
+            role_state.clone(),
+            promote_self_id(),
+            promote_leader_id(),
+        );
+        let response = app
+            .oneshot(json_post(
+                "/replication/promote",
+                &serde_json::json!({
+                    "promoted_by": promoter_actor().as_str(),
+                    "reason": "split-brain",
+                    "force": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        let reason = hydra
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                EventKind::ReplicaPromoted { reason, .. } => reason.clone(),
+                _ => None,
+            })
+            .expect("forced promotion must emit audit with reason");
+        assert!(reason.contains("split-brain"));
+        assert!(reason.contains("FORCED"));
     }
 }

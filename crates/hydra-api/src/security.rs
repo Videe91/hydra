@@ -15,6 +15,7 @@
 //! thin wrappers over the unified config.
 
 use crate::auth::AuthConfig;
+use hydra_core::ReplicaId;
 use hydra_net::replication_worker::ReplicationPullerConfig;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
@@ -137,6 +138,14 @@ pub struct ServerSecurityConfig {
     /// `serve_with_security` spawns the puller and drains it on
     /// shutdown. Default `None` for back-compat.
     pub replication: Option<ReplicationServerConfig>,
+    /// V2 next-level — this node's own `ReplicaId`, used by the
+    /// `POST /replication/promote` admin route to stamp the
+    /// `ReplicaPromoted` audit commit with the right peer id.
+    /// `None` (default) → the promote route is NOT installed (the
+    /// node has no identity in the cluster yet, so promotion is
+    /// meaningless). Operators wanting failover capability set
+    /// this explicitly at boot.
+    pub self_peer_id: Option<ReplicaId>,
 }
 
 impl ServerSecurityConfig {
@@ -149,6 +158,7 @@ impl ServerSecurityConfig {
             rate_limit: RateLimitMode::Off,
             role: RuntimeRole::Leader,
             replication: None,
+            self_peer_id: None,
         }
     }
 
@@ -162,6 +172,7 @@ impl ServerSecurityConfig {
             rate_limit: RateLimitMode::Off,
             role: RuntimeRole::Leader,
             replication: None,
+            self_peer_id: None,
         }
     }
 
@@ -198,6 +209,16 @@ impl ServerSecurityConfig {
     /// server shutdown. Worker fatal does NOT tear down the server.
     pub fn with_replication(mut self, replication: ReplicationServerConfig) -> Self {
         self.replication = Some(replication);
+        self
+    }
+
+    /// V2 next-level — set this node's own `ReplicaId`. Required
+    /// for the `POST /replication/promote` admin route; absent it
+    /// the promote route is not installed. The id is stamped into
+    /// the `ReplicaPromoted` audit commit emitted on a successful
+    /// promotion.
+    pub fn with_self_peer_id(mut self, id: ReplicaId) -> Self {
+        self.self_peer_id = Some(id);
         self
     }
 }

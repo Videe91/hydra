@@ -32,6 +32,7 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use hydra_core::error::{HydraError, Result};
+use hydra_engine::prelude::EngineRole;
 use hydra_core::{
     ActorId, CommitBatch, ReplicaId, ReplicationLag, ReplicationOffset, SnapshotId,
 };
@@ -1518,6 +1519,7 @@ impl ReplicationPuller {
             failures: 0,
             last_error: None,
             last_error_kind: None,
+            self_exited_after_promotion: false,
         };
 
         if shutdown.is_cancelled() {
@@ -1543,6 +1545,28 @@ impl ReplicationPuller {
         let mut current_backoff = self.config.retry.initial_backoff;
 
         loop {
+            // V2 next-level — self-exit on promotion. If the local
+            // engine has been promoted to Leader (via the admin
+            // route POST /replication/promote, or by a direct
+            // operator `Hydra::set_role(Leader)` call), the puller
+            // is now a no-op. Returning Ok with the
+            // `self_exited_after_promotion` flag lets the auto-
+            // spawn drain path complete cleanly without the
+            // operator having to chase the shutdown token. One
+            // read-lock per tick on the engine; cost negligible
+            // against the pull's existing IO.
+            {
+                let hydra_arc = self.runtime.hydra();
+                let role = hydra_arc.read().await.role();
+                if role == EngineRole::Leader {
+                    // Force-flush the heartbeat one last time so the
+                    // post-promotion on-disk record is fresh.
+                    self.force_flush_heartbeat_on_shutdown().await;
+                    report.self_exited_after_promotion = true;
+                    return Ok(report);
+                }
+            }
+
             // Run the next operation: bootstrap (if pending) or pull.
             let op_result = if bootstrap_pending {
                 self.try_bootstrap_from_latest_snapshot().await.map(|boot| {
@@ -1930,6 +1954,12 @@ pub struct ReplicationLoopReport {
     pub failures: u64,
     pub last_error: Option<String>,
     pub last_error_kind: Option<ReplicationPullErrorKind>,
+    /// V2 next-level — the worker exited cleanly because the local
+    /// engine became a Leader (via `POST /replication/promote` or a
+    /// direct `Hydra::set_role(Leader)` call). The puller of a
+    /// Leader is a no-op and self-exiting saves the operator from
+    /// having to chase the shutdown token after a promotion.
+    pub self_exited_after_promotion: bool,
 }
 
 /// V2 patch 4E — fatal-exit error from `run_until_cancelled`. Carries
@@ -2027,6 +2057,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let puller = ReplicationPuller::new(
             follower_runtime.clone(),
             ReplicationPullerConfig {
@@ -2073,6 +2110,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let puller = ReplicationPuller::new(
             follower_runtime.clone(),
             ReplicationPullerConfig {
@@ -2140,6 +2184,13 @@ mod tests {
         let (addr, _server) = spawn_leader(router).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let puller = ReplicationPuller::new(
             follower_runtime,
             ReplicationPullerConfig {
@@ -2190,10 +2241,14 @@ mod tests {
         // chained off the leader's seq=1 hash, but the follower's
         // existing seq=1 hash is different. previous_hash mismatch.
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // Seed the follower's local ledger BEFORE flipping role to
+        // Follower — the polish-#5 engine guard rejects ingest on
+        // Follower. Then flip role for the worker self-exit check.
         {
             let hydra = follower_runtime.hydra();
             let mut hydra = hydra.write().await;
             hydra.ingest(signal("follower_local")).unwrap();
+            hydra.set_role(EngineRole::Follower);
         }
 
         let puller = ReplicationPuller::new(
@@ -2249,6 +2304,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let puller = ReplicationPuller::new(
             follower_runtime.clone(),
             ReplicationPullerConfig {
@@ -2299,6 +2361,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let puller = ReplicationPuller::new(
             follower_runtime.clone(),
             ReplicationPullerConfig {
@@ -2378,6 +2447,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let puller = ReplicationPuller::new(
             follower_runtime.clone(),
             ReplicationPullerConfig {
@@ -2479,6 +2555,13 @@ mod tests {
         let (addr, _server) = spawn_leader(router).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let puller = ReplicationPuller::new(
             follower_runtime.clone(),
             ReplicationPullerConfig {
@@ -2536,6 +2619,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime.clone())).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let puller = ReplicationPuller::new(
             follower_runtime.clone(),
             ReplicationPullerConfig {
@@ -2671,6 +2761,13 @@ mod tests {
         // Pre-cancel — the loop must return immediately without any
         // bootstrap or pull IO. No leader server needed.
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let puller = ReplicationPuller::new(
             follower_runtime.clone(),
             loop_config(
@@ -2708,6 +2805,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let puller = ReplicationPuller::new(
             follower_runtime.clone(),
             loop_config(format!("http://{addr}"), Duration::from_millis(50), true),
@@ -2749,6 +2853,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let puller = ReplicationPuller::new(
             follower_runtime.clone(),
             loop_config(format!("http://{addr}"), Duration::from_millis(10), false),
@@ -2795,6 +2906,13 @@ mod tests {
         // `retry.max_attempts = 1` so the loop gives up after one
         // failed attempt instead of retrying forever (the default).
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = loop_config(
             "http://127.0.0.1:1".to_string(),
             Duration::from_millis(10),
@@ -2922,6 +3040,13 @@ mod tests {
         let (addr, _server) = spawn_leader(router).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = loop_config(format!("http://{addr}"), Duration::from_millis(20), false);
         config.retry.max_attempts = 5;
         config.retry.initial_backoff = Duration::from_millis(1);
@@ -2980,6 +3105,13 @@ mod tests {
         let (addr, _server) = spawn_leader(router).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = loop_config(format!("http://{addr}"), Duration::from_millis(10), false);
         config.retry.max_attempts = 100; // doesn't matter — fatal short-circuits
         let puller = ReplicationPuller::new(follower_runtime, config);
@@ -3014,10 +3146,14 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // Seed the follower's local ledger BEFORE flipping role to
+        // Follower — polish #5 engine guard rejects ingest on
+        // Follower. Then flip role for the worker self-exit check.
         {
             let hydra = follower_runtime.hydra();
             let mut hydra = hydra.write().await;
             hydra.ingest(signal("follower_local")).unwrap();
+            hydra.set_role(EngineRole::Follower);
         }
 
         let mut config = loop_config(format!("http://{addr}"), Duration::from_millis(10), false);
@@ -3046,6 +3182,13 @@ mod tests {
         let (addr, _server) = spawn_leader(router).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = loop_config(format!("http://{addr}"), Duration::from_millis(10), false);
         config.retry.max_attempts = 5;
         config.retry.initial_backoff = Duration::from_millis(1);
@@ -3108,6 +3251,13 @@ mod tests {
         write_cursor_file(&cursor_path, follower_peer_id(), persisted.clone());
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             "http://127.0.0.1:1".to_string(),
@@ -3153,6 +3303,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
@@ -3201,6 +3358,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = loop_config(format!("http://{addr}"), Duration::from_millis(10), false);
         config.cursor_path = Some(cursor_path.clone());
         let puller = ReplicationPuller::new(follower_runtime.clone(), config);
@@ -3232,6 +3396,13 @@ mod tests {
         std::fs::write(&cursor_path, b"not-json-at-all{").unwrap();
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             "http://127.0.0.1:1".to_string(),
@@ -3271,6 +3442,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
@@ -3341,6 +3519,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
@@ -3372,6 +3557,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
@@ -3406,6 +3598,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
@@ -3443,6 +3642,13 @@ mod tests {
         write_heartbeat_file(&heartbeat_path, record);
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             "http://127.0.0.1:1".to_string(),
@@ -3502,6 +3708,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
@@ -3548,6 +3761,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
@@ -3621,6 +3841,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
@@ -3680,6 +3907,13 @@ mod tests {
         // debounce is 10s, because the counter increments are
         // material.
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
 
         // First, observe a baseline lag so persist_heartbeat_state_if_lagged
         // has something to write. We do that by directly recording a
@@ -3737,6 +3971,13 @@ mod tests {
         let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
@@ -3951,6 +4192,13 @@ mod tests {
         let recorder = Arc::new(PrometheusTextRecorder::new());
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
@@ -4026,6 +4274,55 @@ mod tests {
                 "hydra_replication_consecutive_failures{peer_id=\"replica_puller_test\"} 0"
             ),
             "expected consecutive_failures gauge at 0 (successful pull resets), got:\n{after_apply}"
+        );
+    }
+
+    // === V2 next-level — worker self-exit on promotion ===
+
+    /// When the engine flips to Leader (e.g. via `POST /replication/promote`
+    /// or a direct `Hydra::set_role(Leader)` call), the puller's
+    /// `run_until_cancelled` loop must exit cleanly with
+    /// `self_exited_after_promotion = true` on the next tick — the
+    /// operator should not have to chase the shutdown token.
+    #[tokio::test]
+    async fn worker_self_exits_when_engine_becomes_leader() {
+        let (leader_runtime, _leader_proc) = RuntimeBuilder::new().build();
+        let (addr, _server) = spawn_leader(replication_router(leader_runtime)).await;
+
+        let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
+        let mut config = loop_config(format!("http://{addr}"), Duration::from_millis(50), false);
+        // Disable jitter so the timing in this test is deterministic.
+        config.retry.jitter = JitterMode::Off;
+        let puller = ReplicationPuller::new(follower_runtime.clone(), config);
+        let token = CancellationToken::new();
+
+        // Schedule a Leader-flip ~80ms in: by then the worker has
+        // ticked once on the Follower path; the next iteration
+        // observes EngineRole::Leader and self-exits.
+        let runtime_for_flip = follower_runtime.clone();
+        let flipper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let hydra = runtime_for_flip.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.set_role(EngineRole::Leader);
+        });
+
+        let report = puller.run_until_cancelled(token).await.unwrap();
+        flipper.await.unwrap();
+        assert!(
+            report.self_exited_after_promotion,
+            "worker must report self-exit after engine flip, got {report:?}"
+        );
+        assert!(
+            !report.cancelled,
+            "self-exit is not a cancel-shutdown path; cancelled must stay false"
         );
     }
 
@@ -4108,6 +4405,13 @@ mod tests {
         .await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             // localhost resolves to 127.0.0.1; the cert SAN matches.
@@ -4144,6 +4448,13 @@ mod tests {
         .await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("https://localhost:{}", addr.port()),
@@ -4185,6 +4496,13 @@ mod tests {
         });
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
@@ -4219,6 +4537,13 @@ mod tests {
         .await;
 
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
+        // V2 next-level — set Follower role so the worker doesn't
+        // self-exit at the top of the loop.
+        follower_runtime
+            .hydra()
+            .write()
+            .await
+            .set_role(EngineRole::Follower);
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("https://localhost:{}", addr.port()),
@@ -4247,7 +4572,8 @@ mod tests {
     fn bad_pinned_cert_path_panics_in_new() {
         // Fail-fast: bad PEM path → panic in `ReplicationPuller::new`,
         // NOT a runtime error on first pull. TLS config is boot-time
-        // infrastructure.
+        // infrastructure. (Sync test — no async needed; the panic
+        // happens during client construction before any tokio work.)
         let (follower_runtime, _follower_proc) = RuntimeBuilder::new().build();
         let mut config = ReplicationPullerConfig::new(
             follower_peer_id(),

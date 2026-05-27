@@ -15,8 +15,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use hydra_core::ActorId;
 use hydra_net::http::{
-    commits_router, events_router, ingest_router, query_router, replication_role_router,
-    replication_router, schema_router, sensor_router, snapshots_router,
+    commits_router, events_router, ingest_router, query_router, replication_promote_router,
+    replication_role_router, replication_router, schema_router, sensor_router, snapshots_router,
 };
 use hydra_net::runtime::{RuntimeBuilder, RuntimeHandle};
 use hydra_sdk::HydraRuntime;
@@ -114,9 +114,25 @@ pub fn build_router_with_security(
         .merge(events_router(runtime.clone()))
         .merge(query_router(runtime.clone()))
         .merge(replication_router(runtime.clone()))
-        .merge(replication_role_router(runtime.clone(), role_state.clone()))
-        .merge(snapshots_router(runtime))
-        .layer(cors_layer());
+        .merge(replication_role_router(runtime.clone(), role_state.clone()));
+
+    // V2 next-level — promote router is only installed when the
+    // operator has set `self_peer_id` (this node's identity in the
+    // cluster) AND has a replication config (so a leader_peer_id
+    // is reachable). Without both, promotion is meaningless — the
+    // node has no identity, or no leader to be promoted away from.
+    if let (Some(self_peer_id), Some(repl)) =
+        (&security.self_peer_id, &security.replication)
+    {
+        app = app.merge(replication_promote_router(
+            runtime.clone(),
+            role_state.clone(),
+            self_peer_id.clone(),
+            repl.puller.peer_id.clone(),
+        ));
+    }
+
+    let mut app = app.merge(snapshots_router(runtime)).layer(cors_layer());
 
     // V2 patch 4H + polish #6 — role layer. Always installed so the
     // runtime role flip (`POST /replication/role`) takes effect
@@ -1943,6 +1959,7 @@ mod tests {
                 },
                 role: RuntimeRole::Leader,
                 replication: None,
+                self_peer_id: None,
             },
         );
         // One request fits comfortably in burst=2.
@@ -1967,6 +1984,7 @@ mod tests {
                 },
                 role: RuntimeRole::Leader,
                 replication: None,
+                self_peer_id: None,
             },
         );
         let peer = test_peer();
@@ -2003,6 +2021,7 @@ mod tests {
                 },
                 role: RuntimeRole::Leader,
                 replication: None,
+                self_peer_id: None,
             },
         );
         let peer_a: std::net::SocketAddr = "127.0.0.1:50100".parse().unwrap();
@@ -2032,6 +2051,7 @@ mod tests {
                 rate_limit: RateLimitMode::Off,
                 role: RuntimeRole::Leader,
                 replication: None,
+                self_peer_id: None,
             },
         );
         let request = Request::builder()
@@ -2067,6 +2087,7 @@ mod tests {
                 rate_limit: RateLimitMode::Off,
                 role: RuntimeRole::Leader,
                 replication: None,
+                self_peer_id: None,
             },
         );
         let response = app
@@ -2113,6 +2134,7 @@ mod tests {
             rate_limit: RateLimitMode::Off,
             role: RuntimeRole::Leader,
             replication: None,
+            self_peer_id: None,
         };
         let result = serve_with_security(runtime, "127.0.0.1:0", bad).await;
         assert!(result.is_err());
@@ -2556,6 +2578,93 @@ mod tests {
         assert_eq!(runtime.hydra().read().await.commit_count(), 1);
     }
 
+    // === V2 next-level — failover / promotion route ===
+
+    /// End-to-end: a Follower with `self_peer_id` configured can
+    /// call `POST /replication/promote` on itself. Proves:
+    ///   1. The promote route is installed when `self_peer_id` is set
+    ///   2. `rejected_on_follower` does NOT block this route on a Follower
+    ///   3. The full middleware stack (auth/tenant/role) lets it through
+    ///   4. Engine + HTTP role flip in lockstep after success
+    #[tokio::test]
+    async fn follower_can_promote_itself_via_http() {
+        use crate::security::{ReplicationServerConfig, ServerSecurityConfig};
+        use hydra_core::{ActorId, EventKind, ReplicaId, ReplicationLag, ReplicationMode,
+            ReplicationPeer, ReplicationRole};
+        use hydra_net::replication_worker::ReplicationPullerConfig;
+        use hydra_net::role::RuntimeRole;
+        use hydra_engine::prelude::EngineRole;
+
+        let runtime = test_runtime();
+        let self_id = ReplicaId::from_str("replica_self_e2e");
+        let leader_id = ReplicaId::from_str("replica_leader_e2e");
+
+        // Seed the follower: register self as a peer (cluster bootstrap
+        // analog), record a zero-lag heartbeat for the leader.
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest(EventKind::ReplicaRegistered {
+                    peer: ReplicationPeer::registered(
+                        self_id.clone(),
+                        ReplicationRole::Follower,
+                        ReplicationMode::SnapshotThenTail,
+                        ActorId::from_str("actor_e2e_bootstrap"),
+                    ),
+                })
+                .unwrap();
+            hydra.set_role(EngineRole::Follower);
+            hydra.record_replication_heartbeat(
+                leader_id.clone(),
+                ReplicationLag::observe(50, 50, chrono::Utc::now()),
+            );
+        }
+
+        // Wire the server with: follower role, replication config
+        // (so the promote route picks up leader_peer_id), and
+        // self_peer_id.
+        let puller_config = ReplicationPullerConfig::new(
+            leader_id.clone(),
+            "http://127.0.0.1:1".to_string(), // unreachable; we never spawn the worker
+            ActorId::from_str("actor_e2e_restorer"),
+        );
+        let security = ServerSecurityConfig::off()
+            .with_role(RuntimeRole::Follower)
+            .with_replication(ReplicationServerConfig::new(puller_config))
+            .with_self_peer_id(self_id.clone());
+        let app = build_router_with_security(runtime.clone(), security);
+
+        // Hit `POST /replication/promote`. The follower must be
+        // allowed to call this on itself; the lag is 0 so no force
+        // needed.
+        let response = app
+            .oneshot(post(
+                "/replication/promote",
+                serde_json::json!({
+                    "promoted_by": "actor_oncall_e2e",
+                    "reason": "leader unreachable (e2e test)"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "promote on follower must not be 409-blocked"
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Engine role flipped to Leader and audit commit emitted.
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        assert_eq!(hydra.role(), EngineRole::Leader);
+        let promoted = hydra.events().into_iter().rev().any(|e| {
+            matches!(&e.kind, EventKind::ReplicaPromoted { peer_id, .. } if peer_id == &self_id)
+        });
+        assert!(promoted, "ReplicaPromoted audit commit must be present");
+    }
+
     // === V2 patch 4I — server auto-start of replication worker ===
 
     use crate::security::ReplicationServerConfig;
@@ -2614,6 +2723,14 @@ mod tests {
 
         let (follower_runtime, _follower_proc) =
             hydra_net::runtime::RuntimeBuilder::new().build();
+        // V2 next-level — the worker self-exits when engine role
+        // is Leader. Set the follower's engine role to Follower so
+        // the worker actually runs the pull loop.
+        {
+            let hydra = follower_runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra.set_role(hydra_engine::prelude::EngineRole::Follower);
+        }
         let mut puller_config = ReplicationPullerConfig::new(
             replica_peer(),
             format!("http://{leader_addr}"),
