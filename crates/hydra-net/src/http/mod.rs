@@ -15,7 +15,8 @@ pub use commits::{commits_router, CommitsHttpState};
 pub use diagnostics::{
     diagnostics_router, AnomalyEntry, AnomalyQuery, AnomalyResponse,
     CounterfactualDiagnosticsResponse, CounterfactualQuery, CoverageDiagnosticsResponse,
-    CoverageQuery, DiagnosticsHttpState,
+    CoverageQuery, DiagnosticsHttpState, EvolutionDiagnosticsResponse, EvolutionMetricEntry,
+    EvolutionQuery,
 };
 pub use events::{events_router, EventsHttpState};
 pub use ingest::{ingest_router, IngestHttpState};

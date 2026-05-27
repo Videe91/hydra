@@ -50,10 +50,11 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use hydra_core::EventId;
+use hydra_core::{EventId, SubscriptionId};
 use hydra_engine::anomaly::Anomaly;
 use hydra_engine::counterfactual::GraphDiff;
 use hydra_engine::coverage::CoverageReport;
+use hydra_engine::evolution::{FireRecord, MissRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -83,6 +84,7 @@ pub fn diagnostics_router(runtime: RuntimeHandle) -> Router {
             "/diagnostics/counterfactual/:event_id",
             get(get_counterfactual),
         )
+        .route("/diagnostics/evolution", get(get_evolution))
         .with_state(DiagnosticsHttpState::new(runtime))
 }
 
@@ -630,6 +632,256 @@ fn render_counterfactual_summary(
         && impact.properties_changed == 0
     {
         parts.push("Zero-impact event: removing it changes nothing.".to_string());
+    }
+
+    parts.join(" ")
+}
+
+// === GET /diagnostics/evolution ===
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvolutionQuery {
+    /// Filter: only return the entry for this subscription id.
+    /// Unknown id returns 200 with empty `metrics[]` and summary
+    /// mentioning the requested name (lag-endpoint convention).
+    pub subscription_id: Option<String>,
+    /// Filter: only return subscriptions with
+    /// `total_fires >= min_fires`. Useful for hiding subs that
+    /// haven't fired enough to have meaningful stats.
+    pub min_fires: Option<u64>,
+    /// Default false. When true, response carries the per-fire
+    /// log and miss log. When false, both serialize as `null`
+    /// (transport omission — different from `[]` which would
+    /// mean "tracked subscription with no fires/misses recorded").
+    pub include_logs: Option<bool>,
+    /// Cap on the number of metric entries returned. Default 100,
+    /// max 1000.
+    pub limit: Option<usize>,
+}
+
+/// One subscription's metrics in the evolution response.
+///
+/// Explicit transport DTO — does NOT `#[serde(flatten)]` the
+/// engine's `SubscriptionMetrics`. Reasons:
+///   - The four derived stats (`precision`, `recall`,
+///     `false_positive_rate`, `pending_outcomes`) are methods on
+///     `SubscriptionMetrics`, not fields. We compute them
+///     server-side and emit as JSON fields.
+///   - The diagnostics contract evolves independently. V3 might
+///     add F1, MCC, calibration, accuracy@k, etc. without forcing
+///     every client to re-parse.
+///
+/// **`precision` / `recall` / `false_positive_rate`**:
+///   - `null` → undefined (no judged outcomes yet for precision /
+///     no positives-or-misses for recall). NOT the same as `0.0`.
+///   - `0.0` → genuinely zero. All judged outcomes were FP, or
+///     all the catch-set was missed.
+///
+/// **`fire_log` / `miss_log`**:
+///   - `null` → caller did NOT request logs (`include_logs=false`).
+///     Transport-level omission.
+///   - `[]` → caller requested logs but the subscription has none.
+///   - `[...]` → the records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionMetricEntry {
+    pub subscription_id: SubscriptionId,
+    pub subscription_name: String,
+    pub total_fires: u64,
+    pub total_reactions: u64,
+    pub true_positives: u64,
+    pub false_positives: u64,
+    pub auto_accepted: u64,
+    pub false_negatives: u64,
+    pub precision: Option<f64>,
+    pub recall: Option<f64>,
+    pub false_positive_rate: Option<f64>,
+    pub pending_outcomes: u64,
+    pub fire_log: Option<Vec<FireRecord>>,
+    pub miss_log: Option<Vec<MissRecord>>,
+}
+
+/// `GET /diagnostics/evolution` response.
+///
+/// Same metadata triplet (`engine_duration_ms`, `analysis_scope`,
+/// `summary`) as the other diagnostic endpoints. Adds
+/// `total_fires_across_all` as a quick scalar of cluster
+/// subscription activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionDiagnosticsResponse {
+    pub metrics: Vec<EvolutionMetricEntry>,
+    pub subscription_count: usize,
+    pub metric_count: usize,
+    pub truncated: bool,
+    pub total_fires_across_all: u64,
+    pub summary: String,
+    pub engine_duration_ms: u64,
+    pub analysis_scope: String,
+}
+
+async fn get_evolution(
+    State(state): State<DiagnosticsHttpState>,
+    headers: HeaderMap,
+    Query(query): Query<EvolutionQuery>,
+) -> Response {
+    if let Err(e) = extract_tenant(&headers) {
+        return tenant_error_response(e);
+    }
+
+    let subscription_id_filter = query.subscription_id.as_deref();
+    let min_fires = query.min_fires.unwrap_or(0);
+    let include_logs = query.include_logs.unwrap_or(false);
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+
+    let hydra_arc = state.runtime.hydra();
+    let hydra = hydra_arc.read().await;
+
+    let start = Instant::now();
+    let all_metrics = hydra.tracker().all_metrics();
+    let subscription_count = all_metrics.len();
+    let total_fires_across_all: u64 = all_metrics.iter().map(|m| m.total_fires).sum();
+
+    // Filter pass: subscription_id (exact match) + min_fires.
+    let mut filtered: Vec<&hydra_engine::evolution::SubscriptionMetrics> = all_metrics
+        .into_iter()
+        .filter(|m| match subscription_id_filter {
+            Some(name) => m.subscription_id.as_str() == name,
+            None => true,
+        })
+        .filter(|m| m.total_fires >= min_fires)
+        .collect();
+
+    // Default sort: total_fires desc (most-active first).
+    filtered.sort_by(|a, b| b.total_fires.cmp(&a.total_fires));
+
+    let metric_count = filtered.len();
+    let truncated = metric_count > limit;
+
+    let metrics: Vec<EvolutionMetricEntry> = filtered
+        .into_iter()
+        .take(limit)
+        .map(|m| EvolutionMetricEntry {
+            subscription_id: m.subscription_id.clone(),
+            subscription_name: m.subscription_name.clone(),
+            total_fires: m.total_fires,
+            total_reactions: m.total_reactions,
+            true_positives: m.true_positives,
+            false_positives: m.false_positives,
+            auto_accepted: m.auto_accepted,
+            false_negatives: m.false_negatives,
+            precision: m.precision(),
+            recall: m.recall(),
+            false_positive_rate: m.false_positive_rate(),
+            pending_outcomes: m.pending_outcomes(),
+            fire_log: if include_logs {
+                Some(m.fire_log.clone())
+            } else {
+                None
+            },
+            miss_log: if include_logs {
+                Some(m.miss_log.clone())
+            } else {
+                None
+            },
+        })
+        .collect();
+
+    let engine_duration_ms = start.elapsed().as_millis() as u64;
+
+    let summary = render_evolution_summary(
+        subscription_count,
+        &metrics,
+        subscription_id_filter,
+        total_fires_across_all,
+    );
+
+    Json(EvolutionDiagnosticsResponse {
+        metrics,
+        subscription_count,
+        metric_count,
+        truncated,
+        total_fires_across_all,
+        summary,
+        engine_duration_ms,
+        analysis_scope: "global".to_string(),
+    })
+    .into_response()
+}
+
+/// Deterministic narrative. Highlights worst FPR and highest
+/// recall (the two most operator-actionable axes), plus a count
+/// of subs with no judged outcomes (the calibration-pending set).
+fn render_evolution_summary(
+    subscription_count: usize,
+    metrics: &[EvolutionMetricEntry],
+    subscription_id_filter: Option<&str>,
+    total_fires: u64,
+) -> String {
+    if subscription_count == 0 {
+        return "Tracked 0 subscription(s).".to_string();
+    }
+    if metrics.is_empty() {
+        if let Some(name) = subscription_id_filter {
+            return format!(
+                "Tracked {subscription_count} subscription(s); 0 matched filter subscription_id='{name}'."
+            );
+        }
+        return format!(
+            "Tracked {subscription_count} subscription(s); 0 matched the requested filters."
+        );
+    }
+
+    let mut parts: Vec<String> = vec![format!(
+        "Tracked {subscription_count} subscription(s), {total_fires} total fires across all."
+    )];
+
+    // Worst FPR among entries that have judged outcomes.
+    let worst_fpr: Option<&EvolutionMetricEntry> = metrics
+        .iter()
+        .filter(|m| m.false_positive_rate.is_some())
+        .max_by(|a, b| {
+            let av = a.false_positive_rate.unwrap_or(0.0);
+            let bv = b.false_positive_rate.unwrap_or(0.0);
+            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    if let Some(m) = worst_fpr {
+        if let Some(fpr) = m.false_positive_rate {
+            parts.push(format!(
+                "Worst false-positive rate: '{}' ({:.0}% FPR over {} fires).",
+                m.subscription_name,
+                fpr * 100.0,
+                m.total_fires
+            ));
+        }
+    }
+
+    // Highest recall among entries that have it.
+    let best_recall: Option<&EvolutionMetricEntry> = metrics
+        .iter()
+        .filter(|m| m.recall.is_some())
+        .max_by(|a, b| {
+            let av = a.recall.unwrap_or(0.0);
+            let bv = b.recall.unwrap_or(0.0);
+            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    if let Some(m) = best_recall {
+        if let Some(r) = m.recall {
+            parts.push(format!(
+                "Highest recall: '{}' ({:.0}%).",
+                m.subscription_name,
+                r * 100.0
+            ));
+        }
+    }
+
+    // Calibration-pending count.
+    let no_outcomes = metrics
+        .iter()
+        .filter(|m| m.precision.is_none())
+        .count();
+    if no_outcomes > 0 {
+        parts.push(format!(
+            "{no_outcomes} subscription(s) have no judged outcomes yet."
+        ));
     }
 
     parts.join(" ")
@@ -1306,5 +1558,236 @@ mod tests {
         assert!(raw.get("event_found").is_some());
         assert!(raw.get("magnitude").is_some());
         assert!(raw.get("affected_types").is_some());
+    }
+
+    // === GET /diagnostics/evolution ===
+
+    use hydra_core::subscription::{EventFilter, Subscription, SubscriptionHandler};
+
+    /// Simple no-op handler that produces no reactions. Used to
+    /// register subscriptions in tests without complicating the
+    /// cascade or the fire-counting logic.
+    struct NoopHandler;
+    impl SubscriptionHandler for NoopHandler {
+        fn handle(
+            &self,
+            _event: &hydra_core::Event,
+            _graph: &dyn hydra_core::graph::GraphReader,
+        ) -> Vec<EventKind> {
+            Vec::new()
+        }
+    }
+
+    /// Register a subscription matching NodeCreated on the given
+    /// hydra. Returns its SubscriptionId for later lookup.
+    async fn register_node_created_sub(
+        runtime: &crate::runtime::RuntimeHandle,
+        name: &str,
+    ) -> hydra_core::SubscriptionId {
+        let sub = Subscription::new(name, EventFilter::NodeCreated, 100, Box::new(NoopHandler));
+        let id = sub.id.clone();
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        hydra.register(sub);
+        id
+    }
+
+    /// Trigger the subscription `n` times by ingesting `n`
+    /// NodeCreated events. `Hydra::ingest_event_internal_unguarded`
+    /// calls `tracker.record_cascade` after every ingest, so the
+    /// tracker accumulates fires automatically.
+    async fn fire_node_created(
+        runtime: &crate::runtime::RuntimeHandle,
+        type_id: &str,
+        n: usize,
+    ) {
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        for _ in 0..n {
+            hydra
+                .ingest_for_tenant(
+                    EventKind::NodeCreated {
+                        node_id: NodeId::new(),
+                        type_id: type_id.to_string(),
+                        properties: HashMap::new(),
+                    },
+                    tenant(),
+                )
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn evolution_returns_empty_when_no_subscriptions() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/evolution"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EvolutionDiagnosticsResponse = read_json(response).await;
+        assert!(decoded.metrics.is_empty());
+        assert_eq!(decoded.subscription_count, 0);
+        assert_eq!(decoded.metric_count, 0);
+        assert!(!decoded.truncated);
+        assert_eq!(decoded.total_fires_across_all, 0);
+        assert_eq!(decoded.analysis_scope, "global");
+        assert!(decoded.summary.contains("0 subscription"));
+    }
+
+    #[tokio::test]
+    async fn evolution_returns_metrics_for_tracked_subscription() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let _sub_id = register_node_created_sub(&runtime, "tagger").await;
+        fire_node_created(&runtime, "ec2", 3).await;
+
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/evolution"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EvolutionDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.subscription_count, 1);
+        assert_eq!(decoded.metric_count, 1);
+        let entry = &decoded.metrics[0];
+        assert_eq!(entry.subscription_name, "tagger");
+        assert_eq!(entry.total_fires, 3);
+        // No outcomes recorded → precision/recall/fpr all None.
+        assert!(entry.precision.is_none());
+        assert!(entry.recall.is_none());
+        assert!(entry.false_positive_rate.is_none());
+        assert_eq!(entry.pending_outcomes, 3);
+        assert_eq!(decoded.total_fires_across_all, 3);
+    }
+
+    #[tokio::test]
+    async fn evolution_omits_logs_by_default() {
+        // Default include_logs=false → fire_log + miss_log MUST be
+        // JSON null in the wire form. Not `[]` (which would mean
+        // "tracked sub with no records"). The semantic distinction
+        // mirrors counterfactual's diff: Option<GraphDiff>.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let _ = register_node_created_sub(&runtime, "no_logs_default").await;
+        fire_node_created(&runtime, "ec2", 1).await;
+
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/evolution"))
+            .await
+            .unwrap();
+        let decoded: EvolutionDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.metrics.len(), 1);
+        assert!(decoded.metrics[0].fire_log.is_none());
+        assert!(decoded.metrics[0].miss_log.is_none());
+        // Confirm wire form — fire_log + miss_log serialize to null,
+        // not to empty arrays.
+        let raw = serde_json::to_value(&decoded).unwrap();
+        let entry = &raw["metrics"][0];
+        assert!(entry.get("fire_log").map(|v| v.is_null()).unwrap_or(false));
+        assert!(entry.get("miss_log").map(|v| v.is_null()).unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn evolution_includes_logs_when_requested() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let _ = register_node_created_sub(&runtime, "with_logs").await;
+        fire_node_created(&runtime, "ec2", 2).await;
+
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/evolution?include_logs=true"))
+            .await
+            .unwrap();
+        let decoded: EvolutionDiagnosticsResponse = read_json(response).await;
+        let entry = &decoded.metrics[0];
+        assert!(entry.fire_log.is_some(), "logs requested but null");
+        assert_eq!(entry.fire_log.as_ref().unwrap().len(), 2);
+        // miss_log is Some(empty Vec) — caller asked for it, no
+        // misses have been recorded.
+        assert!(entry.miss_log.is_some());
+        assert!(entry.miss_log.as_ref().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn evolution_filters_by_subscription_id() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let alpha_id = register_node_created_sub(&runtime, "alpha").await;
+        let _beta_id = register_node_created_sub(&runtime, "beta").await;
+        fire_node_created(&runtime, "ec2", 1).await;
+
+        let app = diagnostics_router(runtime);
+
+        // Positive: filter by alpha returns just alpha.
+        let response = app
+            .clone()
+            .oneshot(empty_get(&format!(
+                "/diagnostics/evolution?subscription_id={alpha_id}"
+            )))
+            .await
+            .unwrap();
+        let decoded: EvolutionDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.metrics.len(), 1);
+        assert_eq!(decoded.metrics[0].subscription_id, alpha_id);
+        // subscription_count is engine-wide (2), unaffected by filter.
+        assert_eq!(decoded.subscription_count, 2);
+
+        // Negative: unknown id → 200 + empty + summary mentions it.
+        let response = app
+            .oneshot(empty_get(
+                "/diagnostics/evolution?subscription_id=sub_nonexistent",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let decoded: EvolutionDiagnosticsResponse = read_json(response).await;
+        assert!(decoded.metrics.is_empty());
+        assert!(decoded.summary.contains("sub_nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn evolution_filters_by_min_fires() {
+        // Two subs, one fires 5 times, one fires 1 time. min_fires=3
+        // → only the busy one surfaces.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let _ = register_node_created_sub(&runtime, "busy").await;
+        fire_node_created(&runtime, "ec2", 5).await;
+        // Register the second one AFTER the first 5 fires so it
+        // doesn't see them.
+        let _quiet_id = register_node_created_sub(&runtime, "quiet").await;
+        fire_node_created(&runtime, "rds", 1).await;
+        // busy now has 5+1=6 fires (it matches every NodeCreated),
+        // quiet has 1 fire (only the rds one, since it was
+        // registered before that).
+        // Use min_fires=3 to filter to busy only.
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/evolution?min_fires=3"))
+            .await
+            .unwrap();
+        let decoded: EvolutionDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.metrics.len(), 1);
+        assert_eq!(decoded.metrics[0].subscription_name, "busy");
+        assert!(decoded.metrics[0].total_fires >= 3);
+    }
+
+    #[tokio::test]
+    async fn evolution_response_carries_metadata_fields() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = diagnostics_router(runtime);
+        let response = app
+            .oneshot(empty_get("/diagnostics/evolution"))
+            .await
+            .unwrap();
+        let decoded: EvolutionDiagnosticsResponse = read_json(response).await;
+        assert_eq!(decoded.analysis_scope, "global");
+        let raw = serde_json::to_value(&decoded).unwrap();
+        assert!(raw.get("engine_duration_ms").is_some());
+        assert!(raw.get("analysis_scope").is_some());
+        assert!(raw.get("subscription_count").is_some());
+        assert!(raw.get("metric_count").is_some());
+        assert!(raw.get("total_fires_across_all").is_some());
+        assert!(raw.get("summary").is_some());
     }
 }

@@ -5,6 +5,7 @@ use crate::cascade::CascadeResult;
 use crate::event_log::EventLog;
 use crate::registry::SubscriptionRegistry;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -12,7 +13,7 @@ use std::collections::HashMap;
 // ============================================================================
 
 /// Tracks how effective a single subscription has been over time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionMetrics {
     /// Which subscription this tracks
     pub subscription_id: SubscriptionId,
@@ -85,7 +86,7 @@ impl SubscriptionMetrics {
 }
 
 /// A record of a single subscription fire
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FireRecord {
     /// When the subscription fired
     pub timestamp: DateTime<Utc>,
@@ -99,7 +100,7 @@ pub struct FireRecord {
 
 /// A record of a missed event — retroactively labeled by a human during
 /// incident review. "This subscription should have caught event X but didn't."
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissRecord {
     /// When the miss was recorded (not when the event happened)
     pub recorded_at: DateTime<Utc>,
@@ -114,7 +115,8 @@ pub struct MissRecord {
 /// Renamed from `Outcome` to avoid colliding with the universal
 /// `hydra_core::Outcome` (which is the result of an executed action). A
 /// deprecated `Outcome` type alias is kept below for back-compat.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubscriptionOutcome {
     /// Human confirmed the action was correct
     Confirmed,
