@@ -14,3 +14,15 @@
 
 # Claude Code local state
 .claude/settings.local.json
+
+# Python SDK build / cache / venv
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+**/.venv/
+**/dist/
+**/build/
