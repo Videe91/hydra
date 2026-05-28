@@ -1,3 +1,4 @@
+use crate::durability::{sync_file, sync_parent_dir, DurabilityPolicy};
 use hydra_core::commit::CommitBatch;
 use hydra_core::error::{HydraError, Result};
 use hydra_engine::commit_ledger::CommitBatchWriter;
@@ -17,12 +18,19 @@ use std::path::{Path, PathBuf};
 /// CommitLedger creates an atomic CommitBatch.
 /// CommitLog persists that batch durably.
 ///
+/// Durability is governed by [`DurabilityPolicy`]. The default
+/// (`DurabilityPolicy::DataOnly`) calls `File::sync_data()` after
+/// every append so a committed batch survives a power loss the
+/// instant `append()` returns. Tests can opt out via
+/// `open_with_policy(path, DurabilityPolicy::None)` for speed.
+///
 /// Later versions can replace JSONL with a framed binary format, checksummed
 /// pages, compression, encryption, or segment files without changing the
 /// higher-level database contract.
 #[derive(Debug, Clone)]
 pub struct CommitLog {
     path: PathBuf,
+    policy: DurabilityPolicy,
 }
 
 /// Result of `CommitLog::compact_through`.
@@ -35,10 +43,27 @@ pub struct CommitLogCompactionReport {
 }
 
 impl CommitLog {
-    /// Open or create a commit log at `path`.
+    /// Open or create a commit log at `path` with the production
+    /// default durability policy ([`DurabilityPolicy::DataOnly`]).
     ///
     /// Parent directories are created automatically.
+    ///
+    /// To opt out of fsync (tests, dev), use
+    /// [`CommitLog::open_with_policy`] with [`DurabilityPolicy::None`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_policy(path, DurabilityPolicy::default())
+    }
+
+    /// Open or create a commit log with an explicit durability policy.
+    ///
+    /// Production callers should prefer [`CommitLog::open`], which
+    /// defaults to `DataOnly`. The escape hatch exists so tests can
+    /// configure `None` (no fsync) and operators with niche needs can
+    /// pick `Full` (sync_all per write).
+    pub fn open_with_policy(
+        path: impl AsRef<Path>,
+        policy: DurabilityPolicy,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
@@ -58,17 +83,29 @@ impl CommitLog {
                     path.display()
                 ))
             })?;
-        Ok(Self { path })
+        Ok(Self { path, policy })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// The durability policy configured at construction time.
+    pub fn policy(&self) -> DurabilityPolicy {
+        self.policy
+    }
+
     /// Append one committed batch to the log.
     ///
-    /// The write is flushed before returning. v0 does not fsync yet; a later
-    /// durability patch can add configurable fsync policy.
+    /// On return, the batch is durable to the level configured by the
+    /// [`DurabilityPolicy`]:
+    ///   - `None`     → only the BufWriter is flushed into the OS
+    ///   - `DataOnly` → `File::sync_data()` (fdatasync) called
+    ///   - `Full`     → `File::sync_all()` (fsync) called
+    ///
+    /// `append` does NOT fsync the parent directory because the log
+    /// file's directory entry already exists — only renames need
+    /// `sync_parent_dir`. See `compact_through` for that path.
     pub fn append(&self, batch: &CommitBatch) -> Result<()> {
         let file = OpenOptions::new()
             .create(true)
@@ -101,6 +138,19 @@ impl CommitLog {
         writer.flush().map_err(|err| {
             HydraError::StorageError(format!(
                 "failed to flush commit log {}: {err}",
+                self.path.display()
+            ))
+        })?;
+        let file = writer.into_inner().map_err(|err| {
+            HydraError::StorageError(format!(
+                "failed to recover commit log file handle {}: {}",
+                self.path.display(),
+                err.into_error()
+            ))
+        })?;
+        sync_file(&file, self.policy).map_err(|err| {
+            HydraError::StorageError(format!(
+                "failed to fsync commit log {}: {err}",
                 self.path.display()
             ))
         })?;
@@ -221,7 +271,24 @@ impl CommitLog {
                     temp_path.display()
                 ))
             })?;
+            // Step 1 of the rename trap: fsync the temp file BEFORE
+            // the rename so its contents survive a power loss between
+            // the rename and the next page-cache flush.
+            let file = writer.into_inner().map_err(|err| {
+                HydraError::StorageError(format!(
+                    "failed to recover compacted commit log file handle {}: {}",
+                    temp_path.display(),
+                    err.into_error()
+                ))
+            })?;
+            sync_file(&file, self.policy).map_err(|err| {
+                HydraError::StorageError(format!(
+                    "failed to fsync compacted commit log {}: {err}",
+                    temp_path.display()
+                ))
+            })?;
         }
+        // Step 2: rename is atomic on POSIX (for visibility).
         fs::rename(&temp_path, &self.path).map_err(|err| {
             HydraError::StorageError(format!(
                 "failed to atomically replace commit log {} with {}: {err}",
@@ -229,6 +296,9 @@ impl CommitLog {
                 temp_path.display()
             ))
         })?;
+        // Step 3: fsync the parent directory so the rename itself —
+        // i.e. the directory-entry change — is durable.
+        sync_parent_dir(&self.path, self.policy)?;
         Ok(CommitLogCompactionReport {
             cutoff_sequence,
             removed_count,
@@ -562,5 +632,117 @@ mod tests {
         assert_eq!(loaded.len(), 2);
 
         let _ = fs::remove_file(&path);
+    }
+
+    // === Durability policy ===
+    //
+    // These tests pin behavior, not crash-safety. Proving crash-safety
+    // under power loss requires fault injection (kill -9 between
+    // syscalls); see the durability module docs and the operator
+    // runbook for the manual procedure.
+
+    #[test]
+    fn commit_log_open_defaults_to_dataonly() {
+        let path = temp_path("open_default_is_dataonly");
+        let log = CommitLog::open(&path).unwrap();
+        // Production default: writes are durable on return.
+        assert_eq!(log.policy(), DurabilityPolicy::DataOnly);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn commit_log_open_with_policy_none_round_trips() {
+        // `None` policy skips fsync but must still produce a usable
+        // commit log — same write/read contract, just less durability.
+        let path = temp_path("policy_none_round_trips");
+        let log = CommitLog::open_with_policy(&path, DurabilityPolicy::None).unwrap();
+        assert_eq!(log.policy(), DurabilityPolicy::None);
+        log.append(&commit_batch("a", 1)).unwrap();
+        log.append(&commit_batch("b", 2)).unwrap();
+        let loaded = log.load_all().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].sequence, 1);
+        assert_eq!(loaded[1].sequence, 2);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn commit_log_open_with_policy_dataonly_round_trips() {
+        // `DataOnly` fsyncs every append. The append/load contract is
+        // unchanged; this test is the existence proof that fsync
+        // doesn't break the read path.
+        let path = temp_path("policy_dataonly_round_trips");
+        let log = CommitLog::open_with_policy(&path, DurabilityPolicy::DataOnly).unwrap();
+        assert_eq!(log.policy(), DurabilityPolicy::DataOnly);
+        log.append(&commit_batch("a", 1)).unwrap();
+        log.append(&commit_batch("b", 2)).unwrap();
+        log.append(&commit_batch("c", 3)).unwrap();
+        let loaded = log.load_all().unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[2].sequence, 3);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn commit_log_compact_round_trips_under_dataonly() {
+        // Compaction goes through the rename trap (temp file fsync,
+        // rename, parent-dir fsync). Verify it still produces the
+        // expected retained set when the policy is `DataOnly`.
+        let path = temp_path("compact_under_dataonly");
+        let log = CommitLog::open_with_policy(&path, DurabilityPolicy::DataOnly).unwrap();
+        log.append(&commit_batch("a", 1)).unwrap();
+        log.append(&commit_batch("b", 2)).unwrap();
+        log.append(&commit_batch("c", 3)).unwrap();
+        let report = log.compact_through(2).unwrap();
+        assert_eq!(report.removed_count, 2);
+        assert_eq!(report.retained_count, 1);
+        let loaded = log.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].sequence, 3);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn durability_policy_none_and_dataonly_bytes_match() {
+        // The fsync policy must NOT change the on-disk byte stream.
+        // It only changes whether those bytes are durably flushed to
+        // physical media. A drift here would mean the policies write
+        // different content, which would break read-back compatibility.
+        let path_none = temp_path("bytes_match_none");
+        let path_data = temp_path("bytes_match_dataonly");
+        let batches = vec![
+            commit_batch("a", 1),
+            commit_batch("b", 2),
+            commit_batch("c", 3),
+        ];
+
+        let log_none =
+            CommitLog::open_with_policy(&path_none, DurabilityPolicy::None).unwrap();
+        let log_data =
+            CommitLog::open_with_policy(&path_data, DurabilityPolicy::DataOnly).unwrap();
+        for batch in &batches {
+            log_none.append(batch).unwrap();
+            log_data.append(batch).unwrap();
+        }
+
+        let bytes_none = fs::read(&path_none).unwrap();
+        let bytes_data = fs::read(&path_data).unwrap();
+        assert_eq!(
+            bytes_none, bytes_data,
+            "DurabilityPolicy must not change on-disk bytes"
+        );
+
+        // And compaction should also produce identical bytes.
+        log_none.compact_through(1).unwrap();
+        log_data.compact_through(1).unwrap();
+        let after_none = fs::read(&path_none).unwrap();
+        let after_data = fs::read(&path_data).unwrap();
+        assert_eq!(
+            after_none, after_data,
+            "compaction must also be byte-identical across policies"
+        );
+
+        let _ = fs::remove_file(path_none);
+        let _ = fs::remove_file(path_data);
     }
 }
