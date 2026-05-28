@@ -41,11 +41,13 @@ from ._types import (
     Evidence,
     EvidenceId,
     IngestResponse,
+    LineageResponse,
     Node,
     NodeId,
     Outcome,
     TenantId,
 )
+from .diagnostics import _Diagnostics
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
@@ -97,6 +99,10 @@ class Hydra:
         # or tracebacks (per the strategic-review additional
         # recommendation).
         self._has_token = token is not None
+        # Diagnostic-surface namespace — one instance per client, no
+        # property-descriptor magic. Methods are
+        # `hy.diagnostics.{anomaly,coverage,counterfactual,evolution}`.
+        self.diagnostics = _Diagnostics(self._http, tenant)
 
     def __repr__(self) -> str:
         """Token-redacted representation. Prevents bearer-token leaks
@@ -451,3 +457,25 @@ class Hydra:
             _paths.query_outcomes_for_action_path(action_id), tenant=tenant
         )
         return [Outcome.model_validate(o) for o in raw["outcomes"]]
+
+    # ========================================================================
+    # Lineage — the "why did this happen?" surface
+    # ========================================================================
+
+    async def lineage(
+        self,
+        event_id: EventId,
+        *,
+        depth: int | None = None,
+        tenant: TenantId | None = None,
+    ) -> LineageResponse:
+        """Return the causal context around an event: ancestors, descendants, and every related evidence/claim/action/outcome/policy artifact."""
+        params: dict[str, Any] = {}
+        if depth is not None:
+            params["depth"] = depth
+        raw = await self._http.get(
+            _paths.lineage_path(event_id),
+            params=params or None,
+            tenant=tenant,
+        )
+        return LineageResponse.model_validate(raw)

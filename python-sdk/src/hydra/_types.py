@@ -472,3 +472,370 @@ class ReplicationPromotionStatusResponse(BaseModel):
     self_peer_id: ReplicaId
     current_role: RuntimeRole
     last_promotion: LastPromotionInfo | None = None
+
+
+# === Patch 3: lineage wire models ===
+#
+# Each is a 1:1 mirror of the corresponding `hydra-net::http::lineage`
+# struct. Per Design Rule #2, no DTO restructuring.
+
+
+class LineageEventSummary(BaseModel):
+    """Compact event header in a `LineageResponse`. Note: `kind`
+    here is the snake_case **discriminator string**
+    (e.g. `"signal"`, `"claim_proposed"`), NOT the full tagged-
+    union body that `Event.kind` carries elsewhere. Agents fetch
+    the full event body via `hy.get_event(id)` if they need it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: EventId
+    timestamp: str
+    kind: str
+    summary: str
+    caused_by: list[EventId] = Field(default_factory=list)
+    cascade_id: CascadeId
+    cascade_depth: int
+
+
+class LineageEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: EvidenceId
+    kind: str  # the EvidencePayload.kind discriminator string
+    reliability: float
+    observed_at: str
+    caused_by: EventId
+
+
+class LineageClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: ClaimId
+    kind: str  # ClaimKind (PascalCase wire form)
+    status: str  # ClaimStatus (PascalCase wire form)
+    predicate: str
+    confidence: float
+    caused_by: EventId
+
+
+class LineageAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: ActionId
+    kind: str
+    status: str  # ActionStatus
+    caused_by: EventId
+
+
+class LineageOutcome(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: OutcomeId
+    kind: str  # OutcomeKind
+    action_id: ActionId
+    caused_by: EventId
+
+
+class LineagePolicyDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: PolicyDecisionId
+    kind: str
+    policy_id: str | None = None
+    action_id: ActionId
+    caused_by: EventId
+
+
+class LineageApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: ApprovalId
+    status: str
+    action_id: ActionId
+    caused_by: EventId
+
+
+class LineageResponse(BaseModel):
+    """`GET /lineage/:event_id` response. The flat-keyed shape
+    (per `HYDRA_SYSTEM_STUDY.md`): `events` carries summaries of
+    every event in the causal context; `evidence`/`claims`/
+    `actions`/`outcomes`/`policy_decisions`/`approval_requests`
+    are the epistemic / action / policy artifacts referenced by
+    those events; `ancestors` and `descendants` are id-only DAG
+    topology lists. `explanation_summary` is a deterministic
+    server-rendered narrative (not LLM-generated)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seed_event_id: EventId
+    depth: int
+    events: list[LineageEventSummary] = Field(default_factory=list)
+    evidence: list[LineageEvidence] = Field(default_factory=list)
+    claims: list[LineageClaim] = Field(default_factory=list)
+    actions: list[LineageAction] = Field(default_factory=list)
+    outcomes: list[LineageOutcome] = Field(default_factory=list)
+    policy_decisions: list[LineagePolicyDecision] = Field(default_factory=list)
+    approval_requests: list[LineageApprovalRequest] = Field(default_factory=list)
+    ancestors: list[EventId] = Field(default_factory=list)
+    descendants: list[EventId] = Field(default_factory=list)
+    truncated: bool
+    explanation_summary: str
+
+
+# === Patch 3: anomaly wire models ===
+
+
+class Anomaly(BaseModel):
+    """Mirrors `hydra-engine::anomaly::Anomaly`.
+
+    `kind` is the AnomalyKind tagged-union body, served as
+    `{"kind": "topology_degree", "details": {...}}` per the
+    engine's `#[serde(tag="kind", content="details",
+    rename_all="snake_case")]`. The SDK leaves it as `dict[str, Any]`
+    for v0 — typed discriminated union is a future patch.
+
+    Note the double-`kind` reading: the outer key (`Anomaly.kind`)
+    is the struct field, the inner `kind` (inside the dict) is the
+    AnomalyKind tag.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: dict[str, Any]
+    description: str
+    severity: float
+    affected_nodes: list[NodeId] = Field(default_factory=list)
+    trigger_event: EventId | None = None
+    detected_at: str
+
+
+class AnomalyEntry(Anomaly):
+    """Anomaly with a stable content-hash id added on top.
+
+    The engine flattens `Anomaly` into `AnomalyEntry` via
+    `#[serde(flatten)]`, so the wire form has `anomaly_id` and
+    all the Anomaly fields at the same top level.
+    """
+
+    anomaly_id: str
+
+
+class AnomalyResponse(BaseModel):
+    """`GET /diagnostics/anomaly` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    anomalies: list[AnomalyEntry] = Field(default_factory=list)
+    rule_count: int
+    anomaly_count: int
+    truncated: bool
+    summary: str
+    engine_duration_ms: int
+    analysis_scope: str
+
+
+# === Patch 3: coverage wire models ===
+
+
+class CoverageGap(BaseModel):
+    """Mirrors `hydra-engine::coverage::CoverageGap`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expectation_index: int
+    description: str
+    fulfillment: float
+    affected_nodes: list[NodeId] = Field(default_factory=list)
+
+
+class CoverageReport(BaseModel):
+    """Mirrors `hydra-engine::coverage::CoverageReport`. Returned
+    per registered model in the coverage diagnostics response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_name: str
+    score: float
+    total_expectations: int
+    met: int
+    gaps: list[CoverageGap] = Field(default_factory=list)
+    evaluated_at: str
+
+
+class CoverageDiagnosticsResponse(BaseModel):
+    """`GET /diagnostics/coverage` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reports: list[CoverageReport] = Field(default_factory=list)
+    model_count: int
+    report_count: int
+    truncated: bool
+    summary: str
+    engine_duration_ms: int
+    analysis_scope: str
+
+
+# === Patch 3: counterfactual wire models ===
+
+
+class PropertyDiff(BaseModel):
+    """Mirrors `hydra-engine::counterfactual::PropertyDiff`.
+
+    `actual` / `counterfactual` are `Optional<Value>` in Rust — the
+    Hydra core `Value` is polymorphic; we accept `Any` here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    actual: Any | None = None
+    counterfactual: Any | None = None
+
+
+class NodeDiff(BaseModel):
+    """Mirrors `hydra-engine::counterfactual::NodeDiff`.
+
+    `alive_diff` is Rust `Option<(bool, bool)>` → JSON tuple as
+    `[actual, counterfactual]` or null."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: NodeId
+    property_diffs: list[PropertyDiff] = Field(default_factory=list)
+    alive_diff: tuple[bool, bool] | None = None
+
+
+class EdgeDiff(BaseModel):
+    """Mirrors `hydra-engine::counterfactual::EdgeDiff`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    edge_id: EdgeId
+    property_diffs: list[PropertyDiff] = Field(default_factory=list)
+    alive_diff: tuple[bool, bool] | None = None
+
+
+class GraphDiff(BaseModel):
+    """Mirrors `hydra-engine::counterfactual::GraphDiff`. The full
+    structural delta between actual and counterfactual projections."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    nodes_only_in_actual: list[NodeId] = Field(default_factory=list)
+    nodes_only_in_counterfactual: list[NodeId] = Field(default_factory=list)
+    nodes_changed: list[NodeDiff] = Field(default_factory=list)
+    edges_only_in_actual: list[EdgeId] = Field(default_factory=list)
+    edges_only_in_counterfactual: list[EdgeId] = Field(default_factory=list)
+    edges_changed: list[EdgeDiff] = Field(default_factory=list)
+
+
+class CounterfactualDiagnosticsResponse(BaseModel):
+    """`GET /diagnostics/counterfactual/:event_id` response.
+
+    **Three-state `diff` semantics** (preserved exactly from the
+    server contract):
+      - `Some(GraphDiff with non-empty arrays)` → here's the delta.
+      - `Some(GraphDiff with all-empty arrays)` → removing this
+        event would change NOTHING. Zero-impact event. Meaningful.
+      - `None` (JSON null) → caller passed `include_diff=false`.
+        Transport-level omission, NOT zero impact.
+
+    Pydantic's `Optional[GraphDiff]` round-trips this exactly:
+    JSON `null` deserializes to `None`; JSON object deserializes
+    to a `GraphDiff` (possibly with empty arrays).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: EventId
+    event_found: bool
+    counterfactual_mode: str
+    causal_subtree_size: int
+    nodes_affected: int
+    edges_affected: int
+    properties_changed: int
+    affected_types: dict[str, int] = Field(default_factory=dict)
+    magnitude: float
+    diff: GraphDiff | None = None
+    summary: str
+    engine_duration_ms: int
+    analysis_scope: str
+
+
+# === Patch 3: evolution wire models ===
+
+
+class FireRecord(BaseModel):
+    """Mirrors `hydra-engine::evolution::FireRecord`.
+
+    `outcome` is `Option<SubscriptionOutcome>` — `None` means the
+    human hasn't judged this fire yet."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    timestamp: str
+    trigger_event_id: EventId
+    reaction_count: int
+    outcome: SubscriptionOutcome | None = None
+
+
+class MissRecord(BaseModel):
+    """Mirrors `hydra-engine::evolution::MissRecord` — a
+    retroactively-labeled event the subscription should have
+    caught but didn't."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    recorded_at: str
+    missed_event_id: EventId
+    reason: str | None = None
+
+
+class EvolutionMetricEntry(BaseModel):
+    """Mirrors `hydra-net::http::diagnostics::EvolutionMetricEntry`.
+
+    **Two load-bearing Optional semantics**:
+
+      `precision` / `recall` / `false_positive_rate` are
+      `Option<f64>` — `None` means undefined (no judged outcomes
+      yet for precision; no positives-or-misses for recall).
+      Distinct from `0.0` (genuinely zero — all judged were FP,
+      or all the catch-set was missed).
+
+      `fire_log` / `miss_log` are `Option<Vec<...>>` —
+      `None` means caller didn't request logs
+      (`include_logs=False`). `[]` means requested but empty.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    subscription_id: SubscriptionId
+    subscription_name: str
+    total_fires: int
+    total_reactions: int
+    true_positives: int
+    false_positives: int
+    auto_accepted: int
+    false_negatives: int
+    precision: float | None = None
+    recall: float | None = None
+    false_positive_rate: float | None = None
+    pending_outcomes: int
+    fire_log: list[FireRecord] | None = None
+    miss_log: list[MissRecord] | None = None
+
+
+class EvolutionDiagnosticsResponse(BaseModel):
+    """`GET /diagnostics/evolution` response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    metrics: list[EvolutionMetricEntry] = Field(default_factory=list)
+    subscription_count: int
+    metric_count: int
+    truncated: bool
+    total_fires_across_all: int
+    summary: str
+    engine_duration_ms: int
+    analysis_scope: str

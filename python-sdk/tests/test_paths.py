@@ -57,3 +57,20 @@ def test_path_segment_encoding_handles_reserved_chars() -> None:
     assert (
         _paths.query_claim_path("claim_01J9XYZ_ABC123") == "/query/claims/claim_01J9XYZ_ABC123"
     )
+
+
+def test_lineage_path() -> None:
+    """`/lineage/:event_id` is its own router, not under `/query/`."""
+    assert _paths.lineage_path("evt_abc") == "/lineage/evt_abc"
+
+
+def test_diagnostics_paths() -> None:
+    """Four diagnostic surfaces; counterfactual takes the event_id
+    in the path, the others take filters as query params."""
+    assert _paths.diagnostics_anomaly_path() == "/diagnostics/anomaly"
+    assert _paths.diagnostics_coverage_path() == "/diagnostics/coverage"
+    assert (
+        _paths.diagnostics_counterfactual_path("evt_abc")
+        == "/diagnostics/counterfactual/evt_abc"
+    )
+    assert _paths.diagnostics_evolution_path() == "/diagnostics/evolution"

@@ -403,3 +403,344 @@ def test_confidence_clamps_at_pydantic_validation() -> None:
     }
     with pytest.raises(ValidationError):
         Claim.model_validate(raw_bad)
+
+
+# === Patch 3: lineage + diagnostics type round-trips ===
+#
+# Each test pins the wire form by parsing → re-emitting → comparing.
+# Catches drift in either the engine's serialization or the SDK's
+# Pydantic models early.
+
+
+def test_lineage_response_round_trips() -> None:
+    """Full LineageResponse with events, claims, and evidence
+    populated. Verifies the flat-keyed shape parses cleanly."""
+    from hydra import LineageResponse
+
+    raw = {
+        "seed_event_id": "evt_seed",
+        "depth": 10,
+        "events": [
+            {
+                "id": "evt_seed",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "kind": "signal",
+                "summary": "signal: x",
+                "caused_by": [],
+                "cascade_id": "csc_a",
+                "cascade_depth": 0,
+            }
+        ],
+        "evidence": [
+            {
+                "id": "evd_a",
+                "kind": "obs",
+                "reliability": 0.9,
+                "observed_at": "2026-01-01T00:00:00Z",
+                "caused_by": "evt_seed",
+            }
+        ],
+        "claims": [
+            {
+                "id": "claim_b",
+                "kind": "AnomalyFinding",
+                "status": "Proposed",
+                "predicate": "is_anomalous",
+                "confidence": 0.85,
+                "caused_by": "evt_seed",
+            }
+        ],
+        "actions": [],
+        "outcomes": [],
+        "policy_decisions": [],
+        "approval_requests": [],
+        "ancestors": [],
+        "descendants": [],
+        "truncated": False,
+        "explanation_summary": "Seed event: signal: x.",
+    }
+    parsed = LineageResponse.model_validate(raw)
+    assert parsed.seed_event_id == "evt_seed"
+    assert parsed.events[0].kind == "signal"  # snake_case discriminator string
+    assert parsed.claims[0].confidence == 0.85
+    assert parsed.evidence[0].reliability == 0.9
+
+
+def test_anomaly_entry_round_trips_with_tagged_kind() -> None:
+    """AnomalyEntry has anomaly_id flattened with the Anomaly fields
+    (Rust `#[serde(flatten)]`). The kind tagged-union dict carries
+    `{"kind": "...", "details": {...}}` per `#[serde(tag="kind",
+    content="details", rename_all="snake_case")]`."""
+    from hydra import AnomalyEntry
+
+    raw = {
+        "anomaly_id": "anom_xyz",
+        "kind": {
+            "kind": "topology_degree",
+            "details": {
+                "node_id": "node_x",
+                "edge_type": "depends_on",
+                "expected_min": 1,
+                "expected_max": 100,
+                "actual": 0,
+            },
+        },
+        "description": "dataset node_x has 0 edges",
+        "severity": 0.7,
+        "affected_nodes": ["node_x"],
+        "trigger_event": None,
+        "detected_at": "2026-01-01T00:00:00Z",
+    }
+    parsed = AnomalyEntry.model_validate(raw)
+    assert parsed.anomaly_id == "anom_xyz"
+    assert parsed.severity == 0.7
+    assert parsed.kind["kind"] == "topology_degree"
+    assert parsed.kind["details"]["actual"] == 0
+    assert parsed.model_dump() == raw
+
+
+def test_coverage_report_round_trips() -> None:
+    from hydra import CoverageReport
+
+    raw = {
+        "model_name": "sentinel_aws_coverage",
+        "score": 0.8,
+        "total_expectations": 5,
+        "met": 4,
+        "gaps": [
+            {
+                "expectation_index": 2,
+                "description": "missing backup_policy",
+                "fulfillment": 0.0,
+                "affected_nodes": [],
+            }
+        ],
+        "evaluated_at": "2026-01-01T00:00:00Z",
+    }
+    parsed = CoverageReport.model_validate(raw)
+    assert parsed.model_name == "sentinel_aws_coverage"
+    assert parsed.score == 0.8
+    assert len(parsed.gaps) == 1
+    assert parsed.gaps[0].fulfillment == 0.0
+
+
+def test_graph_diff_round_trips_with_node_diffs() -> None:
+    """GraphDiff with one node-only-in-actual, one changed node
+    carrying property_diffs + alive_diff. Verifies the
+    Option<(bool, bool)> tuple deserializes cleanly."""
+    from hydra import GraphDiff
+
+    raw = {
+        "nodes_only_in_actual": ["node_a"],
+        "nodes_only_in_counterfactual": [],
+        "nodes_changed": [
+            {
+                "node_id": "node_b",
+                "property_diffs": [
+                    {
+                        "key": "alive_count",
+                        "actual": 42,
+                        "counterfactual": 41,
+                    }
+                ],
+                "alive_diff": [True, False],
+            }
+        ],
+        "edges_only_in_actual": [],
+        "edges_only_in_counterfactual": [],
+        "edges_changed": [],
+    }
+    parsed = GraphDiff.model_validate(raw)
+    assert parsed.nodes_only_in_actual == ["node_a"]
+    assert len(parsed.nodes_changed) == 1
+    nd = parsed.nodes_changed[0]
+    assert nd.node_id == "node_b"
+    assert nd.alive_diff == (True, False)
+    assert nd.property_diffs[0].actual == 42
+    assert nd.property_diffs[0].counterfactual == 41
+
+
+def test_counterfactual_response_with_diff() -> None:
+    """`diff: Some(...)` round-trips. The Optional[GraphDiff] is
+    populated with a real GraphDiff."""
+    from hydra import CounterfactualDiagnosticsResponse
+
+    raw = {
+        "event_id": "evt_x",
+        "event_found": True,
+        "counterfactual_mode": "single_event_removal",
+        "causal_subtree_size": 3,
+        "nodes_affected": 1,
+        "edges_affected": 0,
+        "properties_changed": 0,
+        "affected_types": {"dataset": 1},
+        "magnitude": 10.0,
+        "diff": {
+            "nodes_only_in_actual": ["node_x"],
+            "nodes_only_in_counterfactual": [],
+            "nodes_changed": [],
+            "edges_only_in_actual": [],
+            "edges_only_in_counterfactual": [],
+            "edges_changed": [],
+        },
+        "summary": "Removing evt_x would undo 3 cascaded events.",
+        "engine_duration_ms": 5,
+        "analysis_scope": "global",
+    }
+    parsed = CounterfactualDiagnosticsResponse.model_validate(raw)
+    assert parsed.diff is not None
+    assert parsed.diff.nodes_only_in_actual == ["node_x"]
+    assert parsed.magnitude == 10.0
+
+
+def test_counterfactual_response_diff_none_means_omitted() -> None:
+    """CRITICAL semantic: `diff: None` (JSON null) means transport
+    omission (caller passed `include_diff=false`). It MUST round-trip
+    cleanly as `None`, NOT as a GraphDiff with empty arrays."""
+    from hydra import CounterfactualDiagnosticsResponse
+
+    raw = {
+        "event_id": "evt_x",
+        "event_found": True,
+        "counterfactual_mode": "single_event_removal",
+        "causal_subtree_size": 3,
+        "nodes_affected": 1,
+        "edges_affected": 0,
+        "properties_changed": 0,
+        "affected_types": {"dataset": 1},
+        "magnitude": 10.0,
+        "diff": None,
+        "summary": "diff omitted",
+        "engine_duration_ms": 5,
+        "analysis_scope": "global",
+    }
+    parsed = CounterfactualDiagnosticsResponse.model_validate(raw)
+    assert parsed.diff is None
+    # Re-emission: serializing back to JSON must produce `null`, not
+    # an empty-arrays GraphDiff. Confirm via raw dict comparison.
+    assert parsed.model_dump()["diff"] is None
+
+
+def test_evolution_metric_entry_with_logs_round_trips() -> None:
+    """fire_log / miss_log as Some(Vec<...>) — caller asked for logs
+    and they are populated."""
+    from hydra import EvolutionMetricEntry
+
+    raw = {
+        "subscription_id": "sub_a",
+        "subscription_name": "Detect orphans",
+        "total_fires": 2,
+        "total_reactions": 4,
+        "true_positives": 1,
+        "false_positives": 1,
+        "auto_accepted": 0,
+        "false_negatives": 0,
+        "precision": 0.5,
+        "recall": 1.0,
+        "false_positive_rate": 0.5,
+        "pending_outcomes": 0,
+        "fire_log": [
+            {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "trigger_event_id": "evt_a",
+                "reaction_count": 2,
+                "outcome": "confirmed",
+            },
+            {
+                "timestamp": "2026-01-01T00:00:01Z",
+                "trigger_event_id": "evt_b",
+                "reaction_count": 2,
+                "outcome": "dismissed",
+            },
+        ],
+        "miss_log": [],
+    }
+    parsed = EvolutionMetricEntry.model_validate(raw)
+    assert parsed.precision == 0.5
+    assert parsed.fire_log is not None
+    assert len(parsed.fire_log) == 2
+    assert parsed.fire_log[0].outcome == "confirmed"
+    assert parsed.miss_log == []  # Requested-but-empty (NOT None)
+
+
+def test_evolution_metric_entry_logs_none_round_trips() -> None:
+    """CRITICAL semantic: fire_log / miss_log = None means caller
+    didn't ask for logs. Different from `[]` (asked, empty)."""
+    from hydra import EvolutionMetricEntry
+
+    raw = {
+        "subscription_id": "sub_a",
+        "subscription_name": "x",
+        "total_fires": 5,
+        "total_reactions": 10,
+        "true_positives": 3,
+        "false_positives": 2,
+        "auto_accepted": 0,
+        "false_negatives": 0,
+        "precision": 0.6,
+        "recall": 1.0,
+        "false_positive_rate": 0.4,
+        "pending_outcomes": 0,
+        "fire_log": None,
+        "miss_log": None,
+    }
+    parsed = EvolutionMetricEntry.model_validate(raw)
+    assert parsed.fire_log is None
+    assert parsed.miss_log is None
+    re_emitted = parsed.model_dump()
+    assert re_emitted["fire_log"] is None
+    assert re_emitted["miss_log"] is None
+
+
+def test_evolution_metric_entry_precision_none_round_trips() -> None:
+    """CRITICAL semantic: precision/recall/fpr = None means undefined
+    (no judged outcomes yet). Different from 0.0 (genuinely zero)."""
+    from hydra import EvolutionMetricEntry
+
+    raw = {
+        "subscription_id": "sub_new",
+        "subscription_name": "Newly added",
+        "total_fires": 3,
+        "total_reactions": 6,
+        "true_positives": 0,
+        "false_positives": 0,
+        "auto_accepted": 0,
+        "false_negatives": 0,
+        "precision": None,
+        "recall": None,
+        "false_positive_rate": None,
+        "pending_outcomes": 3,
+        "fire_log": None,
+        "miss_log": None,
+    }
+    parsed = EvolutionMetricEntry.model_validate(raw)
+    assert parsed.precision is None
+    assert parsed.recall is None
+    assert parsed.false_positive_rate is None
+    assert parsed.pending_outcomes == 3
+    re_emitted = parsed.model_dump()
+    assert re_emitted["precision"] is None
+    # Distinguishable from a metric where it's genuinely 0.0:
+    zero_raw = {**raw, "precision": 0.0, "false_positive_rate": 1.0}
+    zero_parsed = EvolutionMetricEntry.model_validate(zero_raw)
+    assert zero_parsed.precision == 0.0
+    assert zero_parsed.precision is not None  # NOT None
+
+
+def test_evolution_response_round_trips() -> None:
+    from hydra import EvolutionDiagnosticsResponse
+
+    raw = {
+        "metrics": [],
+        "subscription_count": 0,
+        "metric_count": 0,
+        "truncated": False,
+        "total_fires_across_all": 0,
+        "summary": "Tracked 0 subscription(s).",
+        "engine_duration_ms": 0,
+        "analysis_scope": "global",
+    }
+    parsed = EvolutionDiagnosticsResponse.model_validate(raw)
+    assert parsed.subscription_count == 0
+    assert parsed.metrics == []
+    assert parsed.analysis_scope == "global"

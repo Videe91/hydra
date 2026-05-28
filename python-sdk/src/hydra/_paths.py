@@ -105,3 +105,29 @@ def query_actions_by_status_path(status: str) -> str:
 
 def query_outcomes_for_action_path(action_id: str) -> str:
     return f"/query/actions/{_seg(action_id)}/outcomes"
+
+
+# === /lineage/* ===
+
+
+def lineage_path(event_id: str) -> str:
+    return f"/lineage/{_seg(event_id)}"
+
+
+# === /diagnostics/* ===
+
+
+def diagnostics_anomaly_path() -> str:
+    return "/diagnostics/anomaly"
+
+
+def diagnostics_coverage_path() -> str:
+    return "/diagnostics/coverage"
+
+
+def diagnostics_counterfactual_path(event_id: str) -> str:
+    return f"/diagnostics/counterfactual/{_seg(event_id)}"
+
+
+def diagnostics_evolution_path() -> str:
+    return "/diagnostics/evolution"
