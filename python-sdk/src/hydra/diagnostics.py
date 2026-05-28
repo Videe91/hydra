@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import _paths
-from ._http import HydraHttpClient
+from ._http import HydraHttpClient, HydraHttpClientSync
 from ._types import (
     AnomalyResponse,
     CounterfactualDiagnosticsResponse,
@@ -124,6 +124,118 @@ class _Diagnostics:
         if limit is not None:
             params["limit"] = limit
         data = await self._http.get(
+            _paths.diagnostics_evolution_path(),
+            params=params or None,
+            tenant=tenant,
+        )
+        return EvolutionDiagnosticsResponse.model_validate(data)
+
+
+# === Patch 5: sync mirror ===
+#
+# Line-by-line parity with `_Diagnostics`. Same parameter names, same
+# defaults, same return types. The only differences:
+#   - `self._http` is a `HydraHttpClientSync` (not `HydraHttpClient`)
+#   - No `async`/`await`
+#
+# Kept in the same file as the async class so a reviewer can verify
+# parity by visual diff. Future changes should land in both.
+
+
+class _DiagnosticsSync:
+    """Synchronous mirror of `_Diagnostics`. Access via
+    `hy.diagnostics.<method>` on a `HydraSync` client."""
+
+    def __init__(
+        self, http: HydraHttpClientSync, default_tenant: TenantId | None
+    ) -> None:
+        self._http = http
+        self._default_tenant = default_tenant
+
+    def anomaly(
+        self,
+        *,
+        severity_min: float | None = None,
+        kind: str | None = None,
+        limit: int | None = None,
+        tenant: TenantId | None = None,
+    ) -> AnomalyResponse:
+        """Return the current set of anomalies the engine has detected, optionally filtered by severity, kind, or limit."""
+        params: dict[str, Any] = {}
+        if severity_min is not None:
+            params["severity_min"] = severity_min
+        if kind is not None:
+            params["kind"] = kind
+        if limit is not None:
+            params["limit"] = limit
+        data = self._http.get(
+            _paths.diagnostics_anomaly_path(),
+            params=params or None,
+            tenant=tenant,
+        )
+        return AnomalyResponse.model_validate(data)
+
+    def coverage(
+        self,
+        *,
+        model: str | None = None,
+        failing_only: bool | None = None,
+        limit: int | None = None,
+        tenant: TenantId | None = None,
+    ) -> CoverageDiagnosticsResponse:
+        """Return coverage reports for every registered coverage model, optionally filtered to one model or to failing models only."""
+        params: dict[str, Any] = {}
+        if model is not None:
+            params["model"] = model
+        if failing_only is not None:
+            params["failing_only"] = "true" if failing_only else "false"
+        if limit is not None:
+            params["limit"] = limit
+        data = self._http.get(
+            _paths.diagnostics_coverage_path(),
+            params=params or None,
+            tenant=tenant,
+        )
+        return CoverageDiagnosticsResponse.model_validate(data)
+
+    def counterfactual(
+        self,
+        event_id: EventId,
+        *,
+        include_diff: bool | None = None,
+        tenant: TenantId | None = None,
+    ) -> CounterfactualDiagnosticsResponse:
+        """Return the causal-simulation result for an event: what would the graph look like if this event hadn't happened?"""
+        params: dict[str, Any] = {}
+        if include_diff is not None:
+            params["include_diff"] = "true" if include_diff else "false"
+        data = self._http.get(
+            _paths.diagnostics_counterfactual_path(event_id),
+            params=params or None,
+            tenant=tenant,
+        )
+        return CounterfactualDiagnosticsResponse.model_validate(data)
+
+    def evolution(
+        self,
+        *,
+        subscription_id: str | None = None,
+        min_fires: int | None = None,
+        include_logs: bool | None = None,
+        limit: int | None = None,
+        tenant: TenantId | None = None,
+    ) -> EvolutionDiagnosticsResponse:
+        """Return subscription-effectiveness metrics (precision, recall, false-positive rate) for every tracked subscription."""
+        params: dict[str, Any] = {}
+        if subscription_id is not None:
+            params["subscription_id"] = subscription_id
+        if min_fires is not None:
+            params["min_fires"] = min_fires
+        if include_logs is not None:
+            params["include_logs"] = "true" if include_logs else "false"
+        if limit is not None:
+            params["limit"] = limit
+        data = self._http.get(
             _paths.diagnostics_evolution_path(),
             params=params or None,
             tenant=tenant,

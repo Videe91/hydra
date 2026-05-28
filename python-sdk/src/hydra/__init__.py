@@ -1,6 +1,14 @@
 """hydra-py — Python client for the Hydra living database.
 
-Quickstart:
+Two clients with method-for-method parity:
+
+  - `Hydra`     — async (httpx.AsyncClient). Use from inside an
+                  event loop (FastAPI, anyio, asyncio.run).
+  - `HydraSync` — sync (httpx.Client). Use from scripts, notebooks
+                  (Jupyter runs its own event loop), and synchronous
+                  web frameworks.
+
+Async quickstart:
 
     import asyncio
     from hydra import Hydra, ClaimSubject, ClaimObject
@@ -15,28 +23,32 @@ Quickstart:
             )
             print(resp.event_ids)
 
-            resp = await hy.propose_claim(
-                claim_id="claim_anom_001",
-                subject=ClaimSubject.dataset("revenue_daily"),
-                predicate="is_stale",
-                object=ClaimObject.value(True),
-                created_by="actor_agent",
-                kind="AnomalyFinding",
-                confidence=0.91,
-            )
-
     asyncio.run(main())
 
-Public surface in Patch 2:
-  - `Hydra` — the async client
+Sync quickstart:
+
+    from hydra import HydraSync, ClaimSubject, ClaimObject
+
+    with HydraSync("http://localhost:8080",
+                   token="<bearer>",
+                   tenant="tenant_default") as hy:
+        resp = hy.ingest_signal(
+            name="cloudtrail/CreateBucket",
+            source="node_aws_acct",
+        )
+        print(resp.event_ids)
+
+Both clients share:
   - Wire types: `Node`, `Edge`, `Event`, `Claim`, `Evidence`,
-    `Action`, `Outcome`, `IngestResponse`
+    `Action`, `Outcome`, `IngestResponse`, `LineageResponse`,
+    `AnomalyResponse`, `CoverageDiagnosticsResponse`,
+    `CounterfactualDiagnosticsResponse`,
+    `EvolutionDiagnosticsResponse`, the schema records,
+    `ValidationResponse`, replication models.
   - Tagged-union helpers: `ClaimSubject`, `ClaimObject`,
-    `EvidenceSource`, `ActionTarget`
-  - Type aliases: `EventId`, `NodeId`, etc.
-  - Literal enums: `ClaimStatus`, `ClaimKind`, `ActionStatus`,
-    `OutcomeKind`
-  - Exception hierarchy: `HydraError` + 7 typed subclasses
+    `EvidenceSource`, `ActionTarget`, `ValueTypeOf`.
+  - Namespaces: `.diagnostics`, `.schemas`, `.replication`.
+  - Exception hierarchy: `HydraError` + 7 typed subclasses.
 
 See HYDRA_SDK_DESIGN_RULES.md at the repo root for the immutable
 design rules every patch follows.
@@ -136,6 +148,7 @@ from ._types import (
     ValueTypeOf,
 )
 from .client import Hydra
+from .client_sync import HydraSync
 from .errors import (
     HydraAuthError,
     HydraConnectionError,
@@ -151,6 +164,7 @@ __all__ = [
     "__version__",
     # Client
     "Hydra",
+    "HydraSync",
     # Wire types
     "Action",
     "Claim",
