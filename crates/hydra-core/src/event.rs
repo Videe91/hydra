@@ -1,9 +1,11 @@
 use crate::action::{Action, Outcome};
 use crate::epistemic::{Claim, Evidence};
 use crate::id::{
-    ActionId, ActorId, ApprovalId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, NodeId,
-    PolicyId, ReplicaId, ReplicationRunId, SchemaId, SensorCheckpointId, SensorRunId, TenantId,
+    ActionId, ActorId, ApprovalId, CascadeId, ClaimId, EdgeId, EventId, EvidenceId, MicroModelId,
+    NodeId, PolicyId, ReplicaId, ReplicationRunId, SchemaId, SensorCheckpointId, SensorRunId,
+    TenantId,
 };
+use crate::micromodel::{MicroModelDefinition, MicroModelObservation, MicroModelPrediction, MicroModelStatus};
 use crate::policy::{ApprovalRequest, Policy, PolicyDecision};
 use crate::replication::{
     ReplicationLag, ReplicationOffset, ReplicationPeer, ReplicationPeerStatus, ReplicationRun,
@@ -294,6 +296,25 @@ pub enum EventKind {
         demoted_by: ActorId,
         reason: Option<String>,
     },
+
+    // MicroModel lifecycle (Patch 1 — vocabulary + registry only).
+    // Control-plane events: do not touch the graph projection. Routed
+    // through `Hydra::ingest` so they're durable, auditable, and
+    // replicable like every other Hydra event.
+    MicroModelRegistered {
+        model: MicroModelDefinition,
+    },
+    MicroModelStatusChanged {
+        model_id: MicroModelId,
+        status: MicroModelStatus,
+        reason: Option<String>,
+    },
+    MicroModelPredictionRecorded {
+        prediction: MicroModelPrediction,
+    },
+    MicroModelObservationRecorded {
+        observation: MicroModelObservation,
+    },
 }
 
 impl EventKind {
@@ -352,7 +373,11 @@ impl EventKind {
             | EventKind::ReplicationRunFailed { .. }
             | EventKind::ReplicaStatusChanged { .. }
             | EventKind::ReplicaPromoted { .. }
-            | EventKind::ReplicaDemoted { .. } => None,
+            | EventKind::ReplicaDemoted { .. }
+            | EventKind::MicroModelRegistered { .. }
+            | EventKind::MicroModelStatusChanged { .. }
+            | EventKind::MicroModelPredictionRecorded { .. }
+            | EventKind::MicroModelObservationRecorded { .. } => None,
         }
     }
 
@@ -408,6 +433,10 @@ impl EventKind {
             EventKind::ReplicaStatusChanged { .. } => "replica_status_changed",
             EventKind::ReplicaPromoted { .. } => "replica_promoted",
             EventKind::ReplicaDemoted { .. } => "replica_demoted",
+            EventKind::MicroModelRegistered { .. } => "micro_model_registered",
+            EventKind::MicroModelStatusChanged { .. } => "micro_model_status_changed",
+            EventKind::MicroModelPredictionRecorded { .. } => "micro_model_prediction_recorded",
+            EventKind::MicroModelObservationRecorded { .. } => "micro_model_observation_recorded",
         }
     }
 }
@@ -1188,5 +1217,76 @@ mod tests {
         }
         .target_node()
         .is_none());
+    }
+
+    #[test]
+    fn micromodel_event_kind_names() {
+        use crate::id::MicroModelId;
+        use crate::micromodel::{MicroModelDefinition, MicroModelKind, MicroModelStatus};
+
+        let actor = ActorId::from_str("actor_micromodel");
+        let now = chrono::Utc::now();
+        let definition = MicroModelDefinition::registered(
+            MicroModelId::from_str("mm_lag_v0"),
+            MicroModelKind::ReplicationLagAnomaly,
+            "lag_anomaly_v0",
+            1,
+            vec![],
+            vec![],
+            actor.clone(),
+            now,
+        );
+
+        // The four new EventKind discriminants map to snake_case
+        // names so downstream metrics + lineage rendering can
+        // discriminate them by string.
+        assert_eq!(
+            EventKind::MicroModelRegistered {
+                model: definition.clone()
+            }
+            .kind_name(),
+            "micro_model_registered"
+        );
+        assert_eq!(
+            EventKind::MicroModelStatusChanged {
+                model_id: MicroModelId::from_str("mm_lag_v0"),
+                status: MicroModelStatus::Active,
+                reason: None,
+            }
+            .kind_name(),
+            "micro_model_status_changed"
+        );
+        assert_eq!(
+            EventKind::MicroModelPredictionRecorded {
+                prediction: crate::micromodel::MicroModelPrediction {
+                    model_id: MicroModelId::from_str("mm_lag_v0"),
+                    run_id: crate::id::MicroModelRunId::from_str("mmrun_001"),
+                    input: serde_json::json!({}),
+                    output: serde_json::json!({}),
+                    confidence: 1.0,
+                    explanation: None,
+                    created_at: now,
+                }
+            }
+            .kind_name(),
+            "micro_model_prediction_recorded"
+        );
+        assert_eq!(
+            EventKind::MicroModelObservationRecorded {
+                observation: crate::micromodel::MicroModelObservation {
+                    run_id: crate::id::MicroModelRunId::from_str("mmrun_001"),
+                    observed_outcome: serde_json::json!({}),
+                    error: None,
+                    observed_at: now,
+                }
+            }
+            .kind_name(),
+            "micro_model_observation_recorded"
+        );
+
+        // Control-plane events: none of them target a graph node.
+        assert!(EventKind::MicroModelRegistered { model: definition }
+            .target_node()
+            .is_none());
     }
 }

@@ -398,6 +398,9 @@ mod tests {
             schemas: vec![],
             replication_peers: vec![],
             replication_runs: vec![],
+            micro_models: vec![],
+            micro_model_predictions: vec![],
+            micro_model_observations: vec![],
             metadata: HashMap::new(),
         }
     }

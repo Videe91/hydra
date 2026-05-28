@@ -300,7 +300,11 @@ impl Projection {
             | EventKind::ReplicationRunFailed { .. }
             | EventKind::ReplicaStatusChanged { .. }
             | EventKind::ReplicaPromoted { .. }
-            | EventKind::ReplicaDemoted { .. } => Ok(false),
+            | EventKind::ReplicaDemoted { .. }
+            | EventKind::MicroModelRegistered { .. }
+            | EventKind::MicroModelStatusChanged { .. }
+            | EventKind::MicroModelPredictionRecorded { .. }
+            | EventKind::MicroModelObservationRecorded { .. } => Ok(false),
         }
     }
 

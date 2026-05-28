@@ -3,6 +3,7 @@ use crate::cascade::{CascadeConfig, CascadeEngine, CascadeResult};
 use crate::commit_ledger::CommitLedger;
 use crate::coverage::{CoverageEngine, CoverageReport};
 use crate::schema_gate::{SchemaGate, SchemaGateConfig};
+use crate::micromodel_store::MicroModelStore;
 use crate::schema_registry_store::SchemaRegistryStore;
 use crate::snapshot_store::SnapshotStore;
 use crate::schema_validator::SchemaValidator;
@@ -73,6 +74,9 @@ pub struct Hydra {
     sensor_checkpoint_store: SensorCheckpointStore,
     replication_store: ReplicationStore,
     schema_registry_store: SchemaRegistryStore,
+    /// MicroModel Patch 1 — registry + audit only. Inference and
+    /// background runner land in Patch 2+.
+    micromodel_store: MicroModelStore,
     schema_validator: SchemaValidator,
     schema_gate: SchemaGate,
     snapshot_store: SnapshotStore,
@@ -205,6 +209,7 @@ impl Hydra {
             sensor_checkpoint_store: SensorCheckpointStore::new(),
             replication_store: ReplicationStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
+            micromodel_store: MicroModelStore::new(),
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
             snapshot_store: SnapshotStore::new(),
@@ -253,6 +258,7 @@ impl Hydra {
             sensor_checkpoint_store: SensorCheckpointStore::new(),
             replication_store: ReplicationStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
+            micromodel_store: MicroModelStore::new(),
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
             snapshot_store: SnapshotStore::new(),
@@ -494,6 +500,7 @@ impl Hydra {
             self.sensor_checkpoint_store.apply_event(event)?;
             self.replication_store.apply_event(event)?;
             self.schema_registry_store.apply_event(event)?;
+            self.micromodel_store.apply_event(event)?;
         }
 
         // Record an atomic commit batch for this cascade. v0 ledger is
@@ -633,6 +640,7 @@ impl Hydra {
         self.sensor_checkpoint_store.apply_event(event)?;
         self.replication_store.apply_event(event)?;
         self.schema_registry_store.apply_event(event)?;
+        self.micromodel_store.apply_event(event)?;
         Ok(())
     }
 
@@ -818,6 +826,7 @@ impl Hydra {
         self.sensor_checkpoint_store = SensorCheckpointStore::new();
         self.replication_store = ReplicationStore::new();
         self.schema_registry_store = SchemaRegistryStore::new();
+        self.micromodel_store = MicroModelStore::new();
     }
 
     // === Anomaly Detection (cont.) ===
@@ -1649,6 +1658,113 @@ impl Hydra {
         })
     }
 
+    // === MicroModel registry (Patch 1 — vocabulary + audit only) ===
+    //
+    // Every helper here routes through `self.ingest(EventKind::*)`
+    // rather than mutating `self.micromodel_store` directly — so the
+    // commit ledger, durable writer, observer, and replication path
+    // all see micro-model lifecycle events like any other event.
+
+    /// Read access to the micro-model store.
+    pub fn micromodel_store(&self) -> &crate::micromodel_store::MicroModelStore {
+        &self.micromodel_store
+    }
+
+    /// Register a micro-model. Emits `EventKind::MicroModelRegistered`
+    /// through `ingest(...)` so the registration is durable,
+    /// auditable, and replicable. Returns the model's id back for
+    /// caller convenience.
+    pub fn register_micro_model(
+        &mut self,
+        model: hydra_core::MicroModelDefinition,
+    ) -> hydra_core::error::Result<hydra_core::MicroModelId> {
+        let id = model.id.clone();
+        self.ingest(hydra_core::EventKind::MicroModelRegistered { model })?;
+        Ok(id)
+    }
+
+    /// Move a registered micro-model into a new lifecycle status
+    /// (Registered → Active ↔ Disabled → Archived). Emits
+    /// `EventKind::MicroModelStatusChanged`.
+    pub fn change_micro_model_status(
+        &mut self,
+        model_id: hydra_core::MicroModelId,
+        status: hydra_core::MicroModelStatus,
+        reason: Option<String>,
+    ) -> hydra_core::error::Result<()> {
+        self.ingest(hydra_core::EventKind::MicroModelStatusChanged {
+            model_id,
+            status,
+            reason,
+        })?;
+        Ok(())
+    }
+
+    /// Record one prediction made by a registered model. Patch 1
+    /// does NOT run inference — this helper exists so external
+    /// agents (or Patch 2's first real model) have a single
+    /// engine-level entry point to durably log a prediction.
+    pub fn record_micro_model_prediction(
+        &mut self,
+        prediction: hydra_core::MicroModelPrediction,
+    ) -> hydra_core::error::Result<()> {
+        self.ingest(hydra_core::EventKind::MicroModelPredictionRecorded { prediction })?;
+        Ok(())
+    }
+
+    /// Record the ground-truth observation paired with a prior
+    /// prediction (matched by `run_id`).
+    pub fn record_micro_model_observation(
+        &mut self,
+        observation: hydra_core::MicroModelObservation,
+    ) -> hydra_core::error::Result<()> {
+        self.ingest(hydra_core::EventKind::MicroModelObservationRecorded { observation })?;
+        Ok(())
+    }
+
+    /// Read one registered model by id.
+    pub fn micro_model(
+        &self,
+        id: &hydra_core::MicroModelId,
+    ) -> Option<&hydra_core::MicroModelDefinition> {
+        self.micromodel_store.model(id)
+    }
+
+    /// Snapshot all registered models. Iteration order is the
+    /// underlying HashMap order; callers that need stable ordering
+    /// should sort the returned slice by id.
+    pub fn micro_models(&self) -> Vec<&hydra_core::MicroModelDefinition> {
+        self.micromodel_store.all_models().collect()
+    }
+
+    /// All models registered with the given `kind`. Order is stable
+    /// (sorted by id) per the store's `BTreeSet` index.
+    pub fn micro_models_by_kind(
+        &self,
+        kind: &hydra_core::MicroModelKind,
+    ) -> Vec<&hydra_core::MicroModelDefinition> {
+        self.micromodel_store.models_by_kind(kind)
+    }
+
+    /// Look up one prediction by its `run_id`.
+    pub fn micro_model_prediction(
+        &self,
+        run_id: &hydra_core::MicroModelRunId,
+    ) -> Option<&hydra_core::MicroModelPrediction> {
+        self.micromodel_store.prediction(run_id)
+    }
+
+    /// Look up the observation paired with one prediction by
+    /// `run_id`. Returns `None` if the observation hasn't been
+    /// recorded yet (the typical "prediction made, outcome pending"
+    /// state).
+    pub fn micro_model_observation(
+        &self,
+        run_id: &hydra_core::MicroModelRunId,
+    ) -> Option<&hydra_core::MicroModelObservation> {
+        self.micromodel_store.observation(run_id)
+    }
+
     // === Schema registry ===
 
     /// Read access to the schema registry store.
@@ -2192,6 +2308,21 @@ impl Hydra {
             .all_runs()
             .cloned()
             .collect::<Vec<_>>();
+        let micro_models = self
+            .micromodel_store
+            .all_models()
+            .cloned()
+            .collect::<Vec<_>>();
+        let micro_model_predictions = self
+            .micromodel_store
+            .all_predictions()
+            .cloned()
+            .collect::<Vec<_>>();
+        let micro_model_observations = self
+            .micromodel_store
+            .all_observations()
+            .cloned()
+            .collect::<Vec<_>>();
 
         let manifest = hydra_core::SnapshotManifest::committed(
             hydra_core::SnapshotId::new(),
@@ -2215,7 +2346,12 @@ impl Hydra {
             sensor_checkpoints.len(),
             schemas.len(),
         )
-        .with_replication_counts(replication_peers.len(), replication_runs.len());
+        .with_replication_counts(replication_peers.len(), replication_runs.len())
+        .with_micro_model_counts(
+            micro_models.len(),
+            micro_model_predictions.len(),
+            micro_model_observations.len(),
+        );
         let body = hydra_core::SnapshotBody {
             manifest: manifest.clone(),
             nodes,
@@ -2234,6 +2370,9 @@ impl Hydra {
             schemas,
             replication_peers,
             replication_runs,
+            micro_models,
+            micro_model_predictions,
+            micro_model_observations,
             metadata: std::collections::HashMap::new(),
         };
         // Persist to the backend FIRST so a backend failure aborts the
@@ -2766,6 +2905,164 @@ mod tests {
             .unwrap();
         // Count is unchanged.
         assert_eq!(*observer.0.lock().unwrap(), 1);
+    }
+
+    // === MicroModel Patch 1 — registry + audit only ===
+
+    fn micromodel_actor() -> hydra_core::ActorId {
+        hydra_core::ActorId::from_str("actor_hydra_micromodel_test")
+    }
+
+    fn lag_anomaly_definition() -> hydra_core::MicroModelDefinition {
+        hydra_core::MicroModelDefinition::registered(
+            hydra_core::MicroModelId::from_str("mm_lag_v0"),
+            hydra_core::MicroModelKind::ReplicationLagAnomaly,
+            "lag_anomaly_v0",
+            1,
+            vec![hydra_core::FieldSchema::required(
+                "recent_lag_commits",
+                hydra_core::ValueType::List(Box::new(hydra_core::ValueType::Int)),
+            )],
+            vec![hydra_core::FieldSchema::required(
+                "is_anomalous",
+                hydra_core::ValueType::Bool,
+            )],
+            micromodel_actor(),
+            chrono::Utc::now(),
+        )
+    }
+
+    #[test]
+    fn hydra_registers_micro_model() {
+        let mut hydra = Hydra::new();
+        let def = lag_anomaly_definition();
+        let id = hydra.register_micro_model(def.clone()).unwrap();
+        // Round trip through the store.
+        assert_eq!(hydra.micro_model(&id), Some(&def));
+        // Indexed by kind too.
+        let by_kind =
+            hydra.micro_models_by_kind(&hydra_core::MicroModelKind::ReplicationLagAnomaly);
+        assert_eq!(by_kind.len(), 1);
+        assert_eq!(by_kind[0].id, id);
+        // The event landed in the audit log.
+        let kinds: Vec<_> = hydra
+            .events()
+            .iter()
+            .map(|e| e.kind.kind_name())
+            .collect();
+        assert!(kinds.contains(&"micro_model_registered"));
+    }
+
+    #[test]
+    fn hydra_records_prediction_and_observation() {
+        let mut hydra = Hydra::new();
+        let id = hydra.register_micro_model(lag_anomaly_definition()).unwrap();
+        let run_id = hydra_core::MicroModelRunId::from_str("mmrun_hydra_001");
+
+        // One prediction.
+        let prediction = hydra_core::MicroModelPrediction {
+            model_id: id,
+            run_id: run_id.clone(),
+            input: serde_json::json!({"recent_lag_commits": [10, 12, 11]}),
+            output: serde_json::json!({"is_anomalous": false}),
+            confidence: 0.88,
+            explanation: Some("flat trend".to_string()),
+            created_at: chrono::Utc::now(),
+        };
+        hydra
+            .record_micro_model_prediction(prediction.clone())
+            .unwrap();
+        assert_eq!(hydra.micro_model_prediction(&run_id), Some(&prediction));
+        // Observation matched by run_id.
+        assert!(hydra.micro_model_observation(&run_id).is_none());
+        let observation = hydra_core::MicroModelObservation {
+            run_id: run_id.clone(),
+            observed_outcome: serde_json::json!({"is_anomalous": false}),
+            error: Some(0.0),
+            observed_at: chrono::Utc::now(),
+        };
+        hydra
+            .record_micro_model_observation(observation.clone())
+            .unwrap();
+        assert_eq!(hydra.micro_model_observation(&run_id), Some(&observation));
+    }
+
+    #[test]
+    fn hydra_status_change_updates_store() {
+        let mut hydra = Hydra::new();
+        let id = hydra.register_micro_model(lag_anomaly_definition()).unwrap();
+        assert_eq!(
+            hydra.micro_model(&id).unwrap().status,
+            hydra_core::MicroModelStatus::Registered
+        );
+        hydra
+            .change_micro_model_status(
+                id.clone(),
+                hydra_core::MicroModelStatus::Active,
+                Some("promote after smoke test".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            hydra.micro_model(&id).unwrap().status,
+            hydra_core::MicroModelStatus::Active
+        );
+    }
+
+    #[test]
+    fn hydra_snapshot_restore_preserves_micro_models() {
+        let mut hydra = Hydra::new();
+        let id = hydra.register_micro_model(lag_anomaly_definition()).unwrap();
+        let run_id = hydra_core::MicroModelRunId::from_str("mmrun_hydra_restore");
+        hydra
+            .record_micro_model_prediction(hydra_core::MicroModelPrediction {
+                model_id: id.clone(),
+                run_id: run_id.clone(),
+                input: serde_json::json!({}),
+                output: serde_json::json!({"is_anomalous": true}),
+                confidence: 0.93,
+                explanation: None,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        hydra
+            .record_micro_model_observation(hydra_core::MicroModelObservation {
+                run_id: run_id.clone(),
+                observed_outcome: serde_json::json!({"is_anomalous": true}),
+                error: Some(0.0),
+                observed_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        // Snapshot.
+        let manifest = hydra.snapshot(micromodel_actor()).unwrap();
+        assert_eq!(manifest.total_micro_models, 1);
+        assert_eq!(manifest.total_micro_model_predictions, 1);
+        assert_eq!(manifest.total_micro_model_observations, 1);
+
+        // Pull the snapshot body out and restore into a FRESH hydra
+        // via the body-and-replay path. The store must rehydrate
+        // from event replay alone.
+        let body = hydra
+            .snapshot_body(&manifest.id)
+            .expect("snapshot body present")
+            .clone();
+        let mut restored = Hydra::new();
+        restored
+            .recover_from_snapshot_body_and_replay(body, vec![], micromodel_actor())
+            .unwrap();
+
+        // Model survives.
+        assert!(restored.micro_model(&id).is_some());
+        // Prediction + observation join by run_id.
+        assert!(restored.micro_model_prediction(&run_id).is_some());
+        assert!(restored.micro_model_observation(&run_id).is_some());
+        // And the kind index works after restore.
+        assert_eq!(
+            restored
+                .micro_models_by_kind(&hydra_core::MicroModelKind::ReplicationLagAnomaly)
+                .len(),
+            1
+        );
     }
 }
 

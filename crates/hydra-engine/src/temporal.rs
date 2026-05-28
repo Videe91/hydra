@@ -421,7 +421,11 @@ impl TemporalIndex {
             | EventKind::ReplicationRunFailed { .. }
             | EventKind::ReplicaStatusChanged { .. }
             | EventKind::ReplicaPromoted { .. }
-            | EventKind::ReplicaDemoted { .. } => false,
+            | EventKind::ReplicaDemoted { .. }
+            | EventKind::MicroModelRegistered { .. }
+            | EventKind::MicroModelStatusChanged { .. }
+            | EventKind::MicroModelPredictionRecorded { .. }
+            | EventKind::MicroModelObservationRecorded { .. } => false,
         }
     }
 

@@ -16,6 +16,7 @@ pub mod policy_engine;
 pub mod policy_agent;
 pub mod commit_ledger;
 pub mod sensor_checkpoint_store;
+pub mod micromodel_store;
 pub mod replication_store;
 pub mod schema_registry_store;
 pub mod schema_validator;

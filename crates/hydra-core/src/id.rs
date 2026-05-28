@@ -190,6 +190,14 @@ define_id!(OutcomeId, "out");
 // Replication IDs (V2 patch 1 — vocabulary only)
 define_id!(ReplicaId, "replica");
 define_id!(ReplicationRunId, "replrun");
+// MicroModel IDs (vocabulary + registry — Patch 1)
+//
+// `mm` prefix for the model definition, `mmrun` for one prediction
+// run. A run id ties a prediction to its corresponding observation
+// (recorded after the predicted outcome is known) so accuracy can
+// be computed against ground truth without a separate join.
+define_id!(MicroModelId, "mm");
+define_id!(MicroModelRunId, "mmrun");
 
 #[cfg(test)]
 mod tests {

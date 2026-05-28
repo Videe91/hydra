@@ -3,6 +3,7 @@ use crate::edge::Edge;
 use crate::epistemic::{Claim, Evidence};
 use crate::event::Value;
 use crate::id::{ActorId, SnapshotId, TenantId};
+use crate::micromodel::{MicroModelDefinition, MicroModelObservation, MicroModelPrediction};
 use crate::node::Node;
 use crate::policy::{ApprovalRequest, PolicyDecision};
 use crate::replication::{ReplicationPeer, ReplicationRun};
@@ -62,6 +63,14 @@ pub struct SnapshotManifest {
     pub total_replication_peers: usize,
     #[serde(default)]
     pub total_replication_runs: usize,
+    /// MicroModel Patch 1 — registry counts. `#[serde(default)]` so
+    /// manifests written before Patch 1 deserialize as zero.
+    #[serde(default)]
+    pub total_micro_models: usize,
+    #[serde(default)]
+    pub total_micro_model_predictions: usize,
+    #[serde(default)]
+    pub total_micro_model_observations: usize,
     pub metadata: HashMap<String, Value>,
 }
 
@@ -100,6 +109,14 @@ pub struct SnapshotBody {
     pub replication_peers: Vec<ReplicationPeer>,
     #[serde(default)]
     pub replication_runs: Vec<ReplicationRun>,
+    /// MicroModel Patch 1 — registry state. `#[serde(default)]` so
+    /// bodies written before Patch 1 deserialize with empty vectors.
+    #[serde(default)]
+    pub micro_models: Vec<MicroModelDefinition>,
+    #[serde(default)]
+    pub micro_model_predictions: Vec<MicroModelPrediction>,
+    #[serde(default)]
+    pub micro_model_observations: Vec<MicroModelObservation>,
     pub metadata: HashMap<String, Value>,
 }
 
@@ -154,6 +171,11 @@ impl SnapshotManifest {
             // attach counts via `with_replication_counts(peers, runs)`.
             total_replication_peers: 0,
             total_replication_runs: 0,
+            // MicroModel Patch 1: same pattern — defaults to zero,
+            // engine attaches via `with_micro_model_counts(...)`.
+            total_micro_models: 0,
+            total_micro_model_predictions: 0,
+            total_micro_model_observations: 0,
             metadata: HashMap::new(),
         }
     }
@@ -165,6 +187,27 @@ impl SnapshotManifest {
     pub fn with_replication_counts(mut self, peers: usize, runs: usize) -> Self {
         self.total_replication_peers = peers;
         self.total_replication_runs = runs;
+        self
+    }
+
+    /// Attach micro-model registry counts. Chainable; mirrors
+    /// `with_replication_counts` so the engine's snapshot path can
+    /// stack both setters without churn:
+    ///
+    /// ```ignore
+    /// SnapshotManifest::committed(...)
+    ///     .with_replication_counts(peers, runs)
+    ///     .with_micro_model_counts(models, predictions, observations)
+    /// ```
+    pub fn with_micro_model_counts(
+        mut self,
+        models: usize,
+        predictions: usize,
+        observations: usize,
+    ) -> Self {
+        self.total_micro_models = models;
+        self.total_micro_model_predictions = predictions;
+        self.total_micro_model_observations = observations;
         self
     }
 
@@ -337,6 +380,9 @@ mod tests {
             schemas: vec![],
             replication_peers: vec![],
             replication_runs: vec![],
+            micro_models: vec![],
+            micro_model_predictions: vec![],
+            micro_model_observations: vec![],
             metadata: HashMap::new(),
         };
         let json = serde_json::to_string(&body).unwrap();
