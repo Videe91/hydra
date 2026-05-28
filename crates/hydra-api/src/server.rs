@@ -15,9 +15,9 @@ use axum::routing::{get, post};
 use axum::Router;
 use hydra_core::ActorId;
 use hydra_net::http::{
-    commits_router, diagnostics_router, events_router, ingest_router, lineage_router,
-    query_router, replication_promote_router, replication_role_router, replication_router,
-    schema_router, sensor_router, snapshots_router,
+    commit_stream_router, commits_router, diagnostics_router, events_router, ingest_router,
+    lineage_router, query_router, replication_promote_router, replication_role_router,
+    replication_router, schema_router, sensor_router, snapshots_router, CommitBroadcaster,
 };
 use hydra_net::runtime::{RuntimeBuilder, RuntimeHandle};
 use hydra_sdk::HydraRuntime;
@@ -106,12 +106,53 @@ pub fn build_router_with_security(
     // makes runtime role flipping take effect immediately.
     let role_state = RoleState::new(security.role);
 
+    // Living-database — build one `CommitBroadcaster` per server.
+    // Attach it as the engine's commit observer (live fan-out fires on
+    // every committed batch AFTER the durable writer succeeds), AND
+    // hand a clone to the `commit_stream_router` so SSE subscribers
+    // can `.subscribe()` per connection. The broadcaster swallows
+    // send errors when there are zero receivers, so this is safe to
+    // attach unconditionally even when no clients are connected.
+    //
+    // `try_write` is correct here: `build_router_with_security`
+    // runs at server boot before any request handler can race for
+    // the lock. We may be called from inside a tokio runtime (e.g.
+    // `#[tokio::test]`), so `blocking_write` would deadlock — and
+    // there are no other writers yet, so contention is impossible.
+    let commit_broadcaster = Arc::new(CommitBroadcaster::new());
+    {
+        let hydra = runtime.hydra();
+        let broadcaster_for_engine = commit_broadcaster.clone()
+            as Arc<dyn hydra_engine::commit_ledger::CommitObserver>;
+        let attached = match hydra.try_write() {
+            Ok(mut guard) => {
+                guard.set_commit_observer(broadcaster_for_engine);
+                true
+            }
+            Err(_) => false,
+        };
+        if !attached {
+            // Pre-existing lock holder — exceptional but not
+            // fatal. The stream router will still serve catch-up
+            // replay from the in-memory ledger; only live fan-out
+            // is lost. Log so operators notice.
+            tracing::warn!(
+                target: "hydra::commit_stream",
+                "Hydra write lock held during router build; \
+                 CommitObserver not attached. Live SSE fan-out \
+                 disabled for this server; catch-up replay still \
+                 works."
+            );
+        }
+    }
+
     let state = AppState::new(runtime.clone());
     let mut app = legacy_routes(state)
         .merge(schema_router(runtime.clone()))
         .merge(ingest_router(runtime.clone()))
         .merge(sensor_router(runtime.clone()))
         .merge(commits_router(runtime.clone()))
+        .merge(commit_stream_router(runtime.clone(), commit_broadcaster.clone()))
         .merge(events_router(runtime.clone()))
         .merge(query_router(runtime.clone()))
         .merge(lineage_router(runtime.clone()))

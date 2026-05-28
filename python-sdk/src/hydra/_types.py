@@ -1174,3 +1174,111 @@ class ReplicationLagResponse(BaseModel):
 
     peer_id: ReplicaId
     lag: ReplicationLag | None = None
+
+
+# === Patch 6 (commit-stream SSE): `hy.subscribe_commits()` wire types ===
+#
+# `CommitBatch` on the engine has ~11 fields including
+# `event_records`, `commit_hash`, `previous_hash`, `idempotency_key`,
+# `metadata`, etc. The full Pydantic port would require modeling
+# `EventCommitRecord`, `CommitStatus`, `CommitHash` separately. Per
+# the Patch 6 design (Option C — "halfway"), we type the fields
+# agents actually use (`id`, `sequence`, `events`, `committed_at`,
+# the two hashes) and keep everything else accessible via `raw`.
+
+
+class CommitBatchLite(BaseModel):
+    """Lightly-typed view of an engine `CommitBatch`.
+
+    Agents iterate `events`, branch on `sequence`, and treat
+    `committed_at` as the temporal anchor. `commit_hash` and
+    `previous_hash` are exposed for callers doing chain verification.
+
+    Anything else the engine carries — `event_records`,
+    `idempotency_key`, `metadata`, `committed_by`, `status` — stays
+    in `raw` (the full wire dict). Pydantic's `model_validate` reads
+    the same dict twice: once to populate the typed fields, once to
+    preserve the unfiltered shape on `raw`. Costs ~1 dict copy per
+    commit, which is dwarfed by the SSE wire latency.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: CommitId
+    sequence: int
+    events: list[Event] = Field(default_factory=list)
+    committed_at: str
+    commit_hash: str | None = None
+    previous_hash: str | None = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def from_wire(cls, payload: dict[str, Any]) -> CommitBatchLite:
+        """Construct from the engine's CommitBatch wire shape. The
+        full payload survives on `raw` so callers can reach fields
+        the SDK doesn't yet type."""
+        return cls(
+            id=payload["id"],
+            sequence=payload["sequence"],
+            events=[Event.model_validate(e) for e in payload.get("events", [])],
+            committed_at=payload["committed_at"],
+            commit_hash=payload.get("commit_hash"),
+            previous_hash=payload.get("previous_hash"),
+            raw=payload,
+        )
+
+
+class CommitStreamCommit(BaseModel):
+    """SSE `event: commit` — one committed batch fanned out from
+    the engine."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["commit"] = "commit"
+    commit: CommitBatchLite
+
+
+class CommitStreamHeartbeat(BaseModel):
+    """SSE `event: heartbeat` — emitted every 15s on every open
+    stream so clients can distinguish an idle engine from a dropped
+    connection. `head_sequence` is the engine's latest committed
+    sequence at the moment the heartbeat was emitted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["heartbeat"] = "heartbeat"
+    head_sequence: int
+
+
+class CommitStreamLag(BaseModel):
+    """SSE `event: lag` — emitted at most once at the start of a
+    stream if the caller's `after_sequence` is below what the engine
+    can replay. The stream continues from `starting_at_sequence`; the
+    client decides whether to reconcile the gap via
+    `/replication/commits`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["lag"] = "lag"
+    requested_after_sequence: int
+    starting_at_sequence: int
+
+
+class CommitStreamError(BaseModel):
+    """SSE `event: error` — terminal. Emitted when a subscriber
+    lagged past the broadcast capacity (slow consumer) or the
+    server hit a serialization problem. The client should reconnect
+    with `after_sequence` set to the last commit it observed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["error"] = "error"
+    error: str
+    hint: str | None = None
+
+
+# Union of every item the SDK yields from
+# `hy.subscribe_commits(...)`. Callers branch on `item.type`.
+CommitStreamItem = (
+    CommitStreamCommit | CommitStreamHeartbeat | CommitStreamLag | CommitStreamError
+)

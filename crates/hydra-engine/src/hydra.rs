@@ -65,6 +65,11 @@ pub struct Hydra {
     policy_agent: PolicyAgent,
     commit_ledger: CommitLedger,
     commit_writer: Option<Box<dyn crate::commit_ledger::CommitBatchWriter>>,
+    /// Live fan-out for committed batches. Called AFTER the durable
+    /// writer succeeds; failures cannot affect commit success because
+    /// the trait returns `()`. `None` by default — no in-process
+    /// subscribers, no overhead.
+    commit_observer: Option<std::sync::Arc<dyn crate::commit_ledger::CommitObserver>>,
     sensor_checkpoint_store: SensorCheckpointStore,
     replication_store: ReplicationStore,
     schema_registry_store: SchemaRegistryStore,
@@ -196,6 +201,7 @@ impl Hydra {
             ),
             commit_ledger: CommitLedger::new(),
             commit_writer: None,
+            commit_observer: None,
             sensor_checkpoint_store: SensorCheckpointStore::new(),
             replication_store: ReplicationStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
@@ -243,6 +249,7 @@ impl Hydra {
             ),
             commit_ledger: CommitLedger::new(),
             commit_writer: None,
+            commit_observer: None,
             sensor_checkpoint_store: SensorCheckpointStore::new(),
             replication_store: ReplicationStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
@@ -497,6 +504,14 @@ impl Hydra {
             .commit_events(result.events.clone(), idempotency_key)?;
         if let Some(writer) = &self.commit_writer {
             writer.append_commit(&commit)?;
+        }
+        // Live fan-out — calls the observer (if attached) AFTER the
+        // durable writer has succeeded. The trait returns `()`, so a
+        // saturated channel or disconnected subscriber can't roll
+        // back a commit that's already on disk. See
+        // `commit_ledger::CommitObserver` for the contract.
+        if let Some(observer) = &self.commit_observer {
+            observer.observe_commit(&commit);
         }
 
         // I8: Persist cascade events to WAL (if configured)
@@ -2322,6 +2337,31 @@ impl Hydra {
     pub fn has_commit_writer(&self) -> bool {
         self.commit_writer.is_some()
     }
+
+    /// Attach a live commit observer.
+    ///
+    /// The observer is called on every committed batch AFTER the
+    /// durable writer (if any) succeeds. Observer failures cannot
+    /// affect commit success — the trait returns `()`. The argument
+    /// is an `Arc` so the same observer can be shared with HTTP
+    /// state, metrics sinks, or other components that also need to
+    /// react to commits.
+    pub fn set_commit_observer(
+        &mut self,
+        observer: std::sync::Arc<dyn crate::commit_ledger::CommitObserver>,
+    ) {
+        self.commit_observer = Some(observer);
+    }
+
+    /// Detach the live commit observer. The durable writer (if any)
+    /// is untouched.
+    pub fn clear_commit_observer(&mut self) {
+        self.commit_observer = None;
+    }
+
+    pub fn has_commit_observer(&self) -> bool {
+        self.commit_observer.is_some()
+    }
 }
 
 impl Default for Hydra {
@@ -2641,6 +2681,91 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("events"));
+    }
+
+    // === CommitObserver — live fan-out for committed batches ===
+
+    #[test]
+    fn commit_observer_fires_on_each_ingest() {
+        use crate::commit_ledger::CommitObserver;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, Default)]
+        struct CountingObserver {
+            count: Mutex<usize>,
+            last_seq: Mutex<Option<u64>>,
+        }
+
+        impl CommitObserver for CountingObserver {
+            fn observe_commit(&self, batch: &hydra_core::CommitBatch) {
+                *self.count.lock().unwrap() += 1;
+                *self.last_seq.lock().unwrap() = Some(batch.sequence);
+            }
+        }
+
+        let observer = Arc::new(CountingObserver::default());
+        let mut hydra = Hydra::new();
+        hydra.set_commit_observer(observer.clone() as Arc<dyn CommitObserver>);
+        assert!(hydra.has_commit_observer());
+
+        // Three independent ingests → three observer fires, three
+        // distinct sequences.
+        for i in 0..3 {
+            hydra
+                .ingest(hydra_core::EventKind::Signal {
+                    source: hydra_core::id::NodeId::from_str("test.observer"),
+                    name: format!("tick-{i}"),
+                    payload: HashMap::new(),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(*observer.count.lock().unwrap(), 3);
+        // Sequences are 1-indexed and monotonic.
+        assert_eq!(*observer.last_seq.lock().unwrap(), Some(3));
+    }
+
+    #[test]
+    fn commit_observer_clears_correctly() {
+        use crate::commit_ledger::CommitObserver;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, Default)]
+        struct CountingObserver(Mutex<usize>);
+        impl CommitObserver for CountingObserver {
+            fn observe_commit(&self, _batch: &hydra_core::CommitBatch) {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+
+        let observer = Arc::new(CountingObserver::default());
+        let mut hydra = Hydra::new();
+        hydra.set_commit_observer(observer.clone() as Arc<dyn CommitObserver>);
+
+        hydra
+            .ingest(hydra_core::EventKind::Signal {
+                source: hydra_core::id::NodeId::from_str("test.clear"),
+                name: "before".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+        assert_eq!(*observer.0.lock().unwrap(), 1);
+
+        // After clear the observer must no longer fire — even though
+        // the Arc still has a clone outstanding, the engine drops
+        // its reference and never calls observe_commit again.
+        hydra.clear_commit_observer();
+        assert!(!hydra.has_commit_observer());
+
+        hydra
+            .ingest(hydra_core::EventKind::Signal {
+                source: hydra_core::id::NodeId::from_str("test.clear"),
+                name: "after".to_string(),
+                payload: HashMap::new(),
+            })
+            .unwrap();
+        // Count is unchanged.
+        assert_eq!(*observer.0.lock().unwrap(), 1);
     }
 }
 

@@ -33,6 +33,12 @@ from ._types import (
     ClaimId,
     ClaimKind,
     ClaimStatus,
+    CommitBatchLite,
+    CommitStreamCommit,
+    CommitStreamError,
+    CommitStreamHeartbeat,
+    CommitStreamItem,
+    CommitStreamLag,
     Confidence,
     Edge,
     EdgeId,
@@ -503,3 +509,115 @@ class Hydra:
             tenant=tenant,
         )
         return LineageResponse.model_validate(raw)
+
+    # ========================================================================
+    # Commit stream — the "watch forever" surface
+    # ========================================================================
+
+    async def subscribe_commits(
+        self,
+        *,
+        after_sequence: int = 0,
+        tenant: TenantId | None = None,
+    ):
+        """Yield committed batches as they happen, plus heartbeat /
+        lag / error sentinels.
+
+        Opens a long-lived Server-Sent-Events connection to
+        `GET /commits/stream?after_sequence=N`. The engine first
+        replays every in-memory commit with sequence strictly
+        greater than `after_sequence`, then streams new commits as
+        they land. Use `after_sequence=<last commit sequence you
+        observed>` to resume cleanly across reconnects.
+
+        Yields one of four typed items per SSE event:
+
+          - `CommitStreamCommit(type="commit", commit=CommitBatchLite)`
+            — one per committed batch. The `commit.events` list is
+            already parsed into `Event` objects; `commit.raw` carries
+            the full wire dict for anything the SDK doesn't yet type.
+          - `CommitStreamHeartbeat(type="heartbeat", head_sequence=N)`
+            — emitted every 15s so the client knows the connection
+            is alive during quiet windows.
+          - `CommitStreamLag(type="lag", requested_after_sequence,
+            starting_at_sequence)` — at most once at the start of the
+            stream, if the caller asked for sequences the engine
+            can no longer replay. The stream still opens and
+            continues from `starting_at_sequence`. The caller
+            decides whether to reconcile via `/replication/commits`.
+          - `CommitStreamError(type="error", error, hint?)` —
+            terminal. The server emits this when a subscriber lags
+            past the broadcast buffer (slow consumer). After this
+            event the stream closes; reconnect with `after_sequence`
+            set to the last commit sequence you observed.
+
+        Usage:
+
+            async for item in hy.subscribe_commits(after_sequence=0):
+                if item.type == "commit":
+                    for event in item.commit.events:
+                        ...
+                elif item.type == "lag":
+                    # operator dashboard / re-bootstrap
+                elif item.type == "error":
+                    break  # connection closing
+                # heartbeat is optional to handle
+
+        Cancel by exiting the `async for` (closing the iterator
+        cancels the underlying HTTP stream).
+
+        Per Rule #7, `tenant=` overrides the client default on the
+        outgoing connection, though the engine does NOT filter the
+        stream by tenant — the audit view is cluster-wide and the
+        client filters `event.tenant_id` itself if needed.
+        """
+        params: dict[str, Any] = {}
+        if after_sequence > 0:
+            params["after_sequence"] = after_sequence
+
+        async for event_name, data in self._http.stream_sse(
+            _paths.commits_stream_path(),
+            params=params or None,
+            tenant=tenant,
+        ):
+            item = _parse_commit_stream_item(event_name, data)
+            if item is not None:
+                yield item
+                if isinstance(item, CommitStreamError):
+                    # Server emitted a terminal error event. The
+                    # underlying connection is closing; surface that
+                    # to the caller by ending the iterator.
+                    return
+
+
+def _parse_commit_stream_item(
+    event_name: str, data: str
+) -> CommitStreamItem | None:
+    """Translate one SSE `(event_name, data)` pair into a typed
+    stream item. Unknown event names are silently skipped (forward-
+    compatible with future server-side event types). Malformed
+    payloads produce a `CommitStreamError` synthetic so callers see
+    a single error vocabulary regardless of whether the failure was
+    on the wire or in the parse."""
+    import json
+
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError as exc:
+        return CommitStreamError(
+            error=f"failed to parse SSE data for event '{event_name}': {exc}",
+            hint="this is a client-side parse error, not a server signal",
+        )
+
+    if event_name == "commit":
+        return CommitStreamCommit(commit=CommitBatchLite.from_wire(payload))
+    if event_name == "heartbeat":
+        return CommitStreamHeartbeat.model_validate(
+            {"type": "heartbeat", **payload}
+        )
+    if event_name == "lag":
+        return CommitStreamLag.model_validate({"type": "lag", **payload})
+    if event_name == "error":
+        return CommitStreamError.model_validate({"type": "error", **payload})
+    # Unknown event name — silently skip for forward compatibility.
+    return None

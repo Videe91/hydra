@@ -16,6 +16,35 @@ pub trait CommitBatchWriter: Send + Sync {
     fn append_commit(&self, batch: &CommitBatch) -> Result<()>;
 }
 
+/// Pluggable, non-fallible observer for committed batches.
+///
+/// Where `CommitBatchWriter` is for *durable* sinks (the commit log
+/// on disk, the WAL), `CommitObserver` is for *live* fan-out to
+/// in-process subscribers — most importantly, the
+/// `GET /commits/stream` SSE handler that lets agents tail the
+/// database.
+///
+/// **Contract**:
+///   - Observer failure MUST NOT affect commit success. The return
+///     type is `()` so an implementation literally cannot propagate
+///     an error to the engine.
+///   - Observers are called AFTER `CommitBatchWriter::append_commit`
+///     succeeds — a commit that didn't make it to durable storage is
+///     never visible on the live stream.
+///   - Observers receive a reference and may clone if they need to
+///     enqueue.
+///
+/// The intentional non-failability is what lets HydraEngine stay
+/// independent of any networking concerns: a saturated broadcast
+/// channel or a disconnected client should never roll back a commit
+/// that has already been durably written.
+pub trait CommitObserver: Send + Sync {
+    /// Called once per committed batch, after the durable writer has
+    /// succeeded. Implementations should be cheap and non-blocking;
+    /// the engine call is synchronous in the ingest path.
+    fn observe_commit(&self, batch: &CommitBatch);
+}
+
 /// In-memory commit ledger for committed cascade batches.
 ///
 /// v0 intentionally uses deterministic std hashing over serialized event/batch

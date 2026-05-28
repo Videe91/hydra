@@ -121,19 +121,37 @@ hy.propose_action(..., caused_by=seed_event_id)
 
 Real agents that ingest a cascade in *one* call (via a custom Event with multiple reactions) wouldn't need this manual threading — the cascade engine assigns `caused_by` itself. The pattern in this demo is the easiest way to get the loop visible end-to-end with four separate, idempotent agent calls.
 
-## What's next
+## What's next — the *live* watcher
 
-The current demo runs **once**. The agent observes, decides, proposes, explains, and exits. The next demo upgrade turns it into a long-lived watcher:
+The run-once script is the first proof. The companion script in this folder, [`data_quality_watcher_live.py`](./data_quality_watcher_live.py), is the *living* proof:
 
-```python
-# Future: hy.subscribe_commits()
-async for batch in hy.subscribe_commits(after_sequence=...):
-    for event in batch.events:
-        if matches_data_quality_signal(event):
-            agent_react(event)
+```bash
+python data_quality_watcher_live.py
 ```
 
-That requires a `GET /commits/stream` SSE endpoint on the engine and an `hy.subscribe_commits()` method in the SDK — both intentionally out of scope for this demo. This patch ships the run-once loop so the *visible* "aha" lands first; the always-on watcher follows once the substrate exists.
+It opens a long-lived `GET /commits/stream` connection and reacts to every new `warehouse.null_spike` signal as it lands. Then, in another terminal, run the original `data_quality_watcher.py` (or anything else that ingests a null-spike) and watch the live watcher react in milliseconds:
+
+```
+[seq 42] 1 event(s)
+  ! null-spike signal observed (source=node_snowflake_prod_orders)
+  → reacted: evd=evd_live_evt_…, claim=claim_live_evt_…, action=act_live_evt_…
+    lineage: Seed event: signal: warehouse.null_spike. Recorded 1 evidence record(s) (metric_observation). Produced 1 claim(s) (has_data_quality_incident=Proposed). Resulted in 1 action(s) (Quarantine(Proposed)).
+```
+
+That is the moment Hydra is visibly alive: database changes → agent reacts → Hydra records why → lineage explains it. Ctrl-C to exit. The watcher reconnects automatically with the right `after_sequence` cursor if the stream drops.
+
+The live version uses the **async** `Hydra` client because `subscribe_commits` is async-only in this patch (sync mirror is deferred to a later patch).
+
+## Beyond live
+
+What the live demo still doesn't have, that a production agent would:
+
+- A multi-stage reaction policy (notify → quarantine → escalate)
+- Concurrency control (currently single-stream, single-task)
+- Subscription / reflex API so the engine itself can fan out reactions instead of an external watcher
+- Approval workflow integration (`ApprovalRequest` surface in the SDK)
+
+Each of those is its own patch. The pattern in this folder — observe, support, propose, act, explain, and now *watch* — is the core. Everything else builds on it.
 
 ## Caveats
 

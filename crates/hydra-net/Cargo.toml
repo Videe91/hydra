@@ -46,6 +46,12 @@ fs2 = "0.4"
 # already in the workspace dep tree transitively, so this is zero
 # new build cost.
 rand = "0.8"
+# Living-database phase — wrap a tokio mpsc::Receiver as a
+# futures::Stream so the SSE handler in `http::commit_stream` can
+# feed catch-up + live commits + heartbeats into one ordered stream
+# without hand-rolling a Stream impl. Smallest dep that does the
+# job; no broader futures pull-in.
+tokio-stream = "0.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -139,6 +139,13 @@ def test_schema_validate_paths() -> None:
     )
 
 
+def test_commits_stream_path() -> None:
+    """`/commits/stream` is the SSE endpoint. Caller appends
+    `?after_sequence=N` as a query param via the `params=` kwarg —
+    not part of the path string."""
+    assert _paths.commits_stream_path() == "/commits/stream"
+
+
 def test_replication_read_paths() -> None:
     """Six operator-facing replication reads. Puller-internal routes
     (`/replication/commits`, `/replication/snapshot/*`) are

@@ -1,3 +1,4 @@
+pub mod commit_stream;
 pub mod commits;
 pub mod diagnostics;
 pub mod events;
@@ -11,6 +12,11 @@ pub mod sensor;
 pub mod snapshots;
 pub mod tenant;
 
+pub use commit_stream::{
+    commit_stream_router, CommitBroadcaster, CommitStreamErrorPayload,
+    CommitStreamHeartbeatPayload, CommitStreamHttpState, CommitStreamLagPayload,
+    CommitStreamQuery, COMMIT_STREAM_CAPACITY,
+};
 pub use commits::{commits_router, CommitsHttpState};
 pub use diagnostics::{
     diagnostics_router, AnomalyEntry, AnomalyQuery, AnomalyResponse,

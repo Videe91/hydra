@@ -147,6 +147,110 @@ class HydraHttpClient:
             return _parse_success(response)
         _raise_for_error(method, response)
 
+    async def stream_sse(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        tenant: str | None = None,
+    ):
+        """Open a long-lived Server-Sent-Events connection and yield
+        `(event_name, data_str)` tuples as the server emits them.
+
+        Used by `Hydra.subscribe_commits(...)`. Read timeout is
+        disabled for the duration of the stream (SSE intentionally
+        idles between events; the per-request 10s timeout would
+        otherwise hang up an idle connection).
+
+        Errors:
+          - 4xx/5xx on the initial response → typed `HydraError`
+            subclass via `_raise_for_error` (no body consumed).
+          - Transport failure mid-stream → `HydraConnectionError`.
+          - Yields stop when the server closes the stream.
+        """
+        headers = self._headers(tenant)
+        headers.setdefault("Accept", "text/event-stream")
+        # Read timeout=None so the stream can idle between events.
+        # Connect timeout stays bounded so a dead server still fails
+        # fast on .stream() open.
+        stream_timeout = httpx.Timeout(
+            connect=10.0, read=None, write=10.0, pool=10.0
+        )
+
+        try:
+            async with self._client.stream(
+                "GET",
+                path,
+                params=params,
+                headers=headers,
+                timeout=stream_timeout,
+            ) as response:
+                if not response.is_success:
+                    # Consume body so the typed exception carries it.
+                    await response.aread()
+                    _raise_for_error("GET", response)
+
+                async for event in _iter_sse_events(response.aiter_lines()):
+                    yield event
+        except httpx.TransportError as exc:
+            raise HydraConnectionError(
+                f"GET {self.base_url}{path}: {exc}",
+                url=f"{self.base_url}{path}",
+            ) from exc
+
+
+async def _iter_sse_events(line_iter):
+    """Parse the SSE wire format. Yields `(event_name, data)` tuples.
+
+    Implements the subset of the WHATWG EventSource grammar Hydra
+    actually emits: `event:`, `data:`, and the comment lines that
+    start with `:`. Multi-line `data:` is concatenated with `\\n` per
+    the spec — even though Hydra's server currently emits single-line
+    data, agents may add line-broken JSON later and the SDK should
+    parse it correctly.
+
+    Field-name comparison is byte-exact (per the spec). One optional
+    leading space after the colon is stripped. Blank line dispatches
+    the buffered event; comments (lines beginning with `:`) are
+    ignored.
+
+    Lines that don't match any known field are silently dropped, also
+    per the spec. The `id:` and `retry:` fields are accepted but not
+    surfaced — Hydra doesn't use them today.
+    """
+    event_name: str | None = None
+    data_lines: list[str] = []
+
+    async for raw_line in line_iter:
+        line = raw_line.rstrip("\r")
+        if line == "":
+            if data_lines:
+                yield (event_name or "message", "\n".join(data_lines))
+            event_name = None
+            data_lines = []
+            continue
+        if line.startswith(":"):
+            continue  # comment
+        # Split on the first colon.
+        if ":" in line:
+            field, _, value = line.partition(":")
+            # Strip one optional space after the colon.
+            if value.startswith(" "):
+                value = value[1:]
+        else:
+            field, value = line, ""
+        if field == "event":
+            event_name = value
+        elif field == "data":
+            data_lines.append(value)
+        # `id`, `retry`, and any unknown field are ignored.
+
+    # Flush any trailing event that lacked a final blank line. SSE
+    # spec actually says incomplete events should be discarded, but
+    # being lenient here matches what real Python SSE clients do.
+    if data_lines:
+        yield (event_name or "message", "\n".join(data_lines))
+
 
 class HydraHttpClientSync:
     """Sync HTTP client wrapper. Internal.

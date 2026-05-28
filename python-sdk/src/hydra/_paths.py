@@ -241,6 +241,16 @@ def schemas_validate_edge_update_path() -> str:
     return "/schemas/validate/edge-update"
 
 
+# === /commits/stream — SSE subscription ===
+
+
+def commits_stream_path() -> str:
+    """Server-Sent-Events stream of every committed batch. Caller
+    supplies `?after_sequence=N` to tail strictly after a known
+    sequence; defaults to 0 (replay everything still in memory)."""
+    return "/commits/stream"
+
+
 # === /replication/* (read-only operator surface) ===
 
 
