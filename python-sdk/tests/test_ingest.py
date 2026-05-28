@@ -288,3 +288,76 @@ async def test_ingest_400_raises_validation_error_with_body_preserved(
     with pytest.raises(HydraValidationError) as exc_info:
         await hy.ingest_signal(name="x", source="node_y")
     assert exc_info.value.body == {"error": "tenant header required"}
+
+
+# === caused_by threading — wires the agent's living-loop lineage ===
+
+
+@pytest.mark.asyncio
+async def test_caused_by_threads_through_evidence_claim_action(
+    hy: Hydra, respx_mock: respx.MockRouter
+) -> None:
+    """Verify that `caused_by=<event_id>` flows from the SDK helper
+    into the wire body's embedded Evidence/Claim/Action record. Without
+    this, the engine stores `caused_by: null` and `hy.lineage(seed_id)`
+    can't enrich the response with downstream records — the four
+    separate ingest calls produce four disconnected cascades.
+
+    Pins the wire-shape contract that the Demo Agent 1 (data quality
+    watcher) depends on: passing the seed event id back through each
+    record so lineage traversal finds them.
+    """
+    route = respx_mock.post("https://hydra.test/ingest").mock(
+        return_value=httpx.Response(200, json=INGEST_OK)
+    )
+
+    await hy.add_evidence(
+        evidence_id="evd_001",
+        source=EvidenceSource.system("snowflake"),
+        payload_kind="metric_observation",
+        payload_data={"value": 0.38},
+        caused_by="evt_seed",
+    )
+    body = json.loads(route.calls.last.request.content)
+    assert body["event_kind"]["EvidenceAdded"]["evidence"]["caused_by"] == "evt_seed"
+
+    await hy.propose_claim(
+        claim_id="claim_001",
+        subject=ClaimSubject.dataset("orders"),
+        predicate="has_data_quality_incident",
+        object=ClaimObject.value(True),
+        created_by="actor_agent",
+        kind="AnomalyFinding",
+        caused_by="evt_seed",
+    )
+    body = json.loads(route.calls.last.request.content)
+    assert body["event_kind"]["ClaimProposed"]["claim"]["caused_by"] == "evt_seed"
+
+    await hy.propose_action(
+        action_id="act_001",
+        kind="Quarantine",
+        targets=[ActionTarget.dataset("orders")],
+        proposed_by="actor_agent",
+        caused_by="evt_seed",
+    )
+    body = json.loads(route.calls.last.request.content)
+    assert body["event_kind"]["ActionProposed"]["action"]["caused_by"] == "evt_seed"
+
+
+@pytest.mark.asyncio
+async def test_caused_by_defaults_to_none_when_omitted(
+    hy: Hydra, respx_mock: respx.MockRouter
+) -> None:
+    """Backward compat: omitting `caused_by` keeps the historical
+    behavior of sending `caused_by: null` on the embedded record.
+    Pre-Demo-Agent-1 callers continue to work unchanged."""
+    route = respx_mock.post("https://hydra.test/ingest").mock(
+        return_value=httpx.Response(200, json=INGEST_OK)
+    )
+    await hy.add_evidence(
+        evidence_id="evd_001",
+        source=EvidenceSource.system("snowflake"),
+        payload_kind="metric_observation",
+    )
+    body = json.loads(route.calls.last.request.content)
+    assert body["event_kind"]["EvidenceAdded"]["evidence"]["caused_by"] is None

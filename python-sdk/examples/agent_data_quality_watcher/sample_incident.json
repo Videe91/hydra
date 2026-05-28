@@ -1,0 +1,8 @@
+{
+  "dataset": "orders",
+  "column": "customer_id",
+  "metric": "null_rate",
+  "value": 0.38,
+  "baseline": 0.02,
+  "severity": "high"
+}

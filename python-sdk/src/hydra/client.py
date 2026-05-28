@@ -191,6 +191,7 @@ class Hydra:
         evidence_against: list[EvidenceId] | None = None,
         valid_from: str | None = None,
         valid_until: str | None = None,
+        caused_by: EventId | None = None,
         tenant: TenantId | None = None,
         idempotency_key: str | None = None,
     ) -> IngestResponse:
@@ -201,6 +202,11 @@ class Hydra:
         The engine accepts the claim with whatever id you supply —
         callers generate ULIDs/UUIDs themselves (Rule #11: the SDK
         does not auto-generate identities).
+
+        `caused_by` is the upstream `EventId` this claim was formed in
+        response to — typically the signal event whose evidence
+        motivated this belief. Setting it lets
+        `hy.lineage(seed_event_id)` surface this claim in the chain.
         """
         from datetime import datetime, timezone
 
@@ -221,7 +227,7 @@ class Hydra:
             "created_by": created_by,
             "created_at": now_iso,
             "updated_at": now_iso,
-            "caused_by": None,
+            "caused_by": caused_by,
         }
         event_kind = {"ClaimProposed": {"claim": claim}}
         return await self._ingest(event_kind, tenant=tenant, idempotency_key=idempotency_key)
@@ -235,6 +241,7 @@ class Hydra:
         payload_data: dict[str, Any] | None = None,
         reliability: Confidence = 1.0,
         observed_at: str | None = None,
+        caused_by: EventId | None = None,
         tenant: TenantId | None = None,
         idempotency_key: str | None = None,
     ) -> IngestResponse:
@@ -243,6 +250,11 @@ class Hydra:
         Use `EvidenceSource.warehouse(...)` / `.api(...)` / `.human(...)`
         / `.agent(...)` / `.document(...)` / `.system(...)` to construct
         the `source` argument.
+
+        `caused_by` is the upstream `EventId` this evidence ties back
+        to — typically the signal event that motivated recording it.
+        Setting it lets `hy.lineage(seed_event_id)` discover this
+        evidence record during enrichment.
         """
         from datetime import datetime, timezone
 
@@ -256,7 +268,7 @@ class Hydra:
             "reliability": reliability,
             "observed_at": observed_iso,
             "recorded_at": now_iso,
-            "caused_by": None,
+            "caused_by": caused_by,
         }
         event_kind = {"EvidenceAdded": {"evidence": evidence}}
         return await self._ingest(event_kind, tenant=tenant, idempotency_key=idempotency_key)
@@ -271,6 +283,7 @@ class Hydra:
         related_claims: list[ClaimId] | None = None,
         supporting_evidence: list[EvidenceId] | None = None,
         payload: dict[str, Any] | None = None,
+        caused_by: EventId | None = None,
         tenant: TenantId | None = None,
         idempotency_key: str | None = None,
     ) -> IngestResponse:
@@ -286,6 +299,11 @@ class Hydra:
 
         `targets`: list of `ActionTarget.node("...")` /
         `ActionTarget.dataset("...")` etc.
+
+        `caused_by` is the upstream `EventId` this action was proposed
+        in response to — typically the signal event whose claim
+        motivated this remediation. Setting it lets
+        `hy.lineage(seed_event_id)` surface this action in the chain.
         """
         from datetime import datetime, timezone
 
@@ -306,7 +324,7 @@ class Hydra:
             "updated_at": now_iso,
             "approved_at": None,
             "executed_at": None,
-            "caused_by": None,
+            "caused_by": caused_by,
         }
         event_kind = {"ActionProposed": {"action": action}}
         return await self._ingest(event_kind, tenant=tenant, idempotency_key=idempotency_key)

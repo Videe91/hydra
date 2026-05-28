@@ -170,10 +170,15 @@ class HydraSync:
         evidence_against: list[EvidenceId] | None = None,
         valid_from: str | None = None,
         valid_until: str | None = None,
+        caused_by: EventId | None = None,
         tenant: TenantId | None = None,
         idempotency_key: str | None = None,
     ) -> IngestResponse:
-        """Propose a new claim. Sync mirror of `Hydra.propose_claim`."""
+        """Propose a new claim. Sync mirror of `Hydra.propose_claim`.
+
+        See `Hydra.propose_claim` for the `caused_by` semantics —
+        threading the upstream signal event id makes the claim show up
+        in `hy.lineage(signal_event_id)`."""
         from datetime import datetime, timezone
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -193,7 +198,7 @@ class HydraSync:
             "created_by": created_by,
             "created_at": now_iso,
             "updated_at": now_iso,
-            "caused_by": None,
+            "caused_by": caused_by,
         }
         event_kind = {"ClaimProposed": {"claim": claim}}
         return self._ingest(event_kind, tenant=tenant, idempotency_key=idempotency_key)
@@ -207,10 +212,13 @@ class HydraSync:
         payload_data: dict[str, Any] | None = None,
         reliability: Confidence = 1.0,
         observed_at: str | None = None,
+        caused_by: EventId | None = None,
         tenant: TenantId | None = None,
         idempotency_key: str | None = None,
     ) -> IngestResponse:
-        """Add an Evidence record. Sync mirror of `Hydra.add_evidence`."""
+        """Add an Evidence record. Sync mirror of `Hydra.add_evidence`.
+
+        See `Hydra.add_evidence` for the `caused_by` semantics."""
         from datetime import datetime, timezone
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -223,7 +231,7 @@ class HydraSync:
             "reliability": reliability,
             "observed_at": observed_iso,
             "recorded_at": now_iso,
-            "caused_by": None,
+            "caused_by": caused_by,
         }
         event_kind = {"EvidenceAdded": {"evidence": evidence}}
         return self._ingest(event_kind, tenant=tenant, idempotency_key=idempotency_key)
@@ -238,10 +246,13 @@ class HydraSync:
         related_claims: list[ClaimId] | None = None,
         supporting_evidence: list[EvidenceId] | None = None,
         payload: dict[str, Any] | None = None,
+        caused_by: EventId | None = None,
         tenant: TenantId | None = None,
         idempotency_key: str | None = None,
     ) -> IngestResponse:
-        """Propose a new Action. Sync mirror of `Hydra.propose_action`."""
+        """Propose a new Action. Sync mirror of `Hydra.propose_action`.
+
+        See `Hydra.propose_action` for the `caused_by` semantics."""
         from datetime import datetime, timezone
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -261,7 +272,7 @@ class HydraSync:
             "updated_at": now_iso,
             "approved_at": None,
             "executed_at": None,
-            "caused_by": None,
+            "caused_by": caused_by,
         }
         event_kind = {"ActionProposed": {"action": action}}
         return self._ingest(event_kind, tenant=tenant, idempotency_key=idempotency_key)
