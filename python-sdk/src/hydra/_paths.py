@@ -131,3 +131,138 @@ def diagnostics_counterfactual_path(event_id: str) -> str:
 
 def diagnostics_evolution_path() -> str:
     return "/diagnostics/evolution"
+
+
+# === /schemas/* — read ===
+
+
+def schemas_active_path() -> str:
+    return "/schemas/active"
+
+
+def schemas_disabled_path() -> str:
+    return "/schemas/disabled"
+
+
+def schemas_archived_path() -> str:
+    return "/schemas/archived"
+
+
+def schema_entity_path(type_id: str) -> str:
+    return f"/schemas/entity/{_seg(type_id)}"
+
+
+def schema_edge_path(type_id: str) -> str:
+    return f"/schemas/edge/{_seg(type_id)}"
+
+
+def schema_evidence_path(kind: str) -> str:
+    return f"/schemas/evidence/{_seg(kind)}"
+
+
+def schema_claim_predicate_path(predicate: str) -> str:
+    return f"/schemas/claim/{_seg(predicate)}"
+
+
+def schema_action_path(action_kind: str) -> str:
+    return f"/schemas/action/{_seg(action_kind)}"
+
+
+def schema_policy_path(policy_kind: str) -> str:
+    return f"/schemas/policy/{_seg(policy_kind)}"
+
+
+# === /schemas/* — register ===
+
+
+def schemas_register_entity_path() -> str:
+    return "/schemas/entity"
+
+
+def schemas_register_edge_path() -> str:
+    return "/schemas/edge"
+
+
+def schemas_register_evidence_path() -> str:
+    return "/schemas/evidence"
+
+
+def schemas_register_claim_predicate_path() -> str:
+    return "/schemas/claim-predicate"
+
+
+def schemas_register_action_path() -> str:
+    return "/schemas/action"
+
+
+def schemas_register_policy_condition_path() -> str:
+    return "/schemas/policy-condition"
+
+
+# === /schemas/:schema_id/* — lifecycle ===
+
+
+def schema_disable_path(schema_id: str) -> str:
+    return f"/schemas/{_seg(schema_id)}/disable"
+
+
+def schema_archive_path(schema_id: str) -> str:
+    return f"/schemas/{_seg(schema_id)}/archive"
+
+
+# === /schemas/validate/* ===
+
+
+def schemas_validate_action_path() -> str:
+    return "/schemas/validate/action"
+
+
+def schemas_validate_evidence_path() -> str:
+    return "/schemas/validate/evidence"
+
+
+def schemas_validate_claim_path() -> str:
+    return "/schemas/validate/claim"
+
+
+def schemas_validate_node_create_path() -> str:
+    return "/schemas/validate/node-create"
+
+
+def schemas_validate_node_update_path() -> str:
+    return "/schemas/validate/node-update"
+
+
+def schemas_validate_edge_create_path() -> str:
+    return "/schemas/validate/edge-create"
+
+
+def schemas_validate_edge_update_path() -> str:
+    return "/schemas/validate/edge-update"
+
+
+# === /replication/* (read-only operator surface) ===
+
+
+def replication_status_path() -> str:
+    return "/replication/status"
+
+
+def replication_peers_path() -> str:
+    return "/replication/peers"
+
+
+def replication_peer_path(peer_id: str) -> str:
+    return f"/replication/peers/{_seg(peer_id)}"
+
+
+def replication_peer_lag_path(peer_id: str) -> str:
+    return f"/replication/peers/{_seg(peer_id)}/lag"
+
+
+def replication_role_path() -> str:
+    return "/replication/role"
+
+
+def replication_promotion_status_path() -> str:
+    return "/replication/promotion-status"

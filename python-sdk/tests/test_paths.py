@@ -74,3 +74,84 @@ def test_diagnostics_paths() -> None:
         == "/diagnostics/counterfactual/evt_abc"
     )
     assert _paths.diagnostics_evolution_path() == "/diagnostics/evolution"
+
+
+# === Patch 4: schemas + replication ===
+
+
+def test_schema_read_paths() -> None:
+    """Three list-by-status endpoints plus six single-fetch reads
+    keyed by the natural identifier (type_id / kind / predicate /
+    action_kind / policy_kind)."""
+    assert _paths.schemas_active_path() == "/schemas/active"
+    assert _paths.schemas_disabled_path() == "/schemas/disabled"
+    assert _paths.schemas_archived_path() == "/schemas/archived"
+    assert _paths.schema_entity_path("type_invoice") == "/schemas/entity/type_invoice"
+    assert _paths.schema_edge_path("type_depends_on") == "/schemas/edge/type_depends_on"
+    assert _paths.schema_evidence_path("bank_transaction") == "/schemas/evidence/bank_transaction"
+    assert _paths.schema_claim_predicate_path("is_stale") == "/schemas/claim/is_stale"
+    assert _paths.schema_action_path("PostLedgerEntry") == "/schemas/action/PostLedgerEntry"
+    assert _paths.schema_policy_path("AutoApproval") == "/schemas/policy/AutoApproval"
+
+
+def test_schema_register_paths() -> None:
+    """One register endpoint per SchemaDefinition variant. Note
+    `claim-predicate` and `policy-condition` use hyphenated paths
+    (matches the engine), distinct from the lookup paths
+    (`/schemas/claim/...`, `/schemas/policy/...`)."""
+    assert _paths.schemas_register_entity_path() == "/schemas/entity"
+    assert _paths.schemas_register_edge_path() == "/schemas/edge"
+    assert _paths.schemas_register_evidence_path() == "/schemas/evidence"
+    assert (
+        _paths.schemas_register_claim_predicate_path()
+        == "/schemas/claim-predicate"
+    )
+    assert _paths.schemas_register_action_path() == "/schemas/action"
+    assert (
+        _paths.schemas_register_policy_condition_path()
+        == "/schemas/policy-condition"
+    )
+
+
+def test_schema_lifecycle_paths() -> None:
+    """Disable + archive routes — schema_id goes in the path."""
+    assert _paths.schema_disable_path("sch_x") == "/schemas/sch_x/disable"
+    assert _paths.schema_archive_path("sch_x") == "/schemas/sch_x/archive"
+
+
+def test_schema_validate_paths() -> None:
+    """Seven preflight validators (`validate_policy` deferred per
+    Patch 4 scope)."""
+    assert _paths.schemas_validate_action_path() == "/schemas/validate/action"
+    assert _paths.schemas_validate_evidence_path() == "/schemas/validate/evidence"
+    assert _paths.schemas_validate_claim_path() == "/schemas/validate/claim"
+    assert (
+        _paths.schemas_validate_node_create_path() == "/schemas/validate/node-create"
+    )
+    assert (
+        _paths.schemas_validate_node_update_path() == "/schemas/validate/node-update"
+    )
+    assert (
+        _paths.schemas_validate_edge_create_path() == "/schemas/validate/edge-create"
+    )
+    assert (
+        _paths.schemas_validate_edge_update_path() == "/schemas/validate/edge-update"
+    )
+
+
+def test_replication_read_paths() -> None:
+    """Six operator-facing replication reads. Puller-internal routes
+    (`/replication/commits`, `/replication/snapshot/*`) are
+    intentionally NOT exposed via _paths."""
+    assert _paths.replication_status_path() == "/replication/status"
+    assert _paths.replication_peers_path() == "/replication/peers"
+    assert _paths.replication_peer_path("replica_a") == "/replication/peers/replica_a"
+    assert (
+        _paths.replication_peer_lag_path("replica_a")
+        == "/replication/peers/replica_a/lag"
+    )
+    assert _paths.replication_role_path() == "/replication/role"
+    assert (
+        _paths.replication_promotion_status_path()
+        == "/replication/promotion-status"
+    )

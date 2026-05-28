@@ -744,3 +744,228 @@ def test_evolution_response_round_trips() -> None:
     assert parsed.subscription_count == 0
     assert parsed.metrics == []
     assert parsed.analysis_scope == "global"
+
+
+# === Patch 4: schemas + replication round-trips ===
+
+
+def test_field_schema_primitive_value_type_round_trips() -> None:
+    """ValueType primitives serialize as bare JSON strings."""
+    from hydra._types import FieldSchema
+
+    raw = {
+        "name": "amount",
+        "value_type": "Float",
+        "required": True,
+        "default_value": None,
+        "description": None,
+        "metadata": {},
+    }
+    parsed = FieldSchema.model_validate(raw)
+    assert parsed.value_type == "Float"
+    assert parsed.model_dump(mode="json") == raw
+
+
+def test_field_schema_list_of_custom_value_type_round_trips() -> None:
+    """**Recursive ValueType** — `List<Custom<TypeId>>` serializes as
+    `{"List": {"Custom": "type_x"}}`. Pins that nested dicts survive
+    the round trip without restructuring."""
+    from hydra._types import FieldSchema
+
+    raw = {
+        "name": "invoice_refs",
+        "value_type": {"List": {"Custom": "type_invoice"}},
+        "required": True,
+        "default_value": None,
+        "description": "list of related invoices",
+        "metadata": {"docs_url": "https://example.com/x"},
+    }
+    parsed = FieldSchema.model_validate(raw)
+    assert parsed.value_type == {"List": {"Custom": "type_invoice"}}
+    assert parsed.description == "list of related invoices"
+    assert parsed.model_dump(mode="json") == raw
+
+
+def test_entity_type_schema_round_trips() -> None:
+    from hydra._types import EntityTypeSchema
+
+    raw = {
+        "id": "sch_001",
+        "tenant_id": "tenant_demo",
+        "type_id": "type_invoice",
+        "name": "Invoice",
+        "status": "Active",
+        "fields": [
+            {
+                "name": "amount",
+                "value_type": "Float",
+                "required": True,
+                "default_value": None,
+                "description": None,
+                "metadata": {},
+            }
+        ],
+        "created_by": "actor_admin",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "metadata": {},
+    }
+    parsed = EntityTypeSchema.model_validate(raw)
+    assert parsed.status == "Active"
+    assert parsed.fields[0].required is True
+    assert parsed.model_dump(mode="json") == raw
+
+
+def test_claim_predicate_schema_with_null_subject_type_round_trips() -> None:
+    """`subject_type: None` means the predicate applies to any entity
+    type — load-bearing distinct from a populated `subject_type`."""
+    from hydra._types import ClaimPredicateSchema
+
+    raw = {
+        "id": "sch_pred_001",
+        "tenant_id": None,
+        "predicate": "is_flagged",
+        "status": "Active",
+        "subject_type": None,
+        "object_type": "Bool",
+        "allowed_claim_kinds": ["ManualFlag"],
+        "created_by": "actor_x",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "metadata": {},
+    }
+    parsed = ClaimPredicateSchema.model_validate(raw)
+    assert parsed.subject_type is None
+    assert parsed.object_type == "Bool"
+    assert parsed.model_dump(mode="json") == raw
+
+
+def test_validation_response_valid_round_trips() -> None:
+    from hydra._types import ValidationResponse
+
+    raw = {"valid": True, "schema_id": "sch_act_001", "errors": []}
+    parsed = ValidationResponse.model_validate(raw)
+    assert parsed.valid is True
+    assert parsed.errors == []
+    assert parsed.model_dump(mode="json") == raw
+
+
+def test_validation_response_invalid_round_trips() -> None:
+    from hydra._types import ValidationResponse
+
+    raw = {
+        "valid": False,
+        "schema_id": "sch_act_001",
+        "errors": [
+            {
+                "schema_id": "sch_act_001",
+                "path": "amount",
+                "message": "expected Float, got String",
+            }
+        ],
+    }
+    parsed = ValidationResponse.model_validate(raw)
+    assert parsed.valid is False
+    assert parsed.errors[0].path == "amount"
+    assert parsed.model_dump(mode="json") == raw
+
+
+def test_validation_response_schema_id_null_when_no_match() -> None:
+    """When no schema is registered for the payload's kind, server
+    sends `valid: true` with `schema_id: null` (permissive)."""
+    from hydra._types import ValidationResponse
+
+    raw: dict = {"valid": True, "schema_id": None, "errors": []}
+    parsed = ValidationResponse.model_validate(raw)
+    assert parsed.schema_id is None
+
+
+def test_replication_peer_round_trips_full() -> None:
+    from hydra._types import ReplicationPeer
+
+    raw = {
+        "id": "replica_b",
+        "tenant_id": None,
+        "role": "Follower",
+        "status": "Online",
+        "endpoint": "https://b.hydra.test",
+        "mode": "CommitLogStreaming",
+        "last_offset": {
+            "sequence": 42,
+            "commit_id": "commit_xyz",
+            "commit_hash": "hash_xyz",
+        },
+        "last_lag": {
+            "leader_sequence": 50,
+            "follower_sequence": 42,
+            "lag_commits": 8,
+            "observed_at": "2026-01-01T00:00:00Z",
+        },
+        "registered_by": "actor_admin",
+        "registered_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:01Z",
+        "metadata": {},
+    }
+    parsed = ReplicationPeer.model_validate(raw)
+    assert parsed.role == "Follower"
+    assert parsed.mode == "CommitLogStreaming"
+    assert parsed.last_offset is not None
+    assert parsed.last_offset.sequence == 42
+    assert parsed.last_lag is not None
+    assert parsed.last_lag.lag_commits == 8
+    assert parsed.model_dump(mode="json") == raw
+
+
+def test_replication_peer_with_null_offsets_round_trips() -> None:
+    """Fresh peer — registered, no offset/lag observed yet. The
+    `Option<...>` semantics must round-trip as JSON null, not be
+    omitted."""
+    from hydra._types import ReplicationPeer
+
+    raw = {
+        "id": "replica_fresh",
+        "tenant_id": None,
+        "role": "Follower",
+        "status": "Registered",
+        "endpoint": None,
+        "mode": "SnapshotThenTail",
+        "last_offset": None,
+        "last_lag": None,
+        "registered_by": "actor_x",
+        "registered_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "metadata": {},
+    }
+    parsed = ReplicationPeer.model_validate(raw)
+    assert parsed.last_offset is None
+    assert parsed.last_lag is None
+    assert parsed.model_dump(mode="json") == raw
+
+
+def test_replication_lag_response_null_lag_round_trips() -> None:
+    """**Critical semantic** — `lag: None` is the intentional "no
+    observation" state, NOT a 404 substitute."""
+    from hydra._types import ReplicationLagResponse
+
+    raw = {"peer_id": "replica_unseen", "lag": None}
+    parsed = ReplicationLagResponse.model_validate(raw)
+    assert parsed.lag is None
+    assert parsed.model_dump(mode="json") == raw
+
+
+def test_replication_status_response_pascal_role_round_trips() -> None:
+    """`ReplicationStatusResponse.role` uses PascalCase
+    `ReplicationRole` (Leader/Follower/Observer) — NOT the lowercase
+    `RuntimeRole` from `/replication/role`."""
+    from hydra._types import ReplicationStatusResponse
+
+    raw = {
+        "role": "Leader",
+        "head_sequence": 100,
+        "head_commit_id": "commit_head",
+        "peers": [],
+    }
+    parsed = ReplicationStatusResponse.model_validate(raw)
+    assert parsed.role == "Leader"
+    assert parsed.head_sequence == 100
+    assert parsed.model_dump(mode="json") == raw

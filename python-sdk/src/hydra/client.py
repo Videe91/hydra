@@ -10,9 +10,9 @@ each accepts a per-call `tenant=` override (Rule #7), each preserves
 server errors verbatim (Rule #8) via the typed exception hierarchy.
 
 Future patches add:
-  - Patch 3: `lineage(...)`, `diagnostics.{anomaly, coverage,
+  - Patch 3 (shipped): `lineage(...)`, `diagnostics.{anomaly, coverage,
     counterfactual, evolution}(...)`
-  - Patch 4: schema register/validate, replication read-only
+  - Patch 4 (shipped): `schemas.*`, `replication.*` (read-only)
   - Patch 5: sync mirror, README, quickstart
 """
 
@@ -48,6 +48,8 @@ from ._types import (
     TenantId,
 )
 from .diagnostics import _Diagnostics
+from .replication import _Replication
+from .schemas import _Schemas
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
@@ -103,6 +105,10 @@ class Hydra:
         # property-descriptor magic. Methods are
         # `hy.diagnostics.{anomaly,coverage,counterfactual,evolution}`.
         self.diagnostics = _Diagnostics(self._http, tenant)
+        # Patch 4 — schema register/read/lifecycle/validate, and
+        # read-only replication operator introspection.
+        self.schemas = _Schemas(self._http, tenant)
+        self.replication = _Replication(self._http, tenant)
 
     def __repr__(self) -> str:
         """Token-redacted representation. Prevents bearer-token leaks

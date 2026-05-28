@@ -839,3 +839,338 @@ class EvolutionDiagnosticsResponse(BaseModel):
     summary: str
     engine_duration_ms: int
     analysis_scope: str
+
+
+# === Patch 4: schema IDs ===
+
+SchemaId = str
+
+
+# === Patch 4: schema lifecycle status (PascalCase, Rust serde default) ===
+
+SchemaStatus = Literal["Active", "Disabled", "Archived"]
+
+
+# === Patch 4: ValueType — recursive, externally-tagged ===
+#
+# `hydra_core::ValueType` is an externally-tagged Rust enum. Wire form
+# is a mix: unit variants serialize as bare JSON strings; the two
+# parameterized variants serialize as single-key objects.
+#
+#   "Null", "Bool", "Int", "Float", "String", "Timestamp",
+#   "Object", "Any"
+#   {"List": <ValueType>}            # recursive
+#   {"Custom": "type_x"}             # TypeId
+#
+# Per the approved Patch 4 design: keep this as `str | dict[str, Any]`
+# and provide ergonomic constructors via `ValueTypeOf` so users don't
+# hand-roll the shape. Matches the Patch 2 precedent for ClaimSubject /
+# EvidenceSource / ActionTarget tagged unions.
+
+ValueType = str | dict[str, Any]
+
+
+class ValueTypeOf:
+    """Constructor helpers for `ValueType`.
+
+    Each method returns the externally-tagged JSON shape the engine
+    expects. Compose recursively:
+
+        ValueTypeOf.list_of("Int")
+          → {"List": "Int"}
+
+        ValueTypeOf.list_of(ValueTypeOf.custom("type_invoice"))
+          → {"List": {"Custom": "type_invoice"}}
+    """
+
+    NULL: str = "Null"
+    BOOL: str = "Bool"
+    INT: str = "Int"
+    FLOAT: str = "Float"
+    STRING: str = "String"
+    TIMESTAMP: str = "Timestamp"
+    OBJECT: str = "Object"
+    ANY: str = "Any"
+
+    @staticmethod
+    def list_of(inner: ValueType) -> dict[str, Any]:
+        return {"List": inner}
+
+    @staticmethod
+    def custom(type_id: TypeId) -> dict[str, Any]:
+        return {"Custom": type_id}
+
+
+# === Patch 4: FieldSchema ===
+
+
+class FieldSchema(BaseModel):
+    """Mirrors `hydra_core::FieldSchema`.
+
+    `default_value` is `Option<Value>` server-side and `Value` is
+    polymorphic (`String | Int | Float | Bool | Timestamp | List |
+    Map | Null`). We accept `Any` here — Pydantic round-trips it
+    untyped, matching the engine's permissive value vocabulary.
+
+    `description` and `metadata` default to None / {}, matching
+    Rust's `#[serde(default)]`-shaped permissiveness on read.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value_type: ValueType
+    required: bool
+    default_value: Any | None = None
+    description: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# === Patch 4: per-kind schema records ===
+
+
+class EntityTypeSchema(BaseModel):
+    """Mirrors `hydra_core::EntityTypeSchema`. Returned by
+    `GET /schemas/entity/:type_id`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: SchemaId
+    tenant_id: TenantId | None = None
+    type_id: TypeId
+    name: str
+    status: SchemaStatus
+    fields: list[FieldSchema] = Field(default_factory=list)
+    created_by: ActorId
+    created_at: str
+    updated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class EdgeTypeSchema(BaseModel):
+    """Mirrors `hydra_core::EdgeTypeSchema`. Structurally identical
+    to EntityTypeSchema; distinguished by registration route and by
+    the `SchemaDefinition` external tag on list endpoints."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: SchemaId
+    tenant_id: TenantId | None = None
+    type_id: TypeId
+    name: str
+    status: SchemaStatus
+    fields: list[FieldSchema] = Field(default_factory=list)
+    created_by: ActorId
+    created_at: str
+    updated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvidencePayloadSchema(BaseModel):
+    """Mirrors `hydra_core::EvidencePayloadSchema`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: SchemaId
+    tenant_id: TenantId | None = None
+    kind: str
+    status: SchemaStatus
+    fields: list[FieldSchema] = Field(default_factory=list)
+    created_by: ActorId
+    created_at: str
+    updated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ClaimPredicateSchema(BaseModel):
+    """Mirrors `hydra_core::ClaimPredicateSchema`.
+
+    `subject_type` is `Option<TypeId>`: `None` means the predicate
+    applies to any entity type; `Some(t)` constrains it.
+
+    `object_type` is a full `ValueType` (primitives or `Custom`),
+    NOT a TypeId."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: SchemaId
+    tenant_id: TenantId | None = None
+    predicate: str
+    status: SchemaStatus
+    subject_type: TypeId | None = None
+    object_type: ValueType
+    allowed_claim_kinds: list[str] = Field(default_factory=list)
+    created_by: ActorId
+    created_at: str
+    updated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ActionPayloadSchema(BaseModel):
+    """Mirrors `hydra_core::ActionPayloadSchema`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: SchemaId
+    tenant_id: TenantId | None = None
+    action_kind: str
+    status: SchemaStatus
+    fields: list[FieldSchema] = Field(default_factory=list)
+    created_by: ActorId
+    created_at: str
+    updated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PolicyConditionSchema(BaseModel):
+    """Mirrors `hydra_core::PolicyConditionSchema`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: SchemaId
+    tenant_id: TenantId | None = None
+    policy_kind: str
+    status: SchemaStatus
+    fields: list[FieldSchema] = Field(default_factory=list)
+    created_by: ActorId
+    created_at: str
+    updated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# === Patch 4: schema register / validation responses ===
+
+
+class SchemaIdResponse(BaseModel):
+    """Returned from every `POST /schemas/...` register call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_id: SchemaId
+
+
+class SchemaValidationErrorResponse(BaseModel):
+    """One validation error inside a `ValidationResponse`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_id: SchemaId | None = None
+    path: str
+    message: str
+
+
+class ValidationResponse(BaseModel):
+    """Returned by every `POST /schemas/validate/*` route.
+
+    **Always 200 OK** — validation failure surfaces as `valid: False`
+    with a populated `errors[]`, NOT as an HTTP error. The SDK does
+    not raise on `valid: False`; callers branch on `.valid`.
+
+    `schema_id` is `None` when no matching schema exists for the
+    payload's kind/predicate — the engine treats absence as
+    pass-through (permissive). Later enforcement happens at
+    ingest-time via the SchemaGate policy.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    valid: bool
+    schema_id: SchemaId | None = None
+    errors: list[SchemaValidationErrorResponse] = Field(default_factory=list)
+
+
+# === Patch 4: replication wire enums (PascalCase, Rust serde default) ===
+#
+# Note the deliberate split from `RuntimeRole`:
+#   `RuntimeRole` is the lowercase Literal used by `/replication/role`
+#     ("leader" | "follower") — runtime-controllable HTTP-layer role.
+#   `ReplicationRole` is the PascalCase cluster vocabulary on
+#     ReplicationPeer.role and ReplicationStatusResponse.role:
+#     "Leader" | "Follower" | "Observer" (Observer reserved).
+
+ReplicationRole = Literal["Leader", "Follower", "Observer"]
+
+ReplicationPeerStatus = Literal[
+    "Registered",
+    "Online",
+    "Lagging",
+    "Offline",
+    "Failed",
+    "Promoted",
+    "Demoted",
+]
+
+ReplicationMode = Literal["CommitLogStreaming", "SnapshotThenTail"]
+
+
+# === Patch 4: replication wire models ===
+
+
+class ReplicationOffset(BaseModel):
+    """Mirrors `hydra_core::ReplicationOffset`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sequence: int
+    commit_id: CommitId | None = None
+    commit_hash: str | None = None
+
+
+class ReplicationLag(BaseModel):
+    """Mirrors `hydra_core::ReplicationLag`. `lag_commits` is computed
+    server-side as `leader_sequence.saturating_sub(follower_sequence)`
+    — floors at 0 on clock skew rather than wrapping."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    leader_sequence: int
+    follower_sequence: int
+    lag_commits: int
+    observed_at: str
+
+
+class ReplicationPeer(BaseModel):
+    """Mirrors `hydra_core::ReplicationPeer`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: ReplicaId
+    tenant_id: TenantId | None = None
+    role: ReplicationRole
+    status: ReplicationPeerStatus
+    endpoint: str | None = None
+    mode: ReplicationMode
+    last_offset: ReplicationOffset | None = None
+    last_lag: ReplicationLag | None = None
+    registered_by: ActorId
+    registered_at: str
+    updated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReplicationStatusResponse(BaseModel):
+    """`GET /replication/status` response.
+
+    Note `role` is `ReplicationRole` (PascalCase, the cluster
+    vocabulary), distinct from the lowercase `RuntimeRole` returned
+    by `GET /replication/role`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: ReplicationRole
+    head_sequence: int
+    head_commit_id: CommitId | None = None
+    peers: list[ReplicationPeer] = Field(default_factory=list)
+
+
+class ReplicationLagResponse(BaseModel):
+    """`GET /replication/peers/:peer_id/lag` response.
+
+    **`lag: None` is the intentional "no observation yet" state**, not
+    a 404. The route never 404s — unknown peer_ids also return
+    `{peer_id, lag: null}` for stable polling semantics."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    peer_id: ReplicaId
+    lag: ReplicationLag | None = None
