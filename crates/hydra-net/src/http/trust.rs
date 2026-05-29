@@ -216,11 +216,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: actor.clone(),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload: HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -263,9 +265,10 @@ mod tests {
             body.score,
             body.factors,
         );
-        // 15 factors: Patch 9's 12 baseline + Patch 12's 3
-        // historical reflex factors.
-        assert_eq!(body.factors.len(), 15);
+        // 16 factors: Patch 9's 12 baseline + Patch 12's 3
+        // historical reflex factors + Patch 13's
+        // model_operator_rejected_historically.
+        assert_eq!(body.factors.len(), 16);
         assert!(!body.related_action_ids.is_empty());
     }
 

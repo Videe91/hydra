@@ -854,11 +854,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: actor.clone(),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload: HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };

@@ -187,11 +187,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: prometheus(),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload,
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at,
             caused_by: None,
         }

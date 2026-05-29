@@ -33,7 +33,7 @@ pub use micromodels::{
 };
 pub use observations::{
     observations_router, MicroModelObservationResponse, ObservationsHttpState,
-    RecordObservationFromOutcomeRequest,
+    RecordObservationFromOutcomeRequest, RecordObservationFromRejectedActionRequest,
 };
 pub use diagnostics::{
     diagnostics_router, AnomalyEntry, AnomalyQuery, AnomalyResponse,

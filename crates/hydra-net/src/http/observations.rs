@@ -54,7 +54,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use hydra_core::{ActorId, MicroModelRunId, OutcomeId};
+use hydra_core::{ActionId, ActorId, MicroModelRunId, OutcomeId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -68,18 +68,37 @@ impl ObservationsHttpState {
     }
 }
 
-/// Build the observations router. One route in v0.
+/// Build the observations router. Two routes:
+/// - `/from-outcome/:outcome_id` (Patch 8 — positive learning)
+/// - `/from-rejected-action/:action_id` (Patch 13 — corrective
+///   learning)
 pub fn observations_router(runtime: RuntimeHandle) -> Router {
     Router::new()
         .route(
             "/diagnostics/micromodels/observations/from-outcome/:outcome_id",
             post(record_observation_from_outcome),
         )
+        .route(
+            "/diagnostics/micromodels/observations/from-rejected-action/:action_id",
+            post(record_observation_from_rejected_action),
+        )
         .with_state(ObservationsHttpState::new(runtime))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordObservationFromOutcomeRequest {
+    pub observed_by: ActorId,
+}
+
+/// Body for `POST /diagnostics/micromodels/observations/from-rejected-action/:action_id`
+/// (Trust Patch 5 / Patch 13).
+///
+/// Field shape is identical to the from-outcome request — Patch 13
+/// reuses the SDK / wire vocabulary deliberately so callers can
+/// learn one shape and use it for both positive and corrective
+/// observation recording.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordObservationFromRejectedActionRequest {
     pub observed_by: ActorId,
 }
 
@@ -144,22 +163,76 @@ async fn record_observation_from_outcome(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+async fn record_observation_from_rejected_action(
+    State(state): State<ObservationsHttpState>,
+    Path(action_id): Path<String>,
+    request: Result<
+        Json<RecordObservationFromRejectedActionRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let request = match request {
+        Ok(Json(req)) => req,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid request body: {err}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let action_id = ActionId::from_str(&action_id);
+
+    let hydra = state.runtime.hydra();
+    let mut hydra = hydra.write().await;
+
+    let observation = match hydra.record_micro_model_observation_from_rejected_action(
+        action_id,
+        request.observed_by.clone(),
+    ) {
+        Ok(obs) => obs,
+        Err(err) => return engine_error_response(err),
+    };
+    let body = MicroModelObservationResponse {
+        run_id: observation.run_id,
+        observed_outcome: observation.observed_outcome,
+        error: observation.error,
+        observed_at: observation.observed_at,
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
 fn engine_error_response(err: hydra_core::error::HydraError) -> Response {
     use hydra_core::error::HydraError;
     match err {
-        // Unknown outcome id → 404.
-        HydraError::QueryError(msg) if msg.contains("unknown outcome") => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse { error: msg }),
-        )
-            .into_response(),
-        // Chain-walk failure (outcome exists but ancestry isn't a
-        // MicroModel reflex) → 400.
-        HydraError::QueryError(msg) if msg.contains("outcome not traceable") => (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: msg }),
-        )
-            .into_response(),
+        // Unknown outcome (Patch 8) or action (Patch 13) → 404.
+        HydraError::QueryError(msg)
+            if msg.contains("unknown outcome") || msg.contains("unknown action") =>
+        {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse { error: msg }),
+            )
+                .into_response()
+        }
+        // Chain-walk failures and Patch 13's state-machine /
+        // cascade-rejector guards → 400. The client made a
+        // semantically wrong call (this outcome / action isn't a
+        // learning signal), not a server error.
+        HydraError::QueryError(msg)
+            if msg.contains("outcome not traceable")
+                || msg.contains("action not traceable")
+                || msg.contains("invalid action state")
+                || msg.contains("rejected by cascade") =>
+        {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: msg }),
+            )
+                .into_response()
+        }
         other => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -331,11 +404,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: actor.clone(),
             approved_by: Some(actor.clone()),
+            rejected_by: None,
             policy_id: None,
             payload: HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: Some(now),
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -429,5 +504,250 @@ mod tests {
             obj.get("operator_rejected").and_then(|v| v.as_bool()),
             Some(false)
         );
+    }
+
+    // === Trust Patch 5 (Patch 13) — rejection-path observations ===
+
+    /// Drive a model-derived chain, then OPERATOR-reject the
+    /// proposed action. Returns the rejected action_id.
+    async fn drive_chain_and_operator_reject(
+        runtime: &crate::runtime::RuntimeHandle,
+    ) -> hydra_core::ActionId {
+        let actor = hydra_core::ActorId::from_str("actor_test_requester");
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        // HumanApproval policy so cascade leaves it Proposed.
+        let now = chrono::Utc::now();
+        let policy = hydra_core::Policy {
+            id: hydra_core::PolicyId::new(),
+            tenant_id: None,
+            name: "Require human".to_string(),
+            kind: hydra_core::PolicyKind::HumanApproval,
+            status: hydra_core::PolicyStatus::Active,
+            scope: hydra_core::PolicyScope::AnyAction,
+            condition: HashMap::new(),
+            metadata: HashMap::new(),
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(EventKind::PolicyRegistered { policy })
+            .unwrap();
+        hydra
+            .evaluate_commit_rate_anomaly(actor.clone())
+            .unwrap();
+        hydra.set_commit_rate_anomaly_model(primed_test_model());
+        let need = 100u64.saturating_sub(hydra.commit_count() as u64);
+        for i in 0..need {
+            hydra
+                .ingest(EventKind::Signal {
+                    source: hydra_core::NodeId::from_str("test.signal"),
+                    name: format!("test_signal_{i}"),
+                    payload: HashMap::new(),
+                })
+                .unwrap();
+        }
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(actor)
+            .unwrap();
+        let action_id = assessment.action_ids[0].clone();
+        let operator = hydra_core::ActorId::from_str("actor_oncall_alice");
+        hydra
+            .reject_action(
+                action_id.clone(),
+                operator,
+                "maintenance window".to_string(),
+            )
+            .unwrap();
+        action_id
+    }
+
+    #[tokio::test]
+    async fn record_observation_from_rejected_action_returns_envelope() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let action_id = drive_chain_and_operator_reject(&runtime).await;
+        let app = observations_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!(
+                    "/diagnostics/micromodels/observations/from-rejected-action/{action_id}"
+                ),
+                serde_json::json!({ "observed_by": "actor_oncall_alice" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: MicroModelObservationResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        let obj = body.observed_outcome.as_object().unwrap();
+        assert_eq!(
+            obj.get("action_lifecycle").and_then(|v| v.as_str()),
+            Some("rejected")
+        );
+        assert_eq!(
+            obj.get("operator_rejected").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            obj.get("rejection_reason").and_then(|v| v.as_str()),
+            Some("maintenance window")
+        );
+    }
+
+    #[tokio::test]
+    async fn record_observation_from_rejected_action_unknown_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = observations_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/diagnostics/micromodels/observations/from-rejected-action/act_ghost",
+                serde_json::json!({ "observed_by": "actor_oncall" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn record_observation_from_rejected_action_wrong_status_returns_400() {
+        // Action exists but is Approved (not Rejected) — must
+        // surface as 400.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let now = chrono::Utc::now();
+        let action_id = hydra_core::ActionId::new();
+        let action = Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: ActionKind::Notify,
+            status: ActionStatus::Approved,
+            targets: vec![ActionTarget::System("hydra".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: Some(actor.clone()),
+            rejected_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: Some(now),
+            rejected_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest(EventKind::ActionProposed { action })
+                .unwrap();
+        }
+        let app = observations_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!(
+                    "/diagnostics/micromodels/observations/from-rejected-action/{action_id}"
+                ),
+                serde_json::json!({ "observed_by": "actor_ops" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(
+            body.error.contains("invalid action state"),
+            "got: {}",
+            body.error
+        );
+    }
+
+    #[tokio::test]
+    async fn record_observation_from_rejected_action_cascade_rejection_returns_400() {
+        // Register a Block policy so the cascade rejects with the
+        // cascade actor. Then the operator-recorded observation
+        // request must be refused (400 with "rejected by cascade").
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let now = chrono::Utc::now();
+        let policy = hydra_core::Policy {
+            id: hydra_core::PolicyId::new(),
+            tenant_id: None,
+            name: "Block".to_string(),
+            kind: hydra_core::PolicyKind::Block,
+            status: hydra_core::PolicyStatus::Active,
+            scope: hydra_core::PolicyScope::AnyAction,
+            condition: HashMap::new(),
+            metadata: HashMap::new(),
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        let action_id = {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest(EventKind::PolicyRegistered { policy })
+                .unwrap();
+            hydra
+                .evaluate_commit_rate_anomaly(actor.clone())
+                .unwrap();
+            hydra.set_commit_rate_anomaly_model(primed_test_model());
+            let need = 100u64.saturating_sub(hydra.commit_count() as u64);
+            for i in 0..need {
+                hydra
+                    .ingest(EventKind::Signal {
+                        source: hydra_core::NodeId::from_str("test.signal"),
+                        name: format!("test_signal_{i}"),
+                        payload: HashMap::new(),
+                    })
+                    .unwrap();
+            }
+            let assessment = hydra
+                .evaluate_commit_rate_anomaly_and_propose_action(actor)
+                .unwrap();
+            assessment.action_ids[0].clone()
+        };
+        let app = observations_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!(
+                    "/diagnostics/micromodels/observations/from-rejected-action/{action_id}"
+                ),
+                serde_json::json!({ "observed_by": "actor_ops" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(
+            body.error.contains("rejected by cascade"),
+            "got: {}",
+            body.error
+        );
+    }
+
+    #[tokio::test]
+    async fn record_observation_from_rejected_action_missing_observed_by_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = observations_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/diagnostics/micromodels/observations/from-rejected-action/act_x",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

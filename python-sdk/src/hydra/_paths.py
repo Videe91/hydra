@@ -154,6 +154,26 @@ def diagnostics_micromodels_observation_from_outcome_path(outcome_id: str) -> st
     return f"/diagnostics/micromodels/observations/from-outcome/{_seg(outcome_id)}"
 
 
+def diagnostics_micromodels_observation_from_rejected_action_path(action_id: str) -> str:
+    """`POST /diagnostics/micromodels/observations/from-rejected-action/{action_id}`
+    — Trust Patch 5 (Patch 13). Corrective-memory companion to the
+    from-outcome path: synthesizes a MicroModelObservation for an
+    OPERATOR-rejected model-derived action. Body: `{observed_by}`.
+
+    Refused (400) when:
+      - action is not in Rejected status
+      - action was rejected by cascade (policy enforcement), not
+        by an operator — cascade rejections aren't learning signal
+      - action isn't model-derived (no related_claims, or claim
+        not traced to a MicroModelPrediction)
+
+    404 on unknown action_id. Reuses `write:diagnostics` scope."""
+    return (
+        f"/diagnostics/micromodels/observations/from-rejected-action/"
+        f"{_seg(action_id)}"
+    )
+
+
 # === /actions/* (Patch 6 — operator approval workflow) ===
 
 

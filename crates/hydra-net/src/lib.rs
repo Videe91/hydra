@@ -27,8 +27,8 @@ pub mod prelude {
         EvolutionDiagnosticsResponse, ExecuteActionRequest, IngestHttpState, LineageHttpState,
         LineageResponse, MicroModelObservationResponse, MicroModelsHttpState,
         ObservationsHttpState, QueryHttpState, RecordObservationFromOutcomeRequest,
-        RejectActionRequest, SchemaHttpState, SensorHttpState, SnapshotsHttpState, TrustHttpState,
-        COMMIT_STREAM_CAPACITY,
+        RecordObservationFromRejectedActionRequest, RejectActionRequest, SchemaHttpState,
+        SensorHttpState, SnapshotsHttpState, TrustHttpState, COMMIT_STREAM_CAPACITY,
     };
     pub use crate::metrics::{
         metrics_router, MetricsRecorder, NoopRecorder, PrometheusTextRecorder,

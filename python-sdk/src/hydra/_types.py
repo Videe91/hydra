@@ -402,11 +402,17 @@ class Action(BaseModel):
     supporting_evidence: list[EvidenceId] = Field(default_factory=list)
     proposed_by: ActorId
     approved_by: ActorId | None = None
+    # Trust Patch 5 (Patch 13) — rejector actor + timestamp.
+    # Mirrors approved_by / approved_at for symmetric audit.
+    # Default-None so wire envelopes from pre-Patch-13 servers
+    # validate without rewrite.
+    rejected_by: ActorId | None = None
     policy_id: PolicyId | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str
     approved_at: str | None = None
+    rejected_at: str | None = None
     executed_at: str | None = None
     caused_by: EventId | None = None
 

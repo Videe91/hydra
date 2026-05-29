@@ -16,6 +16,7 @@ from typing import Any
 from . import _paths
 from ._http import HydraHttpClient, HydraHttpClientSync
 from ._types import (
+    ActionId,
     ActorId,
     AnomalyResponse,
     CommitRateAnomalyAssessment,
@@ -215,6 +216,47 @@ class _Diagnostics:
         )
         return MicroModelObservation.model_validate(raw)
 
+    async def record_observation_from_rejected_action(
+        self,
+        action_id: ActionId,
+        *,
+        observed_by: ActorId,
+        tenant: TenantId | None = None,
+    ) -> MicroModelObservation:
+        """Record an observation for an OPERATOR-rejected model-derived
+        action (Trust Patch 5 / Patch 13). Corrective-memory companion
+        to `record_observation_from_outcome`.
+
+        Walks `action.related_claims[0]` → `claim.caused_by` →
+        MicroModelPredictionRecorded → `prediction.run_id` and
+        synthesizes a MicroModelObservation whose `observed_outcome`
+        JSON carries `action_lifecycle == "rejected"`,
+        `operator_rejected == true`, and the `rejection_reason`
+        copied from the original `EventKind::ActionRejected` event.
+
+        Refused when:
+          - action_id unknown → `HydraNotFoundError` (404)
+          - action.status != Rejected → `HydraValidationError` (400)
+          - action.rejected_by is cascade actor (policy enforcement,
+            not human judgment) → `HydraValidationError` (400)
+          - action not traceable to a MicroModelPrediction →
+            `HydraValidationError` (400)
+
+        v0 caveat: cascade rejections never produce observations.
+        The negative trust factor `model_operator_rejected_historically`
+        therefore reflects HUMAN rejection history only — which is
+        the intended invariant.
+        """
+        body = {"observed_by": observed_by}
+        raw = await self._http.post(
+            _paths.diagnostics_micromodels_observation_from_rejected_action_path(
+                action_id
+            ),
+            json=body,
+            tenant=tenant,
+        )
+        return MicroModelObservation.model_validate(raw)
+
 
 # === Patch 5: sync mirror ===
 #
@@ -365,6 +407,28 @@ class _DiagnosticsSync:
         body = {"observed_by": observed_by}
         raw = self._http.post(
             _paths.diagnostics_micromodels_observation_from_outcome_path(outcome_id),
+            json=body,
+            tenant=tenant,
+        )
+        return MicroModelObservation.model_validate(raw)
+
+    def record_observation_from_rejected_action(
+        self,
+        action_id: ActionId,
+        *,
+        observed_by: ActorId,
+        tenant: TenantId | None = None,
+    ) -> MicroModelObservation:
+        """Sync mirror of the async
+        `record_observation_from_rejected_action` — synthesizes a
+        rejection-shaped MicroModelObservation for an
+        operator-rejected action. See the async docstring for full
+        semantics and error mapping."""
+        body = {"observed_by": observed_by}
+        raw = self._http.post(
+            _paths.diagnostics_micromodels_observation_from_rejected_action_path(
+                action_id
+            ),
             json=body,
             tenant=tenant,
         )

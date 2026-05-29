@@ -163,9 +163,20 @@ impl ActionStore {
                     action.updated_at = event.timestamp;
                 })?;
             }
-            EventKind::ActionRejected { action_id, .. } => {
+            EventKind::ActionRejected {
+                action_id,
+                rejected_by,
+                // Patch 13 — the reason is captured in the
+                // ActionRejected event itself; the rejection
+                // observation reads it from there when the
+                // operator records via
+                // record_micro_model_observation_from_rejected_action.
+                reason: _,
+            } => {
                 self.mutate_action(action_id, |action| {
                     action.status = ActionStatus::Rejected;
+                    action.rejected_by = Some(rejected_by.clone());
+                    action.rejected_at = Some(event.timestamp);
                     action.updated_at = event.timestamp;
                 })?;
             }
@@ -360,11 +371,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: actor(),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload,
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         }

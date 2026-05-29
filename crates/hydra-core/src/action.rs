@@ -73,6 +73,12 @@ pub struct Action {
     pub proposed_by: ActorId,
     /// Actor who approved the action, if approval was required.
     pub approved_by: Option<ActorId>,
+    /// Actor who rejected the action — populated by
+    /// `EventKind::ActionRejected` (Trust Patch 5 / Patch 13).
+    /// `#[serde(default)]` so audit logs / snapshots written
+    /// before Patch 13 replay unchanged.
+    #[serde(default)]
+    pub rejected_by: Option<ActorId>,
     /// Optional policy that allowed/blocked/required review for this action.
     pub policy_id: Option<PolicyId>,
     /// Free structured payload for action-specific details.
@@ -80,6 +86,11 @@ pub struct Action {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub approved_at: Option<DateTime<Utc>>,
+    /// Timestamp at which the action was rejected (Patch 13).
+    /// Mirrors `approved_at` for symmetric audit. `#[serde(default)]`
+    /// for pre-Patch-13 replay compatibility.
+    #[serde(default)]
+    pub rejected_at: Option<DateTime<Utc>>,
     pub executed_at: Option<DateTime<Utc>>,
     pub caused_by: Option<EventId>,
 }
@@ -168,11 +179,13 @@ mod tests {
             supporting_evidence: vec![EvidenceId::new()],
             proposed_by: actor(),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload,
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };

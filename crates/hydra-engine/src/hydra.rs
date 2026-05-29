@@ -2160,6 +2160,166 @@ impl Hydra {
         Ok(observation)
     }
 
+    // === Trust Patch 5 (Patch 13) — rejection-path observations ===
+    //
+    // The corrective-memory companion to Patch 8. When an operator
+    // rejects a model-derived action, this method synthesizes a
+    // MicroModelObservation with `action_lifecycle: "rejected"` so
+    // Patch 12's reflex trust calibration can read it as a NEGATIVE
+    // signal (Patch 13's new factor `model_operator_rejected_
+    // historically`).
+    //
+    // v0 boundary:
+    //   ✓ Operator-triggered only (caller passes `observed_by`)
+    //   ✓ Cascade rejections REFUSED — a policy refusing an action
+    //     is not the same signal as a human refusing it
+    //   ✓ Action must be in status Rejected (other states → 400)
+    //   ✓ Walk action → claim → prediction → run_id; non-model
+    //     actions are not traceable → 400
+    //   ✓ rejection_reason is extracted from the most recent
+    //     ActionRejected event in the audit log
+    //
+    // No new event variant. Reuses MicroModelObservationRecorded.
+
+    /// Record a MicroModelObservation from an operator-rejected
+    /// action. Mirrors `record_micro_model_observation_from_action_outcome`
+    /// but for the REJECTION path (no outcome exists because
+    /// execution never happened).
+    ///
+    /// `observed_by` is the actor recording the observation (often
+    /// the same operator who rejected it; not enforced).
+    ///
+    /// Errors:
+    /// - Unknown action → `QueryError("unknown action: ...")`
+    /// - Action not Rejected → `QueryError("invalid action state: ...")`
+    /// - `action.rejected_by` missing or cascade actor → `QueryError(
+    ///   "action was rejected by cascade, not operator")`
+    /// - Chain walk failure (non-model-derived) → `QueryError(
+    ///   "action not traceable: ...")`
+    pub fn record_micro_model_observation_from_rejected_action(
+        &mut self,
+        action_id: hydra_core::ActionId,
+        observed_by: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::MicroModelObservation> {
+        // 1. Lookup action.
+        let action = self.action_store.action(&action_id).cloned().ok_or_else(
+            || {
+                hydra_core::error::HydraError::QueryError(format!(
+                    "unknown action: {action_id}"
+                ))
+            },
+        )?;
+
+        // 2. Validate status == Rejected.
+        if action.status != hydra_core::ActionStatus::Rejected {
+            return Err(hydra_core::error::HydraError::QueryError(format!(
+                "invalid action state: {action_id} is {:?}, expected Rejected",
+                action.status
+            )));
+        }
+
+        // 3. Validate rejector is non-cascade. Cascade rejections
+        //    are policy enforcement, not human judgment — they do
+        //    NOT produce a learning signal.
+        let rejector = action.rejected_by.as_ref().ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "action {action_id} is Rejected but rejected_by is unset"
+            ))
+        })?;
+        if hydra_core::is_cascade_approver(rejector) {
+            return Err(hydra_core::error::HydraError::QueryError(format!(
+                "action {action_id} was rejected by cascade ({}), not operator",
+                rejector
+            )));
+        }
+
+        // 4. Walk action → related_claims[0].
+        let claim_id = action.related_claims.first().cloned().ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "action not traceable: {action_id} has no related_claims — \
+                 not a model-derived action"
+            ))
+        })?;
+
+        // 5. Walk claim → caused_by (prediction event).
+        let claim = self.epistemic_store.claim(&claim_id).ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "action not traceable: claim {claim_id} not in epistemic store"
+            ))
+        })?;
+        let prediction_event_id = claim.caused_by.clone().ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "action not traceable: claim {claim_id} has no caused_by"
+            ))
+        })?;
+        let prediction_event = self.event(&prediction_event_id).ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "action not traceable: prediction event {prediction_event_id} \
+                 not in log"
+            ))
+        })?;
+        let prediction = match &prediction_event.kind {
+            hydra_core::EventKind::MicroModelPredictionRecorded { prediction } => {
+                prediction.clone()
+            }
+            other => {
+                return Err(hydra_core::error::HydraError::QueryError(format!(
+                    "action not traceable: claim.caused_by is not \
+                     MicroModelPredictionRecorded (got {:?})",
+                    other.kind_name()
+                )));
+            }
+        };
+        let run_id = prediction.run_id.clone();
+
+        // 6. Find the rejection reason from the most recent
+        //    ActionRejected event for this action_id.
+        let rejection_reason = self
+            .events()
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                hydra_core::EventKind::ActionRejected {
+                    action_id: aid,
+                    reason,
+                    ..
+                } if aid == &action_id => Some(reason.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        // 7. Build observed_outcome JSON. Mirrors Patch 8's contract
+        //    (action_lifecycle, operator_approved, operator_rejected
+        //    keys consistent) so Patch 12's history-reading code
+        //    can distinguish executed vs rejected without schema
+        //    drift.
+        let observed_outcome = serde_json::json!({
+            "outcome_id": serde_json::Value::Null,
+            "action_id": action_id.to_string(),
+            "claim_id": claim_id.to_string(),
+            "outcome_kind": "Rejected",
+            "outcome_summary": format!(
+                "Action rejected by operator: {rejection_reason}"
+            ),
+            "action_lifecycle": "rejected",
+            "operator_approved": false,
+            "operator_rejected": true,
+            "rejection_reason": rejection_reason,
+            "observed_by": observed_by.to_string(),
+        });
+
+        let observation = hydra_core::MicroModelObservation {
+            run_id,
+            observed_outcome,
+            error: None,
+            observed_at: chrono::Utc::now(),
+        };
+        self.ingest(hydra_core::EventKind::MicroModelObservationRecorded {
+            observation: observation.clone(),
+        })?;
+        Ok(observation)
+    }
+
     // === Trust Patch 1 (Patch 9) — claim trust assessment =====
     //
     // Compute-only, deterministic, rule-based. Reads the audit
@@ -2472,7 +2632,51 @@ impl Hydra {
             },
         });
 
-        // 13. contradicting_evidence (-0.20)
+        // === Trust Patch 5 (Patch 13) — corrective memory ====
+        //
+        // 13. model_operator_rejected_historically (-0.15): at
+        //     least one of the model's prior observations has
+        //     action_lifecycle == "rejected" AND the underlying
+        //     action was rejected by a non-cascade actor. Cascade
+        //     rejections (policy enforcement) don't count — only
+        //     human rejections produce this negative signal.
+        //
+        //     Symmetric with model_operator_approved_historically:
+        //     the same "humans have looked at this model" gate, but
+        //     for refusals. Hydra now learns from BOTH endorsement
+        //     and correction.
+        let operator_rejected_historically = source_model_id.is_some()
+            && prior_observations.iter().any(|obs| {
+                let is_rejected = obs
+                    .observed_outcome
+                    .get("action_lifecycle")
+                    .and_then(|v| v.as_str())
+                    == Some("rejected");
+                is_rejected
+                    && observation_action_id(obs)
+                        .and_then(|action_id| self.action_store.action(&action_id))
+                        .and_then(|action| action.rejected_by.as_ref())
+                        .map(|rejector| !hydra_core::is_cascade_approver(rejector))
+                        .unwrap_or(false)
+            });
+        factors.push(hydra_core::TrustFactor {
+            kind: "model_operator_rejected_historically".to_string(),
+            weight: -0.15,
+            applied: operator_rejected_historically,
+            detail: if source_model_id.is_none() {
+                "claim is not model-derived".to_string()
+            } else if operator_rejected_historically {
+                "at least one of the model's prior actions was rejected by \
+                 a non-cascade actor (corrective signal)"
+                    .to_string()
+            } else {
+                "no operator-rejected action found in this model's history \
+                 (cascade rejections don't count)"
+                    .to_string()
+            },
+        });
+
+        // 14. contradicting_evidence (-0.20)
         let against_count = claim.evidence_against.len();
         factors.push(hydra_core::TrustFactor {
             kind: "contradicting_evidence".to_string(),
@@ -2481,7 +2685,7 @@ impl Hydra {
             detail: format!("{against_count} contradicting evidence record(s)"),
         });
 
-        // 14. claim_disputed (-0.30)
+        // 15. claim_disputed (-0.30)
         let disputed = matches!(claim.status, hydra_core::ClaimStatus::Disputed);
         factors.push(hydra_core::TrustFactor {
             kind: "claim_disputed".to_string(),
@@ -2494,7 +2698,7 @@ impl Hydra {
             },
         });
 
-        // 15. claim_retracted (-1.00): the heavy hammer.
+        // 16. claim_retracted (-1.00): the heavy hammer.
         let retracted = matches!(claim.status, hydra_core::ClaimStatus::Retracted);
         factors.push(hydra_core::TrustFactor {
             kind: "claim_retracted".to_string(),
@@ -4133,6 +4337,7 @@ fn build_action_from_assessment(
         supporting_evidence: vec![evidence_id],
         proposed_by: actor,
         approved_by: None,
+        rejected_by: None,
         // No policy DSL in v0. The gate that fires this action is
         // inline in `evaluate_commit_rate_anomaly_and_propose_action`,
         // not a registered Policy record.
@@ -4141,6 +4346,7 @@ fn build_action_from_assessment(
         created_at: prediction.created_at,
         updated_at: prediction.created_at,
         approved_at: None,
+        rejected_at: None,
         executed_at: None,
         // The load-bearing causal link of Patch 4: action points
         // back at the claim event, which already points back at
@@ -5898,11 +6104,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: actor.clone(),
             approved_by: Some(actor.clone()),
+            rejected_by: None,
             policy_id: None,
             payload: std::collections::HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: Some(now),
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -5961,11 +6169,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: actor,
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload: std::collections::HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -6222,11 +6432,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: actor.clone(),
             approved_by: Some(actor.clone()),
+            rejected_by: None,
             policy_id: None,
             payload: std::collections::HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: Some(now),
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -6654,10 +6866,10 @@ mod tests {
         let mut hydra = Hydra::new();
         let (claim_id, _, _) = drive_full_chain_for_trust(&mut hydra);
         let assessment = hydra.assess_claim_trust(&claim_id).unwrap();
-        // 15 factors total: Patch 9 baseline of 12 + Patch 12's
-        // three historical factors (reflex_history_present,
-        // model_proven_executed, model_operator_approved_historically).
-        assert_eq!(assessment.factors.len(), 15);
+        // 16 factors total: Patch 9 baseline of 12 + Patch 12's
+        // three historical factors + Patch 13's
+        // model_operator_rejected_historically.
+        assert_eq!(assessment.factors.len(), 16);
         let unapplied: Vec<&hydra_core::TrustFactor> =
             assessment.factors.iter().filter(|f| !f.applied).collect();
         assert!(
@@ -6742,11 +6954,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: actor,
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload: std::collections::HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -6800,11 +7014,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: actor.clone(),
             approved_by: Some(actor),
+            rejected_by: None,
             policy_id: None,
             payload: std::collections::HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: Some(now),
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -6848,11 +7064,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: actor.clone(),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload: std::collections::HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -6898,11 +7116,13 @@ mod tests {
             supporting_evidence: vec![],
             proposed_by: actor.clone(),
             approved_by: Some(actor),
+            rejected_by: None,
             policy_id: None,
             payload: std::collections::HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: Some(now),
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -7482,6 +7702,349 @@ mod tests {
             );
         }
     }
+
+    // === Trust Patch 5 (Patch 13) — rejection-path observations ===
+
+    /// Drive one full Critical chain, then REJECT the resulting
+    /// action (with a non-cascade operator), so the cascade leaves
+    /// behind:
+    ///   - one model-derived ActionRejected event
+    ///   - an Action with status=Rejected and rejected_by=operator
+    /// Returns the action_id ready for
+    /// `record_micro_model_observation_from_rejected_action`.
+    fn drive_chain_and_reject(
+        hydra: &mut Hydra,
+        operator: hydra_core::ActorId,
+    ) -> hydra_core::ActionId {
+        // Register a HumanApproval policy so the cascade leaves
+        // the action in Proposed (cascade auto-approve would
+        // otherwise transition it to Approved without giving us
+        // a Proposed action to reject).
+        register_any_action_approval_policy(hydra);
+        // Warm + prime model.
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(hydra));
+        ingest_signals(hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let action_id = assessment.action_ids[0].clone();
+        // Reject via Patch 6's helper (operator-triggered).
+        hydra
+            .reject_action(
+                action_id.clone(),
+                operator,
+                "false alarm during maintenance".to_string(),
+            )
+            .unwrap();
+        action_id
+    }
+
+    #[test]
+    fn record_observation_from_rejected_action_unknown_action_returns_query_error() {
+        let mut hydra = Hydra::new();
+        let result = hydra.record_micro_model_observation_from_rejected_action(
+            hydra_core::ActionId::from_str("act_does_not_exist"),
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown action"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_observation_from_rejected_action_wrong_status_returns_error() {
+        // Approved-but-not-rejected action → method must refuse.
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        // Sanity: action is Approved (cascade auto-approved).
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::ActionStatus::Approved
+        );
+        let result = hydra.record_micro_model_observation_from_rejected_action(
+            action_id,
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("invalid action state"), "msg: {msg}");
+                assert!(msg.contains("Rejected"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_observation_from_rejected_action_cascade_only_rejection_refused() {
+        // Cascade rejections must be refused — they're policy
+        // enforcement, not human judgment. To trigger one: register
+        // a PolicyKind::Block policy so the cascade emits
+        // ActionRejected with rejected_by = cascade actor.
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_policy_admin");
+        let policy = hydra_core::Policy {
+            id: hydra_core::PolicyId::new(),
+            tenant_id: None,
+            name: "Block all actions".to_string(),
+            kind: hydra_core::PolicyKind::Block,
+            status: hydra_core::PolicyStatus::Active,
+            scope: hydra_core::PolicyScope::AnyAction,
+            condition: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            created_by: actor,
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::PolicyRegistered { policy })
+            .unwrap();
+        // Warm + prime + drive Critical so cascade emits
+        // ActionRejected for the proposed action.
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        // Cascade-rejected action exists. Its rejected_by should
+        // be the cascade actor id.
+        let action_id = assessment.action_ids[0].clone();
+        let action = hydra.action(&action_id).unwrap();
+        assert_eq!(action.status, hydra_core::ActionStatus::Rejected);
+        let rejector = action.rejected_by.as_ref().unwrap();
+        assert!(
+            hydra_core::is_cascade_approver(rejector),
+            "expected cascade rejector, got {rejector}"
+        );
+        let result = hydra.record_micro_model_observation_from_rejected_action(
+            action_id,
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("rejected by cascade"),
+                    "msg: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_observation_from_rejected_action_records_with_rejection_reason() {
+        // The happy path: a model-derived action rejected by a
+        // non-cascade actor produces an observation with the
+        // rejection-shaped JSON.
+        let mut hydra = Hydra::new();
+        let operator = hydra_core::ActorId::from_str("actor_oncall_alice");
+        let action_id = drive_chain_and_reject(&mut hydra, operator.clone());
+        let observation = hydra
+            .record_micro_model_observation_from_rejected_action(
+                action_id.clone(),
+                operator.clone(),
+            )
+            .unwrap();
+        let obj = observation
+            .observed_outcome
+            .as_object()
+            .expect("observed_outcome is a JSON object");
+        assert_eq!(
+            obj.get("action_lifecycle").and_then(|v| v.as_str()),
+            Some("rejected")
+        );
+        assert_eq!(
+            obj.get("operator_approved").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            obj.get("operator_rejected").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            obj.get("outcome_kind").and_then(|v| v.as_str()),
+            Some("Rejected")
+        );
+        assert_eq!(
+            obj.get("rejection_reason").and_then(|v| v.as_str()),
+            Some("false alarm during maintenance")
+        );
+        assert_eq!(
+            obj.get("action_id").and_then(|v| v.as_str()),
+            Some(action_id.to_string().as_str())
+        );
+        // observed_by is the actor recording (may equal the
+        // rejecter; not enforced in v0).
+        assert_eq!(
+            obj.get("observed_by").and_then(|v| v.as_str()),
+            Some(operator.to_string().as_str())
+        );
+        // Store keys observations by run_id; the record landed.
+        let stored = hydra.micro_model_observation(&observation.run_id).unwrap();
+        assert_eq!(stored.run_id, observation.run_id);
+    }
+
+    #[test]
+    fn assess_claim_trust_operator_rejected_historically_fires_on_prior_operator_rejection() {
+        // Set up a model with prior rejection history, then
+        // propose a NEW claim and assess. The new factor should
+        // fire and penalize.
+        let mut hydra = Hydra::new();
+        let operator = hydra_core::ActorId::from_str("actor_oncall_alice");
+        let _ = drive_chain_and_reject(&mut hydra, operator.clone());
+        // Record the rejection observation so it shows up in
+        // observations_for_model.
+        let rejected_action_id = hydra
+            .action_store()
+            .all_actions()
+            .find(|a| a.status == hydra_core::ActionStatus::Rejected)
+            .map(|a| a.id.clone())
+            .expect("rejected action present");
+        hydra
+            .record_micro_model_observation_from_rejected_action(
+                rejected_action_id,
+                operator,
+            )
+            .unwrap();
+        // Now propose a new model-derived claim and assess.
+        // Re-prime model so the new evaluate lands at Critical.
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        // Approve the next proposed action (the HumanApproval
+        // policy from drive_chain_and_reject is still active, so
+        // a new Critical produces a Proposed action). Then assess.
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let new_claim = assessment.claim_id.unwrap();
+        let trust = hydra.assess_claim_trust(&new_claim).unwrap();
+        let rejected_factor =
+            find_factor(&trust, "model_operator_rejected_historically");
+        assert!(
+            rejected_factor.applied,
+            "expected rejection signal to fire; detail: {}",
+            rejected_factor.detail,
+        );
+        assert_eq!(rejected_factor.weight, -0.15);
+    }
+
+    #[test]
+    fn assess_claim_trust_operator_rejected_historically_ignores_cascade_rejections() {
+        // A model with CASCADE-only rejection history (no operator
+        // ever pressed reject) → the new negative factor must NOT
+        // fire. Mirrors Patch 9/12's load-bearing distinction.
+        //
+        // Note: cascade rejections currently can't easily land a
+        // MicroModelObservation (Patch 13's recorder refuses them),
+        // so we test the factor's filter on a manually-injected
+        // observation whose action.rejected_by is the cascade
+        // actor.
+        let mut hydra = Hydra::new();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+
+        // Block-policy → cascade rejects.
+        let now = chrono::Utc::now();
+        let policy = hydra_core::Policy {
+            id: hydra_core::PolicyId::new(),
+            tenant_id: None,
+            name: "Block all".to_string(),
+            kind: hydra_core::PolicyKind::Block,
+            status: hydra_core::PolicyStatus::Active,
+            scope: hydra_core::PolicyScope::AnyAction,
+            condition: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::PolicyRegistered { policy })
+            .unwrap();
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let rejected_action_id = assessment.action_ids[0].clone();
+        let claim_id = assessment.claim_id.unwrap();
+        // Manually inject a rejection-shaped observation so the
+        // trust assessor's history walk sees a cascade-rejected
+        // entry. This bypasses Patch 13's normal recorder (which
+        // would refuse the cascade rejection) — that refusal is
+        // exactly what protects v0; the test verifies the FACTOR
+        // also filters defensively if observations were
+        // hand-inserted.
+        let prediction_run_id = match &hydra
+            .event(&assessment.prediction_event_id)
+            .unwrap()
+            .kind
+        {
+            hydra_core::EventKind::MicroModelPredictionRecorded { prediction } => {
+                prediction.run_id.clone()
+            }
+            _ => unreachable!(),
+        };
+        let observation = hydra_core::MicroModelObservation {
+            run_id: prediction_run_id,
+            observed_outcome: serde_json::json!({
+                "action_id": rejected_action_id.to_string(),
+                "action_lifecycle": "rejected",
+                "operator_approved": false,
+                "operator_rejected": true,
+            }),
+            error: None,
+            observed_at: chrono::Utc::now(),
+        };
+        hydra
+            .ingest(hydra_core::EventKind::MicroModelObservationRecorded {
+                observation,
+            })
+            .unwrap();
+        // Assess the claim — Patch 13's factor must NOT fire
+        // because the underlying action's rejected_by is the
+        // cascade actor.
+        let trust = hydra.assess_claim_trust(&claim_id).unwrap();
+        let rejected_factor =
+            find_factor(&trust, "model_operator_rejected_historically");
+        assert!(
+            !rejected_factor.applied,
+            "cascade rejections must NOT count; detail: {}",
+            rejected_factor.detail,
+        );
+    }
+
+    #[test]
+    fn action_rejected_sets_rejected_by_and_rejected_at_fields() {
+        // Pin the action_store apply_event behavior added in
+        // Patch 13: ActionRejected now populates Action.rejected_by
+        // AND Action.rejected_at. Symmetric with Patch 6's
+        // ActionApproved → approved_by / approved_at.
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        let before = chrono::Utc::now();
+        let rejecter = hydra_core::ActorId::from_str("actor_oncall_alice");
+        hydra
+            .reject_action(action_id.clone(), rejecter.clone(), "no".to_string())
+            .unwrap();
+        let after = chrono::Utc::now();
+        let action = hydra.action(&action_id).unwrap();
+        assert_eq!(action.status, hydra_core::ActionStatus::Rejected);
+        assert_eq!(action.rejected_by.as_ref(), Some(&rejecter));
+        let rejected_at = action.rejected_at.expect("rejected_at populated");
+        assert!(rejected_at >= before && rejected_at <= after);
+    }
 }
 
 #[cfg(test)]
@@ -7932,11 +8495,13 @@ mod sprint1_tests {
             supporting_evidence: vec![],
             proposed_by: actor.clone(),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload: HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -8624,11 +9189,13 @@ mod sprint1_tests {
             supporting_evidence: vec![],
             proposed_by: actor,
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload: HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -8828,11 +9395,13 @@ mod sprint1_tests {
             supporting_evidence: vec![],
             proposed_by: ActorId::from_str("actor_payroll_agent"),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload: HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -8903,11 +9472,13 @@ mod sprint1_tests {
             supporting_evidence: vec![],
             proposed_by: actor,
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload: HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -9045,11 +9616,13 @@ mod sprint1_tests {
             supporting_evidence: vec![],
             proposed_by: actor.clone(),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload: HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -9326,11 +9899,13 @@ mod sprint1_tests {
             supporting_evidence: vec![],
             proposed_by: ActorId::from_str("actor_bookkeeper"),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload,
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -9386,11 +9961,13 @@ mod sprint1_tests {
             supporting_evidence: vec![],
             proposed_by: ActorId::from_str("actor_bookkeeper"),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload,
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -9422,11 +9999,13 @@ mod sprint1_tests {
             supporting_evidence: vec![],
             proposed_by: ActorId::from_str("actor_bookkeeper"),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload,
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -9485,11 +10064,13 @@ mod sprint1_tests {
             supporting_evidence: vec![],
             proposed_by: ActorId::from_str("actor_bookkeeper"),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload,
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -9550,11 +10131,13 @@ mod sprint1_tests {
             supporting_evidence: vec![],
             proposed_by: ActorId::from_str("actor_bookkeeper"),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload,
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
@@ -9588,11 +10171,13 @@ mod sprint1_tests {
             supporting_evidence: vec![],
             proposed_by: ActorId::from_str("actor_bookkeeper"),
             approved_by: None,
+            rejected_by: None,
             policy_id: None,
             payload: HashMap::new(),
             created_at: now,
             updated_at: now,
             approved_at: None,
+            rejected_at: None,
             executed_at: None,
             caused_by: None,
         };
