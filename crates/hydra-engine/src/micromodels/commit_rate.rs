@@ -373,11 +373,14 @@ fn signed_z_score(observed: f64, mean: f64, variance: f64) -> f64 {
 /// id under which it was recorded. When the model returns Warning or
 /// Critical, the bridge ALSO records a paired `EvidenceAdded` and
 /// `ClaimProposed` event — both with `caused_by = prediction_event_id`
-/// — and the assessment carries the new ids back to the caller.
+/// — and the assessment carries the new ids AND their event ids
+/// back to the caller. The event ids let downstream callers (most
+/// importantly Patch 4's action bridge) chain `caused_by` deeper
+/// without re-scanning the audit log.
 ///
-/// For `WarmingUp` and `Normal` predictions, `evidence_id` and
-/// `claim_id` are `None`: no belief is formed against a baseline the
-/// model hasn't trusted yet (warmup) or a steady-state observation
+/// For `WarmingUp` and `Normal` predictions, every `Option<_>` field
+/// is `None`: no belief is formed against a baseline the model
+/// hasn't trusted yet (warmup) or a steady-state observation
 /// (normal). The prediction is still recorded for audit and
 /// evolution metrics.
 ///
@@ -385,12 +388,49 @@ fn signed_z_score(observed: f64, mean: f64, variance: f64) -> f64 {
 /// output for ergonomic branching — callers shouldn't have to parse
 /// `prediction.output` just to decide whether evidence + claim
 /// landed.
+///
+/// `evidence_event_id` and `claim_event_id` were added in MicroModel
+/// Patch 4 so that the action bridge can set
+/// `action.caused_by = claim_event_id` cleanly. Existing Patch 3
+/// callers that only read `evidence_id` / `claim_id` are unaffected.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommitRateAnomalyAssessment {
     pub prediction: hydra_core::MicroModelPrediction,
     pub prediction_event_id: hydra_core::EventId,
     pub evidence_id: Option<hydra_core::EvidenceId>,
+    pub evidence_event_id: Option<hydra_core::EventId>,
     pub claim_id: Option<hydra_core::ClaimId>,
+    pub claim_event_id: Option<hydra_core::EventId>,
+    pub level: AnomalyLevel,
+}
+
+/// Result of a `Hydra::evaluate_commit_rate_anomaly_and_propose_action`
+/// call (MicroModel Patch 4 — the claim-to-action reflex).
+///
+/// Composes the Patch 3 assessment with one (or more) proposed
+/// actions. Patch 4 ships exactly one action — `ActionKind::Notify`
+/// targeting `System("hydra")` — when the claim passes the gate:
+///
+/// ```text
+///   claim.predicate == "under_abnormal_load"
+///   AND (claim.status == Verified OR claim.confidence >= 0.9)
+/// ```
+///
+/// `action_ids` is a `Vec` so future patches can add Critical-tier
+/// extras (`snapshot_now`, `throttle_agents`) without changing the
+/// assessment shape. WarmingUp / Normal predictions return an empty
+/// vec.
+///
+/// Patch 4 does NOT execute the action — `ActionStatus` stays
+/// `Proposed`. Execution is an explicit future patch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitRateAnomalyActionAssessment {
+    pub prediction: hydra_core::MicroModelPrediction,
+    pub prediction_event_id: hydra_core::EventId,
+    pub evidence_id: Option<hydra_core::EvidenceId>,
+    pub claim_id: Option<hydra_core::ClaimId>,
+    pub claim_event_id: Option<hydra_core::EventId>,
+    pub action_ids: Vec<hydra_core::ActionId>,
     pub level: AnomalyLevel,
 }
 

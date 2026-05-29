@@ -1882,43 +1882,195 @@ impl Hydra {
         let (prediction, prediction_event_id, output) =
             self.record_commit_rate_prediction(actor.clone())?;
 
-        let (evidence_id, claim_id) = if output.level.is_actionable() {
-            // Build + record Evidence first so the Claim can
-            // reference its id in `evidence_for`.
-            let evidence = build_evidence_from_prediction(
-                &prediction,
-                &output,
-                prediction_event_id.clone(),
-            );
-            let new_evidence_id = evidence.id.clone();
-            self.ingest(hydra_core::EventKind::EvidenceAdded { evidence })?;
+        let (evidence_id, evidence_event_id, claim_id, claim_event_id) =
+            if output.level.is_actionable() {
+                // Build + record Evidence first so the Claim can
+                // reference its id in `evidence_for`. Capture the
+                // EvidenceAdded event id off the cascade result so
+                // downstream (Patch 4 action bridge) can chain
+                // `caused_by` cleanly.
+                let evidence = build_evidence_from_prediction(
+                    &prediction,
+                    &output,
+                    prediction_event_id.clone(),
+                );
+                let new_evidence_id = evidence.id.clone();
+                let evidence_cascade = self
+                    .ingest(hydra_core::EventKind::EvidenceAdded { evidence })?;
+                let new_evidence_event_id = evidence_cascade
+                    .events
+                    .first()
+                    .map(|event| event.id.clone())
+                    .expect(
+                        "ingest produces at least the trigger event for \
+                         EvidenceAdded",
+                    );
 
-            // Now the Claim. `created_by` is the caller-supplied
-            // actor — "I, this agent, believe Hydra is under
-            // abnormal load because the model fired."
-            let claim = build_claim_from_prediction(
-                &prediction,
-                &new_evidence_id,
-                actor,
-                prediction_event_id.clone(),
-            );
-            let new_claim_id = claim.id.clone();
-            self.ingest(hydra_core::EventKind::ClaimProposed { claim })?;
+                // Now the Claim. `created_by` is the caller-
+                // supplied actor — "I, this agent, believe Hydra
+                // is under abnormal load because the model fired."
+                // Capture the ClaimProposed event id (events[0]
+                // — the trigger). The verification cascade may
+                // append a ClaimVerified event later in the same
+                // cascade; that one lives at events[1+] and is NOT
+                // what we want for the action bridge's caused_by.
+                let claim = build_claim_from_prediction(
+                    &prediction,
+                    &new_evidence_id,
+                    actor,
+                    prediction_event_id.clone(),
+                );
+                let new_claim_id = claim.id.clone();
+                let claim_cascade =
+                    self.ingest(hydra_core::EventKind::ClaimProposed { claim })?;
+                let new_claim_event_id = claim_cascade
+                    .events
+                    .first()
+                    .map(|event| event.id.clone())
+                    .expect(
+                        "ingest produces at least the trigger event for \
+                         ClaimProposed",
+                    );
 
-            (Some(new_evidence_id), Some(new_claim_id))
-        } else {
-            // WarmingUp / Normal: no belief formed against a
-            // baseline the model hasn't trusted (warmup) or a
-            // steady-state observation (normal).
-            (None, None)
-        };
+                (
+                    Some(new_evidence_id),
+                    Some(new_evidence_event_id),
+                    Some(new_claim_id),
+                    Some(new_claim_event_id),
+                )
+            } else {
+                // WarmingUp / Normal: no belief formed against a
+                // baseline the model hasn't trusted (warmup) or a
+                // steady-state observation (normal).
+                (None, None, None, None)
+            };
 
         Ok(crate::micromodels::CommitRateAnomalyAssessment {
             level: output.level,
             prediction,
             prediction_event_id,
             evidence_id,
+            evidence_event_id,
             claim_id,
+            claim_event_id,
+        })
+    }
+
+    /// Evaluate the built-in commit-rate model AND, on
+    /// Warning / Critical, propose an `ActionKind::Notify` action
+    /// gated by the claim's verification state.
+    ///
+    /// This is the MicroModel Patch 4 reflex: a single call extends
+    /// the Patch 3 chain (`prediction → evidence → claim`) with a
+    /// downstream `ActionProposed { action }` event whose
+    /// `caused_by` points at the `ClaimProposed` event id. Lineage
+    /// queries on the prediction event id surface the full
+    /// `prediction → evidence + claim → action` chain.
+    ///
+    /// Gate (deterministic, no policy DSL in v0):
+    ///
+    /// ```text
+    ///   claim.predicate == "under_abnormal_load"
+    ///   AND (claim.status == Verified OR claim.confidence >= 0.9)
+    /// ```
+    ///
+    /// In practice Hydra's verification agent auto-promotes the
+    /// Patch 3 claim to `Verified` within the same cascade once
+    /// the paired evidence lands. The confidence-OR-Verified gate
+    /// is belt-and-braces for future scenarios where the
+    /// verification cascade doesn't run.
+    ///
+    /// Action shape (full):
+    ///
+    /// ```text
+    ///   kind                 = ActionKind::Notify
+    ///   status               = Proposed
+    ///   targets              = [ActionTarget::System("hydra")]
+    ///   related_claims       = [claim_id]
+    ///   supporting_evidence  = [evidence_id]
+    ///   proposed_by          = actor
+    ///   payload              = {
+    ///     "severity":  Value::String(level.wire_name())
+    ///     "reason":    Value::String(prediction.explanation)
+    ///     "model_id":  Value::String("mm_builtin_commit_rate_v0")
+    ///     "run_id":    Value::String(prediction.run_id)
+    ///   }
+    ///   caused_by            = claim_event_id
+    ///   tenant_id            = None
+    /// ```
+    ///
+    /// `action_ids` on the returned assessment is a `Vec` so future
+    /// patches can add Critical-tier extras (`snapshot_now`,
+    /// `throttle_agents`) without changing the assessment shape.
+    /// Patch 4 ships exactly one action — `Notify` — for both
+    /// Warning and Critical.
+    ///
+    /// Non-idempotent (matches Patches 2 + 3): two calls on the
+    /// same condition produce two distinct assessments, each with
+    /// their own prediction event, evidence, claim, AND action.
+    ///
+    /// Patch 4 does NOT execute the action. `ActionStatus` stays
+    /// `Proposed`; execution, real delivery, throttle, and snapshot
+    /// remain explicit future patches.
+    pub fn evaluate_commit_rate_anomaly_and_propose_action(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<
+        crate::micromodels::CommitRateAnomalyActionAssessment,
+    > {
+        // Step 1 — drive Patch 3. Captures prediction + (maybe)
+        // evidence + (maybe) claim + their event ids.
+        let claim_assessment = self
+            .evaluate_commit_rate_anomaly_and_propose_claim(actor.clone())?;
+
+        // Step 2 — decide whether to fire. WarmingUp / Normal
+        // assessments arrive with `claim_id = None` and we exit
+        // immediately with an empty action vec.
+        let mut action_ids: Vec<hydra_core::ActionId> = Vec::new();
+        if let (Some(claim_id), Some(evidence_id), Some(claim_event_id)) = (
+            claim_assessment.claim_id.as_ref(),
+            claim_assessment.evidence_id.as_ref(),
+            claim_assessment.claim_event_id.as_ref(),
+        ) {
+            // Step 3 — re-read the claim to get its POST-cascade
+            // state. The verification agent may have auto-promoted
+            // it to Verified within the same cascade as the
+            // ClaimProposed ingest.
+            let passes_gate = self
+                .claim(claim_id)
+                .map(|claim| {
+                    claim.predicate == "under_abnormal_load"
+                        && (claim.status
+                            == hydra_core::epistemic::ClaimStatus::Verified
+                            || claim.confidence.value() >= 0.9)
+                })
+                .unwrap_or(false);
+
+            if passes_gate {
+                // Step 4 — build + ingest one Notify action.
+                let action = build_action_from_assessment(
+                    &claim_assessment,
+                    claim_id.clone(),
+                    evidence_id.clone(),
+                    claim_event_id.clone(),
+                    actor,
+                );
+                let new_action_id = action.id.clone();
+                self.ingest(hydra_core::EventKind::ActionProposed { action })?;
+                action_ids.push(new_action_id);
+            }
+        }
+
+        // Step 5 — build the action assessment, mirroring the
+        // Patch 3 fields and adding `action_ids`.
+        Ok(crate::micromodels::CommitRateAnomalyActionAssessment {
+            level: claim_assessment.level,
+            prediction: claim_assessment.prediction,
+            prediction_event_id: claim_assessment.prediction_event_id,
+            evidence_id: claim_assessment.evidence_id,
+            claim_id: claim_assessment.claim_id,
+            claim_event_id: claim_assessment.claim_event_id,
+            action_ids,
         })
     }
 
@@ -2896,6 +3048,88 @@ fn build_claim_from_prediction(
         created_at: prediction.created_at,
         updated_at: prediction.created_at,
         caused_by: Some(prediction_event_id),
+    }
+}
+
+/// Build the `Action` paired with a Warning/Critical claim.
+/// Returns an `ActionKind::Notify` targeting `System("hydra")`,
+/// with the claim + evidence referenced and the model context in
+/// the payload. Pure constructor — no engine access; callers pass
+/// every input.
+///
+/// The Patch 4 spec pins this shape (see
+/// `evaluate_commit_rate_anomaly_and_propose_action` docstring).
+fn build_action_from_assessment(
+    assessment: &crate::micromodels::CommitRateAnomalyAssessment,
+    claim_id: hydra_core::ClaimId,
+    evidence_id: hydra_core::EvidenceId,
+    claim_event_id: hydra_core::EventId,
+    actor: hydra_core::ActorId,
+) -> hydra_core::Action {
+    use hydra_core::action::{ActionKind, ActionStatus, ActionTarget};
+
+    let prediction = &assessment.prediction;
+    let mut payload: std::collections::HashMap<String, hydra_core::Value> =
+        std::collections::HashMap::new();
+    // Severity = the level's wire name. WarmingUp / Normal don't
+    // reach this builder (gated upstream), so the only values that
+    // ever land here are "warning" or "critical".
+    payload.insert(
+        "severity".to_string(),
+        hydra_core::Value::String(assessment.level.wire_name().to_string()),
+    );
+    // Reason mirrors the prediction's `explanation` (set by the
+    // model's `render_reason`). One pithy line operators can drop
+    // straight into a ticket title.
+    payload.insert(
+        "reason".to_string(),
+        hydra_core::Value::String(
+            prediction
+                .explanation
+                .clone()
+                .unwrap_or_default(),
+        ),
+    );
+    payload.insert(
+        "model_id".to_string(),
+        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
+    );
+    payload.insert(
+        "run_id".to_string(),
+        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
+    );
+
+    hydra_core::Action {
+        id: hydra_core::ActionId::new(),
+        // Matches Patches 2 + 3 — multi-tenant action surface is a
+        // future patch.
+        tenant_id: None,
+        // Use the existing ActionKind::Notify vocabulary so any
+        // agent that already pattern-matches on `Notify` sees this
+        // without a code change. The "operator notification" intent
+        // is encoded in the payload's `severity` + `reason`.
+        kind: ActionKind::Notify,
+        // Patch 4 ships proposals only. Execution is a future
+        // patch (Patch 5+).
+        status: ActionStatus::Proposed,
+        targets: vec![ActionTarget::System("hydra".to_string())],
+        related_claims: vec![claim_id],
+        supporting_evidence: vec![evidence_id],
+        proposed_by: actor,
+        approved_by: None,
+        // No policy DSL in v0. The gate that fires this action is
+        // inline in `evaluate_commit_rate_anomaly_and_propose_action`,
+        // not a registered Policy record.
+        policy_id: None,
+        payload,
+        created_at: prediction.created_at,
+        updated_at: prediction.created_at,
+        approved_at: None,
+        executed_at: None,
+        // The load-bearing causal link of Patch 4: action points
+        // back at the claim event, which already points back at
+        // the prediction event. Lineage walks the chain.
+        caused_by: Some(claim_event_id),
     }
 }
 
@@ -4026,6 +4260,345 @@ mod tests {
         // Audit log records both pairs (2 evidence + 2 claim events).
         assert_eq!(count_evidence_events(&hydra), 2);
         assert_eq!(count_claim_events(&hydra), 2);
+    }
+
+    // === MicroModel Patch 4 — Claim-to-Action Reflex ===
+
+    fn count_action_events(hydra: &Hydra) -> usize {
+        hydra
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, hydra_core::EventKind::ActionProposed { .. }))
+            .count()
+    }
+
+    #[test]
+    fn normal_prediction_creates_no_action() {
+        // Drive count to 11 (z=1, Normal). The bridge must:
+        // - return level=Normal
+        // - leave evidence_id / claim_id / claim_event_id None
+        // - return empty action_ids
+        // - NOT append any ActionProposed event.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 11u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+
+        let pre_actions = count_action_events(&hydra);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+
+        assert_eq!(assessment.level, crate::micromodels::AnomalyLevel::Normal);
+        assert!(assessment.evidence_id.is_none());
+        assert!(assessment.claim_id.is_none());
+        assert!(assessment.claim_event_id.is_none());
+        assert!(assessment.action_ids.is_empty());
+        assert_eq!(count_action_events(&hydra), pre_actions);
+    }
+
+    #[test]
+    fn warming_up_creates_no_action() {
+        // Cold engine — first call is WarmingUp by design. The bridge
+        // must NOT fabricate an action against an untrusted baseline.
+        let mut hydra = Hydra::new();
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::AnomalyLevel::WarmingUp
+        );
+        assert!(assessment.action_ids.is_empty());
+        assert!(assessment.claim_event_id.is_none());
+    }
+
+    #[test]
+    fn warning_claim_does_not_pass_default_gate() {
+        // Drive count to 13 (z=3, Warning, confidence=0.75). The
+        // verification agent's default `min_claim_confidence = 0.80`
+        // means Warning claims STAY at `Proposed` (not auto-promoted
+        // to Verified). Combined with the Patch 4 gate
+        // (`Verified OR confidence >= 0.9`), Warning predictions do
+        // NOT fire actions under the default verification policy.
+        //
+        // This is a safety property: only high-confidence beliefs
+        // (auto-verified Critical, OR Warning with operator-tuned
+        // verification policy) trigger operator notifications.
+        // Documented here as load-bearing behavior.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 13u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::AnomalyLevel::Warning
+        );
+        // Patch 3 records still land — only the action gate blocks.
+        assert!(assessment.evidence_id.is_some());
+        assert!(assessment.claim_id.is_some());
+        // No action: Warning doesn't pass the default gate.
+        assert!(assessment.action_ids.is_empty());
+        let claim = hydra.claim(assessment.claim_id.as_ref().unwrap()).unwrap();
+        // The epistemic cascade walks the claim through
+        // `Proposed → Supported → Verified` as evidence + confidence
+        // thresholds are met. Warning's 0.75 confidence is below
+        // the verification floor (0.80), so the claim lands at
+        // `Supported` — not `Verified`, which is what the Patch 4
+        // gate requires for low-confidence claims.
+        assert!(matches!(
+            claim.status,
+            hydra_core::epistemic::ClaimStatus::Proposed
+                | hydra_core::epistemic::ClaimStatus::Supported
+        ));
+        assert!(claim.confidence.value() < 0.9);
+    }
+
+    #[test]
+    fn critical_claim_proposes_notify_operator() {
+        // Drive count to 100 (z=90, Critical). Same Notify action,
+        // higher prediction confidence (0.90).
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::AnomalyLevel::Critical
+        );
+        assert_eq!(assessment.action_ids.len(), 1);
+
+        let action = hydra.action(&assessment.action_ids[0]).unwrap();
+        assert_eq!(action.kind, hydra_core::action::ActionKind::Notify);
+        // Action lands as `Proposed` from the bridge but the policy
+        // cascade may auto-approve low-risk Notify actions. Accept
+        // either Proposed or Approved here — Patch 4's contract is
+        // "action proposed", post-propose cascade behavior is the
+        // engine's, not Patch 4's.
+        assert!(matches!(
+            action.status,
+            hydra_core::action::ActionStatus::Proposed
+                | hydra_core::action::ActionStatus::Approved
+        ));
+        // The Critical-tier prediction confidence is 0.90, so even a
+        // claim that somehow wasn't auto-verified would still pass
+        // the confidence-OR-Verified gate.
+        assert!(assessment.prediction.confidence >= 0.90);
+    }
+
+    #[test]
+    fn action_references_claim_and_evidence() {
+        // The action carries `related_claims` + `supporting_evidence`
+        // pointing back at the same ids the assessment surfaces.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let action = hydra.action(&assessment.action_ids[0]).unwrap();
+
+        assert_eq!(
+            action.related_claims,
+            vec![assessment.claim_id.clone().unwrap()]
+        );
+        assert_eq!(
+            action.supporting_evidence,
+            vec![assessment.evidence_id.clone().unwrap()]
+        );
+        assert_eq!(action.proposed_by, requester());
+        assert!(action.tenant_id.is_none());
+        // NOTE: `approved_by` and `policy_id` may be touched by
+        // Hydra's policy/approval cascade after the action lands
+        // (auto-approval for low-risk Notify actions, for example).
+        // Patch 4's contract is "action proposed"; what the
+        // cascade does after is desired engine behavior.
+    }
+
+    #[test]
+    fn action_caused_by_claim_event() {
+        // The load-bearing causal link of Patch 4:
+        //   action.caused_by == claim_event_id
+        // (not prediction_event_id — that would short-circuit the
+        // chain and lose the "belief → action" hop).
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let action = hydra.action(&assessment.action_ids[0]).unwrap();
+
+        assert_eq!(
+            action.caused_by.as_ref(),
+            assessment.claim_event_id.as_ref()
+        );
+        assert_ne!(
+            action.caused_by.as_ref(),
+            Some(&assessment.prediction_event_id)
+        );
+    }
+
+    #[test]
+    fn action_payload_carries_severity_reason_model_run() {
+        // Pin the 4-key Notify payload shape Patch 4 promised.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let action = hydra.action(&assessment.action_ids[0]).unwrap();
+
+        for key in ["severity", "reason", "model_id", "run_id"] {
+            assert!(
+                action.payload.contains_key(key),
+                "missing payload key {key}"
+            );
+        }
+        // Severity matches level.wire_name().
+        assert!(matches!(
+            action.payload.get("severity"),
+            Some(hydra_core::Value::String(s)) if s == "critical"
+        ));
+        // Reason mirrors the model's `explanation` field.
+        let reason_str = match action.payload.get("reason") {
+            Some(hydra_core::Value::String(s)) => s.clone(),
+            other => panic!("expected reason String, got {other:?}"),
+        };
+        assert_eq!(Some(reason_str), assessment.prediction.explanation);
+        // Model id and run id match the prediction.
+        assert!(matches!(
+            action.payload.get("model_id"),
+            Some(hydra_core::Value::String(s)) if s == BUILTIN_COMMIT_RATE_MODEL_ID
+        ));
+        assert!(matches!(
+            action.payload.get("run_id"),
+            Some(hydra_core::Value::String(s)) if s == assessment.prediction.run_id.as_str()
+        ));
+    }
+
+    #[test]
+    fn action_targets_system_hydra() {
+        // ActionTarget mirrors ClaimSubject — both are
+        // `System("hydra")`. Stable across Patches 3 and 4.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let action = hydra.action(&assessment.action_ids[0]).unwrap();
+
+        assert_eq!(action.targets.len(), 1);
+        assert_eq!(
+            action.targets[0],
+            hydra_core::action::ActionTarget::System("hydra".to_string())
+        );
+    }
+
+    #[test]
+    fn lineage_from_prediction_event_includes_action() {
+        // The "explain the full chain" pin. Walking
+        // `caused_by` from the prediction event must surface:
+        //   - the EvidenceAdded record (via evidence.caused_by)
+        //   - the Claim (via claim.caused_by)
+        //   - and ALSO the Action (via action.caused_by →
+        //     claim_event_id, which itself is reachable from
+        //     the prediction event via the Claim record's
+        //     caused_by chain).
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let prediction_event_id = &assessment.prediction_event_id;
+        let claim_event_id = assessment.claim_event_id.as_ref().unwrap();
+
+        // Prediction event is in the audit log.
+        assert!(hydra
+            .events()
+            .iter()
+            .any(|event| &event.id == prediction_event_id
+                && matches!(event.kind, hydra_core::EventKind::MicroModelPredictionRecorded { .. })));
+
+        // ClaimProposed event is in the audit log AND its caused_by
+        // points at the prediction event. Bind `events` first so the
+        // borrowed iterator outlives the find.
+        let events = hydra.events();
+        let claim_proposed = events
+            .iter()
+            .find(|event| &event.id == claim_event_id)
+            .expect("claim event present");
+        assert!(matches!(
+            claim_proposed.kind,
+            hydra_core::EventKind::ClaimProposed { .. }
+        ));
+
+        // Action records caused_by the CLAIM event (Patch 4
+        // invariant).
+        let actions_for_claim: Vec<_> = hydra
+            .action_store()
+            .all_actions()
+            .filter(|a| a.caused_by.as_ref() == Some(claim_event_id))
+            .collect();
+        assert_eq!(actions_for_claim.len(), 1);
+        assert_eq!(actions_for_claim[0].id, assessment.action_ids[0]);
+
+        // And by transitive walk: claim.caused_by points to
+        // prediction event, so the full chain is reachable from
+        // the seed.
+        let claim = hydra.claim(assessment.claim_id.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            claim.caused_by.as_ref(),
+            Some(prediction_event_id)
+        );
+    }
+
+    #[test]
+    fn two_critical_calls_produce_two_independent_actions() {
+        // Non-idempotent — each call mints a distinct action_id and
+        // appends a separate ActionProposed event.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+
+        let a = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        // Re-prime so the second call also lands in Critical.
+        hydra.commit_rate_anomaly_model =
+            Some(primed_model_with_baseline(10.0, 1.0));
+        let b = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+
+        assert_eq!(a.action_ids.len(), 1);
+        assert_eq!(b.action_ids.len(), 1);
+        assert_ne!(a.action_ids[0], b.action_ids[0]);
+        assert_ne!(a.claim_event_id, b.claim_event_id);
+        assert_ne!(a.prediction_event_id, b.prediction_event_id);
+
+        // Audit log records both action events.
+        assert_eq!(count_action_events(&hydra), 2);
     }
 }
 
