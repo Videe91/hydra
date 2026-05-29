@@ -6,6 +6,7 @@ pub mod events;
 pub mod ingest;
 pub mod lineage;
 pub mod micromodels;
+pub mod observations;
 pub mod pagination;
 pub mod query;
 pub mod replication;
@@ -27,6 +28,10 @@ pub use commits::{commits_router, CommitsHttpState};
 pub use micromodels::{
     micromodels_router, EvaluateCommitRateRequest, EvaluateCommitRateResponse,
     EvaluationMode, MicroModelsHttpState,
+};
+pub use observations::{
+    observations_router, MicroModelObservationResponse, ObservationsHttpState,
+    RecordObservationFromOutcomeRequest,
 };
 pub use diagnostics::{
     diagnostics_router, AnomalyEntry, AnomalyQuery, AnomalyResponse,

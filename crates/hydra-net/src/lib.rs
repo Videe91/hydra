@@ -17,15 +17,17 @@ pub mod prelude {
     pub use crate::bus::{BusConfig, BusMetrics, CascadeNotification};
     pub use crate::http::{
         actions_router, commit_stream_router, commits_router, diagnostics_router, events_router,
-        ingest_router, lineage_router, micromodels_router, query_router, schema_router,
-        sensor_router, snapshots_router, ActionExecutionResponse, ActionTransitionResponse,
-        ActionsHttpState, AnomalyResponse, ApproveActionRequest, CommitBroadcaster,
-        CommitStreamHttpState, CommitsHttpState, CounterfactualDiagnosticsResponse,
-        CoverageDiagnosticsResponse, DiagnosticsHttpState, EvaluateCommitRateRequest,
-        EvaluateCommitRateResponse, EvaluationMode, EventsHttpState,
+        ingest_router, lineage_router, micromodels_router, observations_router, query_router,
+        schema_router, sensor_router, snapshots_router, ActionExecutionResponse,
+        ActionTransitionResponse, ActionsHttpState, AnomalyResponse, ApproveActionRequest,
+        CommitBroadcaster, CommitStreamHttpState, CommitsHttpState,
+        CounterfactualDiagnosticsResponse, CoverageDiagnosticsResponse, DiagnosticsHttpState,
+        EvaluateCommitRateRequest, EvaluateCommitRateResponse, EvaluationMode, EventsHttpState,
         EvolutionDiagnosticsResponse, ExecuteActionRequest, IngestHttpState, LineageHttpState,
-        LineageResponse, MicroModelsHttpState, QueryHttpState, RejectActionRequest,
-        SchemaHttpState, SensorHttpState, SnapshotsHttpState, COMMIT_STREAM_CAPACITY,
+        LineageResponse, MicroModelObservationResponse, MicroModelsHttpState,
+        ObservationsHttpState, QueryHttpState, RecordObservationFromOutcomeRequest,
+        RejectActionRequest, SchemaHttpState, SensorHttpState, SnapshotsHttpState,
+        COMMIT_STREAM_CAPACITY,
     };
     pub use crate::metrics::{
         metrics_router, MetricsRecorder, NoopRecorder, PrometheusTextRecorder,

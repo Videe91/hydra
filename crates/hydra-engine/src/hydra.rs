@@ -2011,6 +2011,155 @@ impl Hydra {
         self.micromodel_store.observation(run_id)
     }
 
+    // === MicroModel Patch 8 — outcome learning loop ============
+    //
+    // Close the model feedback loop: walk backward from a recorded
+    // Outcome to the originating MicroModelPrediction, build a
+    // MicroModelObservation, and record it.
+    //
+    // The chain Patches 3–7 intentionally built:
+    //   Outcome.caused_by         → ActionExecuted event id
+    //   ActionExecuted.action_id  → action_id
+    //   Action.related_claims[0]  → claim_id (shortcut, Patch 4)
+    //   Claim.caused_by           → MicroModelPredictionRecorded
+    //                               event id (Patch 3)
+    //   event.kind.prediction     → prediction.run_id (join key)
+    //
+    // v0 records observations only for **executed** outcomes
+    // (Patch 6 rejections don't emit OutcomeObserved). The
+    // observation carries audit linkage in `observed_outcome:
+    // serde_json::Value`; the struct's existing 4 fields stay
+    // unchanged. No retraining, no trust scoring, no error metric
+    // — that's Patches 9+. `error: None` is v0 honest.
+
+    /// Walk the causal chain from an Outcome back to its originating
+    /// MicroModelPrediction and record a MicroModelObservation
+    /// matched by `prediction.run_id`. The `observed_outcome` JSON
+    /// captures the outcome / action / claim ids + outcome kind +
+    /// summary + lifecycle so future trust/learning patches can
+    /// branch on them.
+    ///
+    /// Errors with `QueryError("unknown outcome: ...")` if the
+    /// outcome_id isn't in the store. Errors with `QueryError(
+    /// "outcome not traceable: ...")` if any step of the chain is
+    /// missing — typically because the outcome wasn't produced by
+    /// a MicroModel reflex (e.g., manually-ingested outcomes).
+    pub fn record_micro_model_observation_from_action_outcome(
+        &mut self,
+        outcome_id: hydra_core::OutcomeId,
+        observed_by: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::MicroModelObservation> {
+        // 1. Lookup outcome.
+        let outcome = self.action_store.outcome(&outcome_id).cloned().ok_or_else(
+            || {
+                hydra_core::error::HydraError::QueryError(format!(
+                    "unknown outcome: {outcome_id}"
+                ))
+            },
+        )?;
+        // 2. outcome.caused_by → ActionExecuted event id.
+        let executed_event_id = outcome.caused_by.clone().ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "outcome not traceable: {outcome_id} has no caused_by"
+            ))
+        })?;
+        // 3. Resolve to event and confirm kind is ActionExecuted.
+        let executed_event = self.event(&executed_event_id).ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "outcome not traceable: ActionExecuted event {executed_event_id} not in log"
+            ))
+        })?;
+        let action_id = match &executed_event.kind {
+            hydra_core::EventKind::ActionExecuted { action_id } => action_id.clone(),
+            other => {
+                return Err(hydra_core::error::HydraError::QueryError(format!(
+                    "outcome not traceable: caused_by event is not ActionExecuted \
+                     (got {:?})",
+                    other.kind_name()
+                )));
+            }
+        };
+        // 4. Action → related_claims[0] (Patch 4 shortcut).
+        let action = self.action_store.action(&action_id).ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "outcome not traceable: action {action_id} not in store"
+            ))
+        })?;
+        let claim_id = action.related_claims.first().cloned().ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "outcome not traceable: action {action_id} has no related_claims \
+                 — not a model-derived action"
+            ))
+        })?;
+        // 5. Claim.caused_by → MicroModelPredictionRecorded event id.
+        let claim = self.epistemic_store.claim(&claim_id).ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "outcome not traceable: claim {claim_id} not in epistemic store"
+            ))
+        })?;
+        let prediction_event_id = claim.caused_by.clone().ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "outcome not traceable: claim {claim_id} has no caused_by"
+            ))
+        })?;
+        // 6. Resolve prediction event and extract the prediction.
+        let prediction_event = self.event(&prediction_event_id).ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "outcome not traceable: prediction event {prediction_event_id} \
+                 not in log"
+            ))
+        })?;
+        let prediction = match &prediction_event.kind {
+            hydra_core::EventKind::MicroModelPredictionRecorded { prediction } => {
+                prediction.clone()
+            }
+            other => {
+                return Err(hydra_core::error::HydraError::QueryError(format!(
+                    "outcome not traceable: claim.caused_by is not \
+                     MicroModelPredictionRecorded (got {:?})",
+                    other.kind_name()
+                )));
+            }
+        };
+        let run_id = prediction.run_id.clone();
+
+        // 7. Build the observed_outcome JSON. Patch 8 v0 keeps the
+        //    MicroModelObservation struct stable and carries audit
+        //    linkage inside this Value blob. The shape is the
+        //    contract — Patch 9 / trust scoring will read these
+        //    fields without further engine surgery.
+        let observed_outcome = serde_json::json!({
+            "outcome_id": outcome_id.to_string(),
+            "action_id": action_id.to_string(),
+            "claim_id": claim_id.to_string(),
+            "outcome_kind": format_outcome_kind_for_observation(&outcome.kind),
+            "outcome_summary": outcome
+                .impact
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "action_lifecycle": "executed",
+            // v0 only walks executed outcomes; rejection-path is a
+            // future patch. These flags are nonetheless explicit so
+            // Patch 9's trust scoring can branch on them without
+            // probing optional fields.
+            "operator_approved": true,
+            "operator_rejected": false,
+            "observed_by": observed_by.to_string(),
+        });
+
+        let observation = hydra_core::MicroModelObservation {
+            run_id,
+            observed_outcome,
+            error: None,
+            observed_at: chrono::Utc::now(),
+        };
+        self.ingest(hydra_core::EventKind::MicroModelObservationRecorded {
+            observation: observation.clone(),
+        })?;
+        Ok(observation)
+    }
+
     // === MicroModel Patch 2 — built-in CommitRateAnomalyModel ===
 
     /// Run one observation of the built-in commit-rate anomaly
@@ -3188,6 +3337,24 @@ impl Default for Hydra {
 }
 
 // === MicroModel Patch 3 — prediction → evidence + claim builders ===
+
+/// Format an `OutcomeKind` for inclusion in Patch 8's
+/// `observed_outcome` JSON. Mirrors the spec's wire shape:
+/// `"Success"` for unit variants and `"Custom(notification_recorded)"`
+/// for `Custom(_)`. Kept module-private — the Patch 8 helper is
+/// the only caller in v0.
+fn format_outcome_kind_for_observation(kind: &hydra_core::OutcomeKind) -> String {
+    use hydra_core::OutcomeKind;
+    match kind {
+        OutcomeKind::Success => "Success".to_string(),
+        OutcomeKind::Failure => "Failure".to_string(),
+        OutcomeKind::PartialSuccess => "PartialSuccess".to_string(),
+        OutcomeKind::NoEffect => "NoEffect".to_string(),
+        OutcomeKind::Regression => "Regression".to_string(),
+        OutcomeKind::Unknown => "Unknown".to_string(),
+        OutcomeKind::Custom(label) => format!("Custom({label})"),
+    }
+}
 
 /// Build the `Evidence` record paired with a Warning/Critical
 /// commit-rate prediction. Pure function — no engine access; the
@@ -5256,6 +5423,306 @@ mod tests {
             })
             .count();
         assert_eq!(exec_events, 0);
+    }
+
+    // === MicroModel Patch 8 — outcome learning loop ===
+    //
+    // The tests below drive the full reflex chain end-to-end:
+    //   primed_hydra (warmed model)
+    //   → ingest_signals to push into Critical territory
+    //   → evaluate_commit_rate_anomaly_and_propose_action (Patches 2-4)
+    //   → cascade auto-approves the Notify action (no policies)
+    //   → execute_notify_action records OutcomeObserved (Patch 7)
+    //   → record_micro_model_observation_from_action_outcome (Patch 8)
+    //
+    // That's the first loop where Hydra remembers whether its own
+    // reflex produced an outcome.
+
+    /// Drive a Critical assessment + execute the Notify action so a
+    /// downstream `OutcomeObserved` exists for Patch 8 to consume.
+    /// Returns the outcome id plus the prediction run_id so tests
+    /// can assert the chain walk recovered the right join key.
+    fn execute_one_test_action(
+        hydra: &mut Hydra,
+    ) -> (hydra_core::OutcomeId, hydra_core::MicroModelRunId) {
+        *hydra = primed_hydra(10.0, 1.0);
+        let need = 100u64 - ledger_count(hydra);
+        ingest_signals(hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let action_id = assessment
+            .action_ids
+            .into_iter()
+            .next()
+            .expect("critical produced an action");
+        // primed_hydra has no policies → cascade auto-approved the
+        // Notify action. execute_notify_action's strict precondition
+        // (status == Approved) is satisfied.
+        let report = hydra
+            .execute_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        // Recover the run_id from the prediction event so tests can
+        // assert the observation's run_id matches.
+        let prediction_event_id = assessment.prediction_event_id;
+        let prediction_event = hydra.event(&prediction_event_id).unwrap();
+        let run_id = match &prediction_event.kind {
+            hydra_core::EventKind::MicroModelPredictionRecorded { prediction } => {
+                prediction.run_id.clone()
+            }
+            _ => panic!("prediction event has unexpected kind"),
+        };
+        (report.outcome_id, run_id)
+    }
+
+    #[test]
+    fn record_observation_walks_outcome_to_prediction_run_id() {
+        // Happy path: full chain walk recovers the prediction's
+        // run_id and ingests MicroModelObservationRecorded matched
+        // by that run_id.
+        let mut hydra = Hydra::new();
+        let (outcome_id, expected_run_id) = execute_one_test_action(&mut hydra);
+        let observer = hydra_core::ActorId::from_str("actor_ops");
+        let observation = hydra
+            .record_micro_model_observation_from_action_outcome(
+                outcome_id.clone(),
+                observer.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(observation.run_id, expected_run_id);
+        assert!(observation.error.is_none(), "Patch 8 v0: no numeric error");
+
+        // Store reflects the observation under the prediction's run_id.
+        let stored = hydra.micro_model_observation(&expected_run_id).unwrap();
+        assert_eq!(stored.run_id, expected_run_id);
+
+        // Audit log contains the MicroModelObservationRecorded event.
+        let recorded = hydra.events().iter().any(|event| {
+            matches!(
+                &event.kind,
+                hydra_core::EventKind::MicroModelObservationRecorded { observation: o }
+                if o.run_id == expected_run_id
+            )
+        });
+        assert!(recorded, "MicroModelObservationRecorded event missing");
+    }
+
+    #[test]
+    fn record_observation_encodes_outcome_id_and_action_id_in_observed_outcome() {
+        // The audit linkage lives in observed_outcome: serde_json::Value
+        // for v0. Tests pin the exact shape so Patch 9 / trust scoring
+        // can rely on the contract.
+        let mut hydra = Hydra::new();
+        let (outcome_id, _) = execute_one_test_action(&mut hydra);
+        let observer = hydra_core::ActorId::from_str("actor_ops");
+        let observation = hydra
+            .record_micro_model_observation_from_action_outcome(
+                outcome_id.clone(),
+                observer.clone(),
+            )
+            .unwrap();
+
+        let obj = observation
+            .observed_outcome
+            .as_object()
+            .expect("observed_outcome is a JSON object");
+        // outcome_id round-trips as a string field.
+        assert_eq!(
+            obj.get("outcome_id").and_then(|v| v.as_str()),
+            Some(outcome_id.to_string().as_str())
+        );
+        // action_id and claim_id are present (Patch 4 populated
+        // action.related_claims so the walk found a non-empty link).
+        assert!(obj.get("action_id").and_then(|v| v.as_str()).is_some());
+        assert!(obj.get("claim_id").and_then(|v| v.as_str()).is_some());
+        // outcome_kind reflects Patch 7's Custom("notification_recorded")
+        // via the dedicated format helper.
+        assert_eq!(
+            obj.get("outcome_kind").and_then(|v| v.as_str()),
+            Some("Custom(notification_recorded)")
+        );
+        // Action lifecycle + operator flags are explicit.
+        assert_eq!(
+            obj.get("action_lifecycle").and_then(|v| v.as_str()),
+            Some("executed")
+        );
+        assert_eq!(
+            obj.get("operator_approved").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            obj.get("operator_rejected").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            obj.get("observed_by").and_then(|v| v.as_str()),
+            Some("actor_ops")
+        );
+        // Summary surfaces Patch 7's "internal stub" marker.
+        let summary = obj
+            .get("outcome_summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(summary.contains("internal stub"), "summary: {summary}");
+    }
+
+    #[test]
+    fn record_observation_unknown_outcome_returns_query_error() {
+        let mut hydra = Hydra::new();
+        let result = hydra.record_micro_model_observation_from_action_outcome(
+            hydra_core::OutcomeId::from_str("out_does_not_exist"),
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown outcome"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+        // No spurious MicroModelObservationRecorded landed.
+        let count = hydra
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    hydra_core::EventKind::MicroModelObservationRecorded { .. }
+                )
+            })
+            .count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn record_observation_outcome_not_from_prediction_chain_returns_error() {
+        // Hand-craft an Outcome whose ancestry is NOT a MicroModel
+        // reflex chain (e.g., a manually-ingested outcome on an
+        // action without related_claims). The walk should fail at
+        // step 4 with "no related_claims — not a model-derived
+        // action".
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let action_id = hydra_core::ActionId::new();
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Notify,
+            status: hydra_core::action::ActionStatus::Approved,
+            targets: vec![hydra_core::action::ActionTarget::System(
+                "hydra".to_string(),
+            )],
+            // Empty — this is what breaks the walk.
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: Some(actor.clone()),
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: Some(now),
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        let report = hydra
+            .execute_notify_action(action_id.clone(), actor.clone())
+            .unwrap();
+        let result = hydra
+            .record_micro_model_observation_from_action_outcome(report.outcome_id, actor);
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("outcome not traceable"), "msg: {msg}");
+                assert!(msg.contains("related_claims"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_observation_idempotent_overwrites_in_store() {
+        // MicroModelStore stores observations by run_id (HashMap key).
+        // A second recording overwrites the cached observation, but
+        // the audit log preserves BOTH events. Patch 8 documents
+        // this v0 behaviour — multi-observation-per-run is a future
+        // patch.
+        let mut hydra = Hydra::new();
+        let (outcome_id, run_id) = execute_one_test_action(&mut hydra);
+        hydra
+            .record_micro_model_observation_from_action_outcome(
+                outcome_id.clone(),
+                hydra_core::ActorId::from_str("actor_first"),
+            )
+            .unwrap();
+        let first_observer = hydra
+            .micro_model_observation(&run_id)
+            .unwrap()
+            .observed_outcome
+            .get("observed_by")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap();
+        assert_eq!(first_observer, "actor_first");
+
+        hydra
+            .record_micro_model_observation_from_action_outcome(
+                outcome_id,
+                hydra_core::ActorId::from_str("actor_second"),
+            )
+            .unwrap();
+        let second_observer = hydra
+            .micro_model_observation(&run_id)
+            .unwrap()
+            .observed_outcome
+            .get("observed_by")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap();
+        assert_eq!(second_observer, "actor_second", "store overwrites latest");
+
+        // Audit log keeps BOTH events.
+        let observation_events: usize = hydra
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    hydra_core::EventKind::MicroModelObservationRecorded { .. }
+                )
+            })
+            .count();
+        assert_eq!(observation_events, 2, "audit log preserves history");
+    }
+
+    #[test]
+    fn record_observation_observation_at_is_recent() {
+        // observed_at is engine-controlled (chrono::Utc::now()). Pin
+        // that it's within a tight window of the call so callers can
+        // trust the timestamp for trust scoring.
+        let mut hydra = Hydra::new();
+        let (outcome_id, _) = execute_one_test_action(&mut hydra);
+        let before = chrono::Utc::now();
+        let observation = hydra
+            .record_micro_model_observation_from_action_outcome(
+                outcome_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let after = chrono::Utc::now();
+        assert!(
+            observation.observed_at >= before && observation.observed_at <= after,
+            "observed_at {} not in [{}, {}]",
+            observation.observed_at,
+            before,
+            after
+        );
     }
 }
 

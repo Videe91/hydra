@@ -122,6 +122,7 @@ from ._types import (
     LineagePolicyDecision,
     LineageResponse,
     MicroModelId,
+    MicroModelObservation,
     MicroModelPrediction,
     MicroModelRunId,
     MissRecord,
@@ -226,6 +227,8 @@ __all__ = [
     "ActionTransitionResponse",
     # Notify execution stub (Patch 7)
     "ActionExecutionResponse",
+    # Outcome learning loop (Patch 8)
+    "MicroModelObservation",
     # Schemas (Patch 4)
     "ActionPayloadSchema",
     "ClaimPredicateSchema",

@@ -1305,6 +1305,39 @@ AnomalyLevel = Literal["warming_up", "normal", "warning", "critical"]
 EvaluationMode = Literal["prediction_only", "claim", "action"]
 
 
+class MicroModelObservation(BaseModel):
+    """Mirrors `hydra_core::MicroModelObservation` — the ground-truth
+    pairing for a prior MicroModelPrediction, matched by `run_id`.
+
+    Patch 8 records this when an Outcome chain walks back to a
+    MicroModelPrediction (`POST /diagnostics/micromodels/observations/
+    from-outcome/{outcome_id}`). The Patch 8 v0 contract:
+
+      - `run_id`             — join key with the prediction
+      - `observed_outcome`   — free-form JSON. For Patch 8's
+        outcome-driven path the dict carries audit linkage
+        (`outcome_id`, `action_id`, `claim_id`, `outcome_kind`,
+        `outcome_summary`, `action_lifecycle`, `operator_approved`,
+        `operator_rejected`, `observed_by`). Future patches may
+        promote selected fields to first-class struct members.
+      - `error`              — scalar loss metric or `None`. v0
+        records `None` because the executed-action stub has no
+        natural numeric error.
+      - `observed_at`        — engine-set timestamp.
+
+    The `MicroModelStore` keys observations by `run_id`, so
+    re-recording for the same run_id OVERWRITES the cached
+    observation. The audit log preserves all events.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: MicroModelRunId
+    observed_outcome: dict[str, Any] = Field(default_factory=dict)
+    error: float | None = None
+    observed_at: str
+
+
 class MicroModelPrediction(BaseModel):
     """Mirrors `hydra_core::MicroModelPrediction`. The model's
     declarative wire shape — `output` and `input` are kept as

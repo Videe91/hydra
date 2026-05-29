@@ -24,6 +24,8 @@ from ._types import (
     EvaluationMode,
     EventId,
     EvolutionDiagnosticsResponse,
+    MicroModelObservation,
+    OutcomeId,
     TenantId,
 )
 
@@ -173,6 +175,46 @@ class _Diagnostics:
         )
         return CommitRateAnomalyAssessment.model_validate(raw)
 
+    async def record_observation_from_outcome(
+        self,
+        outcome_id: OutcomeId,
+        *,
+        observed_by: ActorId,
+        tenant: TenantId | None = None,
+    ) -> MicroModelObservation:
+        """Close the model feedback loop (MicroModel Patch 8).
+
+        Walks the causal chain from a recorded `Outcome` back to
+        the originating `MicroModelPrediction` and records a
+        `MicroModelObservation` matched by the prediction's
+        `run_id`. The audit linkage (outcome_id / action_id /
+        claim_id / outcome_kind / outcome_summary / action_lifecycle
+        / operator_approved / operator_rejected / observed_by) lives
+        inside `observed_outcome` as a JSON dict.
+
+        Patch 8 v0 sets `error = None` because the executed-action
+        path is a stub — no scalar loss metric is meaningful yet.
+        Future patches add real error scoring.
+
+        Errors:
+          - 404 → `HydraNotFoundError`: outcome_id unknown
+          - 400 → `HydraValidationError`: outcome exists but the
+            chain walk failed (not a model-derived executed
+            outcome — e.g., the action had no `related_claims` or
+            the claim had no `caused_by`)
+
+        The `MicroModelStore` keys observations by `run_id`, so a
+        second recording overwrites the cached observation. The
+        audit log keeps every event.
+        """
+        body = {"observed_by": observed_by}
+        raw = await self._http.post(
+            _paths.diagnostics_micromodels_observation_from_outcome_path(outcome_id),
+            json=body,
+            tenant=tenant,
+        )
+        return MicroModelObservation.model_validate(raw)
+
 
 # === Patch 5: sync mirror ===
 #
@@ -307,3 +349,23 @@ class _DiagnosticsSync:
             tenant=tenant,
         )
         return CommitRateAnomalyAssessment.model_validate(raw)
+
+    def record_observation_from_outcome(
+        self,
+        outcome_id: OutcomeId,
+        *,
+        observed_by: ActorId,
+        tenant: TenantId | None = None,
+    ) -> MicroModelObservation:
+        """Sync mirror of the async `record_observation_from_outcome`
+        — walks the causal chain from a recorded `Outcome` back to
+        the originating `MicroModelPrediction` and records a
+        `MicroModelObservation`. See the async docstring for full
+        semantics and error mapping."""
+        body = {"observed_by": observed_by}
+        raw = self._http.post(
+            _paths.diagnostics_micromodels_observation_from_outcome_path(outcome_id),
+            json=body,
+            tenant=tenant,
+        )
+        return MicroModelObservation.model_validate(raw)

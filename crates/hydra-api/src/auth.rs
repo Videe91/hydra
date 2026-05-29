@@ -936,6 +936,18 @@ mod tests {
             required_scopes_for(&Method::POST, "/actions/act-123/execute"),
             vec!["write:execute"]
         );
+        // MicroModel Patch 8 — outcome learning loop. Observation
+        // recording is a diagnostic surface (it mutates Hydra's
+        // causal memory by writing a MicroModelObservationRecorded
+        // event), so it reuses `write:diagnostics` — same scope as
+        // Patch 5's commit-rate evaluation. No new scope.
+        assert_eq!(
+            required_scopes_for(
+                &Method::POST,
+                "/diagnostics/micromodels/observations/from-outcome/out-123",
+            ),
+            vec!["write:diagnostics"]
+        );
         assert_eq!(
             required_scopes_for(&Method::GET, "/query/nodes"),
             vec!["read:query"]

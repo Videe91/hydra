@@ -144,6 +144,16 @@ def diagnostics_micromodels_commit_rate_evaluate_path() -> str:
     return "/diagnostics/micromodels/commit-rate/evaluate"
 
 
+def diagnostics_micromodels_observation_from_outcome_path(outcome_id: str) -> str:
+    """`POST /diagnostics/micromodels/observations/from-outcome/{outcome_id}`
+    — Patch 8 outcome learning loop. Walks the causal chain from a
+    recorded Outcome back to the originating MicroModelPrediction and
+    records a MicroModelObservation matched by `prediction.run_id`.
+    Body: `{observed_by}`. 400 on chain-walk failure; 404 on unknown
+    outcome_id."""
+    return f"/diagnostics/micromodels/observations/from-outcome/{_seg(outcome_id)}"
+
+
 # === /actions/* (Patch 6 — operator approval workflow) ===
 
 
