@@ -299,6 +299,15 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
         if path.starts_with("/maintenance/") {
             return vec!["admin:ops"];
         }
+        // MicroModel Patch 5 — diagnostic evaluations mutate Hydra's
+        // causal memory (prediction event, maybe evidence + claim,
+        // maybe Notify action). Separate write scope so operators
+        // can grant model evaluation access without granting general
+        // ingest. GETs under /diagnostics/* stay at read:query (see
+        // the reads block below); POSTs land here.
+        if path.starts_with("/diagnostics/") {
+            return vec!["write:diagnostics"];
+        }
         // V2 patch 3A: replication is cluster control plane — gate writes
         // with `admin:replication`. The POST entry is pre-wired now so V2
         // patch 3B's `POST /replication/apply` lands without re-touching
@@ -868,6 +877,22 @@ mod tests {
         assert_eq!(
             required_scopes_for(&Method::POST, "/snapshots"),
             vec!["admin:ops"]
+        );
+        // MicroModel Patch 5 — POSTs under /diagnostics/* require
+        // the new `write:diagnostics` scope. GETs under the same
+        // prefix keep `read:query` (asserted below). The split is
+        // load-bearing: diagnostic reads are safe; diagnostic
+        // evaluations mutate Hydra's causal memory.
+        assert_eq!(
+            required_scopes_for(
+                &Method::POST,
+                "/diagnostics/micromodels/commit-rate/evaluate",
+            ),
+            vec!["write:diagnostics"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/diagnostics/anomaly"),
+            vec!["read:query"]
         );
         assert_eq!(
             required_scopes_for(&Method::GET, "/query/nodes"),

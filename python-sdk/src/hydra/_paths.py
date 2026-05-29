@@ -133,6 +133,17 @@ def diagnostics_evolution_path() -> str:
     return "/diagnostics/evolution"
 
 
+# === /diagnostics/micromodels/* (Patch 5 — external evaluation surface) ===
+
+
+def diagnostics_micromodels_commit_rate_evaluate_path() -> str:
+    """`POST /diagnostics/micromodels/commit-rate/evaluate` — drive the
+    built-in CommitRateAnomalyModel from outside the engine. Body
+    carries `mode` ("prediction_only" / "claim" / "action") and
+    `requested_by` (ActorId)."""
+    return "/diagnostics/micromodels/commit-rate/evaluate"
+
+
 # === /schemas/* — read ===
 
 

@@ -16,9 +16,12 @@ from typing import Any
 from . import _paths
 from ._http import HydraHttpClient, HydraHttpClientSync
 from ._types import (
+    ActorId,
     AnomalyResponse,
+    CommitRateAnomalyAssessment,
     CounterfactualDiagnosticsResponse,
     CoverageDiagnosticsResponse,
+    EvaluationMode,
     EventId,
     EvolutionDiagnosticsResponse,
     TenantId,
@@ -129,6 +132,46 @@ class _Diagnostics:
             tenant=tenant,
         )
         return EvolutionDiagnosticsResponse.model_validate(data)
+
+    async def commit_rate_anomaly(
+        self,
+        *,
+        requested_by: ActorId,
+        mode: EvaluationMode = "action",
+        tenant: TenantId | None = None,
+    ) -> CommitRateAnomalyAssessment:
+        """Drive the built-in commit-rate anomaly micro-model from outside the engine.
+
+        `mode` controls how far down the reflex chain the engine walks:
+
+          - `"prediction_only"` — record only the prediction event
+          - `"claim"` — prediction + (Warning/Critical) evidence + claim
+          - `"action"` (default) — full chain through the Notify action
+            when the verification gate passes
+
+        Returns a typed `CommitRateAnomalyAssessment` carrying every
+        id the engine produced plus a server-rendered `summary` and
+        a relative `lineage_url` pointing at the prediction event.
+        Absent ids are `None`, NOT empty strings; `action_ids` is an
+        empty list when no action was proposed.
+
+        The engine method records `MicroModelPredictionRecorded` and
+        (for actionable levels at modes `claim`/`action`) downstream
+        `EvidenceAdded` / `ClaimProposed` / `ActionProposed` events.
+        Patch 5 does NOT execute the action — `ActionStatus::Proposed`
+        is the highest state reached. Execution, delivery, and
+        approval are explicit future patches.
+        """
+        body: dict[str, Any] = {
+            "mode": mode,
+            "requested_by": requested_by,
+        }
+        raw = await self._http.post(
+            _paths.diagnostics_micromodels_commit_rate_evaluate_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return CommitRateAnomalyAssessment.model_validate(raw)
 
 
 # === Patch 5: sync mirror ===
@@ -241,3 +284,26 @@ class _DiagnosticsSync:
             tenant=tenant,
         )
         return EvolutionDiagnosticsResponse.model_validate(data)
+
+    def commit_rate_anomaly(
+        self,
+        *,
+        requested_by: ActorId,
+        mode: EvaluationMode = "action",
+        tenant: TenantId | None = None,
+    ) -> CommitRateAnomalyAssessment:
+        """Sync mirror of the async `commit_rate_anomaly` — drives
+        the built-in commit-rate micro-model from outside the engine
+        via `POST /diagnostics/micromodels/commit-rate/evaluate`.
+        See the async docstring for full semantics, gate behavior,
+        and the level → action recording rules."""
+        body: dict[str, Any] = {
+            "mode": mode,
+            "requested_by": requested_by,
+        }
+        raw = self._http.post(
+            _paths.diagnostics_micromodels_commit_rate_evaluate_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return CommitRateAnomalyAssessment.model_validate(raw)

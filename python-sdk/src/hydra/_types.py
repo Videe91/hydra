@@ -1282,3 +1282,86 @@ class CommitStreamError(BaseModel):
 CommitStreamItem = (
     CommitStreamCommit | CommitStreamHeartbeat | CommitStreamLag | CommitStreamError
 )
+
+
+# === MicroModel Patch 5: external evaluation surface ===
+#
+# Mirrors `hydra-engine::micromodels::CommitRateAnomalyAssessment`
+# plus the HTTP-only `summary` / `lineage_url` fields. Used by
+# `hy.diagnostics.commit_rate_anomaly(...)`.
+
+# IDs for the new chain. Aliases for `str` like the rest of the
+# Patch-1/2 ID newtypes — at runtime they're plain strings.
+MicroModelId = str
+MicroModelRunId = str
+
+
+# Snake-case anomaly levels, exactly matching the Rust engine's
+# `#[serde(rename_all = "snake_case")]` wire form.
+AnomalyLevel = Literal["warming_up", "normal", "warning", "critical"]
+
+# Snake-case evaluation modes for the request body. Default
+# `"action"` — the SDK fills this in when callers omit it.
+EvaluationMode = Literal["prediction_only", "claim", "action"]
+
+
+class MicroModelPrediction(BaseModel):
+    """Mirrors `hydra_core::MicroModelPrediction`. The model's
+    declarative wire shape — `output` and `input` are kept as
+    free-form JSON because each micro-model owns its own schema.
+
+    Agents that want to introspect the commit-rate model's prediction
+    specifically can read `prediction.output["level"]` /
+    `prediction.output["direction"]` / etc. directly off the dict —
+    the SDK doesn't yet provide a typed wrapper per micro-model
+    kind. A later patch may add one when more models exist.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: MicroModelId
+    run_id: MicroModelRunId
+    input: dict[str, Any] = Field(default_factory=dict)
+    output: dict[str, Any] = Field(default_factory=dict)
+    confidence: float
+    explanation: str | None = None
+    created_at: str
+
+
+class CommitRateAnomalyAssessment(BaseModel):
+    """Response shape of `hy.diagnostics.commit_rate_anomaly(...)`.
+
+    The Patch-5 contract pins eight fields and two HTTP-only extras
+    (`summary` and `lineage_url`):
+
+      - `level`      — snake-case anomaly level
+      - `prediction` — full MicroModelPrediction record
+      - `prediction_event_id` — always populated
+      - `evidence_id` / `evidence_event_id` — populated when the
+        model exits warmup and lands at Warning/Critical AND mode
+        is `"claim"` or `"action"`
+      - `claim_id` / `claim_event_id` — same conditions
+      - `action_ids` — non-empty only when mode is `"action"` AND
+        the engine's gate passes (claim.status == Verified OR
+        claim.confidence >= 0.9). Empty list otherwise.
+      - `summary` — deterministic prose, pattern-matchable by
+        agents. The 8-case table is documented in the route handler.
+      - `lineage_url` — relative path (`/lineage/<event_id>`); the
+        caller concatenates with the deployment's base URL.
+
+    `None` for absent ids — NOT empty strings. Empty list for
+    `action_ids` — never `None`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    level: AnomalyLevel
+    prediction: MicroModelPrediction
+    prediction_event_id: EventId
+    evidence_id: EvidenceId | None = None
+    evidence_event_id: EventId | None = None
+    claim_id: ClaimId | None = None
+    claim_event_id: EventId | None = None
+    action_ids: list[ActionId] = Field(default_factory=list)
+    summary: str
+    lineage_url: str

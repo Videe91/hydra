@@ -2074,15 +2074,21 @@ impl Hydra {
         })
     }
 
-    /// Shared private helper: auto-register the built-in model if
-    /// missing, count commits in the window, evaluate the model,
-    /// record `MicroModelPredictionRecorded`, and return the typed
+    /// Shared helper: auto-register the built-in model if missing,
+    /// count commits in the window, evaluate the model, record
+    /// `MicroModelPredictionRecorded`, and return the typed
     /// triple `(prediction, prediction_event_id, output)`.
     ///
     /// Both Patch 2's `evaluate_commit_rate_anomaly` and Patch 3's
     /// bridge funnel through here so the auto-register + counting
     /// + recording logic lives in one place.
-    fn record_commit_rate_prediction(
+    ///
+    /// **Made public in Patch 5** so the HTTP layer
+    /// (`hydra-net::http::micromodels`) can drive `mode =
+    /// "prediction_only"` evaluations and still report the
+    /// prediction event id back to callers — without forcing
+    /// Patch 2's `evaluate_commit_rate_anomaly` signature to change.
+    pub fn record_commit_rate_prediction(
         &mut self,
         actor: hydra_core::ActorId,
     ) -> hydra_core::error::Result<(
@@ -2193,6 +2199,24 @@ impl Hydra {
         &self,
     ) -> Option<&crate::micromodels::CommitRateAnomalyModel> {
         self.commit_rate_anomaly_model.as_ref()
+    }
+
+    /// Replace the running commit-rate anomaly model with a
+    /// preconfigured instance.
+    ///
+    /// Used by:
+    /// - Integration tests that need a deterministic baseline (e.g.
+    ///   `hydra-net`'s HTTP tests for the Patch 5 evaluate endpoint
+    ///   prime the model with `ewma_rate=10, samples_seen=10` so a
+    ///   subsequent spike lands in Critical without walking through
+    ///   warmup).
+    /// - Future state-restoration patches that load EWMA state from
+    ///   a snapshot.
+    pub fn set_commit_rate_anomaly_model(
+        &mut self,
+        model: crate::micromodels::CommitRateAnomalyModel,
+    ) {
+        self.commit_rate_anomaly_model = Some(model);
     }
 
     // === Schema registry ===

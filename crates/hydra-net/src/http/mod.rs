@@ -4,6 +4,7 @@ pub mod diagnostics;
 pub mod events;
 pub mod ingest;
 pub mod lineage;
+pub mod micromodels;
 pub mod pagination;
 pub mod query;
 pub mod replication;
@@ -18,6 +19,10 @@ pub use commit_stream::{
     CommitStreamQuery, COMMIT_STREAM_CAPACITY,
 };
 pub use commits::{commits_router, CommitsHttpState};
+pub use micromodels::{
+    micromodels_router, EvaluateCommitRateRequest, EvaluateCommitRateResponse,
+    EvaluationMode, MicroModelsHttpState,
+};
 pub use diagnostics::{
     diagnostics_router, AnomalyEntry, AnomalyQuery, AnomalyResponse,
     CounterfactualDiagnosticsResponse, CounterfactualQuery, CoverageDiagnosticsResponse,
