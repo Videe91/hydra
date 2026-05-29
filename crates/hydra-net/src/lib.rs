@@ -2,6 +2,7 @@ pub mod sensor;
 pub mod bus;
 pub mod http;
 pub mod metrics;
+pub mod notify_delivery;
 pub mod query;
 pub mod replication_worker;
 pub mod role;
@@ -33,6 +34,7 @@ pub mod prelude {
     pub use crate::metrics::{
         metrics_router, MetricsRecorder, NoopRecorder, PrometheusTextRecorder,
     };
+    pub use crate::notify_delivery::{NotifyAdapter, StubAdapter, WebhookAdapter};
     pub use crate::query::{QueryService, QueryStats};
     pub use crate::replication_worker::{
         ReplicationBootstrapReport, ReplicationHeartbeatRecord, ReplicationLoopError,

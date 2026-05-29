@@ -81,4 +81,4 @@ pub mod state;
 pub mod transport;
 
 pub use auth::{AuthConfig, AuthMode};
-pub use security::{RateLimitMode, ServerSecurityConfig, TlsConfig};
+pub use security::{NotifyDeliveryConfig, RateLimitMode, ServerSecurityConfig, TlsConfig};

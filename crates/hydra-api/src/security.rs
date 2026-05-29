@@ -123,6 +123,31 @@ impl ReplicationServerConfig {
     }
 }
 
+/// Notify delivery mode (Patch 14).
+///
+/// `Stub` → `POST /actions/:id/execute` calls
+/// `Hydra::execute_notify_action` (Patch 7 stub semantic; no
+/// network I/O). Default on `off()` to preserve back-compat.
+///
+/// `Webhook { url, timeout_ms }` → the route's HTTP handler builds
+/// a `WebhookAdapter` and orchestrates real delivery before
+/// invoking `Hydra::execute_notify_action_with_delivery`.
+///
+/// No retries / backoff / DLQ. No auth headers. No template
+/// language. Future patches add adapter variants (Slack,
+/// PagerDuty) and adapter-side config.
+#[derive(Debug, Clone)]
+pub enum NotifyDeliveryConfig {
+    Stub,
+    Webhook { url: String, timeout_ms: u64 },
+}
+
+impl Default for NotifyDeliveryConfig {
+    fn default() -> Self {
+        NotifyDeliveryConfig::Stub
+    }
+}
+
 /// Unified server-security bundle. Construct via [`Self::off`],
 /// [`Self::with_auth`], or by building the struct directly when more
 /// than one knob needs to be set.
@@ -146,6 +171,10 @@ pub struct ServerSecurityConfig {
     /// meaningless). Operators wanting failover capability set
     /// this explicitly at boot.
     pub self_peer_id: Option<ReplicaId>,
+    /// Patch 14 — Notify delivery mode. Default `Stub` preserves
+    /// Patch 7 behavior; operators opt into real webhook delivery
+    /// via `.with_notify_webhook(url, timeout_ms)`.
+    pub notify_delivery: NotifyDeliveryConfig,
 }
 
 impl ServerSecurityConfig {
@@ -159,6 +188,7 @@ impl ServerSecurityConfig {
             role: RuntimeRole::Leader,
             replication: None,
             self_peer_id: None,
+            notify_delivery: NotifyDeliveryConfig::Stub,
         }
     }
 
@@ -173,7 +203,21 @@ impl ServerSecurityConfig {
             role: RuntimeRole::Leader,
             replication: None,
             self_peer_id: None,
+            notify_delivery: NotifyDeliveryConfig::Stub,
         }
+    }
+
+    /// Patch 14 — opt into real webhook Notify delivery. Sets
+    /// `notify_delivery = Webhook { url, timeout_ms }`. The HTTP
+    /// handler at `POST /actions/:id/execute` will build a
+    /// `WebhookAdapter` and orchestrate delivery before invoking
+    /// the engine's `execute_notify_action_with_delivery`.
+    pub fn with_notify_webhook(mut self, url: impl Into<String>, timeout_ms: u64) -> Self {
+        self.notify_delivery = NotifyDeliveryConfig::Webhook {
+            url: url.into(),
+            timeout_ms,
+        };
+        self
     }
 
     /// Builder: attach a TLS configuration. Chainable with the other
@@ -226,5 +270,33 @@ impl ServerSecurityConfig {
 impl Default for ServerSecurityConfig {
     fn default() -> Self {
         Self::off()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_security_config_off_defaults_to_stub_notify_delivery() {
+        // Patch 14 — `off()` MUST default to Stub so existing
+        // deployments preserve Patch 7 behavior bit-identically.
+        // Pinned so a future refactor can't silently flip the
+        // default to Webhook (which would require a URL).
+        let cfg = ServerSecurityConfig::off();
+        assert!(matches!(cfg.notify_delivery, NotifyDeliveryConfig::Stub));
+    }
+
+    #[test]
+    fn server_security_config_with_notify_webhook_builder_sets_config() {
+        let cfg = ServerSecurityConfig::off()
+            .with_notify_webhook("http://localhost:9000/hook", 1500);
+        match cfg.notify_delivery {
+            NotifyDeliveryConfig::Webhook { url, timeout_ms } => {
+                assert_eq!(url, "http://localhost:9000/hook");
+                assert_eq!(timeout_ms, 1500);
+            }
+            other => panic!("expected Webhook, got {other:?}"),
+        }
     }
 }

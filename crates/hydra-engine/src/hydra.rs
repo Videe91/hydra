@@ -1413,6 +1413,210 @@ impl Hydra {
         })
     }
 
+    // === Patch 14 — Notify Delivery Adapter ====================
+    //
+    // The "real-delivery" counterpart to `execute_notify_action`.
+    // The HTTP layer's `NotifyDeliveryAdapter` (in hydra-net) does
+    // the network call OUTSIDE the engine lock, then calls this
+    // method with the result. The engine emits the terminal events
+    // that match the delivery outcome:
+    //
+    //   Succeeded → ActionExecuting → ActionExecuted →
+    //               OutcomeObserved { kind: Success }
+    //
+    //   Failed    → ActionExecuting → ActionFailed →
+    //               OutcomeObserved { kind: Failure }
+    //
+    // The original `execute_notify_action` is preserved as-is for
+    // stub mode (and for tests). Patch 14 does NOT modify Patch 7's
+    // signature — that's the boundary that protects the SDK
+    // surface.
+
+    /// Execute a Notify action with a real delivery outcome.
+    ///
+    /// Preconditions are identical to `execute_notify_action`
+    /// (kind == Notify, status == Approved). The HTTP layer's
+    /// adapter validates these BEFORE the network call so it can
+    /// short-circuit on bad input without doing work; this method
+    /// re-validates inside the lock as defense in depth.
+    ///
+    /// The `delivery` outcome's `adapter`, `status_code`,
+    /// `latency_ms`, and (on failure) `reason` are projected into
+    /// the resulting `Outcome.impact` so future trust calibration
+    /// (Patch 12+) can branch on real delivery signal.
+    pub fn execute_notify_action_with_delivery(
+        &mut self,
+        action_id: hydra_core::ActionId,
+        actor: hydra_core::ActorId,
+        delivery: hydra_core::DeliveryOutcome,
+    ) -> hydra_core::error::Result<hydra_core::ActionExecutionReport> {
+        // 1. Validate action exists.
+        let action = match self.action_store.action(&action_id) {
+            Some(a) => a.clone(),
+            None => {
+                return Err(hydra_core::error::HydraError::QueryError(format!(
+                    "unknown action: {action_id}"
+                )));
+            }
+        };
+        // 2. Validate kind.
+        if action.kind != hydra_core::ActionKind::Notify {
+            return Err(hydra_core::error::HydraError::QueryError(format!(
+                "invalid action kind: {action_id} is not Notify (Patch 14 only \
+                 executes Notify actions; got {:?})",
+                action.kind
+            )));
+        }
+        // 3. Validate status.
+        if action.status != hydra_core::ActionStatus::Approved {
+            return Err(hydra_core::error::HydraError::QueryError(format!(
+                "invalid action state: {action_id} is {:?}, expected Approved",
+                action.status
+            )));
+        }
+        let previous_status = action.status.clone();
+
+        // 4. Ingest ActionExecuting (status flip is the same in
+        //    both success and failure paths — the action ran,
+        //    even if the receiver didn't accept).
+        self.ingest(hydra_core::EventKind::ActionExecuting {
+            action_id: action_id.clone(),
+        })?;
+
+        let now = chrono::Utc::now();
+
+        // 5. Build the outcome's impact map. Common to both
+        //    success and failure: adapter id, latency, stub flag
+        //    explicitly false (distinguishes Patch 14 outcomes
+        //    from Patch 7 stubs).
+        let mut impact: std::collections::HashMap<String, hydra_core::Value> =
+            std::collections::HashMap::new();
+        impact.insert(
+            "stub".to_string(),
+            hydra_core::Value::Bool(false),
+        );
+        impact.insert(
+            "adapter".to_string(),
+            hydra_core::Value::String(delivery.adapter().to_string()),
+        );
+        impact.insert(
+            "latency_ms".to_string(),
+            hydra_core::Value::Int(delivery.latency_ms() as i64),
+        );
+
+        // 6. Branch on delivery outcome.
+        let (executed_event_id, outcome_kind, summary) = match &delivery {
+            hydra_core::DeliveryOutcome::Succeeded {
+                status_code,
+                adapter,
+                ..
+            } => {
+                impact.insert(
+                    "status_code".to_string(),
+                    hydra_core::Value::Int(*status_code as i64),
+                );
+                let summary = format!(
+                    "Notify delivered via {adapter} (status {status_code})"
+                );
+                impact.insert(
+                    "summary".to_string(),
+                    hydra_core::Value::String(summary.clone()),
+                );
+                let cascade = self.ingest(hydra_core::EventKind::ActionExecuted {
+                    action_id: action_id.clone(),
+                })?;
+                let event_id = cascade
+                    .events
+                    .first()
+                    .map(|e| e.id.clone())
+                    .expect("ingest produces the trigger event");
+                (
+                    event_id,
+                    hydra_core::OutcomeKind::Success,
+                    summary,
+                )
+            }
+            hydra_core::DeliveryOutcome::Failed {
+                reason,
+                status_code,
+                adapter,
+                ..
+            } => {
+                if let Some(code) = status_code {
+                    impact.insert(
+                        "status_code".to_string(),
+                        hydra_core::Value::Int(*code as i64),
+                    );
+                }
+                impact.insert(
+                    "reason".to_string(),
+                    hydra_core::Value::String(reason.clone()),
+                );
+                let summary = format!(
+                    "Notify delivery failed via {adapter}: {reason}"
+                );
+                impact.insert(
+                    "summary".to_string(),
+                    hydra_core::Value::String(summary.clone()),
+                );
+                let cascade = self.ingest(hydra_core::EventKind::ActionFailed {
+                    action_id: action_id.clone(),
+                    reason: reason.clone(),
+                })?;
+                let event_id = cascade
+                    .events
+                    .first()
+                    .map(|e| e.id.clone())
+                    .expect("ingest produces the trigger event");
+                (
+                    event_id,
+                    hydra_core::OutcomeKind::Failure,
+                    summary,
+                )
+            }
+        };
+        let _ = summary; // used only to populate impact above
+
+        // 7. Ingest OutcomeObserved. caused_by links to the
+        //    terminal event id so lineage walks reach it.
+        let outcome = hydra_core::Outcome {
+            id: hydra_core::OutcomeId::new(),
+            tenant_id: action.tenant_id.clone(),
+            action_id: action_id.clone(),
+            kind: outcome_kind,
+            observed_events: vec![executed_event_id.clone()],
+            updated_claims: action.related_claims.clone(),
+            produced_evidence: vec![],
+            impact,
+            observed_at: now,
+            recorded_at: now,
+            recorded_by: actor.clone(),
+            caused_by: Some(executed_event_id),
+        };
+        let outcome_id = outcome.id.clone();
+        self.ingest(hydra_core::EventKind::OutcomeObserved { outcome })?;
+
+        // 8. Re-read the action's final status. On success this is
+        //    Executed; on failure, Failed.
+        let final_action = self.action_store.action(&action_id).cloned().ok_or_else(
+            || {
+                hydra_core::error::HydraError::QueryError(format!(
+                    "action vanished after execute: {action_id}"
+                ))
+            },
+        )?;
+        let executed_at = final_action.executed_at.unwrap_or(now);
+
+        Ok(hydra_core::ActionExecutionReport {
+            action_id,
+            previous_status,
+            final_status: final_action.status,
+            outcome_id,
+            executed_by: actor,
+            executed_at,
+        })
+    }
+
     pub fn executing_actions(&self) -> Vec<&hydra_core::Action> {
         self.action_store.executing_actions()
     }
@@ -6234,6 +6438,263 @@ mod tests {
             })
             .count();
         assert_eq!(exec_events, 0);
+    }
+
+    // === Patch 14 — Notify Delivery Adapter ===
+    //
+    // Mirrors the Patch 7 tests but uses the new
+    // `execute_notify_action_with_delivery` method. Patch 7's
+    // `execute_notify_action` is preserved as-is (regression-pinned
+    // by all the tests above).
+
+    #[test]
+    fn execute_notify_action_with_delivery_succeeded_emits_executed_and_success_outcome() {
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        let operator = hydra_core::ActorId::from_str("actor_ops");
+        let delivery = hydra_core::DeliveryOutcome::Succeeded {
+            adapter: "webhook".to_string(),
+            status_code: 204,
+            latency_ms: 42,
+        };
+        let report = hydra
+            .execute_notify_action_with_delivery(
+                action_id.clone(),
+                operator.clone(),
+                delivery,
+            )
+            .unwrap();
+
+        assert_eq!(
+            report.previous_status,
+            hydra_core::action::ActionStatus::Approved
+        );
+        assert_eq!(
+            report.final_status,
+            hydra_core::action::ActionStatus::Executed
+        );
+        // Audit log: ActionExecuted (not ActionFailed) lands.
+        let executed_count = hydra
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, hydra_core::EventKind::ActionExecuted { .. }))
+            .count();
+        assert_eq!(executed_count, 1);
+        let failed_count = hydra
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, hydra_core::EventKind::ActionFailed { .. }))
+            .count();
+        assert_eq!(failed_count, 0);
+        // Outcome carries Success kind.
+        let outcome = hydra.outcome(&report.outcome_id).unwrap();
+        assert_eq!(outcome.kind, hydra_core::OutcomeKind::Success);
+    }
+
+    #[test]
+    fn execute_notify_action_with_delivery_failed_emits_failed_and_failure_outcome() {
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        let operator = hydra_core::ActorId::from_str("actor_ops");
+        let delivery = hydra_core::DeliveryOutcome::Failed {
+            adapter: "webhook".to_string(),
+            reason: "webhook returned 500".to_string(),
+            status_code: Some(500),
+            latency_ms: 31,
+        };
+        let report = hydra
+            .execute_notify_action_with_delivery(
+                action_id.clone(),
+                operator.clone(),
+                delivery,
+            )
+            .unwrap();
+
+        assert_eq!(
+            report.final_status,
+            hydra_core::action::ActionStatus::Failed
+        );
+        // ActionFailed (not ActionExecuted) lands.
+        let executed_count = hydra
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, hydra_core::EventKind::ActionExecuted { .. }))
+            .count();
+        assert_eq!(executed_count, 0);
+        let failed_count = hydra
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, hydra_core::EventKind::ActionFailed { .. }))
+            .count();
+        assert_eq!(failed_count, 1);
+        // Outcome carries Failure kind + the reason in impact.
+        let outcome = hydra.outcome(&report.outcome_id).unwrap();
+        assert_eq!(outcome.kind, hydra_core::OutcomeKind::Failure);
+        let reason = outcome
+            .impact
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(reason.contains("500"), "reason: {reason}");
+    }
+
+    #[test]
+    fn execute_notify_action_with_delivery_refuses_non_notify_kind() {
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let action_id = hydra_core::ActionId::new();
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Backfill,
+            status: hydra_core::action::ActionStatus::Approved,
+            targets: vec![hydra_core::action::ActionTarget::Dataset(
+                "orders".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: Some(actor),
+            rejected_by: None,
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: Some(now),
+            rejected_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        let delivery = hydra_core::DeliveryOutcome::Succeeded {
+            adapter: "webhook".to_string(),
+            status_code: 200,
+            latency_ms: 1,
+        };
+        let result = hydra.execute_notify_action_with_delivery(
+            action_id,
+            hydra_core::ActorId::from_str("actor_ops"),
+            delivery,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("invalid action kind"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_notify_action_with_delivery_refuses_non_approved_status() {
+        // Drive a chain with a HumanApproval policy so the action
+        // stays Proposed → method must refuse.
+        let mut hydra = Hydra::new();
+        register_any_action_approval_policy(&mut hydra);
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_test_proposer");
+        let action_id = hydra_core::ActionId::new();
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Notify,
+            status: hydra_core::action::ActionStatus::Proposed,
+            targets: vec![hydra_core::action::ActionTarget::System(
+                "hydra".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor,
+            approved_by: None,
+            rejected_by: None,
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            rejected_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        let delivery = hydra_core::DeliveryOutcome::Succeeded {
+            adapter: "webhook".to_string(),
+            status_code: 200,
+            latency_ms: 1,
+        };
+        let result = hydra.execute_notify_action_with_delivery(
+            action_id,
+            hydra_core::ActorId::from_str("actor_ops"),
+            delivery,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("invalid action state"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_notify_action_with_delivery_unknown_action_returns_query_error() {
+        let mut hydra = Hydra::new();
+        let delivery = hydra_core::DeliveryOutcome::Succeeded {
+            adapter: "webhook".to_string(),
+            status_code: 200,
+            latency_ms: 1,
+        };
+        let result = hydra.execute_notify_action_with_delivery(
+            hydra_core::ActionId::from_str("act_does_not_exist"),
+            hydra_core::ActorId::from_str("actor_ops"),
+            delivery,
+        );
+        assert!(matches!(
+            result,
+            Err(hydra_core::error::HydraError::QueryError(_))
+        ));
+    }
+
+    #[test]
+    fn execute_notify_action_with_delivery_observation_impact_carries_adapter_metadata() {
+        // Pin the Outcome.impact JSON shape — Patch 12+ trust
+        // calibration may eventually branch on this. Future
+        // patches must preserve `stub: false`, `adapter`,
+        // `latency_ms`, and `status_code` (when present) on
+        // both success and failure paths.
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        let report = hydra
+            .execute_notify_action_with_delivery(
+                action_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+                hydra_core::DeliveryOutcome::Succeeded {
+                    adapter: "webhook".to_string(),
+                    status_code: 202,
+                    latency_ms: 99,
+                },
+            )
+            .unwrap();
+        let outcome = hydra.outcome(&report.outcome_id).unwrap();
+        assert!(matches!(
+            outcome.impact.get("stub"),
+            Some(hydra_core::Value::Bool(false))
+        ));
+        assert_eq!(
+            outcome.impact.get("adapter").and_then(|v| v.as_str()),
+            Some("webhook")
+        );
+        assert_eq!(
+            outcome.impact.get("status_code").and_then(|v| v.as_i64()),
+            Some(202)
+        );
+        assert_eq!(
+            outcome.impact.get("latency_ms").and_then(|v| v.as_i64()),
+            Some(99)
+        );
     }
 
     // === MicroModel Patch 8 — outcome learning loop ===

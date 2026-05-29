@@ -94,7 +94,7 @@ pub use replication::{
 pub use trust::{
     is_cascade_approver, TrustAssessment, TrustFactor, TrustLevel, HYDRA_POLICY_AGENT_ACTOR,
 };
-pub use automation::AutoExecutionDecision;
+pub use automation::{AutoExecutionDecision, DeliveryOutcome};
 
 /// Convenience re-exports for common types
 pub mod prelude {
@@ -143,7 +143,7 @@ pub mod prelude {
         is_cascade_approver, TrustAssessment, TrustFactor, TrustLevel,
         HYDRA_POLICY_AGENT_ACTOR,
     };
-    pub use crate::automation::AutoExecutionDecision;
+    pub use crate::automation::{AutoExecutionDecision, DeliveryOutcome};
     pub use crate::node::{Node, NodeMeta, NodeValidator};
     pub use crate::edge::{Edge, EdgeMeta};
     pub use crate::graph::{GraphReader, TraversalDirection, bfs, bfs_dyn, topological_sort};

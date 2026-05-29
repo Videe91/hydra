@@ -59,6 +59,69 @@ pub struct AutoExecutionDecision {
     pub execution: Option<ActionExecutionReport>,
 }
 
+/// Outcome of a Notify delivery attempt — Patch 14.
+///
+/// Produced by a `NotifyDeliveryAdapter` (in `hydra-net`) and
+/// passed back to the engine via
+/// `Hydra::execute_notify_action_with_delivery`. The engine uses
+/// this to choose which terminal lifecycle event to emit:
+///
+/// ```text
+///   Succeeded → ActionExecuted + OutcomeObserved { Success }
+///   Failed    → ActionFailed   + OutcomeObserved { Failure }
+/// ```
+///
+/// `latency_ms` is measured from the moment the adapter starts
+/// the delivery attempt to when it gets a result (success, error,
+/// or timeout). Always present so trust calibration can later
+/// branch on slow-but-eventually-OK deliveries.
+///
+/// `status_code` is the HTTP status of the receiver's response.
+/// `Some(...)` when a real HTTP response landed (regardless of
+/// 2xx vs non-2xx). `None` on timeout / network error / DNS
+/// failure / any path that never got a status back. This keeps
+/// "the receiver rejected us" distinguishable from "we never
+/// reached the receiver."
+///
+/// `adapter` is a stable string id (e.g. `"webhook"`, `"stub"`,
+/// future `"slack"`/`"pagerduty"`). Stored on the outcome's
+/// `impact` so future patches can filter trust calibration by
+/// delivery mechanism.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DeliveryOutcome {
+    Succeeded {
+        adapter: String,
+        status_code: u16,
+        latency_ms: u64,
+    },
+    Failed {
+        adapter: String,
+        reason: String,
+        status_code: Option<u16>,
+        latency_ms: u64,
+    },
+}
+
+impl DeliveryOutcome {
+    pub fn is_succeeded(&self) -> bool {
+        matches!(self, DeliveryOutcome::Succeeded { .. })
+    }
+
+    pub fn adapter(&self) -> &str {
+        match self {
+            DeliveryOutcome::Succeeded { adapter, .. } => adapter,
+            DeliveryOutcome::Failed { adapter, .. } => adapter,
+        }
+    }
+
+    pub fn latency_ms(&self) -> u64 {
+        match self {
+            DeliveryOutcome::Succeeded { latency_ms, .. } => *latency_ms,
+            DeliveryOutcome::Failed { latency_ms, .. } => *latency_ms,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +182,45 @@ mod tests {
         assert_eq!(json["executed"], true);
         assert!(json["trust"].is_object());
         assert!(json["execution"].is_object());
+    }
+
+    #[test]
+    fn delivery_outcome_succeeded_round_trips_through_json() {
+        let outcome = DeliveryOutcome::Succeeded {
+            adapter: "webhook".to_string(),
+            status_code: 204,
+            latency_ms: 42,
+        };
+        let json = serde_json::to_value(&outcome).unwrap();
+        // PascalCase via serde default — matches every core enum.
+        let succeeded = json
+            .get("Succeeded")
+            .expect("variant-tagged shape: {Succeeded: ...}");
+        assert_eq!(succeeded["adapter"], "webhook");
+        assert_eq!(succeeded["status_code"], 204);
+        assert_eq!(succeeded["latency_ms"], 42);
+        // Roundtrip.
+        let back: DeliveryOutcome = serde_json::from_value(json).unwrap();
+        assert!(back.is_succeeded());
+        assert_eq!(back.adapter(), "webhook");
+        assert_eq!(back.latency_ms(), 42);
+    }
+
+    #[test]
+    fn delivery_outcome_failed_status_code_none_serializes_as_null() {
+        // Network errors / timeouts have no HTTP status. Pin that
+        // None serializes as JSON `null` so downstream consumers
+        // can distinguish "receiver rejected us" from "we never
+        // reached the receiver."
+        let outcome = DeliveryOutcome::Failed {
+            adapter: "webhook".to_string(),
+            reason: "timeout after 5000ms".to_string(),
+            status_code: None,
+            latency_ms: 5000,
+        };
+        let json = serde_json::to_value(&outcome).unwrap();
+        let failed = json.get("Failed").unwrap();
+        assert!(failed["status_code"].is_null());
+        assert!(!outcome.is_succeeded());
     }
 }

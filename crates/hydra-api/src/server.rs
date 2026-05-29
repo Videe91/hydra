@@ -15,11 +15,12 @@ use axum::routing::{get, post};
 use axum::Router;
 use hydra_core::ActorId;
 use hydra_net::http::{
-    actions_router, commit_stream_router, commits_router, diagnostics_router, events_router,
-    ingest_router, lineage_router, micromodels_router, observations_router, query_router,
-    replication_promote_router, replication_role_router, replication_router, schema_router,
-    sensor_router, snapshots_router, trust_router, CommitBroadcaster,
+    actions_router_with_notify, commit_stream_router, commits_router, diagnostics_router,
+    events_router, ingest_router, lineage_router, micromodels_router, observations_router,
+    query_router, replication_promote_router, replication_role_router, replication_router,
+    schema_router, sensor_router, snapshots_router, trust_router, CommitBroadcaster,
 };
+use hydra_net::notify_delivery::{NotifyAdapter, WebhookAdapter};
 use hydra_net::runtime::{RuntimeBuilder, RuntimeHandle};
 use hydra_sdk::HydraRuntime;
 use std::path::Path;
@@ -147,6 +148,23 @@ pub fn build_router_with_security(
         }
     }
 
+    // Patch 14 — Notify delivery adapter. `Stub` (the default)
+    // passes `None` so the actions handler keeps Patch 7
+    // behavior. `Webhook` builds a `WebhookAdapter` and threads
+    // it via Arc into `ActionsHttpState`.
+    let notify_adapter: Option<std::sync::Arc<NotifyAdapter>> =
+        match &security.notify_delivery {
+            crate::security::NotifyDeliveryConfig::Stub => None,
+            crate::security::NotifyDeliveryConfig::Webhook { url, timeout_ms } => {
+                Some(std::sync::Arc::new(NotifyAdapter::Webhook(
+                    WebhookAdapter::new(
+                        url.clone(),
+                        std::time::Duration::from_millis(*timeout_ms),
+                    ),
+                )))
+            }
+        };
+
     let state = AppState::new(runtime.clone());
     let mut app = legacy_routes(state)
         .merge(schema_router(runtime.clone()))
@@ -159,7 +177,7 @@ pub fn build_router_with_security(
         .merge(lineage_router(runtime.clone()))
         .merge(diagnostics_router(runtime.clone()))
         .merge(micromodels_router(runtime.clone()))
-        .merge(actions_router(runtime.clone()))
+        .merge(actions_router_with_notify(runtime.clone(), notify_adapter))
         .merge(observations_router(runtime.clone()))
         .merge(trust_router(runtime.clone()))
         .merge(replication_router(runtime.clone()))
@@ -2013,6 +2031,7 @@ mod tests {
                 role: RuntimeRole::Leader,
                 replication: None,
                 self_peer_id: None,
+                notify_delivery: crate::security::NotifyDeliveryConfig::Stub,
             },
         );
         // One request fits comfortably in burst=2.
@@ -2038,6 +2057,7 @@ mod tests {
                 role: RuntimeRole::Leader,
                 replication: None,
                 self_peer_id: None,
+                notify_delivery: crate::security::NotifyDeliveryConfig::Stub,
             },
         );
         let peer = test_peer();
@@ -2075,6 +2095,7 @@ mod tests {
                 role: RuntimeRole::Leader,
                 replication: None,
                 self_peer_id: None,
+                notify_delivery: crate::security::NotifyDeliveryConfig::Stub,
             },
         );
         let peer_a: std::net::SocketAddr = "127.0.0.1:50100".parse().unwrap();
@@ -2105,6 +2126,7 @@ mod tests {
                 role: RuntimeRole::Leader,
                 replication: None,
                 self_peer_id: None,
+                notify_delivery: crate::security::NotifyDeliveryConfig::Stub,
             },
         );
         let request = Request::builder()
@@ -2141,6 +2163,7 @@ mod tests {
                 role: RuntimeRole::Leader,
                 replication: None,
                 self_peer_id: None,
+                notify_delivery: crate::security::NotifyDeliveryConfig::Stub,
             },
         );
         let response = app
@@ -2188,6 +2211,7 @@ mod tests {
             role: RuntimeRole::Leader,
             replication: None,
             self_peer_id: None,
+            notify_delivery: crate::security::NotifyDeliveryConfig::Stub,
         };
         let result = serve_with_security(runtime, "127.0.0.1:0", bad).await;
         assert!(result.is_err());
