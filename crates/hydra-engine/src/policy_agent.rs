@@ -101,6 +101,11 @@ impl PolicyAgent {
                 events.push(EventKind::ActionApproved {
                     action_id: action.id.clone(),
                     approved_by: self.actor_id.clone(),
+                    // Cascade-driven auto-approval — no
+                    // operator-supplied reason. Patch 6's HTTP
+                    // approval path sets this to `Some(...)` when
+                    // a human approves.
+                    reason: None,
                 });
             }
             PolicyEvaluationDecision::RequireApproval => {
@@ -367,6 +372,7 @@ mod tests {
             EventKind::ActionApproved {
                 action_id,
                 approved_by,
+                ..
             } => {
                 assert_eq!(action_id, &action.id);
                 assert_eq!(approved_by, &actor());

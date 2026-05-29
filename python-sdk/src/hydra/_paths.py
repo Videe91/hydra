@@ -144,6 +144,23 @@ def diagnostics_micromodels_commit_rate_evaluate_path() -> str:
     return "/diagnostics/micromodels/commit-rate/evaluate"
 
 
+# === /actions/* (Patch 6 — operator approval workflow) ===
+
+
+def action_approve_path(action_id: str) -> str:
+    """`POST /actions/{action_id}/approve` — operator-triggered
+    flip from Proposed → Approved (idempotent in v0; the response
+    surfaces `previous_status`). Body: `{actor, reason?}`."""
+    return f"/actions/{_seg(action_id)}/approve"
+
+
+def action_reject_path(action_id: str) -> str:
+    """`POST /actions/{action_id}/reject` — operator-triggered
+    flip to Rejected. Reason is required (load-bearing for the
+    audit log and future outcome learning). Body: `{actor, reason}`."""
+    return f"/actions/{_seg(action_id)}/reject"
+
+
 # === /schemas/* — read ===
 
 

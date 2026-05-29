@@ -150,6 +150,11 @@ impl ActionStore {
             EventKind::ActionApproved {
                 action_id,
                 approved_by,
+                // Patch 6 — operator-supplied reason is captured in
+                // the event itself for audit but not yet projected
+                // onto Action.payload. The store mutates only the
+                // status / approver / timestamps.
+                reason: _,
             } => {
                 self.mutate_action(action_id, |action| {
                     action.status = ActionStatus::Approved;
@@ -413,6 +418,7 @@ mod tests {
             .apply_event(&event(EventKind::ActionApproved {
                 action_id: action_id.clone(),
                 approved_by: actor(),
+                reason: None,
             }))
             .unwrap();
         let approved = store.action(&action_id).unwrap();

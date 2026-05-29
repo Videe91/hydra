@@ -217,6 +217,7 @@ mod tests {
                     .apply_event(&event(EventKind::ActionApproved {
                         action_id,
                         approved_by: prometheus(),
+                        reason: None,
                     }))
                     .unwrap();
             }

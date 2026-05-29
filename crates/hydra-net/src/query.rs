@@ -1366,6 +1366,7 @@ mod action_outcome_query_tests {
             .ingest(EventKind::ActionApproved {
                 action_id: action_id.clone(),
                 approved_by: actor(),
+                reason: None,
             })
             .unwrap();
         hydra

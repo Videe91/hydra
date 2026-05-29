@@ -1365,3 +1365,48 @@ class CommitRateAnomalyAssessment(BaseModel):
     action_ids: list[ActionId] = Field(default_factory=list)
     summary: str
     lineage_url: str
+
+
+# === Patch 6 — operator approval workflow ===
+#
+# Wire form for the approve/reject status fields is **lowercase**
+# (`"proposed"`, `"approved"`, ...) — distinct from the engine's
+# PascalCase `ActionStatus`. The HTTP layer normalises so the
+# transition envelope reads naturally alongside other low-level
+# state labels.
+
+ActionTransitionStatus = Literal[
+    "proposed",
+    "approved",
+    "rejected",
+    "executing",
+    "executed",
+    "failed",
+    "cancelled",
+]
+
+
+class ActionTransitionResponse(BaseModel):
+    """Unified envelope returned by `POST /actions/{id}/approve` and
+    `/reject` (MicroModel Patch 6).
+
+    `previous_status` surfaces the action's state BEFORE the
+    transition so callers can detect idempotent flips (v0 does not
+    enforce terminal action states; a second approve on an Approved
+    action returns 200 with `previous_status == "approved"`).
+
+    `approved_by` is populated on approve; `rejected_by` on reject;
+    the other is `None`. `reason` is the operator-supplied
+    rationale: optional on approve, required on reject.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action_id: ActionId
+    status: ActionTransitionStatus
+    previous_status: ActionTransitionStatus
+    approved_by: ActorId | None = None
+    rejected_by: ActorId | None = None
+    reason: str | None = None
+    approved_at: str | None = None
+    updated_at: str

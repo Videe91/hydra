@@ -29,6 +29,8 @@ from ._types import (
     Action,
     ActionId,
     ActionStatus,
+    ActionTransitionResponse,
+    ActorId,
     Claim,
     ClaimId,
     ClaimKind,
@@ -334,6 +336,64 @@ class Hydra:
         }
         event_kind = {"ActionProposed": {"action": action}}
         return await self._ingest(event_kind, tenant=tenant, idempotency_key=idempotency_key)
+
+    # ========================================================================
+    # Patch 6 — operator approval workflow
+    # ========================================================================
+
+    async def approve_action(
+        self,
+        action_id: ActionId,
+        *,
+        actor: ActorId,
+        reason: str | None = None,
+        tenant: TenantId | None = None,
+    ) -> ActionTransitionResponse:
+        """Approve a proposed action — `POST /actions/{id}/approve`.
+
+        The first human governance gate (MicroModel Patch 6). Flips
+        the action's status to `Approved` and records the operator
+        + reason in the audit log. v0 does NOT enforce terminal
+        states: a second approve on an Approved action returns 200
+        with `previous_status == "approved"`, letting the caller
+        detect idempotent flips.
+
+        `reason` is optional on approve (audit-only when present;
+        the engine does not yet project it onto `Action.payload`).
+        Unknown `action_id` → `HydraNotFoundError` (404).
+        """
+        body: dict[str, Any] = {"actor": actor}
+        if reason is not None:
+            body["reason"] = reason
+        raw = await self._http.post(
+            _paths.action_approve_path(action_id),
+            json=body,
+            tenant=tenant,
+        )
+        return ActionTransitionResponse.model_validate(raw)
+
+    async def reject_action(
+        self,
+        action_id: ActionId,
+        *,
+        actor: ActorId,
+        reason: str,
+        tenant: TenantId | None = None,
+    ) -> ActionTransitionResponse:
+        """Reject a proposed action — `POST /actions/{id}/reject`.
+
+        `reason` is **required** — load-bearing for the audit log
+        and future outcome learning. Symmetry with `approve_action`
+        is intentional; the asymmetric reason requirement is the
+        engine contract. Unknown `action_id` → `HydraNotFoundError`.
+        """
+        body = {"actor": actor, "reason": reason}
+        raw = await self._http.post(
+            _paths.action_reject_path(action_id),
+            json=body,
+            tenant=tenant,
+        )
+        return ActionTransitionResponse.model_validate(raw)
 
     async def _ingest(
         self,

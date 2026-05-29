@@ -308,6 +308,15 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
         if path.starts_with("/diagnostics/") {
             return vec!["write:diagnostics"];
         }
+        // MicroModel Patch 6 — operator approval workflow. The
+        // first human governance gate. Mutates Action status
+        // (Proposed → Approved/Rejected) and records the operator
+        // + reason in the audit log. Separate scope so operator
+        // roles can be granted approval authority without ingest
+        // or diagnostics access.
+        if path == "/actions" || path.starts_with("/actions/") {
+            return vec!["write:approvals"];
+        }
         // V2 patch 3A: replication is cluster control plane — gate writes
         // with `admin:replication`. The POST entry is pre-wired now so V2
         // patch 3B's `POST /replication/apply` lands without re-touching
@@ -893,6 +902,19 @@ mod tests {
         assert_eq!(
             required_scopes_for(&Method::GET, "/diagnostics/anomaly"),
             vec!["read:query"]
+        );
+        // MicroModel Patch 6 — operator approval workflow. POSTs to
+        // /actions/{id}/approve and /actions/{id}/reject require
+        // the new `write:approvals` scope. Separate from
+        // write:diagnostics so operator roles can be granted
+        // approval authority without anything else.
+        assert_eq!(
+            required_scopes_for(&Method::POST, "/actions/act-123/approve"),
+            vec!["write:approvals"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::POST, "/actions/act-123/reject"),
+            vec!["write:approvals"]
         );
         assert_eq!(
             required_scopes_for(&Method::GET, "/query/nodes"),

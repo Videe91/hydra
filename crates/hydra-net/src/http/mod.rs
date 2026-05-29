@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod commit_stream;
 pub mod commits;
 pub mod diagnostics;
@@ -13,6 +14,10 @@ pub mod sensor;
 pub mod snapshots;
 pub mod tenant;
 
+pub use actions::{
+    actions_router, ActionTransitionResponse, ActionsHttpState, ApproveActionRequest,
+    RejectActionRequest,
+};
 pub use commit_stream::{
     commit_stream_router, CommitBroadcaster, CommitStreamErrorPayload,
     CommitStreamHeartbeatPayload, CommitStreamHttpState, CommitStreamLagPayload,

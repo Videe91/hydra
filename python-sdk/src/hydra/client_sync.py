@@ -32,6 +32,8 @@ from ._types import (
     Action,
     ActionId,
     ActionStatus,
+    ActionTransitionResponse,
+    ActorId,
     Claim,
     ClaimId,
     ClaimKind,
@@ -276,6 +278,48 @@ class HydraSync:
         }
         event_kind = {"ActionProposed": {"action": action}}
         return self._ingest(event_kind, tenant=tenant, idempotency_key=idempotency_key)
+
+    # ========================================================================
+    # Patch 6 — operator approval workflow (sync mirror)
+    # ========================================================================
+
+    def approve_action(
+        self,
+        action_id: ActionId,
+        *,
+        actor: ActorId,
+        reason: str | None = None,
+        tenant: TenantId | None = None,
+    ) -> ActionTransitionResponse:
+        """Sync mirror of `Hydra.approve_action`. See the async
+        version for full semantics — same wire contract, same
+        idempotent behaviour, same 404 mapping."""
+        body: dict[str, Any] = {"actor": actor}
+        if reason is not None:
+            body["reason"] = reason
+        raw = self._http.post(
+            _paths.action_approve_path(action_id),
+            json=body,
+            tenant=tenant,
+        )
+        return ActionTransitionResponse.model_validate(raw)
+
+    def reject_action(
+        self,
+        action_id: ActionId,
+        *,
+        actor: ActorId,
+        reason: str,
+        tenant: TenantId | None = None,
+    ) -> ActionTransitionResponse:
+        """Sync mirror of `Hydra.reject_action`. `reason` required."""
+        body = {"actor": actor, "reason": reason}
+        raw = self._http.post(
+            _paths.action_reject_path(action_id),
+            json=body,
+            tenant=tenant,
+        )
+        return ActionTransitionResponse.model_validate(raw)
 
     def _ingest(
         self,

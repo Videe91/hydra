@@ -159,6 +159,13 @@ pub enum EventKind {
     ActionApproved {
         action_id: ActionId,
         approved_by: ActorId,
+        /// Operator-supplied rationale for the approval. Patch 6
+        /// (operator approval workflow) added this field with
+        /// `#[serde(default)]` so events written before Patch 6
+        /// deserialize as `None`. Stored in the audit log; not yet
+        /// surfaced on `Action.payload` — that's a future enhancement.
+        #[serde(default)]
+        reason: Option<String>,
     },
     ActionRejected {
         action_id: ActionId,

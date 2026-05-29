@@ -62,6 +62,8 @@ from ._types import (
     ActionPayloadSchema,
     ActionStatus,
     ActionTarget,
+    ActionTransitionResponse,
+    ActionTransitionStatus,
     ActorId,
     Anomaly,
     AnomalyEntry,
@@ -219,6 +221,8 @@ __all__ = [
     "MicroModelId",
     "MicroModelPrediction",
     "MicroModelRunId",
+    # Operator approval workflow (Patch 6)
+    "ActionTransitionResponse",
     # Schemas (Patch 4)
     "ActionPayloadSchema",
     "ClaimPredicateSchema",
@@ -279,6 +283,7 @@ __all__ = [
     "TypeId",
     # Literal enums
     "ActionStatus",
+    "ActionTransitionStatus",
     "ClaimKind",
     "ClaimStatus",
     "Confidence",

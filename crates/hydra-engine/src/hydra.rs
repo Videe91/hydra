@@ -1189,6 +1189,86 @@ impl Hydra {
         self.action_store.approved_actions()
     }
 
+    // === MicroModel Patch 6 — operator approval workflow ===
+    //
+    // Direct approve / reject helpers for the HTTP layer. Both
+    // ingest the corresponding `EventKind::Action{Approved,Rejected}`
+    // event (so the audit log, commit ledger, durable writer, and
+    // commit observer all see the transition) and return the
+    // post-cascade `Action` snapshot for the caller's response.
+    //
+    // No state-machine enforcement in v0: a Rejected action can be
+    // re-approved, an Approved action re-rejected, etc. The HTTP
+    // layer surfaces `previous_status` so the caller sees the flip.
+    // Future patches may add terminal-state guards. Unknown
+    // action_id returns `HydraError::QueryError("unknown action: ...")`
+    // via the action_store; the HTTP layer maps that to 404.
+
+    /// Approve a proposed (or otherwise non-terminal) action. The
+    /// `reason` is optional — operators may approve with no
+    /// rationale, or supply context that gets stored in the audit
+    /// log. Returns a clone of the post-cascade `Action`.
+    pub fn approve_action(
+        &mut self,
+        action_id: hydra_core::ActionId,
+        actor: hydra_core::ActorId,
+        reason: Option<String>,
+    ) -> hydra_core::error::Result<hydra_core::Action> {
+        // Validate the action exists BEFORE we ingest. The
+        // action_store would error on `mutate_action`, but the
+        // ingest would still record the event in the audit log.
+        // We want clean 404 semantics — no audit pollution from
+        // missing ids.
+        if self.action_store.action(&action_id).is_none() {
+            return Err(hydra_core::error::HydraError::QueryError(format!(
+                "unknown action: {action_id}"
+            )));
+        }
+        self.ingest(hydra_core::EventKind::ActionApproved {
+            action_id: action_id.clone(),
+            approved_by: actor,
+            reason,
+        })?;
+        self.action_store
+            .action(&action_id)
+            .cloned()
+            .ok_or_else(|| {
+                hydra_core::error::HydraError::QueryError(format!(
+                    "action vanished after approve: {action_id}"
+                ))
+            })
+    }
+
+    /// Reject a proposed (or otherwise non-terminal) action. The
+    /// `reason` is required — explicit rejection rationale is
+    /// load-bearing for audit + downstream learning. Returns a
+    /// clone of the post-cascade `Action`.
+    pub fn reject_action(
+        &mut self,
+        action_id: hydra_core::ActionId,
+        actor: hydra_core::ActorId,
+        reason: String,
+    ) -> hydra_core::error::Result<hydra_core::Action> {
+        if self.action_store.action(&action_id).is_none() {
+            return Err(hydra_core::error::HydraError::QueryError(format!(
+                "unknown action: {action_id}"
+            )));
+        }
+        self.ingest(hydra_core::EventKind::ActionRejected {
+            action_id: action_id.clone(),
+            rejected_by: actor,
+            reason,
+        })?;
+        self.action_store
+            .action(&action_id)
+            .cloned()
+            .ok_or_else(|| {
+                hydra_core::error::HydraError::QueryError(format!(
+                    "action vanished after reject: {action_id}"
+                ))
+            })
+    }
+
     pub fn executing_actions(&self) -> Vec<&hydra_core::Action> {
         self.action_store.executing_actions()
     }
@@ -4624,6 +4704,164 @@ mod tests {
         // Audit log records both action events.
         assert_eq!(count_action_events(&hydra), 2);
     }
+
+    // === MicroModel Patch 6 — operator approval helpers ===
+
+    fn propose_one_test_action(hydra: &mut Hydra) -> hydra_core::ActionId {
+        // Drive a Critical assessment so the engine cascade
+        // produces an ActionProposed event we can approve/reject.
+        // primed_hydra primes the model past warmup; ingesting 97
+        // signals on top of the existing ledger pushes the count
+        // into Critical territory.
+        *hydra = primed_hydra(10.0, 1.0);
+        let target = 100u64;
+        let need = target - ledger_count(hydra);
+        ingest_signals(hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        assessment.action_ids.into_iter().next().expect("critical produced an action")
+    }
+
+    #[test]
+    fn approve_action_flips_status_and_records_reason() {
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        // The Critical cascade auto-approves the Notify action via
+        // the policy agent — so the action may already be Approved
+        // before the operator's explicit approve. That's fine: the
+        // operator approval is still recorded in the audit log and
+        // the post-cascade state remains Approved.
+        let approver = hydra_core::ActorId::from_str("actor_oncall_alice");
+        let approved = hydra
+            .approve_action(
+                action_id.clone(),
+                approver.clone(),
+                Some("confirmed by alice".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(approved.id, action_id);
+        assert_eq!(approved.status, hydra_core::action::ActionStatus::Approved);
+        assert_eq!(approved.approved_by, Some(approver));
+        assert!(approved.approved_at.is_some());
+
+        // The ActionApproved event is in the audit log with the
+        // operator-supplied reason.
+        let found = hydra.events().iter().any(|event| {
+            matches!(
+                &event.kind,
+                hydra_core::EventKind::ActionApproved { reason: Some(r), .. }
+                if r == "confirmed by alice"
+            )
+        });
+        assert!(found, "explicit ActionApproved with operator reason missing");
+    }
+
+    #[test]
+    fn reject_action_flips_status_to_rejected() {
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        let rejecter = hydra_core::ActorId::from_str("actor_oncall_alice");
+        let rejected = hydra
+            .reject_action(
+                action_id.clone(),
+                rejecter.clone(),
+                "false alarm — planned maintenance".to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(rejected.id, action_id);
+        assert_eq!(
+            rejected.status,
+            hydra_core::action::ActionStatus::Rejected
+        );
+
+        // The ActionRejected event carries the rejecter + reason.
+        let found = hydra.events().iter().any(|event| {
+            matches!(
+                &event.kind,
+                hydra_core::EventKind::ActionRejected { rejected_by, reason, .. }
+                if rejected_by == &rejecter && reason == "false alarm — planned maintenance"
+            )
+        });
+        assert!(found);
+    }
+
+    #[test]
+    fn approve_unknown_action_returns_query_error() {
+        let mut hydra = Hydra::new();
+        let result = hydra.approve_action(
+            hydra_core::ActionId::from_str("act_does_not_exist"),
+            hydra_core::ActorId::from_str("actor_test"),
+            None,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown action"));
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+        // No spurious event lands in the audit log.
+        let count = hydra
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    hydra_core::EventKind::ActionApproved { .. }
+                )
+            })
+            .count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn reject_unknown_action_returns_query_error() {
+        let mut hydra = Hydra::new();
+        let result = hydra.reject_action(
+            hydra_core::ActionId::from_str("act_does_not_exist"),
+            hydra_core::ActorId::from_str("actor_test"),
+            "ghost".to_string(),
+        );
+        assert!(matches!(
+            result,
+            Err(hydra_core::error::HydraError::QueryError(_))
+        ));
+    }
+
+    #[test]
+    fn approve_action_is_idempotent_no_state_machine_enforcement() {
+        // v0 explicitly does NOT enforce terminal states. An
+        // already-Approved action can be approved again (a second
+        // approver overrides the first, audit captures both
+        // events). Documented as a Patch 6 limitation.
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        let _ = hydra
+            .approve_action(
+                action_id.clone(),
+                hydra_core::ActorId::from_str("actor_first"),
+                None,
+            )
+            .unwrap();
+        let second = hydra
+            .approve_action(
+                action_id.clone(),
+                hydra_core::ActorId::from_str("actor_second"),
+                None,
+            )
+            .unwrap();
+        // Status still Approved. Approver is now the second one.
+        assert_eq!(
+            second.status,
+            hydra_core::action::ActionStatus::Approved
+        );
+        assert_eq!(
+            second.approved_by,
+            Some(hydra_core::ActorId::from_str("actor_second"))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5098,6 +5336,7 @@ mod sprint1_tests {
             .ingest(EventKind::ActionApproved {
                 action_id: action_id.clone(),
                 approved_by: actor.clone(),
+                reason: None,
             })
             .unwrap();
         assert_eq!(hydra.approved_actions().len(), 1);

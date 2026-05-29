@@ -15,8 +15,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use hydra_core::ActorId;
 use hydra_net::http::{
-    commit_stream_router, commits_router, diagnostics_router, events_router, ingest_router,
-    lineage_router, micromodels_router, query_router, replication_promote_router,
+    actions_router, commit_stream_router, commits_router, diagnostics_router, events_router,
+    ingest_router, lineage_router, micromodels_router, query_router, replication_promote_router,
     replication_role_router, replication_router, schema_router, sensor_router, snapshots_router,
     CommitBroadcaster,
 };
@@ -159,6 +159,7 @@ pub fn build_router_with_security(
         .merge(lineage_router(runtime.clone()))
         .merge(diagnostics_router(runtime.clone()))
         .merge(micromodels_router(runtime.clone()))
+        .merge(actions_router(runtime.clone()))
         .merge(replication_router(runtime.clone()))
         .merge(replication_role_router(runtime.clone(), role_state.clone()));
 
