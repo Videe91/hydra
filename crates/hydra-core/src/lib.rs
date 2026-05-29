@@ -14,6 +14,7 @@ pub mod snapshot;
 pub mod subscription;
 pub mod micromodel;
 pub mod replication;
+pub mod trust;
 
 pub use id::{
     ActionId, ActorId, ApprovalId, CascadeId, ClaimId, CommitId, EdgeId, EventId, EvidenceId,
@@ -89,6 +90,9 @@ pub use replication::{
     ReplicationLag, ReplicationMode, ReplicationOffset, ReplicationPeer, ReplicationPeerStatus,
     ReplicationRole, ReplicationRun, ReplicationRunStatus,
 };
+pub use trust::{
+    is_cascade_approver, TrustAssessment, TrustFactor, TrustLevel, HYDRA_POLICY_AGENT_ACTOR,
+};
 
 /// Convenience re-exports for common types
 pub mod prelude {
@@ -132,6 +136,10 @@ pub mod prelude {
     pub use crate::replication::{
         ReplicationLag, ReplicationMode, ReplicationOffset, ReplicationPeer,
         ReplicationPeerStatus, ReplicationRole, ReplicationRun, ReplicationRunStatus,
+    };
+    pub use crate::trust::{
+        is_cascade_approver, TrustAssessment, TrustFactor, TrustLevel,
+        HYDRA_POLICY_AGENT_ACTOR,
     };
     pub use crate::node::{Node, NodeMeta, NodeValidator};
     pub use crate::edge::{Edge, EdgeMeta};

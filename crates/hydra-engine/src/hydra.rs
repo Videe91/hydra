@@ -2160,6 +2160,282 @@ impl Hydra {
         Ok(observation)
     }
 
+    // === Trust Patch 1 (Patch 9) — claim trust assessment =====
+    //
+    // Compute-only, deterministic, rule-based. Reads the audit
+    // chain produced by Patches 3–8 and returns a `TrustAssessment`.
+    // No events emitted, no store mutation, no HTTP, no SDK in
+    // this patch — the engine surface is read-only (`&self`).
+    //
+    // The factor weights are stable IDs that downstream patches
+    // (HTTP/SDK in Patch 10, auto-execute in Patch 11) will read
+    // by string key. Don't rename or repurpose without versioning.
+
+    /// Assess the trust score for one claim by walking its
+    /// audit chain — supporting evidence, contradicting evidence,
+    /// related actions, approvals, executions, outcomes, model
+    /// observations.
+    ///
+    /// Returns `QueryError("unknown claim: ...")` if the claim
+    /// isn't in the epistemic store.
+    ///
+    /// Special case for `ClaimStatus::Retracted`: the
+    /// `claim_retracted` factor still appears in the list with
+    /// `weight = -1.0`, but the assessor force-sets the final
+    /// `score` to `0.0` after factor evaluation so a retracted
+    /// claim can never be "rescued" by accidentally
+    /// counterbalancing positives.
+    pub fn assess_claim_trust(
+        &self,
+        claim_id: &hydra_core::ClaimId,
+    ) -> hydra_core::error::Result<hydra_core::TrustAssessment> {
+        let claim = self.epistemic_store.claim(claim_id).cloned().ok_or_else(
+            || {
+                hydra_core::error::HydraError::QueryError(format!(
+                    "unknown claim: {claim_id}"
+                ))
+            },
+        )?;
+
+        // Walk forward: claim → actions → outcomes; collect ids.
+        let related_actions: Vec<&hydra_core::Action> =
+            self.action_store.actions_for_claim(claim_id);
+        let related_action_ids: Vec<hydra_core::ActionId> =
+            related_actions.iter().map(|a| a.id.clone()).collect();
+        let mut related_outcome_ids: Vec<hydra_core::OutcomeId> = Vec::new();
+        for action in &related_actions {
+            for outcome in self.action_store.outcomes_for_action(&action.id) {
+                related_outcome_ids.push(outcome.id.clone());
+            }
+        }
+
+        // Walk back to the prediction (if any) so we can check
+        // whether a MicroModelObservation has been recorded.
+        // claim.caused_by → MicroModelPredictionRecorded → run_id
+        let observation_run_id: Option<hydra_core::MicroModelRunId> = claim
+            .caused_by
+            .as_ref()
+            .and_then(|event_id| self.event(event_id))
+            .and_then(|event| match &event.kind {
+                hydra_core::EventKind::MicroModelPredictionRecorded { prediction } => {
+                    Some(prediction.run_id.clone())
+                }
+                _ => None,
+            });
+        let observation_run_ids: Vec<hydra_core::MicroModelRunId> =
+            observation_run_id.iter().cloned().collect();
+
+        // Evaluate each factor. Helper closure standardizes the
+        // applied / detail / weight construction.
+        let mut factors: Vec<hydra_core::TrustFactor> = Vec::new();
+
+        // 1. claim_verified (+0.20)
+        let verified = matches!(
+            claim.status,
+            hydra_core::ClaimStatus::Verified | hydra_core::ClaimStatus::Operational
+        );
+        factors.push(hydra_core::TrustFactor {
+            kind: "claim_verified".to_string(),
+            weight: 0.20,
+            applied: verified,
+            detail: if verified {
+                format!("claim.status == {:?}", claim.status)
+            } else {
+                "claim has not reached Verified or Operational".to_string()
+            },
+        });
+
+        // 2. claim_supported (+0.10) — does NOT stack with verified.
+        let supported_only = matches!(claim.status, hydra_core::ClaimStatus::Supported);
+        factors.push(hydra_core::TrustFactor {
+            kind: "claim_supported".to_string(),
+            weight: 0.10,
+            applied: supported_only,
+            detail: if supported_only {
+                "claim.status == Supported (partial — evidence weak)".to_string()
+            } else {
+                "claim is not at Supported status".to_string()
+            },
+        });
+
+        // 3. high_confidence_claim (+0.10): claim.confidence >= 0.80
+        //    mirrors the verification policy default threshold.
+        let high_conf = claim.confidence.value() >= 0.80;
+        factors.push(hydra_core::TrustFactor {
+            kind: "high_confidence_claim".to_string(),
+            weight: 0.10,
+            applied: high_conf,
+            detail: format!(
+                "claim.confidence = {:.2} (threshold 0.80)",
+                claim.confidence.value()
+            ),
+        });
+
+        // 4. supporting_evidence_present (+0.10)
+        let supporting_count = claim.evidence_for.len();
+        factors.push(hydra_core::TrustFactor {
+            kind: "supporting_evidence_present".to_string(),
+            weight: 0.10,
+            applied: supporting_count >= 1,
+            detail: format!("{supporting_count} supporting evidence record(s)"),
+        });
+
+        // 5. reliable_supporting_evidence (+0.10): any evidence_for
+        //    has reliability >= 0.75 (verification policy default).
+        let reliable_evidence = claim.evidence_for.iter().any(|evidence_id| {
+            self.epistemic_store
+                .evidence(evidence_id)
+                .map(|e| e.reliability.value() >= 0.75)
+                .unwrap_or(false)
+        });
+        factors.push(hydra_core::TrustFactor {
+            kind: "reliable_supporting_evidence".to_string(),
+            weight: 0.10,
+            applied: reliable_evidence,
+            detail: if reliable_evidence {
+                "at least one supporting evidence has reliability >= 0.75".to_string()
+            } else {
+                "no supporting evidence meets the 0.75 reliability bar".to_string()
+            },
+        });
+
+        // 6. operator_approved (+0.15): any related action has
+        //    approved_by set to an actor that is NOT the cascade
+        //    auto-approver. v0 caveat: this only sees the LAST
+        //    approver on an action (Patch 6 is lenient/idempotent).
+        let operator_approved = related_actions.iter().any(|action| {
+            action
+                .approved_by
+                .as_ref()
+                .map(|actor| !hydra_core::is_cascade_approver(actor))
+                .unwrap_or(false)
+        });
+        factors.push(hydra_core::TrustFactor {
+            kind: "operator_approved".to_string(),
+            weight: 0.15,
+            applied: operator_approved,
+            detail: if operator_approved {
+                "at least one related action approved by a non-cascade actor".to_string()
+            } else {
+                "no operator approval found (cascade auto-approvals don't count)"
+                    .to_string()
+            },
+        });
+
+        // 7. action_executed (+0.15): any related action reached Executed.
+        let any_executed = related_actions
+            .iter()
+            .any(|action| action.status == hydra_core::ActionStatus::Executed);
+        factors.push(hydra_core::TrustFactor {
+            kind: "action_executed".to_string(),
+            weight: 0.15,
+            applied: any_executed,
+            detail: if any_executed {
+                "at least one related action reached Executed status".to_string()
+            } else {
+                "no related action has been executed".to_string()
+            },
+        });
+
+        // 8. outcome_recorded (+0.10)
+        let outcome_recorded = !related_outcome_ids.is_empty();
+        factors.push(hydra_core::TrustFactor {
+            kind: "outcome_recorded".to_string(),
+            weight: 0.10,
+            applied: outcome_recorded,
+            detail: format!(
+                "{} outcome(s) recorded across related actions",
+                related_outcome_ids.len()
+            ),
+        });
+
+        // 9. model_observation_exists (+0.10): Patch 8 path.
+        let observation_present = observation_run_id
+            .as_ref()
+            .and_then(|run_id| self.micromodel_store.observation(run_id))
+            .is_some();
+        factors.push(hydra_core::TrustFactor {
+            kind: "model_observation_exists".to_string(),
+            weight: 0.10,
+            applied: observation_present,
+            detail: if observation_present {
+                let run = observation_run_id
+                    .as_ref()
+                    .map(|r| r.to_string())
+                    .unwrap_or_default();
+                format!("MicroModelObservation recorded for run_id {run}")
+            } else if observation_run_id.is_some() {
+                "claim traces to a model prediction but no observation recorded yet"
+                    .to_string()
+            } else {
+                "claim is not model-derived (no MicroModelPredictionRecorded ancestor)"
+                    .to_string()
+            },
+        });
+
+        // 10. contradicting_evidence (-0.20)
+        let against_count = claim.evidence_against.len();
+        factors.push(hydra_core::TrustFactor {
+            kind: "contradicting_evidence".to_string(),
+            weight: -0.20,
+            applied: against_count >= 1,
+            detail: format!("{against_count} contradicting evidence record(s)"),
+        });
+
+        // 11. claim_disputed (-0.30)
+        let disputed = matches!(claim.status, hydra_core::ClaimStatus::Disputed);
+        factors.push(hydra_core::TrustFactor {
+            kind: "claim_disputed".to_string(),
+            weight: -0.30,
+            applied: disputed,
+            detail: if disputed {
+                "claim.status == Disputed".to_string()
+            } else {
+                "claim is not at Disputed status".to_string()
+            },
+        });
+
+        // 12. claim_retracted (-1.00): the heavy hammer.
+        let retracted = matches!(claim.status, hydra_core::ClaimStatus::Retracted);
+        factors.push(hydra_core::TrustFactor {
+            kind: "claim_retracted".to_string(),
+            weight: -1.00,
+            applied: retracted,
+            detail: if retracted {
+                "claim.status == Retracted (final score force-clamped to 0.0)".to_string()
+            } else {
+                "claim is not retracted".to_string()
+            },
+        });
+
+        // Sum applied weights → raw score, clamp to [0, 1].
+        let raw: f64 = factors
+            .iter()
+            .filter(|f| f.applied)
+            .map(|f| f.weight)
+            .sum();
+        let mut score = raw.clamp(0.0, 1.0);
+        // Special case: Retracted claims are always score 0.0
+        // regardless of accidental counterbalancing positives.
+        if retracted {
+            score = 0.0;
+        }
+        let level = hydra_core::TrustAssessment::level_for_score(score);
+        let explanation = build_trust_explanation(&claim, &factors, level, score);
+
+        Ok(hydra_core::TrustAssessment {
+            claim_id: claim.id.clone(),
+            score,
+            level,
+            explanation,
+            factors,
+            related_action_ids,
+            related_outcome_ids,
+            observation_run_ids,
+            assessed_at: chrono::Utc::now(),
+        })
+    }
+
     // === MicroModel Patch 2 — built-in CommitRateAnomalyModel ===
 
     /// Run one observation of the built-in commit-rate anomaly
@@ -3337,6 +3613,46 @@ impl Default for Hydra {
 }
 
 // === MicroModel Patch 3 — prediction → evidence + claim builders ===
+
+/// Compose a deterministic prose summary for a `TrustAssessment`.
+/// No LLM. Pattern-matchable by future trust dashboards and
+/// Patch 11's auto-execution policy. Module-private — the only
+/// caller is `Hydra::assess_claim_trust`.
+fn build_trust_explanation(
+    claim: &hydra_core::Claim,
+    factors: &[hydra_core::TrustFactor],
+    level: hydra_core::TrustLevel,
+    score: f64,
+) -> String {
+    let level_label = match level {
+        hydra_core::TrustLevel::High => "High",
+        hydra_core::TrustLevel::Medium => "Medium",
+        hydra_core::TrustLevel::Low => "Low",
+        hydra_core::TrustLevel::Unknown => "Unknown",
+    };
+    let applied: Vec<&hydra_core::TrustFactor> =
+        factors.iter().filter(|f| f.applied).collect();
+    let unapplied_count = factors.len() - applied.len();
+    if applied.is_empty() {
+        return format!(
+            "{level_label} trust (score {score:.2}): no factors fired for \
+             claim {claim_id}. Likely freshly proposed with no actions, evidence, \
+             or outcome chain yet.",
+            claim_id = claim.id
+        );
+    }
+    let factor_summary = applied
+        .iter()
+        .map(|f| f.kind.replace('_', " "))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{level_label} trust (score {score:.2}) for claim {claim_id}: \
+         {factor_summary}. ({unapplied} factor(s) checked but did not fire.)",
+        claim_id = claim.id,
+        unapplied = unapplied_count,
+    )
+}
 
 /// Format an `OutcomeKind` for inclusion in Patch 8's
 /// `observed_outcome` JSON. Mirrors the spec's wire shape:
@@ -5723,6 +6039,356 @@ mod tests {
             before,
             after
         );
+    }
+
+    // === Trust Patch 1 (Patch 9) — claim trust assessment ===
+
+    /// Lookup helper used by the trust tests below — find a factor
+    /// in the assessment by its stable kind id.
+    fn find_factor<'a>(
+        assessment: &'a hydra_core::TrustAssessment,
+        kind: &str,
+    ) -> &'a hydra_core::TrustFactor {
+        assessment
+            .factors
+            .iter()
+            .find(|f| f.kind == kind)
+            .unwrap_or_else(|| panic!("factor {kind} missing from assessment"))
+    }
+
+    /// Pin that the engine's hardcoded cascade-approver actor id
+    /// matches hydra-core's `HYDRA_POLICY_AGENT_ACTOR` constant.
+    /// If cascade.rs ever changes the magic string, this test
+    /// fires before the trust assessor silently loses the
+    /// cascade-vs-operator distinction.
+    #[test]
+    fn cascade_policy_actor_matches_hydra_core_constant() {
+        // Drive a single cascade approval (no policies registered →
+        // PolicyEvaluationDecision::Allow → ActionApproved) and
+        // verify the engine stamped the canonical magic string.
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        let action = hydra.action(&action_id).unwrap();
+        let approver = action
+            .approved_by
+            .as_ref()
+            .expect("cascade auto-approved the Notify action");
+        assert_eq!(approver.as_str(), hydra_core::HYDRA_POLICY_AGENT_ACTOR);
+        assert!(hydra_core::is_cascade_approver(approver));
+    }
+
+    #[test]
+    fn assess_claim_trust_unknown_claim_returns_query_error() {
+        let hydra = Hydra::new();
+        let result = hydra.assess_claim_trust(&hydra_core::ClaimId::from_str(
+            "claim_does_not_exist",
+        ));
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown claim"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    /// Drive the full reflex loop end-to-end and return
+    /// `(claim_id, outcome_id, run_id)` for trust tests.
+    fn drive_full_chain_for_trust(
+        hydra: &mut Hydra,
+    ) -> (
+        hydra_core::ClaimId,
+        hydra_core::OutcomeId,
+        hydra_core::MicroModelRunId,
+    ) {
+        *hydra = primed_hydra(10.0, 1.0);
+        let need = 100u64 - ledger_count(hydra);
+        ingest_signals(hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let action_id = assessment.action_ids[0].clone();
+        let claim_id = assessment.claim_id.clone().unwrap();
+        let report = hydra
+            .execute_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let prediction_event = hydra
+            .event(&assessment.prediction_event_id)
+            .unwrap();
+        let run_id = match &prediction_event.kind {
+            hydra_core::EventKind::MicroModelPredictionRecorded { prediction } => {
+                prediction.run_id.clone()
+            }
+            _ => panic!("expected MicroModelPredictionRecorded"),
+        };
+        // Patch 8: record observation back to the model.
+        hydra
+            .record_micro_model_observation_from_action_outcome(
+                report.outcome_id.clone(),
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        (claim_id, report.outcome_id, run_id)
+    }
+
+    #[test]
+    fn assess_claim_trust_full_chain_returns_high() {
+        // Full reflex loop + Patch 8 observation. Cascade
+        // auto-approved (no policies), so `operator_approved` does
+        // NOT fire — but every other positive factor should.
+        //
+        // Cascade-approved chain factor count (raw sum):
+        //   claim_verified           +0.20 (Patch 3's verification
+        //                                    cascade promotes the
+        //                                    critical claim past
+        //                                    the 0.80 threshold)
+        //   high_confidence_claim    +0.10 (critical = 0.90)
+        //   supporting_evidence_present +0.10
+        //   reliable_supporting_evidence +0.10
+        //   action_executed          +0.15
+        //   outcome_recorded         +0.10
+        //   model_observation_exists +0.10
+        //                            -----
+        //                            +0.85
+        // Without operator approval. That clears the 0.80 High
+        // threshold.
+        let mut hydra = Hydra::new();
+        let (claim_id, _outcome_id, _run_id) = drive_full_chain_for_trust(&mut hydra);
+        let assessment = hydra.assess_claim_trust(&claim_id).unwrap();
+
+        assert_eq!(assessment.claim_id, claim_id);
+        assert!(
+            assessment.score >= 0.80,
+            "expected High-tier score, got {:.3}: factors {:#?}",
+            assessment.score,
+            assessment.factors
+        );
+        assert_eq!(assessment.level, hydra_core::TrustLevel::High);
+        // Pin the explainable factors.
+        assert!(find_factor(&assessment, "claim_verified").applied);
+        assert!(find_factor(&assessment, "action_executed").applied);
+        assert!(find_factor(&assessment, "outcome_recorded").applied);
+        assert!(find_factor(&assessment, "model_observation_exists").applied);
+        // Cascade-only chain → operator_approved is false.
+        assert!(!find_factor(&assessment, "operator_approved").applied);
+        // Related-id collections are populated.
+        assert!(!assessment.related_action_ids.is_empty());
+        assert!(!assessment.related_outcome_ids.is_empty());
+        assert_eq!(assessment.observation_run_ids.len(), 1);
+    }
+
+    #[test]
+    fn assess_claim_trust_just_proposed_returns_low_or_unknown() {
+        // A claim that exists in isolation — no actions, no
+        // outcomes — should score below Medium. Most positive
+        // factors are gated on the action chain.
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let claim_id = hydra_core::ClaimId::new();
+        let claim = hydra_core::Claim {
+            id: claim_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ClaimKind::Hypothesis,
+            subject: hydra_core::ClaimSubject::System("hydra".to_string()),
+            predicate: "test_predicate".to_string(),
+            object: hydra_core::ClaimObject::Value(hydra_core::Value::Bool(true)),
+            confidence: hydra_core::Confidence::new(0.30),
+            status: hydra_core::ClaimStatus::Proposed,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: now,
+            valid_until: None,
+            created_by: actor,
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim })
+            .unwrap();
+        let assessment = hydra.assess_claim_trust(&claim_id).unwrap();
+        assert!(
+            assessment.level == hydra_core::TrustLevel::Low
+                || assessment.level == hydra_core::TrustLevel::Unknown,
+            "expected Low or Unknown, got {:?} (score {:.3})",
+            assessment.level,
+            assessment.score
+        );
+        assert_eq!(assessment.related_action_ids.len(), 0);
+        assert_eq!(assessment.related_outcome_ids.len(), 0);
+        assert_eq!(assessment.observation_run_ids.len(), 0);
+    }
+
+    #[test]
+    fn assess_claim_trust_retracted_claim_zeros_score() {
+        // Even with positive factors that COULD push the score
+        // above 0, a retracted claim must end up at score 0.0 /
+        // Unknown. This is the load-bearing safety check.
+        let mut hydra = Hydra::new();
+        let (claim_id, _outcome_id, _run_id) = drive_full_chain_for_trust(&mut hydra);
+        // Retract the claim — must be ingested as an event.
+        hydra
+            .ingest(hydra_core::EventKind::ClaimRetracted {
+                claim_id: claim_id.clone(),
+                reason: "test-only retraction".to_string(),
+                retracted_by: hydra_core::ActorId::from_str("actor_test"),
+            })
+            .unwrap();
+        let assessment = hydra.assess_claim_trust(&claim_id).unwrap();
+        assert_eq!(assessment.score, 0.0);
+        assert_eq!(assessment.level, hydra_core::TrustLevel::Unknown);
+        let retract_factor = find_factor(&assessment, "claim_retracted");
+        assert!(retract_factor.applied);
+        assert_eq!(retract_factor.weight, -1.00);
+        // claim_verified should also reflect the new status: a
+        // retracted claim is NOT verified.
+        assert!(!find_factor(&assessment, "claim_verified").applied);
+    }
+
+    #[test]
+    fn assess_claim_trust_contradicting_evidence_penalizes() {
+        // A claim with an evidence_against entry should see the
+        // contradicting_evidence factor applied (weight -0.20).
+        // The engine uses EventKind::ClaimDisputed to link
+        // refuting evidence to a claim (see epistemic_store's
+        // `add_disputing_evidence` path).
+        let mut hydra = Hydra::new();
+        let (claim_id, _, _) = drive_full_chain_for_trust(&mut hydra);
+        let now = chrono::Utc::now();
+        let evidence_id = hydra_core::EvidenceId::new();
+        let evidence = hydra_core::Evidence {
+            id: evidence_id.clone(),
+            tenant_id: None,
+            source: hydra_core::EvidenceSource::Human {
+                actor_id: hydra_core::ActorId::from_str("actor_test_human"),
+            },
+            payload: hydra_core::EvidencePayload {
+                kind: "manual_refutation".to_string(),
+                data: std::collections::HashMap::new(),
+            },
+            reliability: hydra_core::Confidence::new(0.90),
+            observed_at: now,
+            recorded_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded { evidence })
+            .unwrap();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimDisputed {
+                claim_id: claim_id.clone(),
+                evidence_id,
+                reason: Some("test refutation".to_string()),
+            })
+            .unwrap();
+        let assessment = hydra.assess_claim_trust(&claim_id).unwrap();
+        let contradict = find_factor(&assessment, "contradicting_evidence");
+        assert!(contradict.applied);
+        assert_eq!(contradict.weight, -0.20);
+    }
+
+    #[test]
+    fn assess_claim_trust_cascade_approved_does_not_count_as_operator() {
+        // The whole point of distinguishing actor_hydra_policy from
+        // an operator actor id: cascade auto-approval is NOT
+        // operator approval. This test pins that the trust score
+        // does NOT credit `operator_approved` when only the cascade
+        // approved the action.
+        let mut hydra = Hydra::new();
+        let (claim_id, _, _) = drive_full_chain_for_trust(&mut hydra);
+        let assessment = hydra.assess_claim_trust(&claim_id).unwrap();
+        let operator = find_factor(&assessment, "operator_approved");
+        assert!(!operator.applied);
+        assert!(operator.detail.contains("no operator approval"));
+        // But every related action does have approved_by set —
+        // it's just set to the cascade actor.
+        for action_id in &assessment.related_action_ids {
+            let action = hydra.action(action_id).unwrap();
+            let approver = action.approved_by.as_ref().unwrap();
+            assert!(hydra_core::is_cascade_approver(approver));
+        }
+    }
+
+    #[test]
+    fn assess_claim_trust_operator_approval_credits_factor() {
+        // Symmetric to the cascade test: register a HumanApproval
+        // policy so the cascade emits ApprovalRequested instead of
+        // auto-approving, then explicitly approve via the Patch 6
+        // helper. The operator_approved factor should then fire.
+        //
+        // We can't reuse `primed_hydra` here because it builds a
+        // fresh engine and would wipe the policy. Inline the prime
+        // so the policy survives.
+        let mut hydra = Hydra::new();
+        register_any_action_approval_policy(&mut hydra);
+        // Warm + seed the commit-rate model in-place.
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64 - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+        let assessment_obj = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let action_id = assessment_obj.action_ids[0].clone();
+        let claim_id = assessment_obj.claim_id.unwrap();
+        // Sanity: the HumanApproval policy meant the action sat in
+        // Proposed waiting for an operator.
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::action::ActionStatus::Proposed
+        );
+        let operator = hydra_core::ActorId::from_str("actor_oncall_alice");
+        hydra
+            .approve_action(action_id, operator.clone(), Some("LGTM".to_string()))
+            .unwrap();
+        let trust = hydra.assess_claim_trust(&claim_id).unwrap();
+        let operator_factor = find_factor(&trust, "operator_approved");
+        assert!(
+            operator_factor.applied,
+            "operator_approved factor must fire after Patch 6 approve_action by \
+             a non-cascade actor; got detail: {}",
+            operator_factor.detail,
+        );
+    }
+
+    #[test]
+    fn assess_claim_trust_factor_list_includes_unapplied_factors() {
+        // Even a fully-loaded chain doesn't fire every factor
+        // (e.g., claim_supported doesn't stack with claim_verified;
+        // contradicting_evidence isn't expected to fire). The
+        // assessment must STILL include the unapplied factors so
+        // the explanation is honest.
+        let mut hydra = Hydra::new();
+        let (claim_id, _, _) = drive_full_chain_for_trust(&mut hydra);
+        let assessment = hydra.assess_claim_trust(&claim_id).unwrap();
+        // 12 factors total per the table.
+        assert_eq!(assessment.factors.len(), 12);
+        let unapplied: Vec<&hydra_core::TrustFactor> =
+            assessment.factors.iter().filter(|f| !f.applied).collect();
+        assert!(
+            !unapplied.is_empty(),
+            "expected at least one unapplied factor; got all applied"
+        );
+        // A specific one we know shouldn't fire on a fresh chain:
+        let contradict = find_factor(&assessment, "contradicting_evidence");
+        assert!(!contradict.applied);
+        assert!(contradict.detail.contains("0 contradicting"));
+    }
+
+    #[test]
+    fn assess_claim_trust_walks_to_observation_when_present() {
+        // Patch 8 path: when an observation has been recorded for
+        // the claim's prediction run, the assessment surfaces the
+        // run_id in observation_run_ids AND
+        // model_observation_exists fires.
+        let mut hydra = Hydra::new();
+        let (claim_id, _, run_id) = drive_full_chain_for_trust(&mut hydra);
+        let assessment = hydra.assess_claim_trust(&claim_id).unwrap();
+        assert!(find_factor(&assessment, "model_observation_exists").applied);
+        assert_eq!(assessment.observation_run_ids, vec![run_id]);
     }
 }
 
