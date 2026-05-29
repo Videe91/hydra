@@ -308,6 +308,22 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
         if path.starts_with("/diagnostics/") {
             return vec!["write:diagnostics"];
         }
+        // Trust Patch 3 (Patch 11) — trust-aware auto-execution.
+        // **CRITICAL ORDERING**: this match MUST come before the
+        // general `/actions/.../execute` clause below, because
+        // `/auto-execute` also ends with `"execute"` — the more
+        // permissive ends_with check would otherwise catch it
+        // and return only `write:execute`, leaking the trust-read
+        // gate.
+        //
+        // Auto-execute requires BOTH scopes because the route both
+        // READS trust judgments (read:trust) AND may MUTATE state
+        // (write:execute). A token granted execute-only can't
+        // probe the trust assessment surface; a token granted
+        // trust-read alone can't trigger execution.
+        if path.starts_with("/actions/") && path.ends_with("/auto-execute") {
+            return vec!["read:trust", "write:execute"];
+        }
         // MicroModel Patch 7 — operator-triggered execution stub.
         // Match BEFORE the general /actions/* approve/reject block
         // so /actions/{id}/execute routes through `write:execute`
@@ -957,6 +973,21 @@ mod tests {
                 "/diagnostics/micromodels/observations/from-outcome/out-123",
             ),
             vec!["write:diagnostics"]
+        );
+        // Trust Patch 3 (Patch 11) — trust-aware auto-execute
+        // requires BOTH read:trust and write:execute. CRITICAL:
+        // the path match MUST come before the general
+        // /actions/.../execute clause because /auto-execute also
+        // ends with "execute". This pin catches ordering
+        // regressions immediately — if a future refactor reorders
+        // these clauses, this test fires before the route's
+        // security envelope silently drops to write:execute only.
+        assert_eq!(
+            required_scopes_for(
+                &Method::POST,
+                "/actions/act-123/auto-execute",
+            ),
+            vec!["read:trust", "write:execute"]
         );
         assert_eq!(
             required_scopes_for(&Method::GET, "/query/nodes"),

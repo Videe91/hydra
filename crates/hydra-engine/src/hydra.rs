@@ -2436,6 +2436,150 @@ impl Hydra {
         })
     }
 
+    // === Trust Patch 3 (Patch 11) — auto-execution gate ============
+    //
+    // The first AUTOMATION surface. Trust judges (Patches 9/10);
+    // automation acts on those judgments — but only when the
+    // judgment says it's safe.
+    //
+    // Patch 11 boundary:
+    //   ✓ Notify-kind actions only (other kinds → Err, never auto)
+    //   ✓ status == Approved precondition (human approval still
+    //     mandatory; Patch 11 only auto-EXECUTES, never auto-approves)
+    //   ✓ TrustLevel::High AND score >= caller's threshold
+    //   ✓ Single related_claim ([0]); v0 doesn't union across multiple
+    //
+    // Error vs decision split (per Patch 11 design):
+    //   - Unknown action_id            → Err (HTTP 404)
+    //   - Wrong KIND                   → Err (HTTP 400) — a Backfill
+    //                                    can NEVER be auto-executed by
+    //                                    this method, so it's a hard
+    //                                    contract error
+    //   - Wrong STATUS                 → Ok(executed=false, ...)
+    //                                    because the second call AFTER
+    //                                    success sees Executed and
+    //                                    must look the same as "not
+    //                                    Approved yet"
+    //   - No related_claims            → Ok(executed=false, trust=None)
+    //   - Trust assessor error         → Err (rare; defensive)
+    //   - Trust below threshold        → Ok(executed=false,
+    //                                       trust=Some(...))
+
+    /// Auto-execute an Approved Notify action when its related
+    /// claim's trust meets `min_trust_score` AND `TrustLevel::High`.
+    /// Returns a decision envelope — the decision IS the data, NOT
+    /// the success axis.
+    ///
+    /// `actor` is the actor recorded on the underlying Outcome /
+    /// `executed_by` when execution does fire. Operators typically
+    /// pass a stable id like `actor_hydra_trust_gate` so the audit
+    /// log distinguishes auto-execution from manual operator runs.
+    ///
+    /// `min_trust_score` is the score floor (independent of level —
+    /// caller may want `0.85` even though `High` starts at `0.80`).
+    pub fn auto_execute_trusted_notify_action(
+        &mut self,
+        action_id: hydra_core::ActionId,
+        actor: hydra_core::ActorId,
+        min_trust_score: f64,
+    ) -> hydra_core::error::Result<hydra_core::AutoExecutionDecision> {
+        // 1. Unknown action → hard 404. Validate-before-any-walk
+        //    matches the rest of the action lifecycle helpers.
+        let action = self.action_store.action(&action_id).cloned().ok_or_else(
+            || {
+                hydra_core::error::HydraError::QueryError(format!(
+                    "unknown action: {action_id}"
+                ))
+            },
+        )?;
+
+        // 2. Wrong KIND → hard error. A non-Notify action can NEVER
+        //    be auto-executed via this method, so the contract is
+        //    a 400, not a decision skip.
+        if action.kind != hydra_core::ActionKind::Notify {
+            return Err(hydra_core::error::HydraError::QueryError(format!(
+                "invalid action kind: {action_id} is not Notify \
+                 (Patch 11 only auto-executes Notify actions; got {:?})",
+                action.kind
+            )));
+        }
+
+        // 3. Wrong STATUS → DECISION SKIP, not error. After a
+        //    successful auto-execute, a second call sees status
+        //    == Executed; that response shape must match the
+        //    "not Approved yet" case so callers can poll
+        //    idempotently.
+        if action.status != hydra_core::ActionStatus::Approved {
+            return Ok(hydra_core::AutoExecutionDecision {
+                executed: false,
+                reason: format!(
+                    "action status is {:?}, not Approved (auto-execute only \
+                     fires for Approved actions)",
+                    action.status
+                ),
+                trust: None,
+                execution: None,
+            });
+        }
+
+        // 4. No related_claims → DECISION SKIP. The action exists,
+        //    it's Approved, it's Notify — but it wasn't proposed
+        //    via the MicroModel reflex chain so we have no claim
+        //    to trust-assess. Caller can fall back to manual
+        //    execute_notify_action.
+        let claim_id = match action.related_claims.first().cloned() {
+            Some(id) => id,
+            None => {
+                return Ok(hydra_core::AutoExecutionDecision {
+                    executed: false,
+                    reason: "action has no related_claims — not trust-assessable \
+                             (likely not a model-derived action)"
+                        .to_string(),
+                    trust: None,
+                    execution: None,
+                });
+            }
+        };
+
+        // 5. Assess the trust. This is the expensive step (walks
+        //    the audit chain) — only run when steps 1-4 cleared.
+        let assessment = self.assess_claim_trust(&claim_id)?;
+
+        // 6. Trust threshold. BOTH level == High AND score >=
+        //    min_trust_score must hold. Patch 9 force-clamps
+        //    Retracted to 0.0, so a retracted claim auto-fails
+        //    the score check.
+        let level_ok = matches!(assessment.level, hydra_core::TrustLevel::High);
+        let score_ok = assessment.score >= min_trust_score;
+        if !(level_ok && score_ok) {
+            return Ok(hydra_core::AutoExecutionDecision {
+                executed: false,
+                reason: format!(
+                    "trust insufficient: level={:?}, score={:.2} (min={:.2})",
+                    assessment.level, assessment.score, min_trust_score
+                ),
+                trust: Some(assessment),
+                execution: None,
+            });
+        }
+
+        // 7. Execute. Patch 7's execute_notify_action re-checks
+        //    the status precondition (defense in depth) and emits
+        //    the full ActionExecuting → ActionExecuted →
+        //    OutcomeObserved chain.
+        let report = self.execute_notify_action(action_id, actor)?;
+
+        Ok(hydra_core::AutoExecutionDecision {
+            executed: true,
+            reason: format!(
+                "trust High (score {:.2}) meets threshold {:.2}; auto-executed",
+                assessment.score, min_trust_score
+            ),
+            trust: Some(assessment),
+            execution: Some(report),
+        })
+    }
+
     // === MicroModel Patch 2 — built-in CommitRateAnomalyModel ===
 
     /// Run one observation of the built-in commit-rate anomaly
@@ -6389,6 +6533,377 @@ mod tests {
         let assessment = hydra.assess_claim_trust(&claim_id).unwrap();
         assert!(find_factor(&assessment, "model_observation_exists").applied);
         assert_eq!(assessment.observation_run_ids, vec![run_id]);
+    }
+
+    // === Trust Patch 3 (Patch 11) — auto-execution gate ===
+
+    /// Drive primed Hydra to Critical → cascade auto-approves the
+    /// Notify action → return action_id. The action is `Approved`
+    /// with `kind == Notify` and `related_claims = [claim_id]` —
+    /// the canonical happy-path input for auto-execute.
+    fn propose_approved_notify_action(hydra: &mut Hydra) -> hydra_core::ActionId {
+        *hydra = primed_hydra(10.0, 1.0);
+        let need = 100u64 - ledger_count(hydra);
+        ingest_signals(hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        assessment.action_ids[0].clone()
+    }
+
+    /// Build a high-trust scenario for Patch 11 auto-execute tests.
+    ///
+    /// **The architectural reality**: a fresh Notify action can't
+    /// reach `TrustLevel::High` because Patch 9's factor design
+    /// awards three positive factors (action_executed, outcome_
+    /// recorded, model_observation_exists) that all REQUIRE prior
+    /// execution. This is correct caution by design — Hydra is
+    /// stingy about trust until evidence of past success exists.
+    ///
+    /// The trick: drive a FULL chain end-to-end (gets to High
+    /// because action1 was executed + observed), then propose a
+    /// SECOND Notify action sharing the same claim. The shared
+    /// claim's trust now has all the "executed sibling" signals,
+    /// so the new action can pass the auto-execute gate.
+    ///
+    /// Returns `(new_action_id, shared_claim_id)`.
+    fn prepare_high_trust_approved_notify(
+        hydra: &mut Hydra,
+    ) -> (hydra_core::ActionId, hydra_core::ClaimId) {
+        let (claim_id, _outcome_id, _run_id) = drive_full_chain_for_trust(hydra);
+        // Sanity: trust on the shared claim is High now.
+        let trust = hydra.assess_claim_trust(&claim_id).unwrap();
+        assert_eq!(trust.level, hydra_core::TrustLevel::High);
+        assert!(trust.score >= 0.80);
+
+        // Ingest a SECOND Notify action linked to the same claim.
+        // Status starts Proposed; the cascade auto-approves
+        // (no policies registered after primed_hydra rebuild).
+        let now = chrono::Utc::now();
+        let action_id = hydra_core::ActionId::new();
+        let actor = hydra_core::ActorId::from_str("actor_test_sibling");
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Notify,
+            status: hydra_core::action::ActionStatus::Proposed,
+            targets: vec![hydra_core::action::ActionTarget::System(
+                "hydra".to_string(),
+            )],
+            related_claims: vec![claim_id.clone()],
+            supporting_evidence: vec![],
+            proposed_by: actor,
+            approved_by: None,
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        // Cascade auto-approves (no HumanApproval policy was
+        // registered for this test). Confirm.
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::action::ActionStatus::Approved
+        );
+        (action_id, claim_id)
+    }
+
+    #[test]
+    fn auto_execute_unknown_action_returns_query_error() {
+        let mut hydra = Hydra::new();
+        let result = hydra.auto_execute_trusted_notify_action(
+            hydra_core::ActionId::from_str("act_ghost"),
+            hydra_core::ActorId::from_str("actor_hydra_trust_gate"),
+            0.80,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown action"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_execute_refuses_non_notify_kind_with_hard_error() {
+        // KIND check is the contract boundary: a Backfill action
+        // CANNOT be auto-executed by this method, regardless of
+        // trust. v0 enforces with a hard QueryError ("invalid
+        // action kind"), which HTTP maps to 400.
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let action_id = hydra_core::ActionId::new();
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Backfill,
+            status: hydra_core::action::ActionStatus::Approved,
+            targets: vec![hydra_core::action::ActionTarget::Dataset(
+                "orders".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: Some(actor),
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: Some(now),
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        let result = hydra.auto_execute_trusted_notify_action(
+            action_id,
+            hydra_core::ActorId::from_str("actor_hydra_trust_gate"),
+            0.80,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("invalid action kind"), "msg: {msg}");
+                assert!(msg.contains("Notify"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_execute_with_non_approved_status_returns_decision_skip() {
+        // STATUS is a decision skip, not a hard error — so the
+        // second call after a successful auto-execute (which leaves
+        // the action in Executed) returns the same shape as
+        // "Proposed waiting for approval". Pin both halves.
+        let mut hydra = Hydra::new();
+        register_any_action_approval_policy(&mut hydra);
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let action_id = hydra_core::ActionId::new();
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Notify,
+            status: hydra_core::action::ActionStatus::Proposed,
+            targets: vec![hydra_core::action::ActionTarget::System(
+                "hydra".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: None,
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        // Sanity: action is Proposed (the registered policy kept it).
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::action::ActionStatus::Proposed
+        );
+        let decision = hydra
+            .auto_execute_trusted_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_hydra_trust_gate"),
+                0.80,
+            )
+            .unwrap();
+        assert!(!decision.executed);
+        assert!(decision.reason.contains("not Approved"));
+        assert!(decision.trust.is_none());
+        assert!(decision.execution.is_none());
+    }
+
+    #[test]
+    fn auto_execute_with_no_related_claims_skips() {
+        // Approved Notify action that wasn't model-derived
+        // (related_claims is empty) gets a clean skip with
+        // trust=None.
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let action_id = hydra_core::ActionId::new();
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Notify,
+            status: hydra_core::action::ActionStatus::Approved,
+            targets: vec![hydra_core::action::ActionTarget::System(
+                "hydra".to_string(),
+            )],
+            related_claims: vec![], // ← skip reason
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: Some(actor),
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: Some(now),
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        let decision = hydra
+            .auto_execute_trusted_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_hydra_trust_gate"),
+                0.80,
+            )
+            .unwrap();
+        assert!(!decision.executed);
+        assert!(decision.reason.contains("no related_claims"));
+        assert!(decision.trust.is_none());
+        assert!(decision.execution.is_none());
+    }
+
+    #[test]
+    fn auto_execute_with_low_trust_skips_and_returns_assessment() {
+        // Trust populated even on skip — operators can see WHY
+        // auto-execute refused. A FRESH chain (no prior execution
+        // history) maxes out at score ~0.50 (Medium), so even
+        // a threshold of 0.50 + level check together force a
+        // skip with the assessment surfaced.
+        let mut hydra = Hydra::new();
+        let action_id = propose_approved_notify_action(&mut hydra);
+        let decision = hydra
+            .auto_execute_trusted_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_hydra_trust_gate"),
+                0.80,
+            )
+            .unwrap();
+        assert!(!decision.executed);
+        assert!(decision.reason.contains("trust insufficient"));
+        let trust = decision.trust.as_ref().expect("trust populated on skip");
+        // A fresh chain (no execution history) is Medium-tier at best.
+        assert_ne!(trust.level, hydra_core::TrustLevel::High);
+        assert!(decision.execution.is_none());
+    }
+
+    #[test]
+    fn auto_execute_with_high_trust_executes_and_returns_full_envelope() {
+        // Happy path needs HISTORICAL trust signals: action_executed,
+        // outcome_recorded, model_observation_exists all need a prior
+        // execution to fire. We arrange that by driving a full chain
+        // (first action executes + observes), then proposing a
+        // SECOND Notify action on the same claim. The shared claim
+        // now has High trust, and the new action can pass the gate.
+        //
+        // This mirrors the production flow where calibration history
+        // (Patch 13) will make first-time auto-execute meaningful.
+        let mut hydra = Hydra::new();
+        let (action_id, _claim_id) = prepare_high_trust_approved_notify(&mut hydra);
+        let decision = hydra
+            .auto_execute_trusted_notify_action(
+                action_id.clone(),
+                hydra_core::ActorId::from_str("actor_hydra_trust_gate"),
+                0.80,
+            )
+            .unwrap();
+        assert!(decision.executed, "decision: {decision:#?}");
+        assert!(decision.reason.contains("trust High"));
+        let trust = decision.trust.as_ref().expect("trust populated on execute");
+        assert_eq!(trust.level, hydra_core::TrustLevel::High);
+        assert!(trust.score >= 0.80);
+        let execution = decision
+            .execution
+            .as_ref()
+            .expect("execution populated on execute");
+        assert_eq!(execution.action_id, action_id);
+        assert_eq!(
+            execution.final_status,
+            hydra_core::ActionStatus::Executed
+        );
+        // The action is actually Executed in the store.
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::ActionStatus::Executed
+        );
+    }
+
+    #[test]
+    fn auto_execute_retracted_claim_skips() {
+        // Patch 9 force-clamps Retracted claims to score 0.0.
+        // Auto-execute's `score >= min_trust_score` check fires
+        // BEFORE execute_notify_action ever runs.
+        let mut hydra = Hydra::new();
+        let (action_id, claim_id) = prepare_high_trust_approved_notify(&mut hydra);
+        // Retract the shared claim — sibling action was already
+        // Executed earlier (it's how we got to High); the new
+        // action_id is still Approved, but its claim is now
+        // retracted so auto-execute must skip.
+        hydra
+            .ingest(hydra_core::EventKind::ClaimRetracted {
+                claim_id,
+                retracted_by: hydra_core::ActorId::from_str("actor_oncall"),
+                reason: "false alarm".to_string(),
+            })
+            .unwrap();
+        let decision = hydra
+            .auto_execute_trusted_notify_action(
+                action_id.clone(),
+                hydra_core::ActorId::from_str("actor_hydra_trust_gate"),
+                0.80,
+            )
+            .unwrap();
+        assert!(!decision.executed);
+        let trust = decision.trust.as_ref().unwrap();
+        assert_eq!(trust.score, 0.0);
+        assert_ne!(trust.level, hydra_core::TrustLevel::High);
+        // Action remains Approved — auto-execute didn't fire.
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::ActionStatus::Approved
+        );
+    }
+
+    #[test]
+    fn auto_execute_double_call_second_returns_status_skip() {
+        // First call: succeeds, executes, action → Executed.
+        // Second call on same action: status check fires →
+        // executed=false, reason about non-Approved status.
+        // The decision envelope shape is identical to the
+        // "not Approved yet" case — callers can poll idempotently.
+        let mut hydra = Hydra::new();
+        let (action_id, _claim_id) = prepare_high_trust_approved_notify(&mut hydra);
+        let first = hydra
+            .auto_execute_trusted_notify_action(
+                action_id.clone(),
+                hydra_core::ActorId::from_str("actor_hydra_trust_gate"),
+                0.80,
+            )
+            .unwrap();
+        assert!(first.executed, "first call should fire: {first:#?}");
+        let second = hydra
+            .auto_execute_trusted_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_hydra_trust_gate"),
+                0.80,
+            )
+            .unwrap();
+        assert!(!second.executed);
+        assert!(second.reason.contains("not Approved"));
+        assert!(second.reason.contains("Executed"));
+        assert!(second.trust.is_none());
+        assert!(second.execution.is_none());
     }
 }
 

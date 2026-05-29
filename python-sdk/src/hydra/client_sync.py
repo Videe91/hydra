@@ -35,6 +35,7 @@ from ._types import (
     ActionStatus,
     ActionTransitionResponse,
     ActorId,
+    AutoExecutionDecision,
     Claim,
     ClaimId,
     ClaimKind,
@@ -348,6 +349,29 @@ class HydraSync:
     # ========================================================================
     # Trust Patch 2 (Patch 10) — read-only trust assessment (sync mirror)
     # ========================================================================
+
+    def auto_execute_action_if_trusted(
+        self,
+        action_id: ActionId,
+        *,
+        actor: ActorId,
+        min_trust_score: float = 0.80,
+        tenant: TenantId | None = None,
+    ) -> AutoExecutionDecision:
+        """Sync mirror of `Hydra.auto_execute_action_if_trusted`.
+        Same wire contract, same decision-envelope semantics,
+        same error mapping. See the async docstring for full
+        details."""
+        body: dict[str, Any] = {
+            "actor": actor,
+            "min_trust_score": min_trust_score,
+        }
+        raw = self._http.post(
+            _paths.action_auto_execute_path(action_id),
+            json=body,
+            tenant=tenant,
+        )
+        return AutoExecutionDecision.model_validate(raw)
 
     def assess_claim_trust(
         self,

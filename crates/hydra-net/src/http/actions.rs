@@ -59,14 +59,19 @@ impl ActionsHttpState {
     }
 }
 
-/// Build the actions router. Three routes today: `/approve` +
-/// `/reject` (Patch 6 — governance gate) and `/execute` (Patch 7 —
-/// internal execution stub for Notify actions).
+/// Build the actions router. Four routes today: `/approve` +
+/// `/reject` (Patch 6 — governance gate), `/execute` (Patch 7 —
+/// internal execution stub for Notify actions), and
+/// `/auto-execute` (Patch 11 — trust-aware auto-execution gate).
 pub fn actions_router(runtime: RuntimeHandle) -> Router {
     Router::new()
         .route("/actions/:action_id/approve", post(approve_action))
         .route("/actions/:action_id/reject", post(reject_action))
         .route("/actions/:action_id/execute", post(execute_action))
+        .route(
+            "/actions/:action_id/auto-execute",
+            post(auto_execute_action),
+        )
         .with_state(ActionsHttpState::new(runtime))
 }
 
@@ -319,6 +324,90 @@ async fn execute_action(
         outcome_id: report.outcome_id,
         executed_by: report.executed_by,
         executed_at: report.executed_at,
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+// === Trust Patch 3 (Patch 11) — auto-execution gate ============
+
+/// Body for `POST /actions/{id}/auto-execute`.
+///
+/// `min_trust_score` is the floor — auto-execute requires BOTH
+/// `trust.level == High` AND `trust.score >= min_trust_score`.
+/// Defaults to `0.80` on the SDK side; the wire format requires
+/// the caller to send it explicitly so deployments can pick their
+/// own minimum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoExecuteActionRequest {
+    pub actor: ActorId,
+    pub min_trust_score: f64,
+}
+
+/// Wire response for `POST /actions/{id}/auto-execute`.
+///
+/// Mirrors `hydra_core::AutoExecutionDecision`. Returns 200 in
+/// every non-error case — the `executed` boolean is the binding
+/// decision, not the HTTP status. `trust` is populated whenever
+/// the assessor ran (i.e., the action passed kind+status+claim
+/// preconditions); `execution` is populated only when
+/// `executed == true`.
+///
+/// `previous_status` / `final_status` inside the embedded
+/// execution use lowercase wire form for consistency with the
+/// Patch 7 execute envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoExecuteActionResponse {
+    pub executed: bool,
+    pub reason: String,
+    pub trust: Option<hydra_core::TrustAssessment>,
+    pub execution: Option<ActionExecutionResponse>,
+}
+
+async fn auto_execute_action(
+    State(state): State<ActionsHttpState>,
+    Path(action_id): Path<String>,
+    request: Result<Json<AutoExecuteActionRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Json(req)) => req,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid request body: {err}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let action_id = ActionId::from_str(&action_id);
+    let hydra = state.runtime.hydra();
+    let mut hydra = hydra.write().await;
+
+    let decision = match hydra.auto_execute_trusted_notify_action(
+        action_id,
+        request.actor.clone(),
+        request.min_trust_score,
+    ) {
+        Ok(d) => d,
+        Err(err) => return engine_error_response(err),
+    };
+
+    // Translate the embedded ActionExecutionReport into the wire
+    // envelope's lowercase-status form, mirroring Patch 7.
+    let execution_wire = decision.execution.map(|report| ActionExecutionResponse {
+        action_id: report.action_id,
+        previous_status: status_wire_name(&report.previous_status).to_string(),
+        final_status: status_wire_name(&report.final_status).to_string(),
+        outcome_id: report.outcome_id,
+        executed_by: report.executed_by,
+        executed_at: report.executed_at,
+    });
+    let body = AutoExecuteActionResponse {
+        executed: decision.executed,
+        reason: decision.reason,
+        trust: decision.trust,
+        execution: execution_wire,
     };
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -917,5 +1006,293 @@ mod tests {
             serde_json::from_slice(&read_body_bytes(exec_resp).await).unwrap();
         assert_eq!(body.previous_status, "approved");
         assert_eq!(body.final_status, "executed");
+    }
+
+    // === Trust Patch 3 (Patch 11) — auto-execution gate ===
+
+    /// Ingest a fresh model-derived Approved Notify action. Trust on
+    /// its claim will be Medium (~0.50) — auto-execute must skip.
+    /// Returns (action_id, claim_id).
+    async fn ingest_fresh_model_chain(
+        runtime: &crate::runtime::RuntimeHandle,
+    ) -> (hydra_core::ActionId, hydra_core::ClaimId) {
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        // Warm the model + prime to a hot baseline (inline so this
+        // file doesn't reach into the engine test module's
+        // helpers).
+        hydra
+            .evaluate_commit_rate_anomaly(actor.clone())
+            .unwrap();
+        hydra.set_commit_rate_anomaly_model(primed_test_model());
+        let need = 100u64.saturating_sub(hydra.commit_count() as u64);
+        for i in 0..need {
+            hydra
+                .ingest(EventKind::Signal {
+                    source: hydra_core::NodeId::from_str("test.signal"),
+                    name: format!("test_signal_{i}"),
+                    payload: HashMap::new(),
+                })
+                .unwrap();
+        }
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(actor)
+            .unwrap();
+        (
+            assessment.action_ids[0].clone(),
+            assessment.claim_id.unwrap(),
+        )
+    }
+
+    fn primed_test_model() -> hydra_engine::micromodels::CommitRateAnomalyModel {
+        use hydra_engine::micromodels::{CommitRateAnomalyConfig, CommitRateAnomalyModel};
+        let config = CommitRateAnomalyConfig::default();
+        let mut state = hydra_engine::micromodels::CommitRateAnomalyState::default();
+        state.ewma_rate = 10.0;
+        state.ewma_variance = 1.0;
+        state.samples_seen = (config.warmup_samples + 5) as u64;
+        state.last_observed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(120));
+        CommitRateAnomalyModel::with_state(config, state)
+    }
+
+    /// Drive a full chain (execute + observe to get to High trust)
+    /// then propose a SECOND Notify action sharing the claim. The
+    /// new action is Approved with High-trust signals inherited
+    /// from the sibling's execution history.
+    async fn ingest_high_trust_sibling(
+        runtime: &crate::runtime::RuntimeHandle,
+    ) -> hydra_core::ActionId {
+        let (first_action_id, claim_id) = ingest_fresh_model_chain(runtime).await;
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        // Execute the first action + observe → trust High on claim.
+        let report = hydra
+            .execute_notify_action(first_action_id, actor.clone())
+            .unwrap();
+        hydra
+            .record_micro_model_observation_from_action_outcome(
+                report.outcome_id,
+                actor.clone(),
+            )
+            .unwrap();
+        // Sanity: trust on shared claim is High.
+        let trust = hydra.assess_claim_trust(&claim_id).unwrap();
+        assert_eq!(trust.level, hydra_core::TrustLevel::High);
+
+        // Propose a sibling action linked to the same claim.
+        let now = chrono::Utc::now();
+        let sibling_id = hydra_core::ActionId::new();
+        let sibling = Action {
+            id: sibling_id.clone(),
+            tenant_id: None,
+            kind: ActionKind::Notify,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("hydra".to_string())],
+            related_claims: vec![claim_id],
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(EventKind::ActionProposed { action: sibling })
+            .unwrap();
+        // Cascade auto-approves (no HumanApproval policy registered).
+        assert_eq!(
+            hydra.action(&sibling_id).unwrap().status,
+            ActionStatus::Approved
+        );
+        sibling_id
+    }
+
+    #[tokio::test]
+    async fn auto_execute_with_high_trust_returns_full_envelope() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let sibling_id = ingest_high_trust_sibling(&runtime).await;
+        let app = actions_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/actions/{sibling_id}/auto-execute"),
+                serde_json::json!({
+                    "actor": actor_id("actor_hydra_trust_gate"),
+                    "min_trust_score": 0.80,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: AutoExecuteActionResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(body.executed, "decision: {body:#?}");
+        assert!(body.reason.contains("trust High"));
+        let trust = body.trust.as_ref().unwrap();
+        assert_eq!(trust.level, hydra_core::TrustLevel::High);
+        assert!(trust.score >= 0.80);
+        let execution = body.execution.as_ref().unwrap();
+        assert_eq!(execution.previous_status, "approved");
+        assert_eq!(execution.final_status, "executed");
+    }
+
+    #[tokio::test]
+    async fn auto_execute_with_low_trust_returns_200_skip_envelope() {
+        // The decision endpoint contract: trust below threshold
+        // returns 200 with executed=false. NOT 400 or 409 — the
+        // decision is the data.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (action_id, _) = ingest_fresh_model_chain(&runtime).await;
+        let app = actions_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/actions/{action_id}/auto-execute"),
+                serde_json::json!({
+                    "actor": actor_id("actor_hydra_trust_gate"),
+                    "min_trust_score": 0.80,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: AutoExecuteActionResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(!body.executed);
+        assert!(body.reason.contains("trust insufficient"));
+        assert!(body.trust.is_some(), "trust populated on skip");
+        assert!(body.execution.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_execute_unknown_action_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = actions_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/actions/act_ghost/auto-execute",
+                serde_json::json!({
+                    "actor": actor_id("actor_hydra_trust_gate"),
+                    "min_trust_score": 0.80,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn auto_execute_refuses_non_notify_kind_with_400() {
+        // KIND is the hard contract: a Backfill can NEVER be
+        // auto-executed by this method. Returns 400, NOT a
+        // 200 skip envelope.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let action_id = hydra_core::ActionId::new();
+        let now = chrono::Utc::now();
+        let action = Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: ActionKind::Backfill,
+            status: ActionStatus::Approved,
+            targets: vec![ActionTarget::Dataset("orders".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: Some(actor),
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: Some(now),
+            executed_at: None,
+            caused_by: None,
+        };
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest(EventKind::ActionProposed { action })
+                .unwrap();
+        }
+        let app = actions_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/actions/{action_id}/auto-execute"),
+                serde_json::json!({
+                    "actor": actor_id("actor_hydra_trust_gate"),
+                    "min_trust_score": 0.80,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(body.error.contains("invalid action kind"), "got: {}", body.error);
+    }
+
+    #[tokio::test]
+    async fn auto_execute_with_no_related_claims_returns_200_skip() {
+        // Approved Notify action with no claim → 200 skip with
+        // trust=null. Different from kind error (which is 400)
+        // because operators may pre-ingest non-model Notify
+        // actions that need fall-back to manual execute.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let action_id = hydra_core::ActionId::new();
+        let now = chrono::Utc::now();
+        let action = Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: ActionKind::Notify,
+            status: ActionStatus::Approved,
+            targets: vec![ActionTarget::System("hydra".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: Some(actor),
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: Some(now),
+            executed_at: None,
+            caused_by: None,
+        };
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest(EventKind::ActionProposed { action })
+                .unwrap();
+        }
+        let app = actions_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/actions/{action_id}/auto-execute"),
+                serde_json::json!({
+                    "actor": actor_id("actor_hydra_trust_gate"),
+                    "min_trust_score": 0.80,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: AutoExecuteActionResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(!body.executed);
+        assert!(body.reason.contains("no related_claims"));
+        assert!(body.trust.is_none());
+        assert!(body.execution.is_none());
     }
 }

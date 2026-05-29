@@ -32,6 +32,7 @@ from ._types import (
     ActionStatus,
     ActionTransitionResponse,
     ActorId,
+    AutoExecutionDecision,
     Claim,
     ClaimId,
     ClaimKind,
@@ -438,6 +439,54 @@ class Hydra:
     # ========================================================================
     # Trust Patch 2 (Patch 10) — read-only trust assessment
     # ========================================================================
+
+    async def auto_execute_action_if_trusted(
+        self,
+        action_id: ActionId,
+        *,
+        actor: ActorId,
+        min_trust_score: float = 0.80,
+        tenant: TenantId | None = None,
+    ) -> AutoExecutionDecision:
+        """Trust-gated auto-execution (Trust Patch 3 / Patch 11) —
+        `POST /actions/{action_id}/auto-execute`.
+
+        Hydra reads the action's claim trust; if `level == High`
+        AND `score >= min_trust_score`, it fires the underlying
+        execute path. Otherwise returns a decision envelope with
+        `executed=false` and the trust assessment so callers
+        understand WHY.
+
+        v0 boundary:
+          - Notify-kind ONLY. Other kinds → 400.
+          - `status == Approved` required (manual operator approval
+            is NOT skipped — Patch 11 only auto-EXECUTES). Other
+            statuses → 200 with `executed=false` (decision skip).
+          - Single related_claim. Multi-claim aggregation is a
+            future patch.
+
+        Default `min_trust_score=0.80` matches Patch 9's High
+        threshold; operators can pass a stricter value (e.g.
+        `0.95`) for higher-blast-radius actions even though Patch
+        11 itself only runs on Notify.
+
+        Errors:
+          - 400 → `HydraValidationError`: wrong kind (hard contract)
+          - 404 → `HydraNotFoundError`: unknown action_id
+          - All other outcomes (low trust, wrong status, no
+            related claim) return 200 with `executed=false`
+            and an explanatory `reason`.
+        """
+        body: dict[str, Any] = {
+            "actor": actor,
+            "min_trust_score": min_trust_score,
+        }
+        raw = await self._http.post(
+            _paths.action_auto_execute_path(action_id),
+            json=body,
+            tenant=tenant,
+        )
+        return AutoExecutionDecision.model_validate(raw)
 
     async def assess_claim_trust(
         self,

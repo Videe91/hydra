@@ -181,6 +181,21 @@ def action_execute_path(action_id: str) -> str:
     return f"/actions/{_seg(action_id)}/execute"
 
 
+def action_auto_execute_path(action_id: str) -> str:
+    """`POST /actions/{action_id}/auto-execute` — Trust Patch 3
+    (Patch 11). Trust-gated auto-execution. Hydra reads the
+    claim's TrustAssessment (Patch 9/10); if `level == High` AND
+    `score >= min_trust_score`, calls execute_notify_action.
+    Returns 200 with an `AutoExecutionDecision` envelope on every
+    non-error case — the `executed` boolean is the decision, NOT
+    the success axis. 400 only on wrong kind (Backfill etc.);
+    404 on unknown id.
+
+    Body: `{actor, min_trust_score}`. Auth requires BOTH
+    `read:trust` and `write:execute` (Patch 11 ordering rule)."""
+    return f"/actions/{_seg(action_id)}/auto-execute"
+
+
 # === /trust/* (Trust Patch 2 / Patch 10 — read-only trust surface) ===
 #
 # The `/trust/*` namespace is reserved for the whole Trust Layer.

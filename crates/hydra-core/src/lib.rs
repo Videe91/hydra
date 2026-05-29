@@ -12,6 +12,7 @@ pub mod edge;
 pub mod graph;
 pub mod snapshot;
 pub mod subscription;
+pub mod automation;
 pub mod micromodel;
 pub mod replication;
 pub mod trust;
@@ -93,6 +94,7 @@ pub use replication::{
 pub use trust::{
     is_cascade_approver, TrustAssessment, TrustFactor, TrustLevel, HYDRA_POLICY_AGENT_ACTOR,
 };
+pub use automation::AutoExecutionDecision;
 
 /// Convenience re-exports for common types
 pub mod prelude {
@@ -141,6 +143,7 @@ pub mod prelude {
         is_cascade_approver, TrustAssessment, TrustFactor, TrustLevel,
         HYDRA_POLICY_AGENT_ACTOR,
     };
+    pub use crate::automation::AutoExecutionDecision;
     pub use crate::node::{Node, NodeMeta, NodeValidator};
     pub use crate::edge::{Edge, EdgeMeta};
     pub use crate::graph::{GraphReader, TraversalDirection, bfs, bfs_dyn, topological_sort};

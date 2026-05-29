@@ -1548,3 +1548,46 @@ class TrustAssessment(BaseModel):
     related_outcome_ids: list[OutcomeId] = Field(default_factory=list)
     observation_run_ids: list[MicroModelRunId] = Field(default_factory=list)
     assessed_at: str
+
+
+# === Trust Patch 3 (Patch 11) — auto-execution decision ===
+#
+# The decision endpoint contract: every non-error case returns
+# 200 with this envelope. `executed` is the binding decision —
+# `executed=true` when Hydra auto-fired the action; `false`
+# otherwise (insufficient trust, missing claim, wrong status).
+# `trust` is populated whenever the assessor ran; `execution`
+# only when `executed=true`.
+
+
+class AutoExecutionDecision(BaseModel):
+    """Response envelope for `POST /actions/{id}/auto-execute`
+    (Trust Patch 3 / Patch 11).
+
+    The decision IS the data, NOT the success axis:
+
+    - `executed=True`: Hydra auto-fired the action. `trust` and
+      `execution` are both populated.
+    - `executed=False, trust=Some, execution=None`: trust was
+      assessed but didn't clear the bar (level < High OR
+      score < min_trust_score).
+    - `executed=False, trust=None, execution=None`: the action
+      failed kind/status/claim preconditions BEFORE trust was
+      read. `reason` explains which check failed.
+
+    HTTP only 400/404 for hard errors (unknown action, wrong
+    kind). Trust-below-threshold and wrong-status both surface
+    as 200 with `executed=False` — operators can poll
+    idempotently across the action lifecycle.
+
+    Distinct from Patch 6/7 envelopes: this one composes other
+    typed sub-objects (TrustAssessment + ActionExecutionResponse)
+    rather than carrying a flat status field.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    executed: bool
+    reason: str
+    trust: TrustAssessment | None = None
+    execution: ActionExecutionResponse | None = None
