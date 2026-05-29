@@ -1597,3 +1597,55 @@ class AutoExecutionDecision(BaseModel):
     reason: str
     trust: TrustAssessment | None = None
     execution: ActionExecutionResponse | None = None
+
+
+# === Trust Patch 7 (Patch 15) — auto-approval envelope ============
+#
+# Symmetric with AutoExecutionDecision but for the PROPOSED →
+# APPROVED transition. `approved_by` is `actor_hydra_trust_gate`
+# (stable constant) when `approved == true`; `None` on every skip
+# path. No `execution` field — Patch 15 deliberately does NOT
+# auto-execute. Operators wanting auto-approve-then-execute call
+# the Patch 11 auto-execute endpoint on the resulting Approved
+# action.
+
+
+class AutoApprovalDecision(BaseModel):
+    """Response envelope for `POST /actions/{id}/auto-approve`
+    (Trust Patch 7 / Patch 15).
+
+    The decision IS the data, NOT the success axis:
+
+    - `approved=True`: Hydra ingested ActionApproved stamped with
+      `actor_hydra_trust_gate`. `trust` carries the assessment
+      that justified it. `approved_by` is
+      `actor_hydra_trust_gate`.
+    - `approved=False, trust=Some`: trust was assessed but a gate
+      vetoed — score below threshold, level below High, no
+      operator-approved history yet, or a hard-block factor
+      applied (contradicting_evidence, claim_disputed,
+      claim_retracted, model_operator_rejected_historically).
+      `reason` names the specific gate.
+    - `approved=False, trust=None`: the action failed
+      kind/status/claim preconditions BEFORE trust was read.
+
+    HTTP only 400/404 for hard errors (unknown action, wrong
+    kind). Score-below-threshold, hard-block factors, and
+    wrong-status all surface as 200 with `approved=False`.
+
+    Critical invariant: `approved_by`, when set, MUST be
+    `actor_hydra_trust_gate` (not the caller's actor). The caller
+    actor is recorded by HTTP audit; the on-chain approver is
+    Hydra acting on its own behalf. Patch 12's
+    `model_operator_approved_historically` factor filters this
+    actor so auto-approvals do NOT count as operator approval —
+    preventing a self-reinforcing trust spiral.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    approved: bool
+    reason: str
+    trust: TrustAssessment | None = None
+    action_id: str
+    approved_by: str | None = None

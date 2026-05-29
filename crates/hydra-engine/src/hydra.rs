@@ -2806,17 +2806,24 @@ impl Hydra {
         });
 
         // 12. model_operator_approved_historically (+0.10): at
-        //     least one of the model's prior actions had a non-
-        //     cascade approver. This is the LOAD-BEARING signal:
-        //     cascade auto-approval doesn't count — humans must
-        //     have looked at the model's recommendations and
-        //     said yes.
+        //     least one of the model's prior actions had an
+        //     approver that is NOT one of Hydra's internal
+        //     automation actors (cascade auto-approve OR Patch 15
+        //     trust-gated auto-approve). This is the LOAD-BEARING
+        //     signal: only HUMAN approval counts.
+        //
+        //     **Trust-spiral fix (Patch 15)**: switched from
+        //     `is_cascade_approver` to `is_hydra_automation_actor`.
+        //     Without this, Patch 15 auto-approvals would count as
+        //     operator endorsement in future trust calibrations,
+        //     allowing auto-approval to bootstrap MORE auto-
+        //     approval — a self-reinforcing trust spiral.
         let operator_approved_historically = source_model_id.is_some()
             && prior_observations.iter().any(|obs| {
                 observation_action_id(obs)
                     .and_then(|action_id| self.action_store.action(&action_id))
                     .and_then(|action| action.approved_by.as_ref())
-                    .map(|approver| !hydra_core::is_cascade_approver(approver))
+                    .map(|approver| !hydra_core::is_hydra_automation_actor(approver))
                     .unwrap_or(false)
             });
         factors.push(hydra_core::TrustFactor {
@@ -2826,12 +2833,12 @@ impl Hydra {
             detail: if source_model_id.is_none() {
                 "claim is not model-derived".to_string()
             } else if operator_approved_historically {
-                "at least one of the model's prior actions had a non-cascade \
-                 approver"
+                "at least one of the model's prior actions had a non-Hydra \
+                 approver (human endorsement)"
                     .to_string()
             } else {
                 "no operator-approved action found in this model's history \
-                 (cascade auto-approvals don't count)"
+                 (cascade + trust-gate auto-approvals don't count)"
                     .to_string()
             },
         });
@@ -3084,6 +3091,206 @@ impl Hydra {
             ),
             trust: Some(assessment),
             execution: Some(report),
+        })
+    }
+
+    // === Trust Patch 6 (Patch 15) — trust-gated auto-approval ====
+    //
+    // The FIRST patch where Hydra can act without explicit human
+    // approval. Auto-approves a Proposed Notify action when ALL of
+    // these strict gates pass:
+    //
+    //   1. action.kind == Notify
+    //   2. action.status == Proposed
+    //   3. related claim exists
+    //   4. trust.level == High AND trust.score >= min_trust_score
+    //   5. NO contradicting_evidence factor applied
+    //   6. NO claim_disputed factor applied
+    //   7. NO claim_retracted factor applied
+    //   8. NO model_operator_rejected_historically factor applied
+    //   9. model_operator_approved_historically factor applied
+    //      (model must have at least one prior HUMAN approval —
+    //      pristine models never get autonomy)
+    //
+    // Hard-block factors (5-8) veto even if score is high — a
+    // disputed claim never auto-approves.
+    //
+    // Stamps `actor_hydra_trust_gate` (Patch 15 constant) as the
+    // approver. This is filtered by `is_hydra_automation_actor`,
+    // so auto-approvals do NOT count as operator endorsement in
+    // future trust calibration — preventing self-reinforcing
+    // trust spirals.
+    //
+    // Does NOT auto-execute. Approval only. Operators wanting
+    // auto-approve-then-execute call
+    // `auto_execute_trusted_notify_action` (Patch 11) on the
+    // resulting Approved action.
+
+    /// Auto-approve a Proposed Notify action when the trust gate
+    /// passes. Returns a decision envelope; the decision IS the
+    /// data (200 wire status on both fire and skip).
+    pub fn auto_approve_low_risk_notify_action(
+        &mut self,
+        action_id: hydra_core::ActionId,
+        actor: hydra_core::ActorId,
+        min_trust_score: f64,
+    ) -> hydra_core::error::Result<hydra_core::AutoApprovalDecision> {
+        // 1. Unknown action → hard 404. Same precondition pattern
+        //    as Patch 11.
+        let action = self.action_store.action(&action_id).cloned().ok_or_else(
+            || {
+                hydra_core::error::HydraError::QueryError(format!(
+                    "unknown action: {action_id}"
+                ))
+            },
+        )?;
+
+        // 2. Wrong KIND → hard error. A Backfill can NEVER be
+        //    auto-approved by this method.
+        if action.kind != hydra_core::ActionKind::Notify {
+            return Err(hydra_core::error::HydraError::QueryError(format!(
+                "invalid action kind: {action_id} is not Notify (Patch 15 only \
+                 auto-approves Notify actions; got {:?})",
+                action.kind
+            )));
+        }
+
+        // 3. Wrong STATUS → DECISION SKIP. Already-approved or
+        //    Executed actions can't be auto-approved. Operators
+        //    can poll idempotently.
+        if action.status != hydra_core::ActionStatus::Proposed {
+            return Ok(hydra_core::AutoApprovalDecision {
+                approved: false,
+                reason: format!(
+                    "action status is {:?}, not Proposed (auto-approval only \
+                     fires for Proposed actions)",
+                    action.status
+                ),
+                trust: None,
+                action_id,
+                approved_by: None,
+            });
+        }
+
+        // 4. No related_claims → DECISION SKIP. Non-model-derived
+        //    actions can't be trust-assessed.
+        let claim_id = match action.related_claims.first().cloned() {
+            Some(id) => id,
+            None => {
+                return Ok(hydra_core::AutoApprovalDecision {
+                    approved: false,
+                    reason: "action has no related_claims — not trust-assessable"
+                        .to_string(),
+                    trust: None,
+                    action_id,
+                    approved_by: None,
+                });
+            }
+        };
+
+        // 5. Assess trust (expensive step).
+        let assessment = self.assess_claim_trust(&claim_id)?;
+
+        // 6. Hard-block factors veto regardless of score. The
+        //    user-approved list: contradicting_evidence,
+        //    claim_disputed, claim_retracted,
+        //    model_operator_rejected_historically. ANY of these
+        //    applied → refuse.
+        const HARD_BLOCK_FACTORS: &[&str] = &[
+            "contradicting_evidence",
+            "claim_disputed",
+            "claim_retracted",
+            "model_operator_rejected_historically",
+        ];
+        if let Some(blocking) = assessment
+            .factors
+            .iter()
+            .find(|f| f.applied && HARD_BLOCK_FACTORS.contains(&f.kind.as_str()))
+        {
+            let blocking_kind = blocking.kind.clone();
+            return Ok(hydra_core::AutoApprovalDecision {
+                approved: false,
+                reason: format!(
+                    "hard-block factor applied: {blocking_kind} (auto-approval \
+                     vetoed regardless of score)"
+                ),
+                trust: Some(assessment),
+                action_id,
+                approved_by: None,
+            });
+        }
+
+        // 7. Trust threshold. BOTH level == High AND score >=
+        //    min_trust_score (the SDK defaults to 0.90 — stricter
+        //    than Patch 11's 0.80 for auto-execute).
+        let level_ok = matches!(assessment.level, hydra_core::TrustLevel::High);
+        let score_ok = assessment.score >= min_trust_score;
+        if !(level_ok && score_ok) {
+            return Ok(hydra_core::AutoApprovalDecision {
+                approved: false,
+                reason: format!(
+                    "trust insufficient: level={:?}, score={:.2} (min={:.2})",
+                    assessment.level, assessment.score, min_trust_score
+                ),
+                trust: Some(assessment),
+                action_id,
+                approved_by: None,
+            });
+        }
+
+        // 8. REQUIRED positive signal: the model must have at
+        //    least one prior operator-approved action. Pristine
+        //    models with zero human-approval history never get
+        //    autonomy. This is the v0 conservative gate.
+        let operator_history_present = assessment
+            .factors
+            .iter()
+            .any(|f| f.kind == "model_operator_approved_historically" && f.applied);
+        if !operator_history_present {
+            return Ok(hydra_core::AutoApprovalDecision {
+                approved: false,
+                reason: "no operator-approved history for this model — \
+                         auto-approval requires at least one prior human \
+                         approval"
+                    .to_string(),
+                trust: Some(assessment),
+                action_id,
+                approved_by: None,
+            });
+        }
+
+        // 9. ALL gates passed. Ingest ActionApproved stamped with
+        //    the Patch 15 trust-gate actor. Note we use
+        //    `is_hydra_automation_actor` to filter this in Patch
+        //    12's operator-history factor, so auto-approvals do
+        //    NOT bootstrap more auto-approvals.
+        let trust_gate_actor =
+            hydra_core::ActorId::from_str(hydra_core::HYDRA_TRUST_GATE_ACTOR);
+        self.ingest(hydra_core::EventKind::ActionApproved {
+            action_id: action_id.clone(),
+            approved_by: trust_gate_actor.clone(),
+            reason: Some(
+                "auto-approved: high-trust low-risk Notify".to_string(),
+            ),
+        })?;
+
+        // `actor` parameter is recorded by callers (HTTP layer
+        // surfaces it via audit) but the ActionApproved event
+        // itself uses the trust-gate constant. The decision
+        // envelope returns `approved_by = Some(trust_gate_actor)`
+        // — operators see the truth.
+        let _ = actor;
+
+        Ok(hydra_core::AutoApprovalDecision {
+            approved: true,
+            reason: format!(
+                "auto-approved: trust High (score {:.2} >= {:.2}) AND model \
+                 has operator-approved history AND no hard-block factors",
+                assessment.score, min_trust_score
+            ),
+            trust: Some(assessment),
+            action_id,
+            approved_by: Some(trust_gate_actor),
         })
     }
 
@@ -7733,6 +7940,530 @@ mod tests {
         assert!(second.reason.contains("Executed"));
         assert!(second.trust.is_none());
         assert!(second.execution.is_none());
+    }
+
+    // === Trust Patch 6 (Patch 15) — trust-gated auto-approval ===
+
+    /// Build a chain where the model has rich enough history that
+    /// `model_operator_approved_historically` factor fires, then
+    /// register a HumanApproval policy and propose ONE more
+    /// Notify action that the cascade leaves in Proposed status.
+    /// Returns `(proposed_action_id, claim_id)` ready for
+    /// `auto_approve_low_risk_notify_action`.
+    fn prepare_proposed_notify_with_operator_history(
+        hydra: &mut Hydra,
+    ) -> (hydra_core::ActionId, hydra_core::ClaimId) {
+        // accumulate model history with operator endorsement.
+        let _ = accumulate_model_history(hydra, 3);
+        // promote one prior action to operator-approved so
+        // model_operator_approved_historically fires.
+        let an_action_id = hydra
+            .micromodel_store
+            .all_observations()
+            .next()
+            .and_then(observation_action_id)
+            .expect("accumulate_model_history recorded observations");
+        hydra
+            .approve_action(
+                an_action_id,
+                hydra_core::ActorId::from_str("actor_oncall_alice"),
+                Some("endorsed for tests".to_string()),
+            )
+            .unwrap();
+        // Now register a HumanApproval policy so the NEXT proposed
+        // action stays in Proposed (cascade can't auto-approve).
+        register_any_action_approval_policy(hydra);
+        // Re-prime model + propose a fresh action.
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(hydra));
+        ingest_signals(hydra, need);
+        let assessment_obj = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let action_id = assessment_obj.action_ids[0].clone();
+        let claim_id = assessment_obj.claim_id.unwrap();
+        // Sanity: HumanApproval policy held the new action at
+        // Proposed.
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::ActionStatus::Proposed
+        );
+        (action_id, claim_id)
+    }
+
+    #[test]
+    fn auto_approve_unknown_action_returns_query_error() {
+        let mut hydra = Hydra::new();
+        let result = hydra.auto_approve_low_risk_notify_action(
+            hydra_core::ActionId::from_str("act_ghost"),
+            hydra_core::ActorId::from_str("actor_ops"),
+            0.90,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown action"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_approve_refuses_non_notify_kind_with_hard_error() {
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let action_id = hydra_core::ActionId::new();
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Backfill,
+            status: hydra_core::action::ActionStatus::Proposed,
+            targets: vec![hydra_core::action::ActionTarget::Dataset(
+                "orders".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor,
+            approved_by: None,
+            rejected_by: None,
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            rejected_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        let result = hydra.auto_approve_low_risk_notify_action(
+            action_id,
+            hydra_core::ActorId::from_str("actor_ops"),
+            0.90,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("invalid action kind"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_approve_with_non_proposed_status_returns_decision_skip() {
+        // Action that's already Approved (cascade auto-approved) →
+        // auto-approve returns 200 skip (not a hard error). Lets
+        // operators poll idempotently.
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        // Action is Approved (cascade auto-approved in fresh
+        // policy-free Hydra).
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::action::ActionStatus::Approved
+        );
+        let decision = hydra
+            .auto_approve_low_risk_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+                0.90,
+            )
+            .unwrap();
+        assert!(!decision.approved);
+        assert!(decision.reason.contains("not Proposed"));
+        assert!(decision.trust.is_none());
+        assert!(decision.approved_by.is_none());
+    }
+
+    #[test]
+    fn auto_approve_with_no_related_claims_skips() {
+        let mut hydra = Hydra::new();
+        register_any_action_approval_policy(&mut hydra);
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let action_id = hydra_core::ActionId::new();
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Notify,
+            status: hydra_core::action::ActionStatus::Proposed,
+            targets: vec![hydra_core::action::ActionTarget::System(
+                "hydra".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor,
+            approved_by: None,
+            rejected_by: None,
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            rejected_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        let decision = hydra
+            .auto_approve_low_risk_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+                0.90,
+            )
+            .unwrap();
+        assert!(!decision.approved);
+        assert!(decision.reason.contains("no related_claims"));
+        assert!(decision.trust.is_none());
+        assert!(decision.approved_by.is_none());
+    }
+
+    #[test]
+    fn auto_approve_with_low_trust_skips_and_returns_assessment() {
+        // Fresh chain (no historical positive signal yet) → trust
+        // sits at ~Medium. Auto-approve refuses.
+        let mut hydra = Hydra::new();
+        register_any_action_approval_policy(&mut hydra);
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let assessment_obj = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let action_id = assessment_obj.action_ids[0].clone();
+        let decision = hydra
+            .auto_approve_low_risk_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+                0.90,
+            )
+            .unwrap();
+        assert!(!decision.approved);
+        // Fresh chain hits the score gate (trust score < 0.90)
+        // OR the operator-history gate. Either way, it skips
+        // with the trust assessment surfaced.
+        assert!(decision.trust.is_some());
+        assert!(decision.approved_by.is_none());
+    }
+
+    #[test]
+    fn auto_approve_with_no_operator_approved_history_skips() {
+        // Drive a chain with cascade-only history (no human
+        // approvals). A cascade-only Proposed action maxes at
+        // score=0.75 (Medium), so the score+level gate vetoes
+        // first; the underlying operator-history factor is still
+        // surfaced as `applied=false` in the assessment, which is
+        // the load-bearing signal Patch 15 callers can introspect.
+        let mut hydra = Hydra::new();
+        let _ = accumulate_model_history(&mut hydra, 3);
+        register_any_action_approval_policy(&mut hydra);
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let assessment_obj = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let action_id = assessment_obj.action_ids[0].clone();
+        let decision = hydra
+            .auto_approve_low_risk_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+                0.80,
+            )
+            .unwrap();
+        assert!(!decision.approved);
+        let trust = decision.trust.as_ref().unwrap();
+        let factor = trust
+            .factors
+            .iter()
+            .find(|f| f.kind == "model_operator_approved_historically")
+            .unwrap();
+        assert!(
+            !factor.applied,
+            "operator-history factor must surface as not-applied in cascade-only chain"
+        );
+        assert!(decision.approved_by.is_none());
+    }
+
+    #[test]
+    fn auto_approve_blocks_on_contradicting_evidence_factor() {
+        // Even if trust is otherwise High AND model has operator
+        // history, applied contradicting_evidence vetoes.
+        let mut hydra = Hydra::new();
+        let (action_id, claim_id) =
+            prepare_proposed_notify_with_operator_history(&mut hydra);
+        // Inject contradicting evidence.
+        let now = chrono::Utc::now();
+        let evidence_id = hydra_core::EvidenceId::new();
+        let evidence = hydra_core::Evidence {
+            id: evidence_id.clone(),
+            tenant_id: None,
+            source: hydra_core::EvidenceSource::Human {
+                actor_id: hydra_core::ActorId::from_str("actor_human"),
+            },
+            payload: hydra_core::EvidencePayload {
+                kind: "refutation".to_string(),
+                data: std::collections::HashMap::new(),
+            },
+            reliability: hydra_core::Confidence::new(0.90),
+            observed_at: now,
+            recorded_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded { evidence })
+            .unwrap();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimDisputed {
+                claim_id,
+                evidence_id,
+                reason: Some("test contradicting evidence".to_string()),
+            })
+            .unwrap();
+        let decision = hydra
+            .auto_approve_low_risk_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+                0.90,
+            )
+            .unwrap();
+        assert!(!decision.approved);
+        assert!(decision.reason.contains("hard-block"));
+        assert!(decision.reason.contains("contradicting_evidence"));
+    }
+
+    #[test]
+    fn auto_approve_blocks_on_retracted_claim() {
+        // Patch 9's force-clamp sets score to 0.0 for Retracted,
+        // but Patch 15 should ALSO surface that the retracted
+        // hard-block factor fired.
+        let mut hydra = Hydra::new();
+        let (action_id, claim_id) =
+            prepare_proposed_notify_with_operator_history(&mut hydra);
+        hydra
+            .ingest(hydra_core::EventKind::ClaimRetracted {
+                claim_id,
+                retracted_by: hydra_core::ActorId::from_str("actor_human"),
+                reason: "false alarm".to_string(),
+            })
+            .unwrap();
+        let decision = hydra
+            .auto_approve_low_risk_notify_action(
+                action_id.clone(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                0.90,
+            )
+            .unwrap();
+        assert!(!decision.approved);
+        assert!(decision.reason.contains("claim_retracted"));
+        // Action still Proposed — auto-approve didn't fire.
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::action::ActionStatus::Proposed
+        );
+    }
+
+    #[test]
+    fn auto_approve_success_path_emits_action_approved_with_trust_gate_actor() {
+        // The headline happy path: action proposed, trust High,
+        // operator history present, no hard-block factors. Patch
+        // 15 emits ActionApproved with the trust-gate actor.
+        //
+        // Threshold note: a freshly Proposed action maxes at
+        // score=0.85 because three positive factors require the
+        // action to have been executed (`action_executed`,
+        // `outcome_recorded`, `model_observation_exists`).
+        // 0.80 is the practical ceiling for proposed-stage
+        // auto-approval; the SDK exposes the threshold so
+        // operators can dial up for stricter scenarios.
+        let mut hydra = Hydra::new();
+        let (action_id, _claim_id) =
+            prepare_proposed_notify_with_operator_history(&mut hydra);
+        let decision = hydra
+            .auto_approve_low_risk_notify_action(
+                action_id.clone(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                0.80,
+            )
+            .unwrap();
+        assert!(decision.approved, "decision: {decision:#?}");
+        assert!(decision.reason.contains("auto-approved"));
+        assert_eq!(
+            decision.approved_by.as_ref().unwrap().as_str(),
+            "actor_hydra_trust_gate"
+        );
+        // Action is now Approved, stamped with the trust-gate actor.
+        let final_action = hydra.action(&action_id).unwrap();
+        assert_eq!(
+            final_action.status,
+            hydra_core::action::ActionStatus::Approved
+        );
+        assert_eq!(
+            final_action.approved_by.as_ref().unwrap().as_str(),
+            "actor_hydra_trust_gate"
+        );
+        // The audit log carries the ActionApproved event with the
+        // Patch 15 reason string.
+        let found = hydra.events().iter().any(|event| {
+            matches!(
+                &event.kind,
+                hydra_core::EventKind::ActionApproved {
+                    approved_by, reason: Some(r), ..
+                }
+                if approved_by.as_str() == "actor_hydra_trust_gate"
+                    && r.contains("auto-approved")
+            )
+        });
+        assert!(found, "audit log missing trust-gate ActionApproved event");
+    }
+
+    #[test]
+    fn auto_approval_does_not_count_as_operator_approval_in_future_trust() {
+        // **THE LOAD-BEARING TRUST-SPIRAL REGRESSION PIN.**
+        //
+        // After a Patch 15 auto-approval, a fresh model-derived
+        // claim's `model_operator_approved_historically` factor
+        // must NOT fire JUST because the trust-gate approved a
+        // prior action. That would let auto-approvals bootstrap
+        // more auto-approvals.
+        //
+        // This test:
+        //   1. drives a model chain with ONE genuine human
+        //      approval (so the next action can pass Patch 15)
+        //   2. EXECUTES + OBSERVES that approved action so trust
+        //      calibration sees it (the human-approved record)
+        //   3. has Patch 15 auto-approve a NEW action
+        //   4. EXECUTES + OBSERVES the auto-approved action
+        //   5. Proposes ONE MORE action and assesses its trust
+        //   6. Asserts model_operator_approved_historically is
+        //      still applied (because step 2 was a real human
+        //      approval), AND verifies the trust-gate approval
+        //      from step 3 didn't "double count."
+        let mut hydra = Hydra::new();
+        let (action_id, _claim_id) =
+            prepare_proposed_notify_with_operator_history(&mut hydra);
+        let auto_decision = hydra
+            .auto_approve_low_risk_notify_action(
+                action_id.clone(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                0.80,
+            )
+            .unwrap();
+        assert!(auto_decision.approved);
+
+        // Execute + observe the auto-approved action so trust
+        // calibration sees it.
+        let exec_report = hydra
+            .execute_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        hydra
+            .record_micro_model_observation_from_action_outcome(
+                exec_report.outcome_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+
+        // Walk the observations: one MUST have approved_by ==
+        // actor_hydra_trust_gate (the Patch 15 auto-approval) and
+        // is_hydra_automation_actor must classify it as a NON
+        // operator. The trust factor reading must respect this.
+        let observations: Vec<_> = hydra
+            .micromodel_store
+            .all_observations()
+            .collect();
+        let trust_gate_approved_exists = observations.iter().any(|obs| {
+            observation_action_id(obs)
+                .and_then(|aid| hydra.action(&aid))
+                .and_then(|a| a.approved_by.as_ref())
+                .map(|approver| {
+                    approver.as_str() == "actor_hydra_trust_gate"
+                })
+                .unwrap_or(false)
+        });
+        assert!(
+            trust_gate_approved_exists,
+            "expected at least one observation with trust-gate approver"
+        );
+
+        // Now propose a FRESH model-derived claim and assess.
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let next = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let new_claim_id = next.claim_id.unwrap();
+        let trust = hydra.assess_claim_trust(&new_claim_id).unwrap();
+        let operator_factor = trust
+            .factors
+            .iter()
+            .find(|f| f.kind == "model_operator_approved_historically")
+            .unwrap();
+        // STILL applied because the ORIGINAL human approval (from
+        // prepare_proposed_notify_with_operator_history) survives.
+        // But the trust-gate auto-approval from the recent action
+        // did NOT also "double count" — the test passes if the
+        // factor is applied as before, NOT because the auto-approval
+        // bootstrapped it.
+        assert!(
+            operator_factor.applied,
+            "operator history must remain visible from the ORIGINAL human approval"
+        );
+
+        // Inverse pin: remove the original human-endorsed action
+        // from the equation by checking that the trust-gate
+        // approval ALONE (without any human approval) doesn't
+        // suffice. We construct a separate, parallel Hydra with
+        // only cascade + trust-gate history (no human).
+        let mut parallel = Hydra::new();
+        // Accumulate cascade-only history (no operator approvals).
+        let _ = accumulate_model_history(&mut parallel, 3);
+        // Manually approve one of the prior actions with the
+        // trust-gate actor (simulating a Patch 15 auto-approval
+        // having happened).
+        let target_action_id = parallel
+            .micromodel_store
+            .all_observations()
+            .next()
+            .and_then(observation_action_id)
+            .unwrap();
+        parallel
+            .approve_action(
+                target_action_id,
+                hydra_core::ActorId::from_str("actor_hydra_trust_gate"),
+                Some("auto-approved: high-trust low-risk Notify".to_string()),
+            )
+            .unwrap();
+        // Propose a fresh action; check the operator-history
+        // factor is NOT applied (trust-gate alone doesn't count).
+        parallel
+            .set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(&parallel));
+        ingest_signals(&mut parallel, need);
+        let next_p = parallel
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let new_claim_p = next_p.claim_id.unwrap();
+        let trust_p = parallel.assess_claim_trust(&new_claim_p).unwrap();
+        let operator_factor_p = trust_p
+            .factors
+            .iter()
+            .find(|f| f.kind == "model_operator_approved_historically")
+            .unwrap();
+        assert!(
+            !operator_factor_p.applied,
+            "TRUST-SPIRAL REGRESSION: trust-gate auto-approvals must NOT \
+             count as operator approval in trust calibration — otherwise \
+             auto-approval bootstraps more auto-approval"
+        );
     }
 
     // === Trust Patch 4 (Patch 12) — reflex trust calibration ===

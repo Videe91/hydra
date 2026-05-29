@@ -35,6 +35,7 @@ from ._types import (
     ActionStatus,
     ActionTransitionResponse,
     ActorId,
+    AutoApprovalDecision,
     AutoExecutionDecision,
     Claim,
     ClaimId,
@@ -372,6 +373,32 @@ class HydraSync:
             tenant=tenant,
         )
         return AutoExecutionDecision.model_validate(raw)
+
+    def auto_approve_action_if_trusted(
+        self,
+        action_id: ActionId,
+        *,
+        actor: ActorId,
+        min_trust_score: float = 0.90,
+        tenant: TenantId | None = None,
+    ) -> AutoApprovalDecision:
+        """Sync mirror of `Hydra.auto_approve_action_if_trusted`
+        (Trust Patch 7 / Patch 15). Same wire contract, same
+        decision-envelope semantics, same error mapping. See the
+        async docstring for full details including hard-block
+        factors, the operator-history requirement, and the
+        Patch 12 trust-spiral fix that makes auto-approvals NOT
+        count as operator endorsement in future trust calibration."""
+        body: dict[str, Any] = {
+            "actor": actor,
+            "min_trust_score": min_trust_score,
+        }
+        raw = self._http.post(
+            _paths.action_auto_approve_path(action_id),
+            json=body,
+            tenant=tenant,
+        )
+        return AutoApprovalDecision.model_validate(raw)
 
     def assess_claim_trust(
         self,

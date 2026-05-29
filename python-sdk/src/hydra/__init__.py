@@ -66,6 +66,7 @@ from ._types import (
     ActionTransitionResponse,
     ActionTransitionStatus,
     ActorId,
+    AutoApprovalDecision,
     AutoExecutionDecision,
     Anomaly,
     AnomalyEntry,
@@ -237,8 +238,9 @@ __all__ = [
     "TrustAssessment",
     "TrustFactor",
     "TrustLevel",
-    # Automation layer (Patch 11)
+    # Automation layer (Patch 11 + Patch 15)
     "AutoExecutionDecision",
+    "AutoApprovalDecision",
     # Schemas (Patch 4)
     "ActionPayloadSchema",
     "ClaimPredicateSchema",

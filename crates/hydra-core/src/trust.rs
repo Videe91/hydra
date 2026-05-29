@@ -122,9 +122,35 @@ impl TrustAssessment {
 /// magic string.
 pub const HYDRA_POLICY_AGENT_ACTOR: &str = "actor_hydra_policy";
 
+/// Stable string identifier used by `Hydra` for the Patch 15
+/// trust-gated auto-approver. Like `HYDRA_POLICY_AGENT_ACTOR`,
+/// approvals stamped with this actor MUST NOT count as operator
+/// approval for trust calibration — otherwise auto-approvals
+/// would bootstrap more auto-approvals (a self-reinforcing
+/// trust spiral).
+pub const HYDRA_TRUST_GATE_ACTOR: &str = "actor_hydra_trust_gate";
+
 /// Convenience: is this actor the cascade auto-approver?
 pub fn is_cascade_approver(actor: &ActorId) -> bool {
     actor.as_str() == HYDRA_POLICY_AGENT_ACTOR
+}
+
+/// True for any actor that represents Hydra acting on its own
+/// behalf — the cascade policy agent (Patch 6/9) OR the Patch 15
+/// trust-gated auto-approver.
+///
+/// **Load-bearing**: Patch 12's `model_operator_approved_historically`
+/// factor uses this to exclude Hydra's own automation from the
+/// "humans-endorsed" historical signal. Without this exclusion,
+/// Patch 15 auto-approvals would count as operator approval in
+/// future trust calibrations, allowing auto-approval to bootstrap
+/// more auto-approval — a self-reinforcing trust spiral.
+///
+/// Future internal actors (e.g., a Patch 16 model's reflex actor)
+/// should be added here so they're filtered uniformly.
+pub fn is_hydra_automation_actor(actor: &ActorId) -> bool {
+    let s = actor.as_str();
+    s == HYDRA_POLICY_AGENT_ACTOR || s == HYDRA_TRUST_GATE_ACTOR
 }
 
 #[cfg(test)]
@@ -154,6 +180,46 @@ mod tests {
         assert!(!is_cascade_approver(&ActorId::from_str("actor_oncall_alice")));
         assert!(!is_cascade_approver(&ActorId::from_str("actor_ops")));
         assert!(!is_cascade_approver(&ActorId::from_str("hydra_policy")));
+        // The Patch 15 trust-gate actor is NOT the cascade actor
+        // (cascade auto-approves; trust gate is a separate
+        // automation path). Different magic strings on purpose.
+        assert!(!is_cascade_approver(&ActorId::from_str(
+            "actor_hydra_trust_gate"
+        )));
+    }
+
+    #[test]
+    fn is_hydra_automation_actor_recognizes_both_internal_actors() {
+        // CRITICAL for Patch 15: this helper feeds Patch 12's
+        // `model_operator_approved_historically` factor. Both
+        // Hydra-internal actors must be filtered so neither cascade
+        // approval nor trust-gate auto-approval counts as operator
+        // endorsement.
+        assert!(is_hydra_automation_actor(&ActorId::from_str(
+            "actor_hydra_policy"
+        )));
+        assert!(is_hydra_automation_actor(&ActorId::from_str(
+            "actor_hydra_trust_gate"
+        )));
+    }
+
+    #[test]
+    fn is_hydra_automation_actor_does_not_match_operator_actors() {
+        // Real operator actors MUST register as non-automation so
+        // the operator-history positive trust signal can still
+        // fire on genuine human approvals.
+        assert!(!is_hydra_automation_actor(&ActorId::from_str(
+            "actor_oncall_alice"
+        )));
+        assert!(!is_hydra_automation_actor(&ActorId::from_str("actor_ops")));
+        // Substring-match guard — must compare full string, not
+        // prefix.
+        assert!(!is_hydra_automation_actor(&ActorId::from_str(
+            "actor_hydra_policy_admin"
+        )));
+        assert!(!is_hydra_automation_actor(&ActorId::from_str(
+            "actor_hydra_trust_gate_v2"
+        )));
     }
 
     #[test]

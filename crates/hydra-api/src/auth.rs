@@ -335,6 +335,22 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
         if path.starts_with("/actions/") && path.ends_with("/execute") {
             return vec!["write:execute"];
         }
+        // Trust Patch 7 (Patch 15) — trust-gated auto-approval.
+        // **CRITICAL ORDERING**: this match MUST come before the
+        // general /actions/* approve/reject clause below, because
+        // `/auto-approve` also ends with `"approve"` — the more
+        // permissive starts-with check would otherwise catch it
+        // and return only `write:approvals`, leaking the trust-read
+        // gate.
+        //
+        // Auto-approve requires BOTH scopes because the route both
+        // READS trust judgments (read:trust) AND MAY MUTATE state
+        // (write:approvals). A token granted approvals-only can't
+        // probe the trust assessment surface; a token granted
+        // trust-read alone can't trigger an auto-approval.
+        if path.starts_with("/actions/") && path.ends_with("/auto-approve") {
+            return vec!["read:trust", "write:approvals"];
+        }
         // MicroModel Patch 6 — operator approval workflow. The
         // first human governance gate. Mutates Action status
         // (Proposed → Approved/Rejected) and records the operator
@@ -988,6 +1004,19 @@ mod tests {
                 "/actions/act-123/auto-execute",
             ),
             vec!["read:trust", "write:execute"]
+        );
+        // Trust Patch 7 (Patch 15) — trust-gated auto-approval
+        // requires BOTH read:trust and write:approvals. Same
+        // ordering trap as auto-execute: /auto-approve starts with
+        // /actions/ and would otherwise be caught by the general
+        // /actions/* → write:approvals clause, silently dropping
+        // the trust-read gate. This pin catches that regression.
+        assert_eq!(
+            required_scopes_for(
+                &Method::POST,
+                "/actions/act-123/auto-approve",
+            ),
+            vec!["read:trust", "write:approvals"]
         );
         assert_eq!(
             required_scopes_for(&Method::GET, "/query/nodes"),

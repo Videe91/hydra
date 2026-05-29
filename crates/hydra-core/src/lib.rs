@@ -92,9 +92,10 @@ pub use replication::{
     ReplicationRole, ReplicationRun, ReplicationRunStatus,
 };
 pub use trust::{
-    is_cascade_approver, TrustAssessment, TrustFactor, TrustLevel, HYDRA_POLICY_AGENT_ACTOR,
+    is_cascade_approver, is_hydra_automation_actor, TrustAssessment, TrustFactor, TrustLevel,
+    HYDRA_POLICY_AGENT_ACTOR, HYDRA_TRUST_GATE_ACTOR,
 };
-pub use automation::{AutoExecutionDecision, DeliveryOutcome};
+pub use automation::{AutoApprovalDecision, AutoExecutionDecision, DeliveryOutcome};
 
 /// Convenience re-exports for common types
 pub mod prelude {
@@ -140,10 +141,10 @@ pub mod prelude {
         ReplicationPeerStatus, ReplicationRole, ReplicationRun, ReplicationRunStatus,
     };
     pub use crate::trust::{
-        is_cascade_approver, TrustAssessment, TrustFactor, TrustLevel,
-        HYDRA_POLICY_AGENT_ACTOR,
+        is_cascade_approver, is_hydra_automation_actor, TrustAssessment, TrustFactor,
+        TrustLevel, HYDRA_POLICY_AGENT_ACTOR, HYDRA_TRUST_GATE_ACTOR,
     };
-    pub use crate::automation::{AutoExecutionDecision, DeliveryOutcome};
+    pub use crate::automation::{AutoApprovalDecision, AutoExecutionDecision, DeliveryOutcome};
     pub use crate::node::{Node, NodeMeta, NodeValidator};
     pub use crate::edge::{Edge, EdgeMeta};
     pub use crate::graph::{GraphReader, TraversalDirection, bfs, bfs_dyn, topological_sort};

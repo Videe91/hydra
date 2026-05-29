@@ -32,6 +32,7 @@ from ._types import (
     ActionStatus,
     ActionTransitionResponse,
     ActorId,
+    AutoApprovalDecision,
     AutoExecutionDecision,
     Claim,
     ClaimId,
@@ -487,6 +488,66 @@ class Hydra:
             tenant=tenant,
         )
         return AutoExecutionDecision.model_validate(raw)
+
+    async def auto_approve_action_if_trusted(
+        self,
+        action_id: ActionId,
+        *,
+        actor: ActorId,
+        min_trust_score: float = 0.90,
+        tenant: TenantId | None = None,
+    ) -> AutoApprovalDecision:
+        """Trust-gated auto-approval (Trust Patch 7 / Patch 15) —
+        `POST /actions/{action_id}/auto-approve`.
+
+        Hydra reads the action's claim trust; if `level == High`
+        AND `score >= min_trust_score` AND the model has at least
+        one prior operator-approved action AND no hard-block
+        factor applied, it ingests `ActionApproved` stamped with
+        the trust-gate actor (`actor_hydra_trust_gate`).
+        Otherwise returns a decision envelope with
+        `approved=false` and the trust assessment so callers
+        understand WHY.
+
+        Patch 15 is the FIRST automation that bypasses the
+        explicit human approval gate — so defaults are
+        conservative. Default `min_trust_score=0.90` is stricter
+        than Patch 11's auto-execute (0.80) because approval is
+        the human-on-the-loop step.
+
+        v0 boundary:
+          - Notify-kind ONLY. Other kinds → 400.
+          - `status == Proposed` required. Other statuses → 200
+            with `approved=false` (decision skip).
+          - At least one related_claim is required.
+          - Auto-approval ONLY — does NOT auto-execute. Operators
+            wanting auto-approve-then-execute call the Patch 11
+            auto-execute endpoint on the resulting Approved
+            action.
+
+        Hard-block factors that veto regardless of score:
+          - `contradicting_evidence`
+          - `claim_disputed`
+          - `claim_retracted`
+          - `model_operator_rejected_historically`
+
+        Errors:
+          - 400 → `HydraValidationError`: wrong kind (hard contract)
+          - 404 → `HydraNotFoundError`: unknown action_id
+          - All other outcomes (low trust, wrong status, hard-block
+            factor, no operator history) return 200 with
+            `approved=false` and an explanatory `reason`.
+        """
+        body: dict[str, Any] = {
+            "actor": actor,
+            "min_trust_score": min_trust_score,
+        }
+        raw = await self._http.post(
+            _paths.action_auto_approve_path(action_id),
+            json=body,
+            tenant=tenant,
+        )
+        return AutoApprovalDecision.model_validate(raw)
 
     async def assess_claim_trust(
         self,

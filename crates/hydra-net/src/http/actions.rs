@@ -110,6 +110,10 @@ pub fn actions_router_with_notify(
             "/actions/:action_id/auto-execute",
             post(auto_execute_action),
         )
+        .route(
+            "/actions/:action_id/auto-approve",
+            post(auto_approve_action),
+        )
         .with_state(ActionsHttpState::with_notify_delivery(
             runtime,
             notify_delivery,
@@ -525,6 +529,80 @@ async fn auto_execute_action(
         reason: decision.reason,
         trust: decision.trust,
         execution: execution_wire,
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+// === Trust Patch 7 (Patch 15) — auto-approval gate ============
+
+/// Body for `POST /actions/{id}/auto-approve`.
+///
+/// `min_trust_score` is the floor — auto-approval requires BOTH
+/// `trust.level == High` AND `trust.score >= min_trust_score`,
+/// AND the model has at least one prior operator approval, AND
+/// no hard-block factors applied. The SDK defaults to `0.90`
+/// (stricter than Patch 11's auto-execute 0.80). Wire format
+/// requires the caller to send it explicitly so deployments can
+/// pick their own minimum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoApproveActionRequest {
+    pub actor: ActorId,
+    pub min_trust_score: f64,
+}
+
+/// Wire response for `POST /actions/{id}/auto-approve`.
+///
+/// Mirrors `hydra_core::AutoApprovalDecision`. Returns 200 in
+/// every non-error case — the `approved` boolean is the binding
+/// decision, not the HTTP status. `trust` is populated whenever
+/// the assessor ran (i.e., the action passed kind+status+claim
+/// preconditions); `approved_by` is populated only when
+/// `approved == true` (and is always `actor_hydra_trust_gate`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoApproveActionResponse {
+    pub approved: bool,
+    pub reason: String,
+    pub trust: Option<hydra_core::TrustAssessment>,
+    pub action_id: ActionId,
+    pub approved_by: Option<ActorId>,
+}
+
+async fn auto_approve_action(
+    State(state): State<ActionsHttpState>,
+    Path(action_id): Path<String>,
+    request: Result<Json<AutoApproveActionRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Json(req)) => req,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid request body: {err}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let action_id = ActionId::from_str(&action_id);
+    let hydra = state.runtime.hydra();
+    let mut hydra = hydra.write().await;
+
+    let decision = match hydra.auto_approve_low_risk_notify_action(
+        action_id,
+        request.actor.clone(),
+        request.min_trust_score,
+    ) {
+        Ok(d) => d,
+        Err(err) => return engine_error_response(err),
+    };
+
+    let body = AutoApproveActionResponse {
+        approved: decision.approved,
+        reason: decision.reason,
+        trust: decision.trust,
+        action_id: decision.action_id,
+        approved_by: decision.approved_by,
     };
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -1427,6 +1505,340 @@ mod tests {
         assert!(body.reason.contains("no related_claims"));
         assert!(body.trust.is_none());
         assert!(body.execution.is_none());
+    }
+
+    // === Trust Patch 7 (Patch 15) — auto-approval gate (HTTP) ===
+
+    /// Drive a full chain + observe + propose a SECOND Notify action
+    /// that stays Proposed because we register a HumanApproval
+    /// policy AFTER the first action passes through cascade. The
+    /// sibling shares the high-trust claim and has model_operator
+    /// approval history (the first sibling was approved by a real
+    /// operator). Returns the sibling Proposed action_id.
+    async fn ingest_high_trust_proposed_sibling(
+        runtime: &crate::runtime::RuntimeHandle,
+    ) -> hydra_core::ActionId {
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let human = hydra_core::ActorId::from_str("actor_oncall_alice");
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+
+        // Drive a chain: prime → Critical → propose (cascade
+        // auto-approves) → re-approve with a real human (so
+        // model_operator_approved_historically fires later) →
+        // execute + observe to record observation history.
+        hydra
+            .evaluate_commit_rate_anomaly(actor.clone())
+            .unwrap();
+        hydra.set_commit_rate_anomaly_model(primed_test_model());
+        let need = 100u64.saturating_sub(hydra.commit_count() as u64);
+        for i in 0..need {
+            hydra
+                .ingest(EventKind::Signal {
+                    source: hydra_core::NodeId::from_str("test.signal"),
+                    name: format!("test_signal_{i}"),
+                    payload: HashMap::new(),
+                })
+                .unwrap();
+        }
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(actor.clone())
+            .unwrap();
+        let first_action_id = assessment.action_ids[0].clone();
+        let shared_claim = assessment.claim_id.unwrap();
+        // Re-approve with a human so the operator-history factor
+        // fires later. v0 allows re-approving Approved actions; the
+        // most recent approved_by is what trust assessment reads.
+        hydra
+            .approve_action(
+                first_action_id.clone(),
+                human.clone(),
+                Some("endorsed by human".to_string()),
+            )
+            .unwrap();
+        let report = hydra
+            .execute_notify_action(first_action_id, actor.clone())
+            .unwrap();
+        hydra
+            .record_micro_model_observation_from_action_outcome(
+                report.outcome_id,
+                actor.clone(),
+            )
+            .unwrap();
+
+        // Register HumanApproval policy so the NEXT proposed action
+        // stays Proposed.
+        let now = chrono::Utc::now();
+        let policy = Policy {
+            id: PolicyId::new(),
+            tenant_id: None,
+            name: "Patch 15 HTTP — require human approval".to_string(),
+            kind: PolicyKind::HumanApproval,
+            status: PolicyStatus::Active,
+            scope: PolicyScope::AnyAction,
+            condition: HashMap::new(),
+            metadata: HashMap::new(),
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(EventKind::PolicyRegistered { policy })
+            .unwrap();
+
+        // Propose a fresh sibling Notify action sharing the claim.
+        let sibling_id = hydra_core::ActionId::new();
+        let sibling = Action {
+            id: sibling_id.clone(),
+            tenant_id: None,
+            kind: ActionKind::Notify,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("hydra".to_string())],
+            related_claims: vec![shared_claim],
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: None,
+            rejected_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            rejected_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(EventKind::ActionProposed { action: sibling })
+            .unwrap();
+        assert_eq!(
+            hydra.action(&sibling_id).unwrap().status,
+            ActionStatus::Proposed
+        );
+        sibling_id
+    }
+
+    #[tokio::test]
+    async fn auto_approve_success_returns_approved_envelope() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let sibling_id = ingest_high_trust_proposed_sibling(&runtime).await;
+        let app = actions_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/actions/{sibling_id}/auto-approve"),
+                serde_json::json!({
+                    "actor": actor_id("actor_ops"),
+                    "min_trust_score": 0.80,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: AutoApproveActionResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(body.approved, "decision: {body:#?}");
+        assert!(body.reason.contains("auto-approved"));
+        assert_eq!(
+            body.approved_by.as_ref().map(|a| a.as_str()),
+            Some("actor_hydra_trust_gate")
+        );
+        let trust = body.trust.as_ref().unwrap();
+        assert_eq!(trust.level, hydra_core::TrustLevel::High);
+    }
+
+    #[tokio::test]
+    async fn auto_approve_with_low_trust_returns_200_skip_envelope() {
+        // Decision envelope contract: trust below threshold returns
+        // 200 with approved=false, NOT a 4xx. trust is populated.
+        // Use min=1.01 (above the clamp ceiling) so the score gate
+        // always vetoes regardless of how strong the chain became.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let sibling_id = ingest_high_trust_proposed_sibling(&runtime).await;
+        let app = actions_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/actions/{sibling_id}/auto-approve"),
+                serde_json::json!({
+                    "actor": actor_id("actor_ops"),
+                    "min_trust_score": 1.01,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: AutoApproveActionResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(!body.approved, "decision: {body:#?}");
+        assert!(body.reason.contains("trust insufficient"));
+        assert!(body.trust.is_some());
+        assert!(body.approved_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_approve_unknown_action_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = actions_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/actions/act_ghost/auto-approve",
+                serde_json::json!({
+                    "actor": actor_id("actor_ops"),
+                    "min_trust_score": 0.90,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn auto_approve_refuses_non_notify_kind_with_400() {
+        // Wrong KIND is a hard error (400), not a decision skip.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let action_id = hydra_core::ActionId::new();
+        let now = chrono::Utc::now();
+        let action = Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: ActionKind::Backfill,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::Dataset("orders".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor,
+            approved_by: None,
+            rejected_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            rejected_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            hydra
+                .ingest(EventKind::ActionProposed { action })
+                .unwrap();
+        }
+        let app = actions_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/actions/{action_id}/auto-approve"),
+                serde_json::json!({
+                    "actor": actor_id("actor_ops"),
+                    "min_trust_score": 0.90,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(body.error.contains("invalid action kind"), "got: {}", body.error);
+    }
+
+    #[tokio::test]
+    async fn auto_approve_with_non_proposed_status_returns_200_skip() {
+        // Wrong STATUS is a decision skip (200), not an error.
+        // Approved or Executed actions can't be auto-approved.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let action_id = hydra_core::ActionId::new();
+        let now = chrono::Utc::now();
+        let action = Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: ActionKind::Notify,
+            status: ActionStatus::Proposed,
+            targets: vec![ActionTarget::System("hydra".to_string())],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor,
+            approved_by: None,
+            rejected_by: None,
+            policy_id: None,
+            payload: HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            rejected_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        {
+            let hydra = runtime.hydra();
+            let mut hydra = hydra.write().await;
+            // No HumanApproval policy → cascade auto-approves to
+            // Approved status.
+            hydra
+                .ingest(EventKind::ActionProposed { action })
+                .unwrap();
+            assert_eq!(
+                hydra.action(&action_id).unwrap().status,
+                ActionStatus::Approved
+            );
+        }
+        let app = actions_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/actions/{action_id}/auto-approve"),
+                serde_json::json!({
+                    "actor": actor_id("actor_ops"),
+                    "min_trust_score": 0.90,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: AutoApproveActionResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(!body.approved);
+        assert!(body.reason.contains("not Proposed"));
+        assert!(body.trust.is_none());
+        assert!(body.approved_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_approve_stamps_trust_gate_actor_in_action_record() {
+        // Pin that the SUCCESS path actually mutates the action: the
+        // ActionApproved event ingested by Patch 15 carries the
+        // trust-gate actor, not the request body's `actor` (which
+        // is the caller's identity for audit, not the approver).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let sibling_id = ingest_high_trust_proposed_sibling(&runtime).await;
+        let app = actions_router(runtime.clone());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/actions/{sibling_id}/auto-approve"),
+                serde_json::json!({
+                    "actor": actor_id("actor_caller"),
+                    "min_trust_score": 0.80,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        let final_action = hydra.action(&sibling_id).unwrap();
+        assert_eq!(final_action.status, ActionStatus::Approved);
+        assert_eq!(
+            final_action.approved_by.as_ref().map(|a| a.as_str()),
+            Some("actor_hydra_trust_gate"),
+            "trust-gate actor must stamp the action, not the caller"
+        );
     }
 
     // === Patch 14 — Notify Delivery Adapter (HTTP integration) ===

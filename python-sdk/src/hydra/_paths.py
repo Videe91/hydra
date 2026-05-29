@@ -216,6 +216,29 @@ def action_auto_execute_path(action_id: str) -> str:
     return f"/actions/{_seg(action_id)}/auto-execute"
 
 
+def action_auto_approve_path(action_id: str) -> str:
+    """`POST /actions/{action_id}/auto-approve` — Trust Patch 7
+    (Patch 15). Trust-gated auto-approval. Hydra reads the
+    claim's TrustAssessment; if `level == High` AND
+    `score >= min_trust_score` AND the model has at least one
+    prior operator-approved action AND no hard-block factors
+    apply (contradicting_evidence, claim_disputed,
+    claim_retracted, model_operator_rejected_historically), it
+    ingests ActionApproved stamped with the trust-gate actor
+    (`actor_hydra_trust_gate`). Otherwise it returns a skip
+    envelope explaining which gate vetoed.
+
+    Returns 200 with an `AutoApprovalDecision` envelope on every
+    non-error case — the `approved` boolean is the decision, NOT
+    the success axis. 400 only on wrong kind (Backfill etc.);
+    404 on unknown id.
+
+    Body: `{actor, min_trust_score}`. Auth requires BOTH
+    `read:trust` and `write:approvals` (the trust-gate combo
+    mirrors auto-execute's read:trust + write:execute)."""
+    return f"/actions/{_seg(action_id)}/auto-approve"
+
+
 # === /trust/* (Trust Patch 2 / Patch 10 — read-only trust surface) ===
 #
 # The `/trust/*` namespace is reserved for the whole Trust Layer.

@@ -18,8 +18,9 @@ pub mod trust;
 
 pub use actions::{
     actions_router, actions_router_with_notify, ActionExecutionResponse,
-    ActionTransitionResponse, ActionsHttpState, ApproveActionRequest, AutoExecuteActionRequest,
-    AutoExecuteActionResponse, ExecuteActionRequest, RejectActionRequest,
+    ActionTransitionResponse, ActionsHttpState, ApproveActionRequest, AutoApproveActionRequest,
+    AutoApproveActionResponse, AutoExecuteActionRequest, AutoExecuteActionResponse,
+    ExecuteActionRequest, RejectActionRequest,
 };
 pub use commit_stream::{
     commit_stream_router, CommitBroadcaster, CommitStreamErrorPayload,

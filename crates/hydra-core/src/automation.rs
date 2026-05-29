@@ -27,6 +27,7 @@
 //! decisions, not errors.
 
 use crate::action::ActionExecutionReport;
+use crate::id::{ActionId, ActorId};
 use crate::trust::TrustAssessment;
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,49 @@ pub struct AutoExecutionDecision {
     pub reason: String,
     pub trust: Option<TrustAssessment>,
     pub execution: Option<ActionExecutionReport>,
+}
+
+/// The result of `Hydra::auto_approve_low_risk_notify_action` —
+/// Patch 15 trust-gated auto-approval envelope.
+///
+/// Symmetric with `AutoExecutionDecision` (Patch 11) but for the
+/// PROPOSED → APPROVED transition, not Approved → Executed.
+///
+/// Field semantics:
+///
+/// - `approved`: true iff Hydra actually ingested an ActionApproved
+///   event. When true, `approved_by` is `Some(actor_hydra_trust_gate)`
+///   and `trust` carries the assessment that justified the
+///   decision.
+///
+/// - `reason`: deterministic prose explaining the decision. On
+///   skip paths it names the specific gate that vetoed
+///   (e.g. "claim_disputed factor applied", "no operator-
+///   approved history"). Read by operator dashboards and Patch
+///   16+ trust calibration.
+///
+/// - `trust`: populated whenever the assessor ran. None when
+///   pre-trust precondition checks failed (wrong status, no
+///   related claim).
+///
+/// - `action_id`: always the input action_id, even on skip
+///   paths. Lets the caller correlate the decision with the
+///   request without re-deriving it.
+///
+/// - `approved_by`: `Some(actor_hydra_trust_gate)` only when
+///   `approved == true`. `None` on every skip path.
+///
+/// Does NOT carry an `execution` field — Patch 15 deliberately
+/// does NOT auto-execute. Operators wanting auto-approve-then-
+/// execute call Patch 11's auto-execute on the resulting
+/// Approved action.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoApprovalDecision {
+    pub approved: bool,
+    pub reason: String,
+    pub trust: Option<TrustAssessment>,
+    pub action_id: ActionId,
+    pub approved_by: Option<ActorId>,
 }
 
 /// Outcome of a Notify delivery attempt — Patch 14.
@@ -168,6 +212,36 @@ mod tests {
         assert_eq!(json["executed"], false);
         assert!(json["trust"].is_null());
         assert!(json["execution"].is_null());
+    }
+
+    #[test]
+    fn auto_approval_decision_skip_serializes_with_null_fields() {
+        let decision = AutoApprovalDecision {
+            approved: false,
+            reason: "trust insufficient".to_string(),
+            trust: Some(sample_trust()),
+            action_id: ActionId::from_str("act_x"),
+            approved_by: None,
+        };
+        let json = serde_json::to_value(&decision).unwrap();
+        assert_eq!(json["approved"], false);
+        assert!(json["approved_by"].is_null());
+        assert!(json["trust"].is_object());
+        assert_eq!(json["action_id"], "act_x");
+    }
+
+    #[test]
+    fn auto_approval_decision_success_path_carries_trust_gate_actor() {
+        let decision = AutoApprovalDecision {
+            approved: true,
+            reason: "auto-approved: high-trust low-risk Notify".to_string(),
+            trust: Some(sample_trust()),
+            action_id: ActionId::from_str("act_x"),
+            approved_by: Some(ActorId::from_str("actor_hydra_trust_gate")),
+        };
+        let json = serde_json::to_value(&decision).unwrap();
+        assert_eq!(json["approved"], true);
+        assert_eq!(json["approved_by"], "actor_hydra_trust_gate");
     }
 
     #[test]
