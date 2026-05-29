@@ -58,6 +58,7 @@ __version__ = "0.1.0"
 
 from ._types import (
     Action,
+    ActionExecutionResponse,
     ActionId,
     ActionPayloadSchema,
     ActionStatus,
@@ -223,6 +224,8 @@ __all__ = [
     "MicroModelRunId",
     # Operator approval workflow (Patch 6)
     "ActionTransitionResponse",
+    # Notify execution stub (Patch 7)
+    "ActionExecutionResponse",
     # Schemas (Patch 4)
     "ActionPayloadSchema",
     "ClaimPredicateSchema",

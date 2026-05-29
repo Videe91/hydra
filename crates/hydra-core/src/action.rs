@@ -119,6 +119,26 @@ pub struct Outcome {
     pub caused_by: Option<EventId>,
 }
 
+/// Result of executing an action — MicroModel Patch 7.
+///
+/// The execution stub walks an Approved action through
+/// `ActionExecuting → ActionExecuted → OutcomeObserved` and returns
+/// this report so callers can audit the transition and reach the
+/// recorded outcome by id without a follow-up query.
+///
+/// `previous_status` is always `Approved` in v0 (Patch 7 enforces
+/// the strict precondition) but the field is preserved for future
+/// patches where execution may be triggered from other states.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActionExecutionReport {
+    pub action_id: ActionId,
+    pub previous_status: ActionStatus,
+    pub final_status: ActionStatus,
+    pub outcome_id: OutcomeId,
+    pub executed_by: ActorId,
+    pub executed_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

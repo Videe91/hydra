@@ -15,8 +15,8 @@ pub mod snapshots;
 pub mod tenant;
 
 pub use actions::{
-    actions_router, ActionTransitionResponse, ActionsHttpState, ApproveActionRequest,
-    RejectActionRequest,
+    actions_router, ActionExecutionResponse, ActionTransitionResponse, ActionsHttpState,
+    ApproveActionRequest, ExecuteActionRequest, RejectActionRequest,
 };
 pub use commit_stream::{
     commit_stream_router, CommitBroadcaster, CommitStreamErrorPayload,

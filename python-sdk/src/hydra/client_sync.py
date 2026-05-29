@@ -30,6 +30,7 @@ from . import _paths
 from ._http import HydraHttpClientSync
 from ._types import (
     Action,
+    ActionExecutionResponse,
     ActionId,
     ActionStatus,
     ActionTransitionResponse,
@@ -320,6 +321,28 @@ class HydraSync:
             tenant=tenant,
         )
         return ActionTransitionResponse.model_validate(raw)
+
+    # ========================================================================
+    # Patch 7 — Notify execution stub (sync mirror)
+    # ========================================================================
+
+    def execute_action(
+        self,
+        action_id: ActionId,
+        *,
+        actor: ActorId,
+        tenant: TenantId | None = None,
+    ) -> ActionExecutionResponse:
+        """Sync mirror of `Hydra.execute_action`. See the async
+        version for full semantics — same wire contract, same
+        preconditions, same outcome shape."""
+        body = {"actor": actor}
+        raw = self._http.post(
+            _paths.action_execute_path(action_id),
+            json=body,
+            tenant=tenant,
+        )
+        return ActionExecutionResponse.model_validate(raw)
 
     def _ingest(
         self,

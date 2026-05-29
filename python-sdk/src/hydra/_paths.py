@@ -161,6 +161,16 @@ def action_reject_path(action_id: str) -> str:
     return f"/actions/{_seg(action_id)}/reject"
 
 
+def action_execute_path(action_id: str) -> str:
+    """`POST /actions/{action_id}/execute` — operator-triggered
+    Notify-action execution stub (Patch 7). Walks an Approved
+    Notify action through Executing → Executed and records an
+    OutcomeObserved with `kind: Custom("notification_recorded")`.
+    Body: `{actor}`. No real network delivery — Patch 7B adds it.
+    400 on non-Approved status or non-Notify kind; 404 on unknown id."""
+    return f"/actions/{_seg(action_id)}/execute"
+
+
 # === /schemas/* — read ===
 
 

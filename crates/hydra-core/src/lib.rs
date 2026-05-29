@@ -35,6 +35,7 @@ pub use epistemic::{
 };
 pub use action::{
     Action,
+    ActionExecutionReport,
     ActionKind,
     ActionStatus,
     ActionTarget,
@@ -104,7 +105,8 @@ pub mod prelude {
         EvidencePayload, EvidenceSource,
     };
     pub use crate::action::{
-        Action, ActionKind, ActionStatus, ActionTarget, Outcome, OutcomeKind,
+        Action, ActionExecutionReport, ActionKind, ActionStatus, ActionTarget, Outcome,
+        OutcomeKind,
     };
     pub use crate::policy::{
         ApprovalRequest, ApprovalStatus, Policy, PolicyDecision, PolicyDecisionKind, PolicyKind,

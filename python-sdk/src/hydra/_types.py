@@ -1410,3 +1410,34 @@ class ActionTransitionResponse(BaseModel):
     reason: str | None = None
     approved_at: str | None = None
     updated_at: str
+
+
+# === Patch 7 — Notify action execution stub ===
+#
+# The execution surface complements Patch 6's approval gate. An
+# operator approves an action (Patch 6), then triggers execution
+# (Patch 7). v0 is a STUB — no real webhook, no Slack, no secrets.
+# The outcome records `kind: "notification_recorded"` (via the
+# `Custom` OutcomeKind variant on the wire) so future filters can
+# distinguish stubbed executions from real-delivery ones.
+
+
+class ActionExecutionResponse(BaseModel):
+    """Response envelope for `POST /actions/{id}/execute` (MicroModel
+    Patch 7).
+
+    `previous_status` is always `"approved"` in v0 because the
+    engine enforces the precondition. `final_status` is always
+    `"executed"` on success. `outcome_id` references the
+    `OutcomeObserved` event the execution emitted — callers can
+    fetch the full outcome via `list_outcomes_for_action(action_id)`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action_id: ActionId
+    previous_status: ActionTransitionStatus
+    final_status: ActionTransitionStatus
+    outcome_id: OutcomeId
+    executed_by: ActorId
+    executed_at: str

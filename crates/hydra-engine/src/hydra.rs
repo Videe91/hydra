@@ -1269,6 +1269,150 @@ impl Hydra {
             })
     }
 
+    // === Patch 7 — operator-triggered Notify execution stub =====
+    //
+    // The first execution path in the action lifecycle. Walks an
+    // Approved Notify action through the full
+    // `ActionExecuting → ActionExecuted → OutcomeObserved` chain
+    // and returns an `ActionExecutionReport` so callers can audit
+    // the transition and reach the outcome by id without a follow-
+    // up query.
+    //
+    // Strict preconditions (enforced by this method, NOT v0 in
+    // Patch 6's approve/reject):
+    //   - action must exist           → unknown action → QueryError
+    //   - action.kind == Notify       → other kinds   → QueryError
+    //   - action.status == Approved   → other states  → QueryError
+    //
+    // Patch 7 boundary: this is a STUB. No webhook, no Slack, no
+    // secrets, no retries. The `Outcome.impact` records "notification
+    // would be sent" and `OutcomeKind::Custom("notification_recorded")`
+    // marks the stub kind. Real delivery is Patch 7B.
+    //
+    // OutcomeAgent is NOT extended in Patch 7. It already reacts to
+    // ActionExecuted for Backfill only and no-ops for Notify, so
+    // emitting OutcomeObserved here is the explicit, kind-aware path.
+    // Patch 8 owns OutcomeAgent's outcome-learning rewrite.
+
+    /// Execute an approved Notify action as an internal stub.
+    ///
+    /// `actor` is the operator triggering execution — recorded on
+    /// the outcome as `recorded_by`. Returns an
+    /// `ActionExecutionReport` carrying the transition + the
+    /// recorded outcome id.
+    pub fn execute_notify_action(
+        &mut self,
+        action_id: hydra_core::ActionId,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::ActionExecutionReport> {
+        // 1. Validate action exists.
+        let action = match self.action_store.action(&action_id) {
+            Some(a) => a.clone(),
+            None => {
+                return Err(hydra_core::error::HydraError::QueryError(format!(
+                    "unknown action: {action_id}"
+                )));
+            }
+        };
+        // 2. Validate kind.
+        if action.kind != hydra_core::ActionKind::Notify {
+            return Err(hydra_core::error::HydraError::QueryError(format!(
+                "invalid action kind: {action_id} is not Notify (Patch 7 only \
+                 executes Notify actions; got {:?})",
+                action.kind
+            )));
+        }
+        // 3. Validate status.
+        if action.status != hydra_core::ActionStatus::Approved {
+            return Err(hydra_core::error::HydraError::QueryError(format!(
+                "invalid action state: {action_id} is {:?}, expected Approved",
+                action.status
+            )));
+        }
+        let previous_status = action.status.clone();
+
+        // 4. Ingest ActionExecuting. action_store flips status to
+        //    Executing. No agent reacts (OutcomeAgent waits for
+        //    ActionExecuted; PolicyAgent only handles ActionProposed).
+        self.ingest(hydra_core::EventKind::ActionExecuting {
+            action_id: action_id.clone(),
+        })?;
+
+        // 5. Ingest ActionExecuted. action_store flips status to
+        //    Executed and sets executed_at. OutcomeAgent reacts but
+        //    no-ops for Notify (Backfill-only in v0). Capture the
+        //    event id so the outcome's caused_by can point back.
+        let executed_cascade = self.ingest(hydra_core::EventKind::ActionExecuted {
+            action_id: action_id.clone(),
+        })?;
+        let executed_event_id = executed_cascade
+            .events
+            .first()
+            .map(|event| event.id.clone())
+            .expect(
+                "ingest produces at least the trigger event for ActionExecuted",
+            );
+
+        // 6. Build + ingest the stub outcome. `kind: Custom(...)`
+        //    so future filters can identify stub vs real-delivery
+        //    outcomes. `impact` is the operator-readable hint that
+        //    nothing was actually delivered.
+        let now = chrono::Utc::now();
+        let mut impact = std::collections::HashMap::new();
+        impact.insert(
+            "summary".to_string(),
+            hydra_core::Value::String(
+                "Notify action executed as internal stub; \
+                 no real notification was delivered."
+                    .to_string(),
+            ),
+        );
+        impact.insert(
+            "stub".to_string(),
+            hydra_core::Value::Bool(true),
+        );
+        let outcome = hydra_core::Outcome {
+            id: hydra_core::OutcomeId::new(),
+            tenant_id: action.tenant_id.clone(),
+            action_id: action_id.clone(),
+            kind: hydra_core::OutcomeKind::Custom("notification_recorded".to_string()),
+            observed_events: vec![executed_event_id.clone()],
+            updated_claims: action.related_claims.clone(),
+            produced_evidence: vec![],
+            impact,
+            observed_at: now,
+            recorded_at: now,
+            recorded_by: actor.clone(),
+            caused_by: Some(executed_event_id),
+        };
+        let outcome_id = outcome.id.clone();
+        self.ingest(hydra_core::EventKind::OutcomeObserved {
+            outcome,
+        })?;
+
+        // 7. Re-read the post-cascade action to pick up the engine-
+        //    assigned executed_at. Falls back to `now` if the
+        //    action somehow vanished, but action_store guarantees
+        //    it persists across the cascade.
+        let final_action = self.action_store.action(&action_id).cloned().ok_or_else(
+            || {
+                hydra_core::error::HydraError::QueryError(format!(
+                    "action vanished after execute: {action_id}"
+                ))
+            },
+        )?;
+        let executed_at = final_action.executed_at.unwrap_or(now);
+
+        Ok(hydra_core::ActionExecutionReport {
+            action_id,
+            previous_status,
+            final_status: final_action.status,
+            outcome_id,
+            executed_by: actor,
+            executed_at,
+        })
+    }
+
     pub fn executing_actions(&self) -> Vec<&hydra_core::Action> {
         self.action_store.executing_actions()
     }
@@ -4861,6 +5005,257 @@ mod tests {
             second.approved_by,
             Some(hydra_core::ActorId::from_str("actor_second"))
         );
+    }
+
+    // === MicroModel Patch 7 — execution stub helpers ===
+
+    /// Register a HumanApproval / AnyAction policy so the cascade
+    /// emits ApprovalRequested instead of auto-approving via
+    /// PolicyEvaluationDecision::Allow. Used by Patch 7 tests that
+    /// need a Notify action to stay in Proposed until the operator
+    /// approves explicitly.
+    fn register_any_action_approval_policy(hydra: &mut Hydra) {
+        let now = chrono::Utc::now();
+        let policy = hydra_core::Policy {
+            id: hydra_core::PolicyId::new(),
+            tenant_id: None,
+            name: "Patch 7 test — require human approval".to_string(),
+            kind: hydra_core::PolicyKind::HumanApproval,
+            status: hydra_core::PolicyStatus::Active,
+            scope: hydra_core::PolicyScope::AnyAction,
+            condition: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            created_by: hydra_core::ActorId::from_str("actor_test_policy_admin"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::PolicyRegistered { policy })
+            .unwrap();
+    }
+
+    #[test]
+    fn execute_notify_action_walks_approved_to_executed() {
+        // Happy path: an Approved Notify action walks through
+        // Executing → Executed and the report carries the final
+        // state + executed_at. previous_status reflects Approved.
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        // propose_one_test_action's critical cascade auto-approves
+        // (no policies registered), so the action is already
+        // Approved by the time we get here.
+        let operator = hydra_core::ActorId::from_str("actor_ops");
+        let report = hydra
+            .execute_notify_action(action_id.clone(), operator.clone())
+            .unwrap();
+
+        assert_eq!(report.action_id, action_id);
+        assert_eq!(
+            report.previous_status,
+            hydra_core::action::ActionStatus::Approved
+        );
+        assert_eq!(
+            report.final_status,
+            hydra_core::action::ActionStatus::Executed
+        );
+        assert_eq!(report.executed_by, operator);
+
+        let final_action = hydra.action(&action_id).unwrap();
+        assert_eq!(
+            final_action.status,
+            hydra_core::action::ActionStatus::Executed
+        );
+        assert_eq!(final_action.executed_at, Some(report.executed_at));
+    }
+
+    #[test]
+    fn execute_notify_action_records_outcome_with_custom_kind() {
+        // The execution stub must emit an OutcomeObserved with
+        // `kind: Custom("notification_recorded")` and an impact
+        // payload that clearly identifies this as a stub.
+        let mut hydra = Hydra::new();
+        let action_id = propose_one_test_action(&mut hydra);
+        let report = hydra
+            .execute_notify_action(
+                action_id.clone(),
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+
+        let outcomes = hydra.outcomes_for_action(&action_id);
+        // Notify is NOT handled by OutcomeAgent (v0 = Backfill-only),
+        // so exactly one outcome lands: the one Patch 7 emits.
+        assert_eq!(outcomes.len(), 1, "expected exactly one outcome (Patch 7 emission)");
+        let outcome = outcomes[0];
+        assert_eq!(outcome.id, report.outcome_id);
+        assert_eq!(
+            outcome.kind,
+            hydra_core::OutcomeKind::Custom("notification_recorded".to_string())
+        );
+        // Impact carries the stub marker + a human-readable summary.
+        assert!(matches!(
+            outcome.impact.get("stub"),
+            Some(hydra_core::Value::Bool(true))
+        ));
+        assert!(matches!(
+            outcome.impact.get("summary"),
+            Some(hydra_core::Value::String(s)) if s.contains("internal stub")
+        ));
+        // Causal link: outcome.caused_by points at the
+        // ActionExecuted event id so lineage walks reach it.
+        assert!(outcome.caused_by.is_some());
+    }
+
+    #[test]
+    fn execute_notify_action_refuses_non_notify_kind() {
+        // Patch 7 scope discipline: only Notify executes. Other
+        // kinds (Backfill, Quarantine, etc.) return a QueryError
+        // identifying the mismatched kind. No status mutation.
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let action_id = hydra_core::ActionId::new();
+        let actor = hydra_core::ActorId::from_str("actor_test_proposer");
+        // Backfill is a non-Notify kind; create it directly in
+        // Approved state so kind-check fires before status-check.
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Backfill,
+            status: hydra_core::action::ActionStatus::Approved,
+            targets: vec![hydra_core::action::ActionTarget::Dataset(
+                "orders".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: Some(actor.clone()),
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: Some(now),
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        // Action is Backfill in some non-Proposed status after
+        // cascade — execute should still refuse on kind.
+        let result = hydra.execute_notify_action(
+            action_id.clone(),
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("invalid action kind"), "msg: {msg}");
+                assert!(msg.contains("Notify"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+        // No ActionExecuting / ActionExecuted in the audit log.
+        let exec_events = hydra
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    hydra_core::EventKind::ActionExecuting { .. }
+                        | hydra_core::EventKind::ActionExecuted { .. }
+                )
+            })
+            .count();
+        assert_eq!(exec_events, 0);
+    }
+
+    #[test]
+    fn execute_notify_action_refuses_non_approved_status() {
+        // Register a HumanApproval/AnyAction policy BEFORE ingest
+        // so the cascade emits ApprovalRequested instead of
+        // auto-approving via PolicyEvaluationDecision::Allow.
+        // The action stays in Proposed and execute must refuse
+        // with an "invalid action state" error.
+        let mut hydra = Hydra::new();
+        register_any_action_approval_policy(&mut hydra);
+        let now = chrono::Utc::now();
+        let action_id = hydra_core::ActionId::new();
+        let actor = hydra_core::ActorId::from_str("actor_test_proposer");
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Notify,
+            status: hydra_core::action::ActionStatus::Proposed,
+            targets: vec![hydra_core::action::ActionTarget::System(
+                "hydra".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor,
+            approved_by: None,
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        // Sanity: action is Proposed, not Approved.
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::action::ActionStatus::Proposed
+        );
+        let result = hydra.execute_notify_action(
+            action_id.clone(),
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("invalid action state"), "msg: {msg}");
+                assert!(msg.contains("Approved"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+        // Status untouched.
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::action::ActionStatus::Proposed
+        );
+    }
+
+    #[test]
+    fn execute_notify_action_unknown_action_returns_query_error() {
+        // Validate-before-ingest: an unknown action id returns
+        // QueryError("unknown action: ...") and leaves no event
+        // residue in the audit log.
+        let mut hydra = Hydra::new();
+        let result = hydra.execute_notify_action(
+            hydra_core::ActionId::from_str("act_does_not_exist"),
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown action"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+        let exec_events = hydra
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    hydra_core::EventKind::ActionExecuting { .. }
+                        | hydra_core::EventKind::ActionExecuted { .. }
+                        | hydra_core::EventKind::OutcomeObserved { .. }
+                )
+            })
+            .count();
+        assert_eq!(exec_events, 0);
     }
 }
 

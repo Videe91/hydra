@@ -27,6 +27,7 @@ from . import _paths
 from ._http import HydraHttpClient
 from ._types import (
     Action,
+    ActionExecutionResponse,
     ActionId,
     ActionStatus,
     ActionTransitionResponse,
@@ -394,6 +395,44 @@ class Hydra:
             tenant=tenant,
         )
         return ActionTransitionResponse.model_validate(raw)
+
+    # ========================================================================
+    # Patch 7 — operator-triggered Notify execution stub
+    # ========================================================================
+
+    async def execute_action(
+        self,
+        action_id: ActionId,
+        *,
+        actor: ActorId,
+        tenant: TenantId | None = None,
+    ) -> ActionExecutionResponse:
+        """Execute an Approved Notify action — `POST /actions/{id}/execute`.
+
+        v0 is a STUB. No webhook is called, no Slack message is sent.
+        The engine walks the action through `Executing → Executed`
+        and records an `OutcomeObserved` with kind
+        `"notification_recorded"`. The returned envelope carries
+        the outcome id so callers can fetch the full outcome
+        without a follow-up query.
+
+        Strict preconditions enforced by the engine:
+          - action.kind must be `Notify` (other kinds → 400)
+          - action.status must be `Approved` (other states → 400)
+          - action_id must exist (404 otherwise)
+
+        The SDK method is named `execute_action` (not
+        `execute_notify_action`) because Patch 7B will add real
+        delivery and Patch 8+ may broaden execution to other kinds
+        — the signature is stable across that evolution.
+        """
+        body = {"actor": actor}
+        raw = await self._http.post(
+            _paths.action_execute_path(action_id),
+            json=body,
+            tenant=tenant,
+        )
+        return ActionExecutionResponse.model_validate(raw)
 
     async def _ingest(
         self,

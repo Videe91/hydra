@@ -308,6 +308,17 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
         if path.starts_with("/diagnostics/") {
             return vec!["write:diagnostics"];
         }
+        // MicroModel Patch 7 — operator-triggered execution stub.
+        // Match BEFORE the general /actions/* approve/reject block
+        // so /actions/{id}/execute routes through `write:execute`
+        // — a SEPARATE power from approval. Approval and execution
+        // are distinct authorities (an operator may have one
+        // without the other; future patches may also let an agent
+        // execute auto-approved low-risk actions while humans
+        // retain approval).
+        if path.starts_with("/actions/") && path.ends_with("/execute") {
+            return vec!["write:execute"];
+        }
         // MicroModel Patch 6 — operator approval workflow. The
         // first human governance gate. Mutates Action status
         // (Proposed → Approved/Rejected) and records the operator
@@ -915,6 +926,15 @@ mod tests {
         assert_eq!(
             required_scopes_for(&Method::POST, "/actions/act-123/reject"),
             vec!["write:approvals"]
+        );
+        // MicroModel Patch 7 — execution stub. /actions/{id}/execute
+        // requires the new `write:execute` scope, distinct from
+        // write:approvals. Match must come BEFORE the general
+        // /actions/* approve/reject block (asserted here so any
+        // future ordering regression is caught).
+        assert_eq!(
+            required_scopes_for(&Method::POST, "/actions/act-123/execute"),
+            vec!["write:execute"]
         );
         assert_eq!(
             required_scopes_for(&Method::GET, "/query/nodes"),
