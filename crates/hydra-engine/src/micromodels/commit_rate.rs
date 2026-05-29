@@ -75,6 +75,26 @@ impl AnomalyLevel {
             AnomalyLevel::Critical => 0.90,
         }
     }
+
+    /// Stable snake_case wire string. Identical to the serde
+    /// representation — exposed here so the Patch 3 bridge can
+    /// stash the level inside a typed `Value::String` in an
+    /// Evidence payload without round-tripping through serde_json.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            AnomalyLevel::WarmingUp => "warming_up",
+            AnomalyLevel::Normal => "normal",
+            AnomalyLevel::Warning => "warning",
+            AnomalyLevel::Critical => "critical",
+        }
+    }
+
+    /// True for levels that warrant downstream action — Warning or
+    /// Critical. The Patch 3 bridge fires Evidence + Claim only
+    /// when this returns `true`.
+    pub fn is_actionable(&self) -> bool {
+        matches!(self, AnomalyLevel::Warning | AnomalyLevel::Critical)
+    }
 }
 
 /// Direction of the deviation from the EWMA baseline. Only meaningful
@@ -92,6 +112,19 @@ pub enum Direction {
     /// Observed rate is within the warning band, OR EWMA baseline
     /// is below `min_expected_rate` (suppression in effect).
     Stable,
+}
+
+impl Direction {
+    /// Stable snake_case wire string. Same role as
+    /// `AnomalyLevel::wire_name` — lets the bridge stash the
+    /// direction in a typed Evidence payload value.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            Direction::Spike => "spike",
+            Direction::Drop => "drop",
+            Direction::Stable => "stable",
+        }
+    }
 }
 
 /// Tunable thresholds for the EWMA + Z-score detector.
@@ -197,6 +230,16 @@ impl CommitRateAnomalyModel {
             config,
             state: CommitRateAnomalyState::default(),
         }
+    }
+
+    /// Construct a model with an explicit pre-seeded state. Primary
+    /// use case: test fixtures that need a deterministic EWMA
+    /// baseline (e.g. `ewma_rate=10`, `samples_seen` past warmup)
+    /// so the next observation deterministically lands in a chosen
+    /// anomaly band. Also useful for future state-restoration
+    /// patches that load EWMA state from disk.
+    pub fn with_state(config: CommitRateAnomalyConfig, state: CommitRateAnomalyState) -> Self {
+        Self { config, state }
     }
 
     pub fn config(&self) -> &CommitRateAnomalyConfig {
@@ -321,6 +364,34 @@ fn signed_z_score(observed: f64, mean: f64, variance: f64) -> f64 {
     // first ordinary fluctuation produces an absurd z-score.
     let var = variance.max(1.0);
     (observed - mean) / var.sqrt()
+}
+
+/// Result of a `Hydra::evaluate_commit_rate_anomaly_and_propose_claim`
+/// call (MicroModel Patch 3 — the prediction bridge).
+///
+/// Every assessment carries the underlying prediction and the event
+/// id under which it was recorded. When the model returns Warning or
+/// Critical, the bridge ALSO records a paired `EvidenceAdded` and
+/// `ClaimProposed` event — both with `caused_by = prediction_event_id`
+/// — and the assessment carries the new ids back to the caller.
+///
+/// For `WarmingUp` and `Normal` predictions, `evidence_id` and
+/// `claim_id` are `None`: no belief is formed against a baseline the
+/// model hasn't trusted yet (warmup) or a steady-state observation
+/// (normal). The prediction is still recorded for audit and
+/// evolution metrics.
+///
+/// The top-level `level` field is duplicated from the prediction
+/// output for ergonomic branching — callers shouldn't have to parse
+/// `prediction.output` just to decide whether evidence + claim
+/// landed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitRateAnomalyAssessment {
+    pub prediction: hydra_core::MicroModelPrediction,
+    pub prediction_event_id: hydra_core::EventId,
+    pub evidence_id: Option<hydra_core::EvidenceId>,
+    pub claim_id: Option<hydra_core::ClaimId>,
+    pub level: AnomalyLevel,
 }
 
 fn render_reason(

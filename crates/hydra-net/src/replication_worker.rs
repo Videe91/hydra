@@ -3526,7 +3526,7 @@ mod tests {
             .write()
             .await
             .set_role(EngineRole::Follower);
-        let mut config = ReplicationPullerConfig::new(
+        let config = ReplicationPullerConfig::new(
             follower_peer_id(),
             format!("http://{addr}"),
             restorer(),

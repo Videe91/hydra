@@ -29,6 +29,6 @@
 pub mod commit_rate;
 
 pub use commit_rate::{
-    AnomalyLevel, CommitRateAnomalyConfig, CommitRateAnomalyModel, CommitRateAnomalyOutput,
-    CommitRateAnomalyState, Direction,
+    AnomalyLevel, CommitRateAnomalyAssessment, CommitRateAnomalyConfig, CommitRateAnomalyModel,
+    CommitRateAnomalyOutput, CommitRateAnomalyState, Direction,
 };

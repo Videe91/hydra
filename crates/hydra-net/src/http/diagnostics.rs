@@ -894,7 +894,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request};
     use hydra_core::{EventKind, NodeId, TenantId};
-    use hydra_engine::anomaly::{AnomalyKind, TopologyRule};
+    use hydra_engine::anomaly::TopologyRule;
     use std::collections::HashMap;
     use tower::ServiceExt;
 

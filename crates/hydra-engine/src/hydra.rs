@@ -1821,6 +1821,123 @@ impl Hydra {
         &mut self,
         actor: hydra_core::ActorId,
     ) -> hydra_core::error::Result<hydra_core::MicroModelPrediction> {
+        // Patch 2's public surface — unchanged. Funnels through the
+        // shared private helper that Patch 3's bridge also uses.
+        // The typed `Output` and the prediction event id are
+        // available to the helper but discarded here so the legacy
+        // return type stays stable.
+        let (prediction, _event_id, _output) =
+            self.record_commit_rate_prediction(actor)?;
+        Ok(prediction)
+    }
+
+    /// Evaluate the built-in commit-rate model AND, on Warning /
+    /// Critical, propose paired Evidence + Claim records linked
+    /// back to the prediction event.
+    ///
+    /// This is the MicroModel Patch 3 bridge: a single call moves
+    /// the model's verdict from a free-standing prediction (Patch 2)
+    /// into Hydra's epistemic loop — `prediction event → evidence →
+    /// claim`. Lineage queries on the prediction event id surface
+    /// the entire chain.
+    ///
+    /// Behavior by level:
+    /// - `WarmingUp` / `Normal` → prediction only. `evidence_id`
+    ///   and `claim_id` on the returned assessment are `None`.
+    /// - `Warning` / `Critical` → prediction + Evidence + Claim.
+    ///   Both records carry `caused_by = prediction_event_id`. The
+    ///   Claim's `evidence_for` references the new evidence id.
+    ///
+    /// Evidence shape:
+    /// ```text
+    ///   source     = EvidenceSource::System { name: "mm_builtin_commit_rate_v0" }
+    ///   payload    = { kind: "micro_model_prediction", data: typed Values }
+    ///   reliability = prediction.confidence
+    ///   caused_by  = prediction_event_id
+    /// ```
+    ///
+    /// Claim shape:
+    /// ```text
+    ///   kind         = AnomalyFinding
+    ///   subject      = ClaimSubject::System("hydra")
+    ///   predicate    = "under_abnormal_load"
+    ///   object       = ClaimObject::Value(Value::Bool(true))
+    ///   confidence   = prediction.confidence
+    ///   evidence_for = [evidence_id]
+    ///   created_by   = actor  (caller's identity — "this agent believes")
+    ///   caused_by    = prediction_event_id
+    /// ```
+    ///
+    /// Non-idempotent (matches Patch 2): two calls on the same
+    /// condition produce two distinct assessments, each with its
+    /// own prediction event, evidence, and claim. Patch 4 may
+    /// dedup at the action layer.
+    ///
+    /// Patch 3 does NOT yet emit `ActionProposed` — that's Patch 4.
+    pub fn evaluate_commit_rate_anomaly_and_propose_claim(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<crate::micromodels::CommitRateAnomalyAssessment>
+    {
+        let (prediction, prediction_event_id, output) =
+            self.record_commit_rate_prediction(actor.clone())?;
+
+        let (evidence_id, claim_id) = if output.level.is_actionable() {
+            // Build + record Evidence first so the Claim can
+            // reference its id in `evidence_for`.
+            let evidence = build_evidence_from_prediction(
+                &prediction,
+                &output,
+                prediction_event_id.clone(),
+            );
+            let new_evidence_id = evidence.id.clone();
+            self.ingest(hydra_core::EventKind::EvidenceAdded { evidence })?;
+
+            // Now the Claim. `created_by` is the caller-supplied
+            // actor — "I, this agent, believe Hydra is under
+            // abnormal load because the model fired."
+            let claim = build_claim_from_prediction(
+                &prediction,
+                &new_evidence_id,
+                actor,
+                prediction_event_id.clone(),
+            );
+            let new_claim_id = claim.id.clone();
+            self.ingest(hydra_core::EventKind::ClaimProposed { claim })?;
+
+            (Some(new_evidence_id), Some(new_claim_id))
+        } else {
+            // WarmingUp / Normal: no belief formed against a
+            // baseline the model hasn't trusted (warmup) or a
+            // steady-state observation (normal).
+            (None, None)
+        };
+
+        Ok(crate::micromodels::CommitRateAnomalyAssessment {
+            level: output.level,
+            prediction,
+            prediction_event_id,
+            evidence_id,
+            claim_id,
+        })
+    }
+
+    /// Shared private helper: auto-register the built-in model if
+    /// missing, count commits in the window, evaluate the model,
+    /// record `MicroModelPredictionRecorded`, and return the typed
+    /// triple `(prediction, prediction_event_id, output)`.
+    ///
+    /// Both Patch 2's `evaluate_commit_rate_anomaly` and Patch 3's
+    /// bridge funnel through here so the auto-register + counting
+    /// + recording logic lives in one place.
+    fn record_commit_rate_prediction(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<(
+        hydra_core::MicroModelPrediction,
+        hydra_core::EventId,
+        crate::micromodels::CommitRateAnomalyOutput,
+    )> {
         // Step 1 — auto-register the built-in model definition if
         // missing. Goes through `register_micro_model` →
         // `self.ingest(EventKind::MicroModelRegistered)`, so this
@@ -1850,8 +1967,6 @@ impl Hydra {
         }
 
         // Step 2 — count commits in the model's configured window.
-        // Read window_secs off the model (lazy-initialized below if
-        // absent). Walks the commit ledger from latest backwards.
         let window_secs = self
             .commit_rate_anomaly_model
             .as_ref()
@@ -1870,10 +1985,7 @@ impl Hydra {
             .take_while(|batch| batch.committed_at >= window_start)
             .count() as u64;
 
-        // Step 3 — evaluate via the pure model. Lazy-init the model
-        // on first use. Capture `samples_seen` BEFORE the update so
-        // the prediction input field reflects "what the model knew
-        // at the time it scored this sample."
+        // Step 3 — evaluate via the pure model.
         let (samples_seen_before, output) = {
             let model = self
                 .commit_rate_anomaly_model
@@ -1883,9 +1995,7 @@ impl Hydra {
             (samples_before, output)
         };
 
-        // Step 4 — build the typed prediction. `output` goes
-        // verbatim into MicroModelPrediction.output via to_value
-        // (the struct is serde-derived; serialization cannot fail).
+        // Step 4 — build the typed prediction.
         let prediction = hydra_core::MicroModelPrediction {
             model_id: model_id.clone(),
             run_id: hydra_core::MicroModelRunId::new(),
@@ -1902,19 +2012,27 @@ impl Hydra {
             created_at: now,
         };
 
-        // Step 5 — record through the standard ingest path so the
-        // commit ledger, durable writer, observer, and replication
-        // see the prediction event.
-        self.ingest(hydra_core::EventKind::MicroModelPredictionRecorded {
-            prediction: prediction.clone(),
-        })?;
+        // Step 5 — record through ingest, capture the trigger
+        // event id off the CascadeResult.
+        let cascade = self.ingest(
+            hydra_core::EventKind::MicroModelPredictionRecorded {
+                prediction: prediction.clone(),
+            },
+        )?;
+        let prediction_event_id = cascade
+            .events
+            .first()
+            .map(|event| event.id.clone())
+            .expect(
+                "ingest produces at least the trigger event for \
+                 MicroModelPredictionRecorded",
+            );
 
         // `actor` is reserved for a future MicroModelPredictionRecorded
         // variant that carries the requesting actor in the event
-        // body. Patch 2 doesn't yet plumb it through; the parameter
-        // exists so the helper signature stays stable.
+        // body. Patch 2/3 don't yet plumb it through.
         let _ = actor;
-        Ok(prediction)
+        Ok((prediction, prediction_event_id, output))
     }
 
     /// Read access to the running `CommitRateAnomalyModel`. `None`
@@ -2669,6 +2787,118 @@ impl Default for Hydra {
     }
 }
 
+// === MicroModel Patch 3 — prediction → evidence + claim builders ===
+
+/// Build the `Evidence` record paired with a Warning/Critical
+/// commit-rate prediction. Pure function — no engine access; the
+/// caller passes everything in. Used by the bridge in
+/// `Hydra::evaluate_commit_rate_anomaly_and_propose_claim` and
+/// kept module-private since the shape is part of Patch 3's
+/// internal contract.
+fn build_evidence_from_prediction(
+    prediction: &hydra_core::MicroModelPrediction,
+    output: &crate::micromodels::CommitRateAnomalyOutput,
+    prediction_event_id: hydra_core::EventId,
+) -> hydra_core::Evidence {
+    use hydra_core::epistemic::{Confidence, EvidencePayload, EvidenceSource};
+
+    let mut data: std::collections::HashMap<String, hydra_core::Value> =
+        std::collections::HashMap::new();
+    data.insert(
+        "model_id".to_string(),
+        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
+    );
+    data.insert(
+        "run_id".to_string(),
+        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
+    );
+    data.insert(
+        "level".to_string(),
+        hydra_core::Value::String(output.level.wire_name().to_string()),
+    );
+    data.insert(
+        "direction".to_string(),
+        hydra_core::Value::String(output.direction.wire_name().to_string()),
+    );
+    data.insert(
+        "observed_rate".to_string(),
+        hydra_core::Value::Float(output.observed_rate),
+    );
+    data.insert(
+        "expected_rate".to_string(),
+        hydra_core::Value::Float(output.expected_rate),
+    );
+    data.insert(
+        "z_score".to_string(),
+        hydra_core::Value::Float(output.z_score),
+    );
+    data.insert(
+        "reason".to_string(),
+        hydra_core::Value::String(output.reason.clone()),
+    );
+
+    hydra_core::Evidence {
+        id: hydra_core::EvidenceId::new(),
+        // Tenant scoping mirrors Patch 2's prediction event — None
+        // in v0; future patches can thread tenant through the
+        // bridge if needed.
+        tenant_id: None,
+        // Use the model id (not a friendly name) as the source
+        // identifier so evidence joins cleanly back to the registry
+        // entry for `mm_builtin_commit_rate_v0`.
+        source: EvidenceSource::System {
+            name: prediction.model_id.as_str().to_string(),
+        },
+        payload: EvidencePayload {
+            kind: "micro_model_prediction".to_string(),
+            data,
+        },
+        reliability: Confidence::new(prediction.confidence),
+        observed_at: prediction.created_at,
+        recorded_at: prediction.created_at,
+        caused_by: Some(prediction_event_id),
+    }
+}
+
+/// Build the `Claim` paired with the Evidence above. Same purity
+/// contract — no engine access. The Patch 3 spec pins this shape:
+///
+///   subject       = ClaimSubject::System("hydra")
+///   predicate     = "under_abnormal_load"
+///   object        = ClaimObject::Value(Value::Bool(true))
+///   kind          = AnomalyFinding
+///   evidence_for  = [evidence_id]
+///   caused_by     = prediction_event_id
+fn build_claim_from_prediction(
+    prediction: &hydra_core::MicroModelPrediction,
+    evidence_id: &hydra_core::EvidenceId,
+    actor: hydra_core::ActorId,
+    prediction_event_id: hydra_core::EventId,
+) -> hydra_core::Claim {
+    use hydra_core::epistemic::{
+        ClaimKind, ClaimObject, ClaimStatus, ClaimSubject, Confidence,
+    };
+
+    hydra_core::Claim {
+        id: hydra_core::ClaimId::new(),
+        tenant_id: None,
+        kind: ClaimKind::AnomalyFinding,
+        subject: ClaimSubject::System("hydra".to_string()),
+        predicate: "under_abnormal_load".to_string(),
+        object: ClaimObject::Value(hydra_core::Value::Bool(true)),
+        confidence: Confidence::new(prediction.confidence),
+        status: ClaimStatus::Proposed,
+        evidence_for: vec![evidence_id.clone()],
+        evidence_against: vec![],
+        valid_from: prediction.created_at,
+        valid_until: None,
+        created_by: actor,
+        created_at: prediction.created_at,
+        updated_at: prediction.created_at,
+        caused_by: Some(prediction_event_id),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3382,6 +3612,420 @@ mod tests {
 
         hydra.reset_runtime_state_preserving_config();
         assert!(hydra.commit_rate_anomaly_model().is_none());
+    }
+
+    // === MicroModel Patch 3 — prediction → evidence + claim bridge ===
+
+    fn primed_model_with_baseline(
+        rate: f64,
+        variance: f64,
+    ) -> crate::micromodels::CommitRateAnomalyModel {
+        // Build a CommitRateAnomalyModel that's already past
+        // warmup, so the bridge tests don't have to ingest dozens
+        // of priming events before they can observe a Warning or
+        // Critical level. The `last_observed_at` is set to "long
+        // ago" so the recency check inside evaluate_observation
+        // (none in v0) wouldn't fire.
+        let config = crate::micromodels::CommitRateAnomalyConfig::default();
+        let state = crate::micromodels::CommitRateAnomalyState {
+            ewma_rate: rate,
+            ewma_variance: variance,
+            samples_seen: 10, // past default warmup_samples = 5
+            last_observed_at: Some(chrono::Utc::now()),
+        };
+        crate::micromodels::CommitRateAnomalyModel::with_state(config, state)
+    }
+
+    fn ingest_signals(hydra: &mut Hydra, count: u64) {
+        for i in 0..count {
+            hydra
+                .ingest(hydra_core::EventKind::Signal {
+                    source: hydra_core::NodeId::from_str("test.bridge"),
+                    name: format!("noise-{i}"),
+                    payload: std::collections::HashMap::new(),
+                })
+                .unwrap();
+        }
+    }
+
+    /// Test fixture: build a Hydra with the built-in model
+    /// auto-registered, then OVERWRITE the model state with a
+    /// primed baseline at `rate`/`variance`. After this returns,
+    /// the ledger holds 3 background commits (Registered,
+    /// StatusChanged, the warmup-prediction) and the model is past
+    /// warmup with `samples_seen=10`. Tests then ingest a known
+    /// number of signals to drive the observed rate into the
+    /// target band.
+    fn primed_hydra(rate: f64, variance: f64) -> Hydra {
+        let mut hydra = Hydra::new();
+        // First evaluate forces auto-register so the registry
+        // commits don't appear inside the next evaluation's window
+        // count "by surprise."
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        hydra.commit_rate_anomaly_model =
+            Some(primed_model_with_baseline(rate, variance));
+        hydra
+    }
+
+    /// How many commits already sit in the ledger after
+    /// `primed_hydra`. Lets tests target a specific
+    /// `commit_count_in_window` deterministically.
+    fn ledger_count(hydra: &Hydra) -> u64 {
+        hydra.commit_ledger.batches_in_sequence().len() as u64
+    }
+
+    fn count_evidence_events(hydra: &Hydra) -> usize {
+        hydra
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, hydra_core::EventKind::EvidenceAdded { .. }))
+            .count()
+    }
+
+    fn count_claim_events(hydra: &Hydra) -> usize {
+        hydra
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, hydra_core::EventKind::ClaimProposed { .. }))
+            .count()
+    }
+
+    #[test]
+    fn normal_prediction_creates_no_evidence_or_claim() {
+        // Prime model with rate=10, var=1. Then drive the window
+        // count to ~11 (z ≈ 1, Normal). `primed_hydra` already
+        // contains 3 background commits; add 8 more signals so the
+        // count lands at 11.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 11u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+
+        let pre_evidence = count_evidence_events(&hydra);
+        let pre_claim = count_claim_events(&hydra);
+
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+
+        assert_eq!(assessment.level, crate::micromodels::AnomalyLevel::Normal);
+        assert!(assessment.evidence_id.is_none());
+        assert!(assessment.claim_id.is_none());
+        // No new Evidence or Claim events landed.
+        assert_eq!(count_evidence_events(&hydra), pre_evidence);
+        assert_eq!(count_claim_events(&hydra), pre_claim);
+    }
+
+    #[test]
+    fn warming_up_assessment_omits_evidence_and_claim() {
+        // No primed model → first call is WarmingUp by design.
+        // Bridge must NOT propose evidence or claim against a
+        // baseline the model hasn't trusted.
+        let mut hydra = Hydra::new();
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::AnomalyLevel::WarmingUp
+        );
+        assert!(assessment.evidence_id.is_none());
+        assert!(assessment.claim_id.is_none());
+    }
+
+    #[test]
+    fn critical_prediction_creates_evidence_and_claim() {
+        // Prime + drive window count to 100. z = (100-10)/1 = 90 →
+        // Critical / Spike.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::AnomalyLevel::Critical
+        );
+        assert!(assessment.evidence_id.is_some());
+        assert!(assessment.claim_id.is_some());
+
+        // One Evidence + one Claim event landed.
+        assert_eq!(count_evidence_events(&hydra), 1);
+        assert_eq!(count_claim_events(&hydra), 1);
+
+        // The records are queryable via Hydra accessors.
+        let evidence_id = assessment.evidence_id.as_ref().unwrap();
+        let claim_id = assessment.claim_id.as_ref().unwrap();
+        assert!(hydra.evidence(evidence_id).is_some());
+        assert!(hydra.claim(claim_id).is_some());
+    }
+
+    #[test]
+    fn warning_prediction_creates_evidence_and_claim() {
+        // Drive window count to 13. z = (13-10)/1 = 3 → Warning
+        // (z >= warning_z_score=3, < critical_z_score=5).
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 13u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::AnomalyLevel::Warning
+        );
+        assert!(assessment.evidence_id.is_some());
+        assert!(assessment.claim_id.is_some());
+    }
+
+    #[test]
+    fn evidence_carries_micromodel_payload() {
+        // Pin the 8-key Evidence payload shape that Patch 3 promised.
+        // Future patches may add fields but must not rename these.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+        let evidence = hydra
+            .evidence(assessment.evidence_id.as_ref().unwrap())
+            .unwrap();
+
+        // Source is the model id, NOT a friendly name (joins back
+        // to the registry).
+        match &evidence.source {
+            hydra_core::epistemic::EvidenceSource::System { name } => {
+                assert_eq!(name, BUILTIN_COMMIT_RATE_MODEL_ID);
+            }
+            other => panic!("unexpected EvidenceSource variant: {other:?}"),
+        }
+        // Payload kind is the durable discriminant Patch 4+ will
+        // pattern-match on.
+        assert_eq!(evidence.payload.kind, "micro_model_prediction");
+        // All 8 typed fields present.
+        for key in [
+            "model_id",
+            "run_id",
+            "level",
+            "direction",
+            "observed_rate",
+            "expected_rate",
+            "z_score",
+            "reason",
+        ] {
+            assert!(
+                evidence.payload.data.contains_key(key),
+                "missing payload key {key}"
+            );
+        }
+        // Type discipline — floats are Float, strings are String.
+        assert!(matches!(
+            evidence.payload.data.get("observed_rate"),
+            Some(hydra_core::Value::Float(_))
+        ));
+        assert!(matches!(
+            evidence.payload.data.get("level"),
+            Some(hydra_core::Value::String(s)) if s == "critical"
+        ));
+        // Reliability mirrors the prediction confidence.
+        assert_eq!(
+            evidence.reliability.value(),
+            assessment.prediction.confidence
+        );
+        // Tenant scoping is None in v0.
+        assert!(evidence.tenant_id.is_none());
+    }
+
+    #[test]
+    fn claim_references_evidence_via_evidence_for() {
+        // `claim.evidence_for == [evidence_id]` — the structural
+        // belief→support edge that lineage walkers traverse.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+        let evidence_id = assessment.evidence_id.clone().unwrap();
+        let claim = hydra
+            .claim(assessment.claim_id.as_ref().unwrap())
+            .unwrap();
+
+        assert_eq!(claim.evidence_for, vec![evidence_id]);
+        assert!(claim.evidence_against.is_empty());
+
+        // Pin the rest of the Patch 3 claim shape.
+        assert_eq!(claim.kind, hydra_core::epistemic::ClaimKind::AnomalyFinding);
+        assert_eq!(
+            claim.subject,
+            hydra_core::epistemic::ClaimSubject::System("hydra".to_string())
+        );
+        assert_eq!(claim.predicate, "under_abnormal_load");
+        assert_eq!(
+            claim.object,
+            hydra_core::epistemic::ClaimObject::Value(hydra_core::Value::Bool(true))
+        );
+        // The bridge proposes the claim as `Proposed`. Hydra's
+        // verification agent may auto-promote it to `Verified`
+        // within the same cascade once it sees the paired
+        // evidence — that promotion is desired engine behavior,
+        // not a Patch 3 bug, so accept either status here.
+        assert!(matches!(
+            claim.status,
+            hydra_core::epistemic::ClaimStatus::Proposed
+                | hydra_core::epistemic::ClaimStatus::Verified
+        ));
+        assert_eq!(claim.created_by, requester());
+        assert!(claim.tenant_id.is_none());
+    }
+
+    #[test]
+    fn evidence_and_claim_caused_by_prediction_event() {
+        // The most important invariant of Patch 3: both downstream
+        // records' `caused_by` point at the prediction event. This
+        // is what lets `hy.lineage(prediction_event_id)` traverse
+        // forward and surface evidence + claim.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+
+        let evidence = hydra
+            .evidence(assessment.evidence_id.as_ref().unwrap())
+            .unwrap();
+        let claim = hydra
+            .claim(assessment.claim_id.as_ref().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            evidence.caused_by.as_ref(),
+            Some(&assessment.prediction_event_id)
+        );
+        assert_eq!(
+            claim.caused_by.as_ref(),
+            Some(&assessment.prediction_event_id)
+        );
+    }
+
+    #[test]
+    fn lineage_from_prediction_event_includes_evidence_and_claim() {
+        // The "explain it" pin. The HTTP lineage handler's
+        // enrichment scan filters each store by
+        // `record.caused_by ∈ events_in_lineage`. We mirror that
+        // here at the engine level: scan all evidence + claims and
+        // confirm at least one of each points at the prediction
+        // event we just produced.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+        let seed_id = &assessment.prediction_event_id;
+
+        // The prediction event must be in the engine's audit log.
+        assert!(hydra
+            .events()
+            .iter()
+            .any(|event| &event.id == seed_id
+                && matches!(event.kind, hydra_core::EventKind::MicroModelPredictionRecorded { .. })));
+
+        let evidence_for_seed: Vec<_> = hydra
+            .epistemic_store()
+            .all_evidence()
+            .filter(|e| e.caused_by.as_ref() == Some(seed_id))
+            .collect();
+        assert_eq!(evidence_for_seed.len(), 1);
+
+        let claims_for_seed: Vec<_> = hydra
+            .epistemic_store()
+            .all_claims()
+            .filter(|c| c.caused_by.as_ref() == Some(seed_id))
+            .collect();
+        assert_eq!(claims_for_seed.len(), 1);
+        assert_eq!(claims_for_seed[0].predicate, "under_abnormal_load");
+    }
+
+    #[test]
+    fn assessment_carries_level_for_callers() {
+        // Callers branch on `assessment.level` directly rather than
+        // parsing prediction.output JSON. Pin both the actionable
+        // and non-actionable paths.
+        let mut hydra = Hydra::new();
+
+        // First call: WarmingUp.
+        let warming = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+        assert_eq!(
+            warming.level,
+            crate::micromodels::AnomalyLevel::WarmingUp
+        );
+        assert!(!warming.level.is_actionable());
+
+        // Prime + trigger Critical on the same Hydra. WarmingUp
+        // already auto-registered, so background = current ledger.
+        hydra.commit_rate_anomaly_model = Some(primed_model_with_baseline(10.0, 1.0));
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+        let critical = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+        assert_eq!(
+            critical.level,
+            crate::micromodels::AnomalyLevel::Critical
+        );
+        assert!(critical.level.is_actionable());
+    }
+
+    #[test]
+    fn two_critical_calls_produce_two_independent_assessments() {
+        // Non-idempotent (matches Patch 2). Each call mints a new
+        // prediction event, a new evidence id, and a new claim id.
+        let mut hydra = primed_hydra(10.0, 1.0);
+        let target_count = 100u64;
+        let need = target_count - ledger_count(&hydra);
+        ingest_signals(&mut hydra, need);
+        let a = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+        // Re-prime to undo the EWMA shift caused by the first call,
+        // so the second call also lands in Critical.
+        hydra.commit_rate_anomaly_model = Some(primed_model_with_baseline(10.0, 1.0));
+        let b = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+
+        assert_ne!(a.prediction_event_id, b.prediction_event_id);
+        assert_ne!(a.prediction.run_id, b.prediction.run_id);
+        assert_ne!(a.evidence_id, b.evidence_id);
+        assert_ne!(a.claim_id, b.claim_id);
+        assert_eq!(a.level, crate::micromodels::AnomalyLevel::Critical);
+        assert_eq!(b.level, crate::micromodels::AnomalyLevel::Critical);
+
+        // Audit log records both pairs (2 evidence + 2 claim events).
+        assert_eq!(count_evidence_events(&hydra), 2);
+        assert_eq!(count_claim_events(&hydra), 2);
     }
 }
 
