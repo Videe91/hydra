@@ -192,3 +192,81 @@ def test_assess_claim_trust_sync_mirror(
     assert result.level == "High"
     assert result.score == 0.85
     assert len(result.factors) == 12
+
+
+# === Patch 12 — Reflex Trust Calibration ===
+#
+# Patch 12 adds 3 new historical factors to the engine's trust
+# assessment: reflex_history_present, model_proven_executed,
+# model_operator_approved_historically. The SDK side has ZERO new
+# methods or types — TrustFactor and TrustAssessment carry the
+# data as-is.
+#
+# The one critical contract: the SDK MUST preserve factor entries
+# verbatim, including factors whose `kind` is unknown to this SDK
+# version. Future patches will add more factors; old SDK builds
+# must round-trip them without filtering or normalising.
+
+
+REFLEX_CALIBRATED_BODY: dict[str, Any] = {
+    "claim_id": "claim_xyz",
+    "score": 0.85,
+    "level": "High",
+    "explanation": "High trust: claim verified + model has 3 prior successful executions.",
+    "factors": [
+        # Patch 9 baseline (truncated for brevity — only the ones
+        # this test asserts on are needed).
+        {"kind": "claim_verified", "weight": 0.20, "applied": True, "detail": "claim.status == Verified"},
+        {"kind": "operator_approved", "weight": 0.15, "applied": False, "detail": "no operator approval found"},
+        # Patch 12 historical factors:
+        {"kind": "reflex_history_present", "weight": 0.10, "applied": True, "detail": "model has 3 prior observation(s)"},
+        {"kind": "model_proven_executed", "weight": 0.15, "applied": True, "detail": "model has 3 prior observation(s) (proven threshold = 3)"},
+        {"kind": "model_operator_approved_historically", "weight": 0.10, "applied": True, "detail": "at least one of the model's prior actions had a non-cascade approver"},
+        # Forward-compat: a HYPOTHETICAL future Patch 13 factor.
+        # The SDK MUST preserve this without filtering or
+        # normalisation — even though the SDK doesn't know about
+        # `future_outcome_resolved` yet.
+        {"kind": "future_outcome_resolved", "weight": 0.05, "applied": True, "detail": "(future patch — SDK should preserve verbatim)"},
+    ],
+    "related_action_ids": ["act_x"],
+    "related_outcome_ids": ["out_x"],
+    "observation_run_ids": ["mmrun_x"],
+    "assessed_at": "2026-05-29T00:00:00Z",
+}
+
+
+@pytest.mark.asyncio
+async def test_sdk_preserves_patch_12_factor_kinds_verbatim(
+    hy: Hydra, respx_mock: respx.MockRouter
+) -> None:
+    """Patch 12 (reflex calibration) and beyond add new factor
+    `kind` strings. The SDK MUST preserve them all — clients are
+    expected to branch on factor kind without prior knowledge of
+    which version of Hydra added which factor. Don't filter or
+    normalise unknown kinds on the client side.
+
+    This test pins ALL THREE Patch 12 factors AND one
+    forward-compat hypothetical-future factor. If the SDK ever
+    starts filtering by kind allow-list, this test fires
+    immediately."""
+    respx_mock.get(
+        "https://hydra.test/trust/claims/claim_xyz"
+    ).mock(return_value=httpx.Response(200, json=REFLEX_CALIBRATED_BODY))
+
+    result = await hy.assess_claim_trust("claim_xyz")
+
+    kinds = {f.kind for f in result.factors}
+    # Patch 12's 3 historical factors round-trip with their exact
+    # kind strings — these are public API contracts.
+    assert "reflex_history_present" in kinds
+    assert "model_proven_executed" in kinds
+    assert "model_operator_approved_historically" in kinds
+    # A factor unknown to this SDK version still round-trips. This
+    # is the forward-compatibility invariant — Patch 13+ will add
+    # more factors; old SDK builds must surface them as-is.
+    assert "future_outcome_resolved" in kinds
+    # And the details for the Patch 12 factors are preserved.
+    proven = next(f for f in result.factors if f.kind == "model_proven_executed")
+    assert proven.applied is True
+    assert proven.weight == 0.15
+    assert "proven threshold" in proven.detail

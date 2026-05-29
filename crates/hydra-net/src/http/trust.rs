@@ -263,7 +263,9 @@ mod tests {
             body.score,
             body.factors,
         );
-        assert_eq!(body.factors.len(), 12);
+        // 15 factors: Patch 9's 12 baseline + Patch 12's 3
+        // historical reflex factors.
+        assert_eq!(body.factors.len(), 15);
         assert!(!body.related_action_ids.is_empty());
     }
 

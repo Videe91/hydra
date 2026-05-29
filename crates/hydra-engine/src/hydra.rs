@@ -2212,16 +2212,27 @@ impl Hydra {
         // Walk back to the prediction (if any) so we can check
         // whether a MicroModelObservation has been recorded.
         // claim.caused_by → MicroModelPredictionRecorded → run_id
-        let observation_run_id: Option<hydra_core::MicroModelRunId> = claim
+        // Walk back to the prediction (if any) so we can check
+        // whether a MicroModelObservation has been recorded AND
+        // (Patch 12) which model produced the prediction. The
+        // model_id is the key for historical reflex-trust signal.
+        let (observation_run_id, source_model_id): (
+            Option<hydra_core::MicroModelRunId>,
+            Option<hydra_core::MicroModelId>,
+        ) = claim
             .caused_by
             .as_ref()
             .and_then(|event_id| self.event(event_id))
             .and_then(|event| match &event.kind {
                 hydra_core::EventKind::MicroModelPredictionRecorded { prediction } => {
-                    Some(prediction.run_id.clone())
+                    Some((
+                        Some(prediction.run_id.clone()),
+                        Some(prediction.model_id.clone()),
+                    ))
                 }
                 _ => None,
-            });
+            })
+            .unwrap_or((None, None));
         let observation_run_ids: Vec<hydra_core::MicroModelRunId> =
             observation_run_id.iter().cloned().collect();
 
@@ -2373,7 +2384,95 @@ impl Hydra {
             },
         });
 
-        // 10. contradicting_evidence (-0.20)
+        // === Trust Patch 4 (Patch 12) — reflex calibration ====
+        //
+        // Historical factors per model. Shift trust from
+        // "this individual chain looks good" to "this MODEL has
+        // worked before". For non-model claims (source_model_id ==
+        // None), all three emit applied=false with a uniform
+        // "claim is not model-derived" detail.
+        //
+        // O(N) scan over all observations is fine for v0 (hundreds
+        // to low thousands). Patch 13+ can add a model_id index.
+
+        let prior_observations: Vec<&hydra_core::MicroModelObservation> = source_model_id
+            .as_ref()
+            .map(|model_id| {
+                observations_for_model(&self.micromodel_store, model_id)
+            })
+            .unwrap_or_default();
+        let prior_observation_count = prior_observations.len();
+
+        // 10. reflex_history_present (+0.10): model has >= 1 prior
+        //     observation. Lightest historical signal — "this
+        //     reflex has run before, even just once."
+        let history_present =
+            source_model_id.is_some() && prior_observation_count >= 1;
+        factors.push(hydra_core::TrustFactor {
+            kind: "reflex_history_present".to_string(),
+            weight: 0.10,
+            applied: history_present,
+            detail: if source_model_id.is_none() {
+                "claim is not model-derived".to_string()
+            } else {
+                format!(
+                    "model has {prior_observation_count} prior observation(s)"
+                )
+            },
+        });
+
+        // 11. model_proven_executed (+0.15): model has >= 3 prior
+        //     observations. The 3-threshold avoids "trusting after
+        //     one lucky run." Patch 13 may add a true success-rate
+        //     metric on top.
+        const PROVEN_THRESHOLD: usize = 3;
+        let model_proven =
+            source_model_id.is_some() && prior_observation_count >= PROVEN_THRESHOLD;
+        factors.push(hydra_core::TrustFactor {
+            kind: "model_proven_executed".to_string(),
+            weight: 0.15,
+            applied: model_proven,
+            detail: if source_model_id.is_none() {
+                "claim is not model-derived".to_string()
+            } else {
+                format!(
+                    "model has {prior_observation_count} prior observation(s) (proven threshold = {PROVEN_THRESHOLD})"
+                )
+            },
+        });
+
+        // 12. model_operator_approved_historically (+0.10): at
+        //     least one of the model's prior actions had a non-
+        //     cascade approver. This is the LOAD-BEARING signal:
+        //     cascade auto-approval doesn't count — humans must
+        //     have looked at the model's recommendations and
+        //     said yes.
+        let operator_approved_historically = source_model_id.is_some()
+            && prior_observations.iter().any(|obs| {
+                observation_action_id(obs)
+                    .and_then(|action_id| self.action_store.action(&action_id))
+                    .and_then(|action| action.approved_by.as_ref())
+                    .map(|approver| !hydra_core::is_cascade_approver(approver))
+                    .unwrap_or(false)
+            });
+        factors.push(hydra_core::TrustFactor {
+            kind: "model_operator_approved_historically".to_string(),
+            weight: 0.10,
+            applied: operator_approved_historically,
+            detail: if source_model_id.is_none() {
+                "claim is not model-derived".to_string()
+            } else if operator_approved_historically {
+                "at least one of the model's prior actions had a non-cascade \
+                 approver"
+                    .to_string()
+            } else {
+                "no operator-approved action found in this model's history \
+                 (cascade auto-approvals don't count)"
+                    .to_string()
+            },
+        });
+
+        // 13. contradicting_evidence (-0.20)
         let against_count = claim.evidence_against.len();
         factors.push(hydra_core::TrustFactor {
             kind: "contradicting_evidence".to_string(),
@@ -2382,7 +2481,7 @@ impl Hydra {
             detail: format!("{against_count} contradicting evidence record(s)"),
         });
 
-        // 11. claim_disputed (-0.30)
+        // 14. claim_disputed (-0.30)
         let disputed = matches!(claim.status, hydra_core::ClaimStatus::Disputed);
         factors.push(hydra_core::TrustFactor {
             kind: "claim_disputed".to_string(),
@@ -2395,7 +2494,7 @@ impl Hydra {
             },
         });
 
-        // 12. claim_retracted (-1.00): the heavy hammer.
+        // 15. claim_retracted (-1.00): the heavy hammer.
         let retracted = matches!(claim.status, hydra_core::ClaimStatus::Retracted);
         factors.push(hydra_core::TrustFactor {
             kind: "claim_retracted".to_string(),
@@ -3757,6 +3856,48 @@ impl Default for Hydra {
 }
 
 // === MicroModel Patch 3 — prediction → evidence + claim builders ===
+
+/// All observations whose `run_id` maps to a prediction with the
+/// given `model_id`. Patch 12 — Reflex Trust Calibration.
+///
+/// v0 cost is O(N) where N = total observations across ALL
+/// models in the store. For low-thousands deployments this is
+/// single-digit milliseconds. Patch 13+ can add a
+/// `model_id → run_ids` index if it becomes hot.
+fn observations_for_model<'a>(
+    store: &'a crate::micromodel_store::MicroModelStore,
+    model_id: &hydra_core::MicroModelId,
+) -> Vec<&'a hydra_core::MicroModelObservation> {
+    store
+        .all_observations()
+        .filter(|obs| {
+            store
+                .prediction(&obs.run_id)
+                .map(|p| &p.model_id == model_id)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Extract `action_id` from a Patch 8 observation's
+/// `observed_outcome` JSON.
+///
+/// Patch 8's contract packs `{outcome_id, action_id, claim_id,
+/// outcome_kind, ...}` into `observed_outcome: serde_json::Value`.
+/// Patch 12 reads `action_id` to look up the underlying action
+/// and check its `approved_by` against the cascade actor id.
+///
+/// Returns `None` on schema drift (forward-compat) — the trust
+/// factor that uses this just refuses to apply for unparseable
+/// observations.
+fn observation_action_id(
+    obs: &hydra_core::MicroModelObservation,
+) -> Option<hydra_core::ActionId> {
+    obs.observed_outcome
+        .get("action_id")
+        .and_then(|v| v.as_str())
+        .map(hydra_core::ActionId::from_str)
+}
 
 /// Compose a deterministic prose summary for a `TrustAssessment`.
 /// No LLM. Pattern-matchable by future trust dashboards and
@@ -6471,7 +6612,12 @@ mod tests {
         // Warm + seed the commit-rate model in-place.
         let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
         hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
-        let need = 100u64 - ledger_count(&hydra);
+        // accumulate_model_history may push ledger count above 100;
+        // use saturating_sub so the test doesn't underflow. If the
+        // ledger is already past 100, no extra signals are needed —
+        // the window count is already high enough to trigger
+        // Critical against the re-primed baseline.
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
         ingest_signals(&mut hydra, need);
         let assessment_obj = hydra
             .evaluate_commit_rate_anomaly_and_propose_action(requester())
@@ -6508,8 +6654,10 @@ mod tests {
         let mut hydra = Hydra::new();
         let (claim_id, _, _) = drive_full_chain_for_trust(&mut hydra);
         let assessment = hydra.assess_claim_trust(&claim_id).unwrap();
-        // 12 factors total per the table.
-        assert_eq!(assessment.factors.len(), 12);
+        // 15 factors total: Patch 9 baseline of 12 + Patch 12's
+        // three historical factors (reflex_history_present,
+        // model_proven_executed, model_operator_approved_historically).
+        assert_eq!(assessment.factors.len(), 15);
         let unapplied: Vec<&hydra_core::TrustFactor> =
             assessment.factors.iter().filter(|f| !f.applied).collect();
         assert!(
@@ -6904,6 +7052,435 @@ mod tests {
         assert!(second.reason.contains("Executed"));
         assert!(second.trust.is_none());
         assert!(second.execution.is_none());
+    }
+
+    // === Trust Patch 4 (Patch 12) — reflex trust calibration ===
+
+    /// Drive `n` full chains (Critical → Approved → Executed →
+    /// Observed) against the SAME Hydra so the
+    /// `mm_builtin_commit_rate_v0` model accumulates `n` prior
+    /// observations. Returns the LAST claim_id.
+    ///
+    /// Unlike `drive_full_chain_for_trust` (which REPLACES *hydra),
+    /// this helper preserves the engine across iterations so the
+    /// MicroModelStore accumulates observations from every run. The
+    /// model is RE-PRIMED between iterations (not the whole engine)
+    /// so each evaluate call still lands at Critical.
+    fn accumulate_model_history(hydra: &mut Hydra, n: usize) -> hydra_core::ClaimId {
+        // One-time prime: warm + register the model.
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        let mut last_claim_id: Option<hydra_core::ClaimId> = None;
+        let operator = hydra_core::ActorId::from_str("actor_test");
+        for _ in 0..n {
+            // Re-prime the MODEL only (not the engine) so this
+            // iteration's evaluate produces Critical.
+            hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+            // Ingest enough commits so the recent window has a
+            // critical rate. saturating_sub so we never underflow
+            // when the ledger already has lots of prior commits.
+            let need = 100u64.saturating_sub(ledger_count(hydra));
+            ingest_signals(hydra, need);
+            let assessment = hydra
+                .evaluate_commit_rate_anomaly_and_propose_action(requester())
+                .unwrap();
+            let action_id = assessment
+                .action_ids
+                .into_iter()
+                .next()
+                .expect("critical produced an action");
+            let claim_id = assessment.claim_id.unwrap();
+            let report = hydra
+                .execute_notify_action(action_id, operator.clone())
+                .unwrap();
+            hydra
+                .record_micro_model_observation_from_action_outcome(
+                    report.outcome_id,
+                    operator.clone(),
+                )
+                .unwrap();
+            last_claim_id = Some(claim_id);
+        }
+        last_claim_id.expect("n >= 1")
+    }
+
+    #[test]
+    fn assess_claim_trust_zero_model_history_does_not_apply_factors() {
+        // Fresh deployment with NO prior observations. The 3
+        // historical factors must emit with applied=false and
+        // matching detail strings so the assessment surface stays
+        // honest.
+        let mut hydra = Hydra::new();
+        // Drive ONE full chain — this records 1 observation, but
+        // we'll ALSO need a claim that hasn't itself been observed
+        // yet. Easiest: propose a SECOND model-derived claim and
+        // assess THAT one. But for the "zero history" pin we want
+        // a totally fresh chain. Use a manually-constructed
+        // non-model claim instead so we exercise the
+        // "claim is not model-derived" path.
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let claim_id = hydra_core::ClaimId::new();
+        let claim = hydra_core::Claim {
+            id: claim_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ClaimKind::Hypothesis,
+            subject: hydra_core::ClaimSubject::System("hydra".to_string()),
+            predicate: "test".to_string(),
+            object: hydra_core::ClaimObject::Value(hydra_core::Value::Bool(true)),
+            confidence: hydra_core::Confidence::new(0.5),
+            status: hydra_core::ClaimStatus::Proposed,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: now,
+            valid_until: None,
+            created_by: actor,
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim })
+            .unwrap();
+        let assessment = hydra.assess_claim_trust(&claim_id).unwrap();
+        for kind in [
+            "reflex_history_present",
+            "model_proven_executed",
+            "model_operator_approved_historically",
+        ] {
+            let f = find_factor(&assessment, kind);
+            assert!(!f.applied, "factor {kind} should not apply on non-model claim");
+            assert!(
+                f.detail.contains("claim is not model-derived"),
+                "factor {kind} detail wrong: {}",
+                f.detail
+            );
+        }
+    }
+
+    #[test]
+    fn assess_claim_trust_reflex_history_present_fires_at_one_observation() {
+        // One prior observation lights up reflex_history_present
+        // but NOT model_proven_executed (needs >= 3). Drive ONE
+        // chain, then assess a SECOND model-derived claim. The
+        // simplest way: drive_full_chain_for_trust gives us the
+        // first claim AND its observation; then drive a Critical
+        // again on the same Hydra → second claim shares model_id
+        // = mm_builtin_commit_rate_v0.
+        let mut hydra = Hydra::new();
+        // First chain → records observation #1 against the
+        // commit-rate model.
+        let _ = drive_full_chain_for_trust(&mut hydra);
+        // Second chain → produces a NEW claim that has not itself
+        // been observed yet, but inherits the model's history.
+        let (second_claim_id, _, _) = drive_full_chain_for_trust(&mut hydra);
+        // Note drive_full_chain_for_trust ALSO records observation #2.
+        // We need a claim that's freshly proposed BEFORE any of its
+        // own outcomes land. Re-prime + propose a third claim
+        // without executing/observing it.
+        *(&mut hydra) = primed_hydra(10.0, 1.0);
+        // The re-prime resets the engine, losing the prior
+        // observations from drive_full_chain_for_trust. So we must
+        // accumulate history BEFORE re-prime is gone, OR use a
+        // single primed_hydra and propose multiple chains on it
+        // without rebuilding. Use the simpler path: accumulate
+        // history in-line on the same primed instance.
+        let _ = second_claim_id; // suppress unused
+        let mut hydra = Hydra::new();
+        let _ = accumulate_model_history(&mut hydra, 1);
+        // Re-prime the model so this eval call lands at Critical
+        // (accumulate_model_history's last eval advanced the EWMA;
+        // we need to reset it for a fresh Critical signal).
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let assessment_obj = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap();
+        let claim_id = assessment_obj.claim_id.unwrap();
+        let trust = hydra.assess_claim_trust(&claim_id).unwrap();
+        let history = find_factor(&trust, "reflex_history_present");
+        assert!(history.applied, "history present: {}", history.detail);
+        let proven = find_factor(&trust, "model_proven_executed");
+        assert!(!proven.applied, "1 observation should NOT meet proven threshold (3)");
+    }
+
+    #[test]
+    fn assess_claim_trust_proven_executed_requires_three_observations() {
+        // Threshold pin: 2 observations is NOT proven, 3 IS.
+        // Accumulate exactly 2, propose a fresh chain → not proven.
+        // Then bump to 3, propose another fresh chain → proven.
+        let mut hydra = Hydra::new();
+        let _ = accumulate_model_history(&mut hydra, 2);
+        // Re-prime the model so the next eval lands at Critical.
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let two_obs_claim = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap()
+            .claim_id
+            .unwrap();
+        let trust_at_two = hydra.assess_claim_trust(&two_obs_claim).unwrap();
+        let proven_at_two = find_factor(&trust_at_two, "model_proven_executed");
+        assert!(!proven_at_two.applied, "2 observations should not meet threshold; got {}", proven_at_two.detail);
+
+        // Add a third observation. Execute + observe the previous
+        // claim's action to push count to 3.
+        let action_id = hydra
+            .action_store
+            .actions_for_claim(&two_obs_claim)
+            .first()
+            .map(|a| a.id.clone())
+            .expect("claim has at least one action");
+        let report = hydra
+            .execute_notify_action(
+                action_id,
+                hydra_core::ActorId::from_str("actor_test"),
+            )
+            .unwrap();
+        hydra
+            .record_micro_model_observation_from_action_outcome(
+                report.outcome_id,
+                hydra_core::ActorId::from_str("actor_test"),
+            )
+            .unwrap();
+        // Now propose a 4th model-derived claim that hasn't been
+        // observed itself. We want the historical count = 3.
+        *(&mut hydra) = {
+            let mut h = std::mem::replace(&mut hydra, Hydra::new());
+            // primed_hydra rebuilds — we'd lose history. Instead,
+            // re-prime in place: warm + reseed the model. The
+            // existing observations are PRESERVED because we don't
+            // touch the micromodel_store.
+            let _ = h.evaluate_commit_rate_anomaly(requester()).unwrap();
+            h.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+            h
+        };
+        // accumulate_model_history may push ledger count above 100;
+        // use saturating_sub so the test doesn't underflow. If the
+        // ledger is already past 100, no extra signals are needed —
+        // the window count is already high enough to trigger
+        // Critical against the re-primed baseline.
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let third_observed_claim = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap()
+            .claim_id
+            .unwrap();
+        let trust_at_three = hydra.assess_claim_trust(&third_observed_claim).unwrap();
+        let proven_at_three = find_factor(&trust_at_three, "model_proven_executed");
+        assert!(
+            proven_at_three.applied,
+            "3 observations SHOULD meet threshold; got {}",
+            proven_at_three.detail
+        );
+    }
+
+    #[test]
+    fn assess_claim_trust_operator_approved_historically_only_counts_non_cascade() {
+        // Cascade-only history → factor stays unapplied even with
+        // dozens of observations.
+        let mut hydra = Hydra::new();
+        let _ = accumulate_model_history(&mut hydra, 3);
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let fresh_claim = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap()
+            .claim_id
+            .unwrap();
+        let trust_cascade = hydra.assess_claim_trust(&fresh_claim).unwrap();
+        let cascade_only =
+            find_factor(&trust_cascade, "model_operator_approved_historically");
+        assert!(
+            !cascade_only.applied,
+            "cascade auto-approvals must NOT count: {}",
+            cascade_only.detail
+        );
+
+        // Now have an OPERATOR explicitly approve the most recent
+        // model action. (Pre-existing observations are still
+        // cascade-only; the new approval re-stamps the latest
+        // action's approved_by to a non-cascade actor.)
+        let recent_action = hydra
+            .action_store
+            .actions_for_claim(&fresh_claim)
+            .first()
+            .map(|a| a.id.clone())
+            .expect("claim has an action");
+        // Patch 6's approve_action is lenient and re-approves.
+        let operator = hydra_core::ActorId::from_str("actor_oncall_alice");
+        hydra
+            .approve_action(recent_action.clone(), operator, Some("looks ok".into()))
+            .unwrap();
+        // Execute + observe so it counts as historical.
+        let report = hydra
+            .execute_notify_action(
+                recent_action,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        hydra
+            .record_micro_model_observation_from_action_outcome(
+                report.outcome_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        // Propose a NEW claim and check trust again.
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        // accumulate_model_history may push ledger count above 100;
+        // use saturating_sub so the test doesn't underflow. If the
+        // ledger is already past 100, no extra signals are needed —
+        // the window count is already high enough to trigger
+        // Critical against the re-primed baseline.
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let post_operator_claim = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap()
+            .claim_id
+            .unwrap();
+        let trust_with_operator = hydra.assess_claim_trust(&post_operator_claim).unwrap();
+        let operator_factor = find_factor(
+            &trust_with_operator,
+            "model_operator_approved_historically",
+        );
+        assert!(
+            operator_factor.applied,
+            "expected operator-approved historical signal: {}",
+            operator_factor.detail
+        );
+    }
+
+    #[test]
+    fn assess_claim_trust_proven_model_lifts_fresh_chain_to_high() {
+        // The headline test: a new claim from a model that has
+        // accumulated OPERATOR-ENDORSED history reaches High
+        // WITHOUT a sibling sharing the same claim. This is
+        // exactly what Patch 11 couldn't do — Patch 12's reflex
+        // calibration is the fix.
+        //
+        // Score math:
+        //   claim_verified                          +0.20
+        //   high_confidence_claim                   +0.10
+        //   supporting_evidence_present             +0.10
+        //   reliable_supporting_evidence            +0.10
+        //   reflex_history_present                  +0.10 (>= 1 obs)
+        //   model_proven_executed                   +0.15 (>= 3 obs)
+        //   model_operator_approved_historically    +0.10 (endorsed)
+        //                                            =====
+        //                                            +0.85 → High ✓
+        //
+        // Without operator-endorsed history, fresh chains cap at
+        // 0.75 (Medium). That's correct: cascade-only history
+        // hasn't earned human-endorsed trust. The semantic shift
+        // is honest — Patch 12 means "humans have looked at this
+        // model and said yes before."
+        let mut hydra = Hydra::new();
+        let _ = accumulate_model_history(&mut hydra, 3);
+
+        // Promote ONE prior action to operator-approved. Patch 6's
+        // approve_action is lenient — calling it re-stamps
+        // approved_by to the non-cascade actor.
+        let an_action_id = hydra
+            .micromodel_store
+            .all_observations()
+            .next()
+            .and_then(observation_action_id)
+            .expect("accumulate_model_history recorded observation(s)");
+        hydra
+            .approve_action(
+                an_action_id,
+                hydra_core::ActorId::from_str("actor_oncall_alice"),
+                Some("endorsed".to_string()),
+            )
+            .unwrap();
+
+        // Re-prime model so the fresh eval lands at Critical.
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(10.0, 1.0));
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let new_claim = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(requester())
+            .unwrap()
+            .claim_id
+            .unwrap();
+        let trust = hydra.assess_claim_trust(&new_claim).unwrap();
+
+        // All three historical factors should apply.
+        assert!(find_factor(&trust, "reflex_history_present").applied);
+        assert!(find_factor(&trust, "model_proven_executed").applied);
+        assert!(find_factor(&trust, "model_operator_approved_historically").applied);
+        // And the chain reaches High.
+        assert_eq!(
+            trust.level,
+            hydra_core::TrustLevel::High,
+            "expected High; got {:?} with score {:.3} factors {:#?}",
+            trust.level,
+            trust.score,
+            trust.factors
+        );
+        assert!(
+            trust.score >= 0.80,
+            "expected score >= 0.80, got {:.3}",
+            trust.score
+        );
+    }
+
+    #[test]
+    fn assess_claim_trust_non_model_claim_does_not_apply_history_factors() {
+        // A non-model claim with substantial chain trust gets ALL
+        // three historical factors as applied=false. Ensures the
+        // factor list stays consistent across model vs non-model
+        // claims.
+        let mut hydra = Hydra::new();
+        // Drive 3+ observations so model HAS history.
+        let _ = accumulate_model_history(&mut hydra, 3);
+        // Now propose a non-model claim manually.
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_test");
+        let claim_id = hydra_core::ClaimId::new();
+        let claim = hydra_core::Claim {
+            id: claim_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ClaimKind::Hypothesis,
+            subject: hydra_core::ClaimSubject::System("hydra".to_string()),
+            predicate: "non_model_test".to_string(),
+            object: hydra_core::ClaimObject::Value(hydra_core::Value::Bool(true)),
+            confidence: hydra_core::Confidence::new(0.95),
+            status: hydra_core::ClaimStatus::Verified,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: now,
+            valid_until: None,
+            created_by: actor,
+            created_at: now,
+            updated_at: now,
+            caused_by: None, // ← key: not model-derived
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim })
+            .unwrap();
+        let trust = hydra.assess_claim_trust(&claim_id).unwrap();
+        for kind in [
+            "reflex_history_present",
+            "model_proven_executed",
+            "model_operator_approved_historically",
+        ] {
+            let f = find_factor(&trust, kind);
+            assert!(
+                !f.applied,
+                "factor {kind} fired on non-model claim despite global model history"
+            );
+            assert!(
+                f.detail.contains("claim is not model-derived"),
+                "factor {kind} detail wrong: {}",
+                f.detail
+            );
+        }
     }
 }
 
