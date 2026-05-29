@@ -46,6 +46,16 @@ use hydra_core::{Claim, ClaimKind, ClaimStatus, ClaimSubject, Evidence};
 /// let result = hydra.ingest(event_kind)?;
 /// let node = hydra.graph().node(&node_id);
 /// ```
+// === MicroModel Patch 2 — built-in CommitRateAnomalyModel identity ===
+//
+// Stable so re-runs and snapshot restores resolve to the same
+// registry entry. `BUILTIN_COMMIT_RATE_MODEL_ID` is the
+// `MicroModelId` recorded on every prediction event;
+// `BUILTIN_COMMIT_RATE_ACTOR_ID` is the system actor recorded as
+// `created_by` on the auto-register event.
+pub const BUILTIN_COMMIT_RATE_MODEL_ID: &str = "mm_builtin_commit_rate_v0";
+pub const BUILTIN_COMMIT_RATE_ACTOR_ID: &str = "actor_hydra_commit_rate_model";
+
 pub struct Hydra {
     projection: Projection,
     event_log: EventLog,
@@ -77,6 +87,13 @@ pub struct Hydra {
     /// MicroModel Patch 1 — registry + audit only. Inference and
     /// background runner land in Patch 2+.
     micromodel_store: MicroModelStore,
+    /// MicroModel Patch 2 — built-in `CommitRateAnomalyModel`.
+    /// Transient by design (cold restart re-enters WarmingUp).
+    /// `None` until the first call to `evaluate_commit_rate_anomaly`,
+    /// which also auto-registers the model definition in the
+    /// registry.
+    commit_rate_anomaly_model:
+        Option<crate::micromodels::CommitRateAnomalyModel>,
     schema_validator: SchemaValidator,
     schema_gate: SchemaGate,
     snapshot_store: SnapshotStore,
@@ -210,6 +227,7 @@ impl Hydra {
             replication_store: ReplicationStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
             micromodel_store: MicroModelStore::new(),
+            commit_rate_anomaly_model: None,
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
             snapshot_store: SnapshotStore::new(),
@@ -259,6 +277,7 @@ impl Hydra {
             replication_store: ReplicationStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
             micromodel_store: MicroModelStore::new(),
+            commit_rate_anomaly_model: None,
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
             snapshot_store: SnapshotStore::new(),
@@ -827,6 +846,9 @@ impl Hydra {
         self.replication_store = ReplicationStore::new();
         self.schema_registry_store = SchemaRegistryStore::new();
         self.micromodel_store = MicroModelStore::new();
+        // MicroModel Patch 2 — transient by design; cold restart
+        // re-enters WarmingUp on the next evaluation.
+        self.commit_rate_anomaly_model = None;
     }
 
     // === Anomaly Detection (cont.) ===
@@ -1763,6 +1785,144 @@ impl Hydra {
         run_id: &hydra_core::MicroModelRunId,
     ) -> Option<&hydra_core::MicroModelObservation> {
         self.micromodel_store.observation(run_id)
+    }
+
+    // === MicroModel Patch 2 — built-in CommitRateAnomalyModel ===
+
+    /// Run one observation of the built-in commit-rate anomaly
+    /// model and record the prediction.
+    ///
+    /// On first call this auto-registers the model definition
+    /// (`mm_builtin_commit_rate_v0`, kind `CommitRatePredictor`,
+    /// status `Active`) and lazily initializes the in-memory model
+    /// state. The window is `config.window_secs` ending at "now";
+    /// commits in that window are counted and converted to
+    /// commits/minute before being scored against the EWMA
+    /// baseline.
+    ///
+    /// **State is transient**. A process restart drops the EWMA
+    /// state and the next call re-enters `WarmingUp`. The model
+    /// registry entry survives via the snapshot/restore path
+    /// (Patch 1), but the running statistics do not — this is the
+    /// approved Patch 2 boundary; durable model state can come
+    /// later.
+    ///
+    /// `actor` is the actor invoking this evaluation. Patch 2
+    /// doesn't yet thread the requesting actor into the prediction
+    /// event body — the parameter is reserved for a future audit
+    /// surface so the signature stays stable as Patch 3+ refines
+    /// the prediction shape.
+    ///
+    /// Patch boundary: this method records
+    /// `MicroModelPredictionRecorded` only. It does NOT emit
+    /// `EvidenceAdded`, `ClaimProposed`, or `ActionProposed` — that
+    /// linkage is Patch 3, where predictions enter the living loop.
+    pub fn evaluate_commit_rate_anomaly(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::MicroModelPrediction> {
+        // Step 1 — auto-register the built-in model definition if
+        // missing. Goes through `register_micro_model` →
+        // `self.ingest(EventKind::MicroModelRegistered)`, so this
+        // is durable, auditable, and replicable like any other
+        // control-plane event. Promote to Active immediately —
+        // built-in models are usable on register.
+        let model_id =
+            hydra_core::MicroModelId::from_str(BUILTIN_COMMIT_RATE_MODEL_ID);
+        if self.micro_model(&model_id).is_none() {
+            let now = chrono::Utc::now();
+            let definition = hydra_core::MicroModelDefinition::registered(
+                model_id.clone(),
+                hydra_core::MicroModelKind::CommitRatePredictor,
+                "builtin_commit_rate_v0",
+                1,
+                vec![],
+                vec![],
+                hydra_core::ActorId::from_str(BUILTIN_COMMIT_RATE_ACTOR_ID),
+                now,
+            );
+            self.register_micro_model(definition)?;
+            self.change_micro_model_status(
+                model_id.clone(),
+                hydra_core::MicroModelStatus::Active,
+                Some("built-in micro-model: active on register".to_string()),
+            )?;
+        }
+
+        // Step 2 — count commits in the model's configured window.
+        // Read window_secs off the model (lazy-initialized below if
+        // absent). Walks the commit ledger from latest backwards.
+        let window_secs = self
+            .commit_rate_anomaly_model
+            .as_ref()
+            .map(|m| m.config().window_secs)
+            .unwrap_or_else(|| {
+                crate::micromodels::CommitRateAnomalyConfig::default().window_secs
+            });
+        let now = chrono::Utc::now();
+        let window_start =
+            now - chrono::Duration::seconds(window_secs as i64);
+        let commit_count_in_window = self
+            .commit_ledger
+            .batches_in_sequence()
+            .iter()
+            .rev()
+            .take_while(|batch| batch.committed_at >= window_start)
+            .count() as u64;
+
+        // Step 3 — evaluate via the pure model. Lazy-init the model
+        // on first use. Capture `samples_seen` BEFORE the update so
+        // the prediction input field reflects "what the model knew
+        // at the time it scored this sample."
+        let (samples_seen_before, output) = {
+            let model = self
+                .commit_rate_anomaly_model
+                .get_or_insert_with(crate::micromodels::CommitRateAnomalyModel::default);
+            let samples_before = model.state().samples_seen;
+            let output = model.evaluate_observation(now, commit_count_in_window);
+            (samples_before, output)
+        };
+
+        // Step 4 — build the typed prediction. `output` goes
+        // verbatim into MicroModelPrediction.output via to_value
+        // (the struct is serde-derived; serialization cannot fail).
+        let prediction = hydra_core::MicroModelPrediction {
+            model_id: model_id.clone(),
+            run_id: hydra_core::MicroModelRunId::new(),
+            input: serde_json::json!({
+                "observed_at": now.to_rfc3339(),
+                "window_secs": window_secs,
+                "commit_count_in_window": commit_count_in_window,
+                "samples_seen_before_this": samples_seen_before,
+            }),
+            output: serde_json::to_value(&output)
+                .expect("CommitRateAnomalyOutput is serde-derived; cannot fail"),
+            confidence: output.level.confidence(),
+            explanation: Some(output.reason.clone()),
+            created_at: now,
+        };
+
+        // Step 5 — record through the standard ingest path so the
+        // commit ledger, durable writer, observer, and replication
+        // see the prediction event.
+        self.ingest(hydra_core::EventKind::MicroModelPredictionRecorded {
+            prediction: prediction.clone(),
+        })?;
+
+        // `actor` is reserved for a future MicroModelPredictionRecorded
+        // variant that carries the requesting actor in the event
+        // body. Patch 2 doesn't yet plumb it through; the parameter
+        // exists so the helper signature stays stable.
+        let _ = actor;
+        Ok(prediction)
+    }
+
+    /// Read access to the running `CommitRateAnomalyModel`. `None`
+    /// until the first call to `evaluate_commit_rate_anomaly`.
+    pub fn commit_rate_anomaly_model(
+        &self,
+    ) -> Option<&crate::micromodels::CommitRateAnomalyModel> {
+        self.commit_rate_anomaly_model.as_ref()
     }
 
     // === Schema registry ===
@@ -3063,6 +3223,165 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // === MicroModel Patch 2 — built-in CommitRateAnomalyModel ===
+
+    fn requester() -> hydra_core::ActorId {
+        hydra_core::ActorId::from_str("actor_test_commit_rate_caller")
+    }
+
+    fn count_prediction_events(hydra: &Hydra) -> usize {
+        hydra
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, hydra_core::EventKind::MicroModelPredictionRecorded { .. }))
+            .count()
+    }
+
+    #[test]
+    fn hydra_evaluate_commit_rate_anomaly_auto_registers_builtin() {
+        // First call on a fresh engine should auto-register the
+        // built-in model definition under the stable id and
+        // promote it to Active in one call.
+        let mut hydra = Hydra::new();
+        let model_id = hydra_core::MicroModelId::from_str(BUILTIN_COMMIT_RATE_MODEL_ID);
+        assert!(hydra.micro_model(&model_id).is_none());
+
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+
+        let registered = hydra.micro_model(&model_id).expect("registered");
+        assert_eq!(registered.kind, hydra_core::MicroModelKind::CommitRatePredictor);
+        // Auto-registration promotes to Active immediately so the
+        // model is usable for subsequent evaluations.
+        assert_eq!(registered.status, hydra_core::MicroModelStatus::Active);
+        assert_eq!(registered.version, 1);
+        assert_eq!(
+            registered.created_by,
+            hydra_core::ActorId::from_str(BUILTIN_COMMIT_RATE_ACTOR_ID)
+        );
+    }
+
+    #[test]
+    fn hydra_evaluate_idempotent_register() {
+        // Two evaluations must NOT register two model definitions.
+        // Re-registration would overwrite metadata and reset the
+        // status; the auto-register path must be gated on first-use.
+        let mut hydra = Hydra::new();
+        let model_id = hydra_core::MicroModelId::from_str(BUILTIN_COMMIT_RATE_MODEL_ID);
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        let after_first = hydra.micro_model(&model_id).unwrap().clone();
+
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        let after_second = hydra.micro_model(&model_id).unwrap();
+
+        // Identity (id, kind, created_at, version) is unchanged.
+        assert_eq!(after_first.id, after_second.id);
+        assert_eq!(after_first.version, after_second.version);
+        assert_eq!(after_first.created_at, after_second.created_at);
+        // Exactly one registered model under this kind.
+        assert_eq!(
+            hydra
+                .micro_models_by_kind(&hydra_core::MicroModelKind::CommitRatePredictor)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn hydra_evaluate_records_prediction_event() {
+        // The prediction event must land in the audit log so
+        // commit-stream subscribers and lineage walkers see it.
+        let mut hydra = Hydra::new();
+        assert_eq!(count_prediction_events(&hydra), 0);
+
+        let prediction = hydra
+            .evaluate_commit_rate_anomaly(requester())
+            .unwrap();
+
+        // Exactly one MicroModelPredictionRecorded event was
+        // appended.
+        assert_eq!(count_prediction_events(&hydra), 1);
+
+        // The stored prediction matches what was returned.
+        let stored = hydra
+            .micro_model_prediction(&prediction.run_id)
+            .expect("prediction is queryable by run_id");
+        assert_eq!(stored.model_id, prediction.model_id);
+        assert_eq!(stored.confidence, prediction.confidence);
+        assert_eq!(stored.output, prediction.output);
+    }
+
+    #[test]
+    fn hydra_evaluate_run_id_is_unique_per_call() {
+        // Each call mints its own run_id so observations can be
+        // joined back to the right prediction. The Patch 1 store
+        // is keyed by run_id; collisions would silently overwrite.
+        let mut hydra = Hydra::new();
+        let a = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        let b = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        assert_ne!(a.run_id, b.run_id);
+        // Both are queryable independently.
+        assert!(hydra.micro_model_prediction(&a.run_id).is_some());
+        assert!(hydra.micro_model_prediction(&b.run_id).is_some());
+        assert_eq!(count_prediction_events(&hydra), 2);
+    }
+
+    #[test]
+    fn hydra_evaluate_returns_warming_up_on_fresh_engine() {
+        // Cold engine, no prior observations — the model must
+        // honestly report WarmingUp rather than fabricating a
+        // baseline.
+        let mut hydra = Hydra::new();
+        let prediction = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+
+        let output: crate::micromodels::CommitRateAnomalyOutput =
+            serde_json::from_value(prediction.output.clone()).unwrap();
+        assert_eq!(output.level, crate::micromodels::AnomalyLevel::WarmingUp);
+        assert_eq!(output.direction, crate::micromodels::Direction::Stable);
+        assert_eq!(output.z_score, 0.0);
+
+        // Confidence matches the deterministic table.
+        assert_eq!(prediction.confidence, 0.50);
+    }
+
+    #[test]
+    fn hydra_evaluate_input_payload_is_self_describing() {
+        // The Patch 2 spec pins the `input` shape — agents and
+        // future Patch 3 evidence-builders rely on these keys.
+        let mut hydra = Hydra::new();
+        let prediction = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        let input = prediction.input.as_object().expect("input is a JSON object");
+        for key in [
+            "observed_at",
+            "window_secs",
+            "commit_count_in_window",
+            "samples_seen_before_this",
+        ] {
+            assert!(input.contains_key(key), "missing input key {key}");
+        }
+        // The first call's input reports samples_seen_before_this=0
+        // (no prior observations).
+        assert_eq!(input["samples_seen_before_this"], serde_json::json!(0));
+        // window_secs defaults to 60.
+        assert_eq!(input["window_secs"], serde_json::json!(60));
+    }
+
+    #[test]
+    fn hydra_reset_runtime_state_clears_commit_rate_model_state() {
+        // `reset_runtime_state_preserving_config` is the recovery
+        // entry point. The transient model state must be dropped
+        // so a recovered engine re-enters WarmingUp rather than
+        // carrying stale EWMA history forward.
+        let mut hydra = Hydra::new();
+        // Run a couple of evaluations to build state.
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        let _ = hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        assert!(hydra.commit_rate_anomaly_model().is_some());
+        assert!(hydra.commit_rate_anomaly_model().unwrap().state().samples_seen >= 1);
+
+        hydra.reset_runtime_state_preserving_config();
+        assert!(hydra.commit_rate_anomaly_model().is_none());
     }
 }
 
