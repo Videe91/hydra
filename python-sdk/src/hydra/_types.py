@@ -1406,6 +1406,53 @@ class CommitRateAnomalyAssessment(BaseModel):
     lineage_url: str
 
 
+# === MicroModel Patch 16 — replication-lag anomaly ===
+#
+# Wire form mirrors CommitRateAnomalyAssessment with two
+# differences:
+#
+#   - `level` is `ReplicationLagAnomalyLevel` — no `warming_up`
+#     (threshold model, no warmup).
+#   - `peer_id` is required and echoed back so callers don't have
+#     to keep a side mapping when fanning evaluations across peers.
+#
+# The fields without those two differences serialize identically,
+# which is what makes the parallel structure proof of generality.
+
+ReplicationLagAnomalyLevel = Literal["normal", "warning", "critical"]
+"""Subset of `AnomalyLevel` (no `warming_up`)."""
+
+
+class ReplicationLagAnomalyAssessment(BaseModel):
+    """Response shape of `hy.diagnostics.replication_lag_anomaly(...)`
+    (Patch 16). Same envelope as `CommitRateAnomalyAssessment` with
+    two additions/changes:
+
+      - `level` is `ReplicationLagAnomalyLevel` — never
+        `"warming_up"`. Threshold model, no warmup.
+      - `peer_id` is REQUIRED and echoed from the request. Lets
+        callers fan evaluations across peers without keeping a
+        side mapping.
+
+    Same `None`-for-absent-ids / empty-list-for-`action_ids`
+    convention as the commit-rate envelope.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    level: ReplicationLagAnomalyLevel
+    prediction: MicroModelPrediction
+    prediction_event_id: EventId
+    evidence_id: EvidenceId | None = None
+    evidence_event_id: EventId | None = None
+    claim_id: ClaimId | None = None
+    claim_event_id: EventId | None = None
+    action_ids: list[ActionId] = Field(default_factory=list)
+    peer_id: str
+    summary: str
+    lineage_url: str
+
+
 # === Patch 6 — operator approval workflow ===
 #
 # Wire form for the approve/reject status fields is **lowercase**

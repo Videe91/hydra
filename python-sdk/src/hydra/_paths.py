@@ -144,6 +144,24 @@ def diagnostics_micromodels_commit_rate_evaluate_path() -> str:
     return "/diagnostics/micromodels/commit-rate/evaluate"
 
 
+def diagnostics_micromodels_replication_lag_evaluate_path() -> str:
+    """`POST /diagnostics/micromodels/replication-lag/evaluate` —
+    drive the built-in ReplicationLagAnomalyModel (Patch 16) from
+    outside the engine.
+
+    Body carries `mode` ("prediction_only" / "claim" / "action"),
+    `peer_id` (ReplicaId of the follower to evaluate), and
+    `requested_by` (ActorId).
+
+    Returns `ReplicationLagAnomalyAssessment` with the prediction,
+    optional evidence/claim/action ids, the `peer_id` echoed back,
+    a server-rendered `summary`, and a `lineage_url` pointing at
+    the prediction event.
+
+    404 on unknown peer_id."""
+    return "/diagnostics/micromodels/replication-lag/evaluate"
+
+
 def diagnostics_micromodels_observation_from_outcome_path(outcome_id: str) -> str:
     """`POST /diagnostics/micromodels/observations/from-outcome/{outcome_id}`
     — Patch 8 outcome learning loop. Walks the causal chain from a

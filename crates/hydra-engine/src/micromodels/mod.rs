@@ -22,14 +22,24 @@
 //!   Hydra-level helper `evaluate_commit_rate_anomaly(actor)`
 //!   is the only entry point.
 //!
-//! Future patches add models for replication lag, query cost,
-//! cardinality, auto-tuning, and learned indexes — each as its own
-//! `pub mod` here, slotting into the same registry vocabulary.
+//! Patch 16 adds the SECOND built-in model
+//! (`ReplicationLagAnomalyModel`) — proving the reflex stack is
+//! general, not commit-rate-specific. Future patches add models for
+//! query cost, cardinality, auto-tuning, and learned indexes — each
+//! as its own `pub mod` here, slotting into the same registry
+//! vocabulary. Patch 17 may extract a shared `MicroModelReflex`
+//! trait once the parallel structure is proven.
 
 pub mod commit_rate;
+pub mod replication_lag;
 
 pub use commit_rate::{
     AnomalyLevel, CommitRateAnomalyActionAssessment, CommitRateAnomalyAssessment,
     CommitRateAnomalyConfig, CommitRateAnomalyModel, CommitRateAnomalyOutput,
     CommitRateAnomalyState, Direction,
+};
+pub use replication_lag::{
+    ReplicationLagAnomalyActionAssessment, ReplicationLagAnomalyAssessment,
+    ReplicationLagAnomalyConfig, ReplicationLagAnomalyLevel,
+    ReplicationLagAnomalyModel, ReplicationLagAnomalyOutput,
 };

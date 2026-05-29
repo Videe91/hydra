@@ -27,6 +27,7 @@ from ._types import (
     EvolutionDiagnosticsResponse,
     MicroModelObservation,
     OutcomeId,
+    ReplicationLagAnomalyAssessment,
     TenantId,
 )
 
@@ -175,6 +176,56 @@ class _Diagnostics:
             tenant=tenant,
         )
         return CommitRateAnomalyAssessment.model_validate(raw)
+
+    async def replication_lag_anomaly(
+        self,
+        *,
+        peer_id: str,
+        requested_by: ActorId,
+        mode: EvaluationMode = "action",
+        tenant: TenantId | None = None,
+    ) -> ReplicationLagAnomalyAssessment:
+        """Drive the built-in replication-lag anomaly micro-model
+        (MicroModel Patch 16) from outside the engine.
+
+        Second built-in model. Same reflex stack as commit-rate
+        (prediction → evidence → claim → Notify action), threshold-
+        based (no warmup). The model judges one peer at a time:
+        `lag_commits` against `warning_lag_commits=10` /
+        `critical_lag_commits=100`, with a stale-heartbeat override
+        (`stale_heartbeat_after_secs=60`) that forces Critical when
+        the most recent observation is too old.
+
+        `mode` controls how far down the reflex chain the engine walks:
+
+          - `"prediction_only"` — record only the prediction event
+          - `"claim"` — prediction + (Warning/Critical) evidence + claim
+          - `"action"` (default) — full chain through the Notify
+            action when the verification gate passes
+
+        The Notify action's payload carries `peer_id` so the Patch
+        14 delivery adapter can route alerts per-peer.
+
+        Returns a typed `ReplicationLagAnomalyAssessment` carrying
+        every id the engine produced PLUS the `peer_id` echoed back
+        from the request, a server-rendered `summary`, and a
+        relative `lineage_url` pointing at the prediction event.
+
+        Errors:
+          - 404 → `HydraNotFoundError`: unknown `peer_id`
+          - Everything else → `HydraError` subclasses
+        """
+        body: dict[str, Any] = {
+            "mode": mode,
+            "peer_id": peer_id,
+            "requested_by": requested_by,
+        }
+        raw = await self._http.post(
+            _paths.diagnostics_micromodels_replication_lag_evaluate_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return ReplicationLagAnomalyAssessment.model_validate(raw)
 
     async def record_observation_from_outcome(
         self,
@@ -391,6 +442,31 @@ class _DiagnosticsSync:
             tenant=tenant,
         )
         return CommitRateAnomalyAssessment.model_validate(raw)
+
+    def replication_lag_anomaly(
+        self,
+        *,
+        peer_id: str,
+        requested_by: ActorId,
+        mode: EvaluationMode = "action",
+        tenant: TenantId | None = None,
+    ) -> ReplicationLagAnomalyAssessment:
+        """Sync mirror of the async `replication_lag_anomaly` —
+        drives the built-in replication-lag micro-model (Patch 16)
+        via `POST /diagnostics/micromodels/replication-lag/evaluate`.
+        See the async docstring for full semantics, thresholds,
+        and the stale-heartbeat override."""
+        body: dict[str, Any] = {
+            "mode": mode,
+            "peer_id": peer_id,
+            "requested_by": requested_by,
+        }
+        raw = self._http.post(
+            _paths.diagnostics_micromodels_replication_lag_evaluate_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return ReplicationLagAnomalyAssessment.model_validate(raw)
 
     def record_observation_from_outcome(
         self,

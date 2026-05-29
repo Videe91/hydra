@@ -11,18 +11,26 @@
 //!   mode = "action" (default) → Hydra::evaluate_commit_rate_anomaly_and_propose_action
 //! ```
 //!
-//! ## Route
+//! ## Routes
 //!
 //! ```text
-//! POST /diagnostics/micromodels/commit-rate/evaluate
+//! POST /diagnostics/micromodels/commit-rate/evaluate     (Patch 5)
+//! POST /diagnostics/micromodels/replication-lag/evaluate (Patch 16)
 //! ```
+//!
+//! Patch 16 introduces the second model surface. The route shape is
+//! identical to Patch 5's — only the request adds `peer_id` and the
+//! response embeds it back so callers don't have to keep their own
+//! mapping. The response's `level` is also a SUPERSET wire string —
+//! commit-rate emits `warming_up`/`normal`/`warning`/`critical`;
+//! replication-lag never emits `warming_up` (it's a threshold model
+//! with no warmup). SDKs treat the union as the allowed set.
 //!
 //! ## Auth
 //!
-//! New scope `write:diagnostics` (added in `hydra-api::auth`).
-//! Diagnostic reads stay on `read:query`; *evaluations* mutate
-//! Hydra's causal memory (prediction event, maybe evidence + claim,
-//! maybe Notify action) so they get their own write scope.
+//! Both routes are POSTs under `/diagnostics/` and pick up
+//! `write:diagnostics` from the existing prefix clause in
+//! `hydra-api::auth`. No new scope.
 //!
 //! ## What is NOT in this patch
 //!
@@ -44,8 +52,9 @@ use axum::{
 };
 use hydra_core::{
     ActionId, ActorId, ClaimId, EventId, EvidenceId, MicroModelPrediction,
+    ReplicaId,
 };
-use hydra_engine::micromodels::AnomalyLevel;
+use hydra_engine::micromodels::{AnomalyLevel, ReplicationLagAnomalyLevel};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -69,6 +78,10 @@ pub fn micromodels_router(runtime: RuntimeHandle) -> Router {
         .route(
             "/diagnostics/micromodels/commit-rate/evaluate",
             post(evaluate_commit_rate),
+        )
+        .route(
+            "/diagnostics/micromodels/replication-lag/evaluate",
+            post(evaluate_replication_lag),
         )
         .with_state(MicroModelsHttpState::new(runtime))
 }
@@ -341,6 +354,276 @@ fn render_summary(level: AnomalyLevel, has_claim: bool, has_action: bool) -> Str
         }
         (AnomalyLevel::Critical, true, true) => {
             "Critical: commit rate anomalous; Notify action proposed.".to_string()
+        }
+    }
+}
+
+// === MicroModel Patch 16 — replication-lag evaluation surface ===
+//
+// Parallel structure to the commit-rate route above. Patch 17 may
+// extract a shared `MicroModelEvaluateResponse<L>` generic; until
+// then the parallel structure IS the proof that the framework
+// generalizes.
+
+/// Request body for `POST /diagnostics/micromodels/replication-lag/evaluate`.
+///
+/// `peer_id` selects the follower. Unknown peer → 404 (the engine
+/// surfaces this as `QueryError("unknown replication peer: ...")`,
+/// which the handler maps).
+///
+/// `mode` defaults to `Action` for symmetry with commit-rate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluateReplicationLagRequest {
+    #[serde(default)]
+    pub mode: EvaluationMode,
+    pub peer_id: ReplicaId,
+    pub requested_by: ActorId,
+}
+
+/// Response body for the replication-lag evaluate endpoint. Mirrors
+/// `EvaluateCommitRateResponse` field-for-field PLUS echoes the
+/// `peer_id` so callers don't have to keep a side mapping when
+/// fanning evaluations across peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluateReplicationLagResponse {
+    /// Snake-case anomaly level: `"normal"`, `"warning"`, or
+    /// `"critical"`. NEVER `"warming_up"` for this model (no warmup).
+    pub level: String,
+    pub prediction: MicroModelPrediction,
+    pub prediction_event_id: EventId,
+    pub evidence_id: Option<EvidenceId>,
+    pub evidence_event_id: Option<EventId>,
+    pub claim_id: Option<ClaimId>,
+    pub claim_event_id: Option<EventId>,
+    /// One-element vec for Warning/Critical (Notify only). Patch
+    /// 16+ may add `quarantine_peer`/`pause_writes_to_peer` here.
+    pub action_ids: Vec<ActionId>,
+    /// Peer this evaluation targeted. Echoed from the request so
+    /// callers don't have to keep a side mapping when fanning.
+    pub peer_id: ReplicaId,
+    /// Deterministic prose summary keyed off `(level, has_claim,
+    /// has_action)`. Agents can pattern-match on it safely.
+    pub summary: String,
+    pub lineage_url: String,
+}
+
+async fn evaluate_replication_lag(
+    State(state): State<MicroModelsHttpState>,
+    request: Result<Json<EvaluateReplicationLagRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Json(req)) => req,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid request body: {err}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let hydra = state.runtime.hydra();
+    let mut hydra = hydra.write().await;
+
+    // Dispatch by mode. Each engine helper returns a slightly
+    // different type; normalize into the same response shape.
+    let outcome = match request.mode {
+        EvaluationMode::PredictionOnly => {
+            match hydra.record_replication_lag_prediction(
+                request.peer_id.clone(),
+                request.requested_by.clone(),
+            ) {
+                Ok((prediction, event_id, output)) => {
+                    ReplicationLagEvaluationOutcome::from_prediction_only(
+                        prediction,
+                        event_id,
+                        output.level,
+                        request.peer_id.clone(),
+                    )
+                }
+                Err(err) => return replication_lag_error_response(err),
+            }
+        }
+        EvaluationMode::Claim => {
+            match hydra.evaluate_replication_lag_anomaly_and_propose_claim(
+                request.peer_id.clone(),
+                request.requested_by.clone(),
+            ) {
+                Ok(assessment) => {
+                    ReplicationLagEvaluationOutcome::from_claim_assessment(
+                        assessment,
+                    )
+                }
+                Err(err) => return replication_lag_error_response(err),
+            }
+        }
+        EvaluationMode::Action => {
+            match hydra.evaluate_replication_lag_anomaly_and_propose_action(
+                request.peer_id.clone(),
+                request.requested_by.clone(),
+            ) {
+                Ok(assessment) => {
+                    ReplicationLagEvaluationOutcome::from_action_assessment(
+                        assessment,
+                    )
+                }
+                Err(err) => return replication_lag_error_response(err),
+            }
+        }
+    };
+
+    let response = build_replication_lag_response(outcome);
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Map engine errors. Patch 16's only structured engine error is
+/// `QueryError("unknown replication peer: ...")` from the peer
+/// lookup — surface as 404. Anything else falls through to 500.
+fn replication_lag_error_response(err: hydra_core::error::HydraError) -> Response {
+    use hydra_core::error::HydraError;
+    match err {
+        HydraError::QueryError(msg) if msg.contains("unknown replication peer") => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse { error: msg }),
+        )
+            .into_response(),
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("engine error: {other}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+struct ReplicationLagEvaluationOutcome {
+    level: ReplicationLagAnomalyLevel,
+    prediction: MicroModelPrediction,
+    prediction_event_id: EventId,
+    evidence_id: Option<EvidenceId>,
+    evidence_event_id: Option<EventId>,
+    claim_id: Option<ClaimId>,
+    claim_event_id: Option<EventId>,
+    action_ids: Vec<ActionId>,
+    peer_id: ReplicaId,
+}
+
+impl ReplicationLagEvaluationOutcome {
+    fn from_prediction_only(
+        prediction: MicroModelPrediction,
+        prediction_event_id: EventId,
+        level: ReplicationLagAnomalyLevel,
+        peer_id: ReplicaId,
+    ) -> Self {
+        Self {
+            level,
+            prediction,
+            prediction_event_id,
+            evidence_id: None,
+            evidence_event_id: None,
+            claim_id: None,
+            claim_event_id: None,
+            action_ids: vec![],
+            peer_id,
+        }
+    }
+
+    fn from_claim_assessment(
+        assessment: hydra_engine::micromodels::ReplicationLagAnomalyAssessment,
+    ) -> Self {
+        Self {
+            level: assessment.level,
+            prediction: assessment.prediction,
+            prediction_event_id: assessment.prediction_event_id,
+            evidence_id: assessment.evidence_id,
+            evidence_event_id: assessment.evidence_event_id,
+            claim_id: assessment.claim_id,
+            claim_event_id: assessment.claim_event_id,
+            action_ids: vec![],
+            peer_id: assessment.peer_id,
+        }
+    }
+
+    fn from_action_assessment(
+        assessment: hydra_engine::micromodels::ReplicationLagAnomalyActionAssessment,
+    ) -> Self {
+        // Same evidence_event_id-drop note as commit-rate: the
+        // action assessment is the loop-closed type, not the all-
+        // event-ids type. Returning None is honest.
+        Self {
+            level: assessment.level,
+            prediction: assessment.prediction,
+            prediction_event_id: assessment.prediction_event_id,
+            evidence_id: assessment.evidence_id,
+            evidence_event_id: None,
+            claim_id: assessment.claim_id,
+            claim_event_id: assessment.claim_event_id,
+            action_ids: assessment.action_ids,
+            peer_id: assessment.peer_id,
+        }
+    }
+}
+
+fn build_replication_lag_response(
+    outcome: ReplicationLagEvaluationOutcome,
+) -> EvaluateReplicationLagResponse {
+    let summary = render_replication_lag_summary(
+        outcome.level,
+        outcome.claim_id.is_some(),
+        !outcome.action_ids.is_empty(),
+    );
+    let lineage_url = format!("/lineage/{}", outcome.prediction_event_id);
+    EvaluateReplicationLagResponse {
+        level: outcome.level.wire_name().to_string(),
+        prediction: outcome.prediction,
+        prediction_event_id: outcome.prediction_event_id,
+        evidence_id: outcome.evidence_id,
+        evidence_event_id: outcome.evidence_event_id,
+        claim_id: outcome.claim_id,
+        claim_event_id: outcome.claim_event_id,
+        action_ids: outcome.action_ids,
+        peer_id: outcome.peer_id,
+        summary,
+        lineage_url,
+    }
+}
+
+/// Deterministic 6-case summary table (no `warming_up` row because
+/// this model never warms up).
+fn render_replication_lag_summary(
+    level: ReplicationLagAnomalyLevel,
+    has_claim: bool,
+    has_action: bool,
+) -> String {
+    match (level, has_claim, has_action) {
+        (ReplicationLagAnomalyLevel::Normal, _, _) => {
+            "Replication lag within thresholds; no claim or action.".to_string()
+        }
+        (ReplicationLagAnomalyLevel::Warning, false, _) => {
+            "Warning: replication lag elevated; no claim or action recorded.".to_string()
+        }
+        (ReplicationLagAnomalyLevel::Warning, true, false) => {
+            "Warning: replication lag elevated; claim recorded, action not proposed \
+             under current verification threshold."
+                .to_string()
+        }
+        (ReplicationLagAnomalyLevel::Warning, true, true) => {
+            "Warning: replication lag elevated; claim recorded and Notify action \
+             proposed."
+                .to_string()
+        }
+        (ReplicationLagAnomalyLevel::Critical, false, _) => {
+            "Critical: replication lag anomalous; no claim or action recorded.".to_string()
+        }
+        (ReplicationLagAnomalyLevel::Critical, true, false) => {
+            "Critical: replication lag anomalous; claim recorded, action not proposed."
+                .to_string()
+        }
+        (ReplicationLagAnomalyLevel::Critical, true, true) => {
+            "Critical: replication lag anomalous; Notify action proposed.".to_string()
         }
     }
 }
@@ -618,5 +901,180 @@ mod tests {
             let parsed: EvaluationMode = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, mode);
         }
+    }
+
+    // === Patch 16 — replication-lag HTTP tests ===
+
+    fn replication_lag_request(body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/diagnostics/micromodels/replication-lag/evaluate")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    async fn register_peer_with_lag(
+        runtime: &crate::runtime::RuntimeHandle,
+        peer_id: &hydra_core::ReplicaId,
+        lag_commits: Option<u64>,
+    ) {
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        let peer = hydra_core::ReplicationPeer::registered(
+            peer_id.clone(),
+            hydra_core::ReplicationRole::Follower,
+            hydra_core::ReplicationMode::CommitLogStreaming,
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        hydra
+            .ingest(EventKind::ReplicaRegistered { peer })
+            .unwrap();
+        if let Some(lag) = lag_commits {
+            let leader = 1_000u64;
+            let follower = leader.saturating_sub(lag);
+            let offset = hydra_core::ReplicationOffset::from_sequence(follower);
+            let observed = hydra_core::ReplicationLag::observe(
+                leader,
+                follower,
+                chrono::Utc::now(),
+            );
+            hydra
+                .ingest(EventKind::ReplicaHeartbeatRecorded {
+                    peer_id: peer_id.clone(),
+                    offset,
+                    lag: Some(observed),
+                })
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_lag_evaluate_unknown_peer_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(replication_lag_request(serde_json::json!({
+                "peer_id": "replica_ghost",
+                "requested_by": actor(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(body.error.contains("unknown replication peer"));
+    }
+
+    #[tokio::test]
+    async fn replication_lag_evaluate_normal_when_lag_low_and_fresh() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_normal");
+        register_peer_with_lag(&runtime, &peer_id, Some(2)).await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(replication_lag_request(serde_json::json!({
+                "peer_id": peer_id.as_str(),
+                "requested_by": actor(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateReplicationLagResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "normal");
+        assert!(body.summary.contains("within thresholds"));
+        assert!(body.claim_id.is_none());
+        assert!(body.action_ids.is_empty());
+        assert_eq!(body.peer_id, peer_id);
+        assert!(body.lineage_url.starts_with("/lineage/"));
+    }
+
+    #[tokio::test]
+    async fn replication_lag_evaluate_critical_with_default_action_mode() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_critical");
+        register_peer_with_lag(&runtime, &peer_id, Some(500)).await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(replication_lag_request(serde_json::json!({
+                "peer_id": peer_id.as_str(),
+                "requested_by": actor(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateReplicationLagResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        assert!(body.claim_id.is_some());
+        assert_eq!(body.action_ids.len(), 1);
+        assert_eq!(body.peer_id, peer_id);
+        assert!(body.summary.contains("Critical"));
+    }
+
+    #[tokio::test]
+    async fn replication_lag_evaluate_prediction_only_skips_claim_and_action() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_pred_only");
+        register_peer_with_lag(&runtime, &peer_id, Some(500)).await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(replication_lag_request(serde_json::json!({
+                "peer_id": peer_id.as_str(),
+                "requested_by": actor(),
+                "mode": "prediction_only",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateReplicationLagResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        assert!(body.claim_id.is_none());
+        assert!(body.evidence_id.is_none());
+        assert!(body.action_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replication_lag_evaluate_claim_mode_skips_action() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_claim_mode");
+        register_peer_with_lag(&runtime, &peer_id, Some(500)).await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(replication_lag_request(serde_json::json!({
+                "peer_id": peer_id.as_str(),
+                "requested_by": actor(),
+                "mode": "claim",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateReplicationLagResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        assert!(body.claim_id.is_some());
+        assert!(body.evidence_id.is_some());
+        // Mode=claim → no action even on Critical.
+        assert!(body.action_ids.is_empty());
+    }
+
+    #[test]
+    fn replication_lag_summary_table_pinned() {
+        // Pin the user-visible strings so a deliberate change is
+        // required to break SDK pattern-matching.
+        assert!(render_replication_lag_summary(
+            ReplicationLagAnomalyLevel::Normal,
+            false,
+            false
+        )
+        .contains("within thresholds"));
+        assert!(render_replication_lag_summary(
+            ReplicationLagAnomalyLevel::Critical,
+            true,
+            true
+        )
+        .contains("Notify action proposed"));
     }
 }

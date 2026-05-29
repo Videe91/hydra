@@ -56,6 +56,15 @@ use hydra_core::{Claim, ClaimKind, ClaimStatus, ClaimSubject, Evidence};
 pub const BUILTIN_COMMIT_RATE_MODEL_ID: &str = "mm_builtin_commit_rate_v0";
 pub const BUILTIN_COMMIT_RATE_ACTOR_ID: &str = "actor_hydra_commit_rate_model";
 
+// === MicroModel Patch 16 — built-in ReplicationLagAnomalyModel identity ===
+//
+// Second built-in model. Same shape as Patch 2's constants —
+// stable model id and system actor — so registry restoration and
+// audit-chain queries treat both models uniformly.
+pub const BUILTIN_REPLICATION_LAG_MODEL_ID: &str = "mm_builtin_replication_lag_v0";
+pub const BUILTIN_REPLICATION_LAG_ACTOR_ID: &str =
+    "actor_hydra_replication_lag_model";
+
 pub struct Hydra {
     projection: Projection,
     event_log: EventLog,
@@ -3726,6 +3735,314 @@ impl Hydra {
         self.commit_rate_anomaly_model = Some(model);
     }
 
+    // === MicroModel Patch 16 — built-in ReplicationLagAnomalyModel ===
+
+    /// Evaluate the built-in replication-lag model against one peer
+    /// and record a `MicroModelPredictionRecorded` event. Patch 16's
+    /// surface — mirrors Patch 2's `evaluate_commit_rate_anomaly`
+    /// shape (returns `MicroModelPrediction`, hides the event id +
+    /// typed output for callers who only want the prediction).
+    ///
+    /// 404 on unknown peer — replication-lag predictions only make
+    /// sense for peers Hydra knows about. The model itself is
+    /// pure; the engine wrapper does the lookup.
+    ///
+    /// **Model state**: Patch 16's replication-lag model is
+    /// stateless (threshold detector, no EWMA), so unlike
+    /// commit-rate there's no `set_replication_lag_anomaly_model`
+    /// getter/setter pair. Construction is on each call.
+    /// A future patch may add per-peer warm state if it becomes
+    /// necessary.
+    pub fn evaluate_replication_lag_anomaly(
+        &mut self,
+        peer_id: hydra_core::ReplicaId,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::MicroModelPrediction> {
+        let (prediction, _event_id, _output) =
+            self.record_replication_lag_prediction(peer_id, actor)?;
+        Ok(prediction)
+    }
+
+    /// Evaluate the built-in replication-lag model AND, on
+    /// Warning/Critical, propose paired Evidence + Claim records
+    /// linked back to the prediction event.
+    ///
+    /// Same bridge shape as Patch 3's commit-rate analog. Proves
+    /// the `prediction → evidence → claim` chain is reusable
+    /// across model kinds — only the payload field set differs.
+    ///
+    /// Claim shape:
+    /// ```text
+    ///   kind         = AnomalyFinding
+    ///   subject      = ClaimSubject::System("hydra.replication")
+    ///   predicate    = "replica_lagging"
+    ///   object       = ClaimObject::Value(Value::Bool(true))
+    ///   confidence   = prediction.confidence
+    ///   evidence_for = [evidence_id]
+    ///   created_by   = actor
+    ///   caused_by    = prediction_event_id
+    /// ```
+    pub fn evaluate_replication_lag_anomaly_and_propose_claim(
+        &mut self,
+        peer_id: hydra_core::ReplicaId,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<
+        crate::micromodels::ReplicationLagAnomalyAssessment,
+    > {
+        let (prediction, prediction_event_id, output) =
+            self.record_replication_lag_prediction(peer_id.clone(), actor.clone())?;
+
+        let (evidence_id, evidence_event_id, claim_id, claim_event_id) =
+            if output.level.is_actionable() {
+                let evidence = build_evidence_from_replication_lag_prediction(
+                    &prediction,
+                    &output,
+                    &peer_id,
+                    prediction_event_id.clone(),
+                );
+                let new_evidence_id = evidence.id.clone();
+                let evidence_cascade = self
+                    .ingest(hydra_core::EventKind::EvidenceAdded { evidence })?;
+                let new_evidence_event_id = evidence_cascade
+                    .events
+                    .first()
+                    .map(|event| event.id.clone())
+                    .expect(
+                        "ingest produces at least the trigger event for \
+                         EvidenceAdded",
+                    );
+
+                let claim = build_claim_from_replication_lag_prediction(
+                    &prediction,
+                    &new_evidence_id,
+                    actor,
+                    prediction_event_id.clone(),
+                );
+                let new_claim_id = claim.id.clone();
+                let claim_cascade =
+                    self.ingest(hydra_core::EventKind::ClaimProposed { claim })?;
+                let new_claim_event_id = claim_cascade
+                    .events
+                    .first()
+                    .map(|event| event.id.clone())
+                    .expect(
+                        "ingest produces at least the trigger event for \
+                         ClaimProposed",
+                    );
+
+                (
+                    Some(new_evidence_id),
+                    Some(new_evidence_event_id),
+                    Some(new_claim_id),
+                    Some(new_claim_event_id),
+                )
+            } else {
+                (None, None, None, None)
+            };
+
+        Ok(crate::micromodels::ReplicationLagAnomalyAssessment {
+            level: output.level,
+            prediction,
+            prediction_event_id,
+            evidence_id,
+            evidence_event_id,
+            claim_id,
+            claim_event_id,
+            peer_id,
+        })
+    }
+
+    /// Evaluate the built-in replication-lag model AND, on
+    /// Warning/Critical, propose an `ActionKind::Notify` action
+    /// gated by the claim's verification state.
+    ///
+    /// Gate (deterministic, no policy DSL in v0):
+    /// ```text
+    ///   claim.predicate == "replica_lagging"
+    ///   AND (claim.status == Verified OR claim.confidence >= 0.9)
+    /// ```
+    ///
+    /// Action shape:
+    /// ```text
+    ///   kind                 = ActionKind::Notify
+    ///   targets              = [ActionTarget::System("hydra.replication")]
+    ///   related_claims       = [claim_id]
+    ///   supporting_evidence  = [evidence_id]
+    ///   payload              = {
+    ///     "severity": level.wire_name()
+    ///     "reason":   prediction.explanation
+    ///     "model_id": "mm_builtin_replication_lag_v0"
+    ///     "run_id":   prediction.run_id
+    ///     "peer_id":  peer_id
+    ///   }
+    ///   caused_by            = claim_event_id
+    /// ```
+    pub fn evaluate_replication_lag_anomaly_and_propose_action(
+        &mut self,
+        peer_id: hydra_core::ReplicaId,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<
+        crate::micromodels::ReplicationLagAnomalyActionAssessment,
+    > {
+        let claim_assessment = self
+            .evaluate_replication_lag_anomaly_and_propose_claim(
+                peer_id.clone(),
+                actor.clone(),
+            )?;
+
+        let mut action_ids: Vec<hydra_core::ActionId> = Vec::new();
+        if let (Some(claim_id), Some(evidence_id), Some(claim_event_id)) = (
+            claim_assessment.claim_id.as_ref(),
+            claim_assessment.evidence_id.as_ref(),
+            claim_assessment.claim_event_id.as_ref(),
+        ) {
+            let passes_gate = self
+                .claim(claim_id)
+                .map(|claim| {
+                    claim.predicate == "replica_lagging"
+                        && (claim.status
+                            == hydra_core::epistemic::ClaimStatus::Verified
+                            || claim.confidence.value() >= 0.9)
+                })
+                .unwrap_or(false);
+
+            if passes_gate {
+                let action = build_action_from_replication_lag_assessment(
+                    &claim_assessment,
+                    claim_id.clone(),
+                    evidence_id.clone(),
+                    claim_event_id.clone(),
+                    actor,
+                );
+                let new_action_id = action.id.clone();
+                self.ingest(hydra_core::EventKind::ActionProposed { action })?;
+                action_ids.push(new_action_id);
+            }
+        }
+
+        Ok(crate::micromodels::ReplicationLagAnomalyActionAssessment {
+            level: claim_assessment.level,
+            prediction: claim_assessment.prediction,
+            prediction_event_id: claim_assessment.prediction_event_id,
+            evidence_id: claim_assessment.evidence_id,
+            claim_id: claim_assessment.claim_id,
+            claim_event_id: claim_assessment.claim_event_id,
+            action_ids,
+            peer_id: claim_assessment.peer_id,
+        })
+    }
+
+    /// Shared helper: auto-register the built-in model definition
+    /// if missing, look up the peer (404 on unknown), compute the
+    /// observed inputs (lag_commits + heartbeat freshness),
+    /// evaluate the pure model, record the prediction event, and
+    /// return the typed triple. Made public so the HTTP layer can
+    /// reach it for `mode = "prediction_only"` evaluations.
+    pub fn record_replication_lag_prediction(
+        &mut self,
+        peer_id: hydra_core::ReplicaId,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<(
+        hydra_core::MicroModelPrediction,
+        hydra_core::EventId,
+        crate::micromodels::ReplicationLagAnomalyOutput,
+    )> {
+        // Step 1 — auto-register the built-in model definition if
+        // missing. Mirrors Patch 2 exactly.
+        let model_id = hydra_core::MicroModelId::from_str(
+            BUILTIN_REPLICATION_LAG_MODEL_ID,
+        );
+        if self.micro_model(&model_id).is_none() {
+            let now = chrono::Utc::now();
+            let definition = hydra_core::MicroModelDefinition::registered(
+                model_id.clone(),
+                hydra_core::MicroModelKind::ReplicationLagAnomaly,
+                "builtin_replication_lag_v0",
+                1,
+                vec![],
+                vec![],
+                hydra_core::ActorId::from_str(BUILTIN_REPLICATION_LAG_ACTOR_ID),
+                now,
+            );
+            self.register_micro_model(definition)?;
+            self.change_micro_model_status(
+                model_id.clone(),
+                hydra_core::MicroModelStatus::Active,
+                Some(
+                    "built-in micro-model: active on register".to_string(),
+                ),
+            )?;
+        }
+
+        // Step 2 — peer lookup. 404 if unknown.
+        let peer = self.replication_peer(&peer_id).cloned().ok_or_else(|| {
+            hydra_core::error::HydraError::QueryError(format!(
+                "unknown replication peer: {peer_id}"
+            ))
+        })?;
+
+        // Step 3 — compute observed inputs from peer state.
+        let now = chrono::Utc::now();
+        let (lag_commits, last_observed_at) = match peer.last_lag.as_ref() {
+            Some(lag) => (lag.lag_commits, Some(lag.observed_at)),
+            None => {
+                // No lag observation yet. Treat as zero lag with
+                // unknown heartbeat — the model converts None to
+                // stale → Critical.
+                (0u64, None)
+            }
+        };
+
+        // Step 4 — evaluate the pure model. Stateless: construct
+        // on each call.
+        let model = crate::micromodels::ReplicationLagAnomalyModel::default();
+        let output =
+            model.evaluate_observation(now, lag_commits, last_observed_at);
+
+        // Step 5 — build the typed prediction.
+        let prediction = hydra_core::MicroModelPrediction {
+            model_id: model_id.clone(),
+            run_id: hydra_core::MicroModelRunId::new(),
+            input: serde_json::json!({
+                "observed_at": now.to_rfc3339(),
+                "peer_id": peer_id.as_str(),
+                "lag_commits": lag_commits,
+                "last_observed_at": last_observed_at
+                    .map(|t| t.to_rfc3339()),
+                "warning_lag_commits": model.config().warning_lag_commits,
+                "critical_lag_commits": model.config().critical_lag_commits,
+                "stale_heartbeat_after_secs":
+                    model.config().stale_heartbeat_after_secs,
+            }),
+            output: serde_json::to_value(&output).expect(
+                "ReplicationLagAnomalyOutput is serde-derived; cannot fail",
+            ),
+            confidence: output.level.confidence(),
+            explanation: Some(output.reason.clone()),
+            created_at: now,
+        };
+
+        // Step 6 — record through ingest, capture event id.
+        let cascade = self.ingest(
+            hydra_core::EventKind::MicroModelPredictionRecorded {
+                prediction: prediction.clone(),
+            },
+        )?;
+        let prediction_event_id = cascade
+            .events
+            .first()
+            .map(|event| event.id.clone())
+            .expect(
+                "ingest produces at least the trigger event for \
+                 MicroModelPredictionRecorded",
+            );
+
+        // `actor` reserved for a future variant that carries the
+        // requesting actor in the event body (same as Patch 2).
+        let _ = actor;
+        Ok((prediction, prediction_event_id, output))
+    }
+
     // === Schema registry ===
 
     /// Read access to the schema registry store.
@@ -4762,6 +5079,175 @@ fn build_action_from_assessment(
         // The load-bearing causal link of Patch 4: action points
         // back at the claim event, which already points back at
         // the prediction event. Lineage walks the chain.
+        caused_by: Some(claim_event_id),
+    }
+}
+
+// === MicroModel Patch 16 — Replication-lag builders ===
+//
+// Mirror the commit-rate builders. Patch 17 may extract a shared
+// trait once the parallel structure has proven itself across two
+// real models; until then the parallel structure IS the proof.
+
+/// Build the `Evidence` record paired with a Warning/Critical
+/// replication-lag prediction. Pure function — no engine access.
+/// `peer_id` is stashed in the payload so downstream queries can
+/// filter evidence by peer without re-deriving from the related
+/// claim.
+fn build_evidence_from_replication_lag_prediction(
+    prediction: &hydra_core::MicroModelPrediction,
+    output: &crate::micromodels::ReplicationLagAnomalyOutput,
+    peer_id: &hydra_core::ReplicaId,
+    prediction_event_id: hydra_core::EventId,
+) -> hydra_core::Evidence {
+    use hydra_core::epistemic::{Confidence, EvidencePayload, EvidenceSource};
+
+    let mut data: std::collections::HashMap<String, hydra_core::Value> =
+        std::collections::HashMap::new();
+    data.insert(
+        "model_id".to_string(),
+        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
+    );
+    data.insert(
+        "run_id".to_string(),
+        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
+    );
+    data.insert(
+        "peer_id".to_string(),
+        hydra_core::Value::String(peer_id.as_str().to_string()),
+    );
+    data.insert(
+        "level".to_string(),
+        hydra_core::Value::String(output.level.wire_name().to_string()),
+    );
+    data.insert(
+        "lag_commits".to_string(),
+        hydra_core::Value::Int(output.lag_commits as i64),
+    );
+    data.insert(
+        "stale_heartbeat".to_string(),
+        hydra_core::Value::Bool(output.stale_heartbeat),
+    );
+    data.insert(
+        "reason".to_string(),
+        hydra_core::Value::String(output.reason.clone()),
+    );
+
+    hydra_core::Evidence {
+        id: hydra_core::EvidenceId::new(),
+        tenant_id: None,
+        source: EvidenceSource::System {
+            name: prediction.model_id.as_str().to_string(),
+        },
+        payload: EvidencePayload {
+            kind: "micro_model_prediction".to_string(),
+            data,
+        },
+        reliability: Confidence::new(prediction.confidence),
+        observed_at: prediction.created_at,
+        recorded_at: prediction.created_at,
+        caused_by: Some(prediction_event_id),
+    }
+}
+
+/// Build the `Claim` paired with the Evidence above. Patch 16
+/// claim shape (subject + predicate differ from commit-rate's):
+///
+///   subject       = ClaimSubject::System("hydra.replication")
+///   predicate     = "replica_lagging"
+///   object        = ClaimObject::Value(Value::Bool(true))
+///   kind          = AnomalyFinding
+fn build_claim_from_replication_lag_prediction(
+    prediction: &hydra_core::MicroModelPrediction,
+    evidence_id: &hydra_core::EvidenceId,
+    actor: hydra_core::ActorId,
+    prediction_event_id: hydra_core::EventId,
+) -> hydra_core::Claim {
+    use hydra_core::epistemic::{
+        ClaimKind, ClaimObject, ClaimStatus, ClaimSubject, Confidence,
+    };
+
+    hydra_core::Claim {
+        id: hydra_core::ClaimId::new(),
+        tenant_id: None,
+        kind: ClaimKind::AnomalyFinding,
+        subject: ClaimSubject::System("hydra.replication".to_string()),
+        predicate: "replica_lagging".to_string(),
+        object: ClaimObject::Value(hydra_core::Value::Bool(true)),
+        confidence: Confidence::new(prediction.confidence),
+        status: ClaimStatus::Proposed,
+        evidence_for: vec![evidence_id.clone()],
+        evidence_against: vec![],
+        valid_from: prediction.created_at,
+        valid_until: None,
+        created_by: actor,
+        created_at: prediction.created_at,
+        updated_at: prediction.created_at,
+        caused_by: Some(prediction_event_id),
+    }
+}
+
+/// Build the Notify `Action` paired with a Warning/Critical
+/// replication-lag claim. Includes `peer_id` in the payload so the
+/// receiving operator (or downstream Notify delivery adapter, P14)
+/// can route the alert per-peer.
+fn build_action_from_replication_lag_assessment(
+    assessment: &crate::micromodels::ReplicationLagAnomalyAssessment,
+    claim_id: hydra_core::ClaimId,
+    evidence_id: hydra_core::EvidenceId,
+    claim_event_id: hydra_core::EventId,
+    actor: hydra_core::ActorId,
+) -> hydra_core::Action {
+    use hydra_core::action::{ActionKind, ActionStatus, ActionTarget};
+
+    let prediction = &assessment.prediction;
+    let mut payload: std::collections::HashMap<String, hydra_core::Value> =
+        std::collections::HashMap::new();
+    payload.insert(
+        "severity".to_string(),
+        hydra_core::Value::String(assessment.level.wire_name().to_string()),
+    );
+    payload.insert(
+        "reason".to_string(),
+        hydra_core::Value::String(
+            prediction.explanation.clone().unwrap_or_default(),
+        ),
+    );
+    payload.insert(
+        "model_id".to_string(),
+        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
+    );
+    payload.insert(
+        "run_id".to_string(),
+        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
+    );
+    // Patch 16 addition vs commit-rate: peer_id in the action
+    // payload. Lets the delivery adapter route alerts per-peer.
+    payload.insert(
+        "peer_id".to_string(),
+        hydra_core::Value::String(assessment.peer_id.as_str().to_string()),
+    );
+
+    hydra_core::Action {
+        id: hydra_core::ActionId::new(),
+        tenant_id: None,
+        kind: ActionKind::Notify,
+        status: ActionStatus::Proposed,
+        // Per Patch 16 spec: target the replication subsystem, not
+        // the engine-as-a-whole.
+        targets: vec![ActionTarget::System("hydra.replication".to_string())],
+        related_claims: vec![claim_id],
+        supporting_evidence: vec![evidence_id],
+        proposed_by: actor,
+        approved_by: None,
+        rejected_by: None,
+        policy_id: None,
+        payload,
+        created_at: prediction.created_at,
+        updated_at: prediction.created_at,
+        approved_at: None,
+        rejected_at: None,
+        executed_at: None,
         caused_by: Some(claim_event_id),
     }
 }
@@ -12737,5 +13223,240 @@ mod sprint1_tests {
         // Ingest now succeeds.
         hydra.ingest(replication_signal("allowed")).unwrap();
         assert_eq!(hydra.commit_count(), 1);
+    }
+
+    // === MicroModel Patch 16 — Replication-lag engine wiring ===
+
+    /// Register a follower peer + (optionally) record one heartbeat
+    /// so `peer.last_lag` is populated with the supplied lag at the
+    /// supplied observation time.
+    fn register_peer_with_lag(
+        hydra: &mut Hydra,
+        peer_id: &hydra_core::ReplicaId,
+        last_lag: Option<(u64, chrono::DateTime<chrono::Utc>)>,
+    ) {
+        let peer = hydra_core::ReplicationPeer::registered(
+            peer_id.clone(),
+            hydra_core::ReplicationRole::Follower,
+            hydra_core::ReplicationMode::CommitLogStreaming,
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        hydra
+            .ingest(hydra_core::EventKind::ReplicaRegistered { peer })
+            .unwrap();
+        if let Some((lag_commits, observed_at)) = last_lag {
+            // Compose a fake leader/follower offset so the lag math
+            // matches the requested `lag_commits`.
+            let leader_seq = 1_000u64;
+            let follower_seq = leader_seq.saturating_sub(lag_commits);
+            let offset = hydra_core::ReplicationOffset::from_sequence(follower_seq);
+            let lag = hydra_core::ReplicationLag::observe(
+                leader_seq,
+                follower_seq,
+                observed_at,
+            );
+            hydra
+                .ingest(hydra_core::EventKind::ReplicaHeartbeatRecorded {
+                    peer_id: peer_id.clone(),
+                    offset,
+                    lag: Some(lag),
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn evaluate_replication_lag_anomaly_unknown_peer_returns_query_error() {
+        let mut hydra = Hydra::new();
+        let result = hydra.evaluate_replication_lag_anomaly(
+            hydra_core::ReplicaId::from_str("replica_ghost"),
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown replication peer"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_replication_lag_anomaly_auto_registers_builtin_model() {
+        let mut hydra = Hydra::new();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_a");
+        register_peer_with_lag(
+            &mut hydra,
+            &peer_id,
+            Some((0, chrono::Utc::now())),
+        );
+        let model_id = hydra_core::MicroModelId::from_str(
+            BUILTIN_REPLICATION_LAG_MODEL_ID,
+        );
+        assert!(hydra.micro_model(&model_id).is_none());
+
+        let _ = hydra
+            .evaluate_replication_lag_anomaly(
+                peer_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert!(
+            hydra.micro_model(&model_id).is_some(),
+            "first evaluate must auto-register the built-in"
+        );
+    }
+
+    #[test]
+    fn evaluate_replication_lag_normal_when_lag_low_and_heartbeat_fresh() {
+        let mut hydra = Hydra::new();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_normal");
+        register_peer_with_lag(
+            &mut hydra,
+            &peer_id,
+            Some((2, chrono::Utc::now())),
+        );
+        let assessment = hydra
+            .evaluate_replication_lag_anomaly_and_propose_action(
+                peer_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::ReplicationLagAnomalyLevel::Normal
+        );
+        assert!(assessment.claim_id.is_none());
+        assert!(assessment.evidence_id.is_none());
+        assert!(assessment.action_ids.is_empty());
+    }
+
+    #[test]
+    fn evaluate_replication_lag_critical_fires_evidence_claim_action() {
+        let mut hydra = Hydra::new();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_critical");
+        register_peer_with_lag(
+            &mut hydra,
+            &peer_id,
+            Some((500, chrono::Utc::now())),
+        );
+        let assessment = hydra
+            .evaluate_replication_lag_anomaly_and_propose_action(
+                peer_id.clone(),
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::ReplicationLagAnomalyLevel::Critical
+        );
+        assert!(assessment.claim_id.is_some());
+        assert!(assessment.evidence_id.is_some());
+        assert_eq!(assessment.action_ids.len(), 1);
+        assert_eq!(assessment.peer_id, peer_id);
+
+        // Verify the claim shape per Patch 16 spec.
+        let claim = hydra.claim(assessment.claim_id.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            claim.subject,
+            hydra_core::ClaimSubject::System("hydra.replication".to_string())
+        );
+        assert_eq!(claim.predicate, "replica_lagging");
+        assert_eq!(claim.kind, hydra_core::ClaimKind::AnomalyFinding);
+    }
+
+    #[test]
+    fn evaluate_replication_lag_action_payload_carries_peer_id() {
+        let mut hydra = Hydra::new();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_payload_check");
+        register_peer_with_lag(
+            &mut hydra,
+            &peer_id,
+            Some((200, chrono::Utc::now())),
+        );
+        let assessment = hydra
+            .evaluate_replication_lag_anomaly_and_propose_action(
+                peer_id.clone(),
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let action_id = assessment.action_ids.into_iter().next().unwrap();
+        let action = hydra.action(&action_id).unwrap();
+        // Patch 16 spec: action targets System("hydra.replication")
+        // (not System("hydra")).
+        assert_eq!(
+            action.targets,
+            vec![hydra_core::action::ActionTarget::System(
+                "hydra.replication".to_string()
+            )]
+        );
+        // Payload carries the peer_id field (Patch 16 addition vs
+        // commit-rate's payload).
+        match action.payload.get("peer_id") {
+            Some(hydra_core::Value::String(s)) => {
+                assert_eq!(s, peer_id.as_str());
+            }
+            other => panic!("expected payload.peer_id String, got {other:?}"),
+        }
+        // Severity = "critical".
+        match action.payload.get("severity") {
+            Some(hydra_core::Value::String(s)) => assert_eq!(s, "critical"),
+            other => panic!("expected severity=critical, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_replication_lag_no_last_lag_is_stale_critical() {
+        // Peer registered but never reported a heartbeat. Model
+        // sees last_observed_at = None → stale → Critical.
+        let mut hydra = Hydra::new();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_silent");
+        register_peer_with_lag(&mut hydra, &peer_id, None);
+        let assessment = hydra
+            .evaluate_replication_lag_anomaly_and_propose_action(
+                peer_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::ReplicationLagAnomalyLevel::Critical
+        );
+        // Stale-heartbeat critical still propagates the full chain.
+        assert_eq!(assessment.action_ids.len(), 1);
+    }
+
+    #[test]
+    fn evaluate_replication_lag_prediction_only_records_only_prediction_event() {
+        let mut hydra = Hydra::new();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_pred_only");
+        register_peer_with_lag(
+            &mut hydra,
+            &peer_id,
+            Some((500, chrono::Utc::now())),
+        );
+        // Patch 16's prediction-only surface is the bottom helper —
+        // no Evidence/Claim/Action even on Critical level.
+        let (prediction, _event_id, output) = hydra
+            .record_replication_lag_prediction(
+                peer_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            output.level,
+            crate::micromodels::ReplicationLagAnomalyLevel::Critical
+        );
+        // No claims for the lag subject (it's a Critical level but
+        // we used prediction-only).
+        let lag_claims: Vec<_> = hydra
+            .epistemic_store
+            .all_claims()
+            .filter(|c| c.predicate == "replica_lagging")
+            .collect();
+        assert!(lag_claims.is_empty());
+        assert_eq!(
+            prediction.model_id.as_str(),
+            BUILTIN_REPLICATION_LAG_MODEL_ID
+        );
     }
 }

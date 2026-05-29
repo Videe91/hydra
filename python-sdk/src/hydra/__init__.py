@@ -141,6 +141,8 @@ from ._types import (
     PropertyDiff,
     ReplicaId,
     ReplicationLag,
+    ReplicationLagAnomalyAssessment,
+    ReplicationLagAnomalyLevel,
     ReplicationLagResponse,
     ReplicationMode,
     ReplicationOffset,
@@ -265,6 +267,9 @@ __all__ = [
     # Replication read-only (Patch 4)
     "LastPromotionInfo",
     "ReplicationLag",
+    # MicroModel Patch 16 — replication-lag anomaly
+    "ReplicationLagAnomalyAssessment",
+    "ReplicationLagAnomalyLevel",
     "ReplicationLagResponse",
     "ReplicationMode",
     "ReplicationOffset",
