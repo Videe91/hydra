@@ -1474,3 +1474,77 @@ class ActionExecutionResponse(BaseModel):
     outcome_id: OutcomeId
     executed_by: ActorId
     executed_at: str
+
+
+# === Trust Patch 2 (Patch 10) — trust layer wire types ===
+#
+# Mirrors `hydra_core::trust` (Patch 9). The Rust struct uses
+# default serde (PascalCase) for `TrustLevel`, so the SDK Literal
+# matches: `"High"`, `"Medium"`, `"Low"`, `"Unknown"`.
+#
+# `TrustFactor.applied=false` entries are LOAD-BEARING: they tell
+# callers "this factor was checked but didn't fire" (e.g., "no
+# operator approval found"). Patch 11's auto-execution policy will
+# branch on these. Don't filter them out client-side.
+
+TrustLevel = Literal["High", "Medium", "Low", "Unknown"]
+
+
+class TrustFactor(BaseModel):
+    """One factor evaluated during trust assessment.
+
+    - `kind` is a stable string id (e.g. `"claim_verified"`,
+      `"operator_approved"`). Patch 11 will branch on these keys
+      — treat them as a public API contract.
+    - `weight` is SIGNED: positive contributes to the score,
+      negative penalizes.
+    - `applied` indicates whether the factor's condition fired.
+      `applied=false` factors are still emitted (the engine's
+      contract is "every factor checked is reported"), with
+      `weight` indicating the value it WOULD have contributed if
+      it had.
+    - `detail` is a short human-readable reason.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    weight: float
+    applied: bool
+    detail: str
+
+
+class TrustAssessment(BaseModel):
+    """Mirrors `hydra_core::TrustAssessment` — the read-only result
+    of `Hydra::assess_claim_trust(claim_id)`.
+
+    Returned by `hy.assess_claim_trust(claim_id)` from
+    `GET /trust/claims/{claim_id}`. The route is tenant-scoped
+    (strict isolation) — the SDK propagates `X-Hydra-Tenant`
+    via the standard tenant override mechanism.
+
+    `score` is clamped `[0.0, 1.0]`. **Special case**: when the
+    underlying claim is `Retracted`, the engine force-sets `score`
+    to `0.0` regardless of factor sum (the `claim_retracted`
+    factor still appears in `factors` with `weight=-1.0`).
+
+    `factors` includes EVERY evaluated factor (applied AND
+    unapplied) so the explanation is honest about what was
+    checked. Don't filter `applied=false` entries client-side.
+
+    `related_action_ids` / `related_outcome_ids` /
+    `observation_run_ids` are the artifacts the walk surfaced —
+    callers can introspect them without re-walking the chain.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: ClaimId
+    score: float
+    level: TrustLevel
+    explanation: str
+    factors: list[TrustFactor]
+    related_action_ids: list[ActionId] = Field(default_factory=list)
+    related_outcome_ids: list[OutcomeId] = Field(default_factory=list)
+    observation_run_ids: list[MicroModelRunId] = Field(default_factory=list)
+    assessed_at: str

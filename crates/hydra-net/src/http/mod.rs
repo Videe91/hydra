@@ -14,6 +14,7 @@ pub mod schema;
 pub mod sensor;
 pub mod snapshots;
 pub mod tenant;
+pub mod trust;
 
 pub use actions::{
     actions_router, ActionExecutionResponse, ActionTransitionResponse, ActionsHttpState,
@@ -59,3 +60,4 @@ pub use schema::{schema_router, SchemaHttpState};
 pub use sensor::{sensor_router, SensorHttpState};
 pub use snapshots::{snapshots_router, SnapshotsHttpState};
 pub use tenant::{extract_tenant, tenant_error_response, TenantError, TENANT_HEADER};
+pub use trust::{trust_router, TrustHttpState};

@@ -52,6 +52,7 @@ from ._types import (
     NodeId,
     Outcome,
     TenantId,
+    TrustAssessment,
 )
 from .diagnostics import _DiagnosticsSync
 from .replication import _ReplicationSync
@@ -343,6 +344,26 @@ class HydraSync:
             tenant=tenant,
         )
         return ActionExecutionResponse.model_validate(raw)
+
+    # ========================================================================
+    # Trust Patch 2 (Patch 10) — read-only trust assessment (sync mirror)
+    # ========================================================================
+
+    def assess_claim_trust(
+        self,
+        claim_id: ClaimId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> TrustAssessment:
+        """Sync mirror of `Hydra.assess_claim_trust`. Same wire
+        contract, same strict-tenant isolation, same error
+        mapping (400 missing tenant, 404 unknown or wrong tenant).
+        See the async docstring for full semantics."""
+        raw = self._http.get(
+            _paths.trust_claim_path(claim_id),
+            tenant=tenant,
+        )
+        return TrustAssessment.model_validate(raw)
 
     def _ingest(
         self,

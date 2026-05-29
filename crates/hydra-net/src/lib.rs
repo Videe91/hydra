@@ -18,7 +18,7 @@ pub mod prelude {
     pub use crate::http::{
         actions_router, commit_stream_router, commits_router, diagnostics_router, events_router,
         ingest_router, lineage_router, micromodels_router, observations_router, query_router,
-        schema_router, sensor_router, snapshots_router, ActionExecutionResponse,
+        schema_router, sensor_router, snapshots_router, trust_router, ActionExecutionResponse,
         ActionTransitionResponse, ActionsHttpState, AnomalyResponse, ApproveActionRequest,
         CommitBroadcaster, CommitStreamHttpState, CommitsHttpState,
         CounterfactualDiagnosticsResponse, CoverageDiagnosticsResponse, DiagnosticsHttpState,
@@ -26,7 +26,7 @@ pub mod prelude {
         EvolutionDiagnosticsResponse, ExecuteActionRequest, IngestHttpState, LineageHttpState,
         LineageResponse, MicroModelObservationResponse, MicroModelsHttpState,
         ObservationsHttpState, QueryHttpState, RecordObservationFromOutcomeRequest,
-        RejectActionRequest, SchemaHttpState, SensorHttpState, SnapshotsHttpState,
+        RejectActionRequest, SchemaHttpState, SensorHttpState, SnapshotsHttpState, TrustHttpState,
         COMMIT_STREAM_CAPACITY,
     };
     pub use crate::metrics::{

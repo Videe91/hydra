@@ -370,6 +370,16 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
     if path == "/replication" || path.starts_with("/replication/") {
         return vec!["read:replication"];
     }
+    // Trust Patch 2 (Patch 10) — trust is governance / intelligence
+    // state, not generic query data. Granting `read:query` should
+    // NOT automatically grant visibility into trust judgments
+    // (which may eventually expose source / agent / model risk).
+    // Reserved for the whole `/trust/*` namespace so future
+    // `/trust/sources/*`, `/trust/actions/*` etc. inherit the
+    // same scope without re-touching this map.
+    if path.starts_with("/trust/") {
+        return vec!["read:trust"];
+    }
     Vec::new()
 }
 
@@ -978,6 +988,15 @@ mod tests {
         assert_eq!(
             required_scopes_for(&Method::POST, "/replication/apply"),
             vec!["admin:replication"]
+        );
+        // Trust Patch 2 (Patch 10) — /trust/* gets its own
+        // `read:trust` scope, separate from read:query, because
+        // trust is governance/intelligence state. The whole
+        // namespace is reserved up front so future
+        // `/trust/sources/*` etc. inherit automatically.
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/trust/claims/claim_abc"),
+            vec!["read:trust"]
         );
         // OPTIONS always has no scope requirement (CORS preflight).
         assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());

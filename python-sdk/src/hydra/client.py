@@ -55,6 +55,7 @@ from ._types import (
     NodeId,
     Outcome,
     TenantId,
+    TrustAssessment,
 )
 from .diagnostics import _Diagnostics
 from .replication import _Replication
@@ -433,6 +434,45 @@ class Hydra:
             tenant=tenant,
         )
         return ActionExecutionResponse.model_validate(raw)
+
+    # ========================================================================
+    # Trust Patch 2 (Patch 10) — read-only trust assessment
+    # ========================================================================
+
+    async def assess_claim_trust(
+        self,
+        claim_id: ClaimId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> TrustAssessment:
+        """Read the trust assessment for one claim
+        (`GET /trust/claims/{claim_id}`).
+
+        Walks the audit chain (Patches 3–8) and returns a
+        deterministic, rule-based `TrustAssessment` with `score`,
+        `level`, `explanation`, and the full factor list (including
+        `applied=false` factors). Read-only — the engine method
+        emits no events.
+
+        Strict tenant isolation: the route requires `X-Hydra-Tenant`
+        (the SDK propagates it automatically). A claim that exists
+        but belongs to a different tenant surfaces as
+        `HydraNotFoundError`, indistinguishable from a missing id
+        — by design, so trust queries can't probe across tenants.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header
+          - 404 → `HydraNotFoundError`: unknown claim id OR wrong tenant
+
+        Top-level method (not under `hy.diagnostics` or `hy.trust`)
+        for v0. Future patches may regroup once `/trust/sources`,
+        `/trust/datasets` etc. land.
+        """
+        raw = await self._http.get(
+            _paths.trust_claim_path(claim_id),
+            tenant=tenant,
+        )
+        return TrustAssessment.model_validate(raw)
 
     async def _ingest(
         self,

@@ -157,6 +157,9 @@ from ._types import (
     SubscriptionId,
     SubscriptionOutcome,
     TenantId,
+    TrustAssessment,
+    TrustFactor,
+    TrustLevel,
     TypeId,
     ValidationResponse,
     ValueType,
@@ -229,6 +232,10 @@ __all__ = [
     "ActionExecutionResponse",
     # Outcome learning loop (Patch 8)
     "MicroModelObservation",
+    # Trust layer (Patch 10)
+    "TrustAssessment",
+    "TrustFactor",
+    "TrustLevel",
     # Schemas (Patch 4)
     "ActionPayloadSchema",
     "ClaimPredicateSchema",

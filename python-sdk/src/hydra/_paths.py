@@ -181,6 +181,22 @@ def action_execute_path(action_id: str) -> str:
     return f"/actions/{_seg(action_id)}/execute"
 
 
+# === /trust/* (Trust Patch 2 / Patch 10 — read-only trust surface) ===
+#
+# The `/trust/*` namespace is reserved for the whole Trust Layer.
+# Patch 10 mounts only `/trust/claims/{id}`; future patches will
+# add `/trust/sources/*`, `/trust/datasets/*`, `/trust/actions/*`,
+# `/trust/models/*` etc. All share the `read:trust` auth scope.
+
+
+def trust_claim_path(claim_id: str) -> str:
+    """`GET /trust/claims/{claim_id}` — read-only trust assessment
+    of one claim (Patch 10). Strict tenant-scoped: requires
+    `X-Hydra-Tenant` header; missing → 400, wrong tenant or
+    unknown id → 404. Returns a `TrustAssessment`."""
+    return f"/trust/claims/{_seg(claim_id)}"
+
+
 # === /schemas/* — read ===
 
 
