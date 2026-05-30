@@ -34,8 +34,10 @@ from ._types import (
     ActorId,
     AutoApprovalDecision,
     AutoExecutionDecision,
+    CausalCell,
     CausalCellChildTrust,
     CausalCellId,
+    CausalCellKind,
     CausalCellTrustAssessment,
     Claim,
     ClaimId,
@@ -635,6 +637,104 @@ class Hydra:
             tenant=tenant,
         )
         return CausalCellTrustAssessment.model_validate(raw)
+
+    async def causal_cell(
+        self,
+        cell_id: CausalCellId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> CausalCell:
+        """Read one CausalCell by id (`GET /causal-cells/{cell_id}` —
+        Patch 25).
+
+        Returns the typed `CausalCell` (fractal-layer composition
+        primitive) without any trust folding — for trust use
+        `assess_causal_cell_trust`. The two surfaces are
+        intentionally separate: cells under `/causal-cells/*`,
+        trust under `/trust/cells/*`.
+
+        Strict tenant isolation: requires `X-Hydra-Tenant`
+        (propagated automatically). A cell that belongs to a
+        different tenant — OR a `None`-tenanted (system) cell
+        queried with a tenant header — surfaces as
+        `HydraNotFoundError`, indistinguishable from a missing
+        id by design.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header
+          - 404 → `HydraNotFoundError`: unknown id, wrong tenant,
+            or `None`-tenanted cell under a tenanted query
+        """
+        raw = await self._http.get(
+            _paths.causal_cell_path(cell_id),
+            tenant=tenant,
+        )
+        return CausalCell.model_validate(raw["cell"])
+
+    async def causal_cells(
+        self,
+        *,
+        kind: CausalCellKind | None = None,
+        limit: int | None = None,
+        after: str | None = None,
+        tenant: TenantId | None = None,
+    ) -> list[CausalCell]:
+        """List CausalCells for the caller's tenant
+        (`GET /causal-cells` — Patch 25).
+
+        Two modes (mutually exclusive in v0):
+
+          - **Paginated unfiltered** (`kind=None`): cursor-based
+            page over all of the caller's tenant cells, sorted by
+            id. `limit` defaults to 100 server-side, capped at
+            500. `after` walks the cursor returned by a previous
+            call. v0 returns the page items as a `list[CausalCell]`
+            — the cursor lives on the wire as `next_cursor` but
+            is NOT surfaced through this convenience method.
+            Callers that need cursor chaining call
+            `/causal-cells` directly via `httpx` or wait for the
+            future `Page[CausalCell]` helper.
+
+          - **Filtered by kind** (`kind="reflex"` etc.): returns
+            the full filtered set, unpaginated. Built-in kind
+            labels are snake_case (`"reflex"`, `"health"`,
+            `"incident"`, `"dataset"`, `"agent"`, `"workflow"`,
+            `"source"`, `"tenant"`, `"case"`); any other non-
+            empty string is treated as `Custom(label)` server-
+            side. Unknown labels return an empty list, NOT 400.
+
+        `None`-tenanted (system) cells are NEVER included.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header
+            OR an unknown `after` cursor (mirrors the rest of
+            the cursor API — silent empty would mask client bugs)
+        """
+        # The kind arg accepts either the union form (str |
+        # dict[str, str]) for symmetry with the wire type, or a
+        # plain snake_case label. Custom kinds on the wire are
+        # `{"Custom": "label"}` but the URL query param wants
+        # the label directly — extract it when a dict is passed.
+        kind_param: str | None
+        if kind is None:
+            kind_param = None
+        elif isinstance(kind, dict):
+            kind_param = kind.get("Custom") or next(iter(kind.values()), None)
+        else:
+            kind_param = kind
+        params: dict[str, str | int] = {}
+        if kind_param is not None:
+            params["kind"] = kind_param
+        if limit is not None:
+            params["limit"] = limit
+        if after is not None:
+            params["after"] = after
+        raw = await self._http.get(
+            _paths.causal_cells_list_path(),
+            params=params if params else None,
+            tenant=tenant,
+        )
+        return [CausalCell.model_validate(c) for c in raw["cells"]]
 
     async def _ingest(
         self,

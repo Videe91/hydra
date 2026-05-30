@@ -15,10 +15,11 @@ use axum::routing::{get, post};
 use axum::Router;
 use hydra_core::ActorId;
 use hydra_net::http::{
-    actions_router_with_notify, commit_stream_router, commits_router, diagnostics_router,
-    events_router, ingest_router, lineage_router, micromodels_router, observations_router,
-    query_router, replication_promote_router, replication_role_router, replication_router,
-    schema_router, sensor_router, snapshots_router, trust_router, CommitBroadcaster,
+    actions_router_with_notify, causal_cells_router, commit_stream_router, commits_router,
+    diagnostics_router, events_router, ingest_router, lineage_router, micromodels_router,
+    observations_router, query_router, replication_promote_router, replication_role_router,
+    replication_router, schema_router, sensor_router, snapshots_router, trust_router,
+    CommitBroadcaster,
 };
 use hydra_net::notify_delivery::{NotifyAdapter, WebhookAdapter};
 use hydra_net::runtime::{RuntimeBuilder, RuntimeHandle};
@@ -180,6 +181,7 @@ pub fn build_router_with_security(
         .merge(actions_router_with_notify(runtime.clone(), notify_adapter))
         .merge(observations_router(runtime.clone()))
         .merge(trust_router(runtime.clone()))
+        .merge(causal_cells_router(runtime.clone()))
         .merge(replication_router(runtime.clone()))
         .merge(replication_role_router(runtime.clone(), role_state.clone()));
 

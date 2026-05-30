@@ -412,6 +412,14 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
     if path.starts_with("/trust/") {
         return vec!["read:trust"];
     }
+    // Patch 25 — CausalCell read/query surface. Cells ARE graph
+    // data (composition primitive over events / claims / actions),
+    // so they gate under `read:query` alongside `/query/*` and
+    // `/diagnostics/*`. Trust over cells stays under `/trust/cells/*`
+    // and `read:trust` — separation preserved.
+    if path == "/causal-cells" || path.starts_with("/causal-cells/") {
+        return vec!["read:query"];
+    }
     Vec::new()
 }
 
@@ -1065,6 +1073,19 @@ mod tests {
         assert_eq!(
             required_scopes_for(&Method::GET, "/trust/cells/cell_abc"),
             vec!["read:trust"]
+        );
+        // Patch 25 — CausalCell read/query routes. Cells are graph
+        // data (composition primitive), gated under `read:query`.
+        // Cell TRUST stays under `/trust/cells/*` → `read:trust`;
+        // these pins keep the two namespaces visibly separate so a
+        // future refactor can't collapse them silently.
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/causal-cells"),
+            vec!["read:query"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/causal-cells/cell_abc"),
+            vec!["read:query"]
         );
         // OPTIONS always has no scope requirement (CORS preflight).
         assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());

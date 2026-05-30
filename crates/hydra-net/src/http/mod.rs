@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod causal_cells;
 pub mod commit_stream;
 pub mod commits;
 pub mod diagnostics;
@@ -21,6 +22,10 @@ pub use actions::{
     ActionTransitionResponse, ActionsHttpState, ApproveActionRequest, AutoApproveActionRequest,
     AutoApproveActionResponse, AutoExecuteActionRequest, AutoExecuteActionResponse,
     ExecuteActionRequest, RejectActionRequest,
+};
+pub use causal_cells::{
+    causal_cells_router, CausalCellResponse, CausalCellsFilteredResponse, CausalCellsHttpState,
+    CausalCellsListResponse, ListCausalCellsQuery,
 };
 pub use commit_stream::{
     commit_stream_router, CommitBroadcaster, CommitStreamErrorPayload,

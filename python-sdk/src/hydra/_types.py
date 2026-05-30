@@ -1698,6 +1698,61 @@ class TrustAssessment(BaseModel):
     assessed_at: str
 
 
+# === Patch 25 — CausalCell read/query wire types ===
+#
+# Patch 20 (engine) introduced the CausalCell vocabulary; Patch
+# 24 made cell *trust* externally legible; Patch 25 makes the
+# cells themselves legible via `GET /causal-cells/*`.
+#
+# `CausalCellKind` on the wire is a union: built-in variants
+# serialize as bare PascalCase strings ("Reflex", "Health", …),
+# while `Custom(label)` serializes as `{"Custom": "label"}` —
+# externally-tagged, matching every other Rust enum-with-payload
+# in the Hydra wire surface.
+
+CausalCellKind = str | dict[str, str]
+
+
+class CausalCell(BaseModel):
+    """Mirrors `hydra_core::CausalCell` — the fractal-layer
+    composition primitive (Patch 20+ engine, Patch 25 wire).
+
+    A CausalCell is a bounded causal unit grouping events,
+    evidence, claims, actions, outcomes, observation runs, and
+    optionally child cells. Patch 21 auto-creates `Reflex` cells
+    from completed reflex chains; Patch 22 composes parent cells
+    from children; Patch 23 folds trust over the composition
+    tree.
+
+    Patch 25 exposes single-cell lookup and tenant-scoped listing.
+    All cell trust assessment is on the parallel `/trust/cells/*`
+    surface (Patch 24); the two namespaces are intentionally
+    kept apart.
+
+    Strict tenant isolation on the HTTP routes: `None`-tenanted
+    (system) cells are INVISIBLE to tenanted queries.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: CausalCellId
+    tenant_id: TenantId | None = None
+    kind: CausalCellKind
+    subject: str
+    source_events: list[EventId] = Field(default_factory=list)
+    evidence_ids: list[EvidenceId] = Field(default_factory=list)
+    claim_ids: list[ClaimId] = Field(default_factory=list)
+    action_ids: list[ActionId] = Field(default_factory=list)
+    outcome_ids: list[OutcomeId] = Field(default_factory=list)
+    observation_run_ids: list[MicroModelRunId] = Field(default_factory=list)
+    child_cell_ids: list[CausalCellId] = Field(default_factory=list)
+    trust_score: float | None = None
+    summary: str | None = None
+    created_by: ActorId
+    created_at: str
+    caused_by: EventId | None = None
+
+
 # === Patch 24 — CausalCell trust folding wire types ===
 #
 # Reuses the existing `TrustLevel` Literal and `TrustFactor`

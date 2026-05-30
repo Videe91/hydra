@@ -4,8 +4,9 @@ use hydra_core::graph::{bfs_dyn, TraversalDirection};
 use hydra_core::id::{CascadeId, EdgeId, EventId, NodeId};
 use hydra_core::node::Node;
 use hydra_core::{
-    Action, ActionId, ActionStatus, Claim, ClaimId, ClaimKind, ClaimStatus, ClaimSubject, Evidence,
-    EvidenceId, Outcome, OutcomeId, SensorCheckpoint, SensorId, SensorRun, TenantId,
+    Action, ActionId, ActionStatus, CausalCell, CausalCellId, CausalCellKind, Claim, ClaimId,
+    ClaimKind, ClaimStatus, ClaimSubject, Evidence, EvidenceId, Outcome, OutcomeId,
+    SensorCheckpoint, SensorId, SensorRun, TenantId,
 };
 use hydra_engine::hydra::Hydra;
 use std::sync::Arc;
@@ -578,6 +579,63 @@ impl QueryService {
             .into_iter()
             .filter(|o| o.tenant_id.as_ref() == Some(tenant))
             .collect()
+    }
+
+    // === Patch 25 — CausalCell read/query surface =====================
+    //
+    // Tenant-scoped accessors mirroring the claim / action / outcome
+    // patterns. `None`-tenanted cells are NEVER returned by these
+    // methods (strict isolation — matches `/trust/cells/:id`).
+    // Order is sorted by `CausalCellId` so cursor pagination from
+    // the HTTP layer is stable across calls (the underlying cell
+    // store uses a HashMap whose iteration order isn't deterministic).
+
+    /// Look up one cell by id, scoped to the given tenant.
+    /// Returns `None` when the cell doesn't exist OR belongs to a
+    /// different tenant OR is `None`-tenanted (system cell).
+    pub async fn cell_for_tenant(
+        &self,
+        id: &CausalCellId,
+        tenant: &TenantId,
+    ) -> Option<CausalCell> {
+        let hydra = self.hydra.read().await;
+        hydra
+            .causal_cell(id)
+            .filter(|cell| cell.tenant_id.as_ref() == Some(tenant))
+            .cloned()
+    }
+
+    /// All cells belonging to `tenant`, sorted by id for stable
+    /// cursor pagination at the HTTP layer.
+    pub async fn cells_for_tenant(&self, tenant: &TenantId) -> Vec<CausalCell> {
+        let hydra = self.hydra.read().await;
+        let mut cells: Vec<CausalCell> = hydra
+            .causal_cells()
+            .filter(|c| c.tenant_id.as_ref() == Some(tenant))
+            .cloned()
+            .collect();
+        cells.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        cells
+    }
+
+    /// All cells with the given `kind` belonging to `tenant`,
+    /// sorted by id. Patch 25 filtered lists are NOT paginated;
+    /// the HTTP layer returns the full filtered set. Future
+    /// patches may add filter-side pagination if needed.
+    pub async fn cells_with_kind_for_tenant(
+        &self,
+        kind: CausalCellKind,
+        tenant: &TenantId,
+    ) -> Vec<CausalCell> {
+        let hydra = self.hydra.read().await;
+        let mut cells: Vec<CausalCell> = hydra
+            .causal_cells_by_kind(&kind)
+            .into_iter()
+            .filter(|c| c.tenant_id.as_ref() == Some(tenant))
+            .cloned()
+            .collect();
+        cells.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        cells
     }
 
     pub async fn runs_for_sensor_for_tenant(

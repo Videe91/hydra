@@ -82,8 +82,10 @@ from ._types import (
     ClaimKind,
     ClaimObject,
     ClaimPredicateSchema,
+    CausalCell,
     CausalCellChildTrust,
     CausalCellId,
+    CausalCellKind,
     CausalCellTrustAssessment,
     ClaimStatus,
     ClaimSubject,
@@ -252,6 +254,13 @@ __all__ = [
     "CausalCellId",
     "CausalCellChildTrust",
     "CausalCellTrustAssessment",
+    # CausalCell read/query (Patch 25) — surfaces individual
+    # cells + tenant-scoped listing via `causal_cell` /
+    # `causal_cells`. `CausalCellKind` covers both built-in
+    # PascalCase variants ("Reflex", etc.) and the externally-
+    # tagged `{"Custom": "label"}` form.
+    "CausalCell",
+    "CausalCellKind",
     # Automation layer (Patch 11 + Patch 15)
     "AutoExecutionDecision",
     "AutoApprovalDecision",

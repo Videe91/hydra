@@ -51,7 +51,9 @@ from ._types import (
     IngestResponse,
     LineageResponse,
     CausalCellChildTrust,
+    CausalCell,
     CausalCellId,
+    CausalCellKind,
     CausalCellTrustAssessment,
     Node,
     NodeId,
@@ -437,6 +439,58 @@ class HydraSync:
             tenant=tenant,
         )
         return CausalCellTrustAssessment.model_validate(raw)
+
+    def causal_cell(
+        self,
+        cell_id: CausalCellId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> CausalCell:
+        """Sync mirror of `Hydra.causal_cell` (Patch 25). Reads one
+        CausalCell by id from `/causal-cells/{cell_id}`. Same strict
+        tenant isolation as the async client (`None`-tenanted cells
+        invisible to tenanted queries; wrong tenant → 404
+        indistinguishable from unknown id)."""
+        raw = self._http.get(
+            _paths.causal_cell_path(cell_id),
+            tenant=tenant,
+        )
+        return CausalCell.model_validate(raw["cell"])
+
+    def causal_cells(
+        self,
+        *,
+        kind: CausalCellKind | None = None,
+        limit: int | None = None,
+        after: str | None = None,
+        tenant: TenantId | None = None,
+    ) -> list[CausalCell]:
+        """Sync mirror of `Hydra.causal_cells` (Patch 25). Two modes:
+        unfiltered cursor pagination (`kind=None`, `limit`/`after`
+        params) vs filtered-by-kind unpaginated. Built-in kinds
+        are snake_case; any other label maps to `Custom(label)`
+        server-side and returns an empty list when no cells match.
+        See the async docstring for full contract."""
+        kind_param: str | None
+        if kind is None:
+            kind_param = None
+        elif isinstance(kind, dict):
+            kind_param = kind.get("Custom") or next(iter(kind.values()), None)
+        else:
+            kind_param = kind
+        params: dict[str, str | int] = {}
+        if kind_param is not None:
+            params["kind"] = kind_param
+        if limit is not None:
+            params["limit"] = limit
+        if after is not None:
+            params["after"] = after
+        raw = self._http.get(
+            _paths.causal_cells_list_path(),
+            params=params if params else None,
+            tenant=tenant,
+        )
+        return [CausalCell.model_validate(c) for c in raw["cells"]]
 
     def _ingest(
         self,

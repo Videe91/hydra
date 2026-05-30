@@ -17,13 +17,15 @@ pub mod prelude {
     };
     pub use crate::bus::{BusConfig, BusMetrics, CascadeNotification};
     pub use crate::http::{
-        actions_router, commit_stream_router, commits_router, diagnostics_router, events_router,
-        ingest_router, lineage_router, micromodels_router, observations_router, query_router,
-        schema_router, sensor_router, snapshots_router, trust_router, ActionExecutionResponse,
-        ActionTransitionResponse, ActionsHttpState, AnomalyResponse, ApproveActionRequest,
-        AutoApproveActionRequest, AutoApproveActionResponse, AutoExecuteActionRequest,
-        AutoExecuteActionResponse, CommitBroadcaster,
-        CommitStreamHttpState, CommitsHttpState, CounterfactualDiagnosticsResponse,
+        actions_router, causal_cells_router, commit_stream_router, commits_router,
+        diagnostics_router, events_router, ingest_router, lineage_router, micromodels_router,
+        observations_router, query_router, schema_router, sensor_router, snapshots_router,
+        trust_router, ActionExecutionResponse, ActionTransitionResponse, ActionsHttpState,
+        AnomalyResponse, ApproveActionRequest, AutoApproveActionRequest,
+        AutoApproveActionResponse, AutoExecuteActionRequest, AutoExecuteActionResponse,
+        CausalCellResponse, CausalCellsFilteredResponse, CausalCellsHttpState,
+        CausalCellsListResponse, CommitBroadcaster, CommitStreamHttpState, CommitsHttpState,
+        CounterfactualDiagnosticsResponse,
         CoverageDiagnosticsResponse, DiagnosticsHttpState,
         EvaluateActionFailureRateRequest, EvaluateActionFailureRateResponse,
         EvaluateAgentLoopStormRequest, EvaluateAgentLoopStormResponse,

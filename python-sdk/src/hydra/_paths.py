@@ -322,6 +322,44 @@ def trust_claim_path(claim_id: str) -> str:
     return f"/trust/claims/{_seg(claim_id)}"
 
 
+# === /causal-cells/* (Patch 25 — CausalCell read/query surface) ===
+#
+# The `/causal-cells/*` namespace is the read-only inspection
+# surface for fractal-layer cells (Patch 20 vocabulary). Patch 25
+# mounts `/causal-cells/{id}` and `/causal-cells` (with optional
+# `?kind=` filter and `?after=/?limit=` pagination). All share
+# the `read:query` auth scope — cells are graph data, not trust
+# judgments, so they live outside the `/trust/*` namespace.
+
+
+def causal_cell_path(cell_id: str) -> str:
+    """`GET /causal-cells/{cell_id}` — single-cell lookup (Patch 25).
+    Strict tenant-scoped: requires `X-Hydra-Tenant`; missing → 400.
+    Wrong tenant, unknown id, OR `None`-tenanted (system) cell
+    queried with a tenant header → 404 (indistinguishable — no
+    cross-tenant leakage). Returns `{cell: CausalCell}`."""
+    return f"/causal-cells/{_seg(cell_id)}"
+
+
+def causal_cells_list_path() -> str:
+    """`GET /causal-cells` — paginated list (or `?kind=<discriminant>`
+    filter) for the caller's tenant (Patch 25).
+
+    Two response shapes:
+      - Unfiltered: `{cells: [...], next_cursor: str | None}` —
+        paginated, cursor-based.
+      - `?kind=<x>`: `{cells: [...]}` — unpaginated, full filtered
+        set. Patch 25 contract — filtered lists are not paginated.
+
+    Unknown `?kind=` strings map to `CausalCellKind::Custom(s)`
+    server-side, so an unknown label returns an empty list, not 400.
+    Bad `?after=` cursor → 400 (mirrors the rest of the cursor API).
+
+    `None`-tenanted (system) cells are NEVER included in either
+    response shape — same strict isolation as `/trust/cells/*`."""
+    return "/causal-cells"
+
+
 def trust_cell_path(cell_id: str) -> str:
     """`GET /trust/cells/{cell_id}` — read-only trust assessment
     of one CausalCell (Patch 24). Folds the Patch 23 12-factor
