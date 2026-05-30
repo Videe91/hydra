@@ -736,6 +736,62 @@ class Hydra:
         )
         return [CausalCell.model_validate(c) for c in raw["cells"]]
 
+    async def compose_hydra_health_cell(
+        self,
+        *,
+        actor: ActorId,
+        tenant: TenantId | None = None,
+    ) -> CausalCell:
+        """Compose the canonical `hydra.health` parent cell
+        (`POST /causal-cells/hydra-health/compose` — Patch 27).
+
+        Walks the calling tenant's stored `Reflex`-kind cells,
+        picks the LATEST cell per built-in self-health subject
+        (commit-rate, replication-lag, agent-loop-storm,
+        action-failure-rate), and composes them into a single
+        `Health`-kind cell with `subject = "hydra.health"`.
+
+        Partial composition is OK: 1–4 self-health subjects
+        present → returns the composed cell with a summary
+        listing present + missing subjects. ZERO found → 404
+        (`HydraNotFoundError`).
+
+        Strict tenant scoping: requires `X-Hydra-Tenant`
+        (propagated automatically). Only THIS tenant's reflex
+        cells participate; `None`-tenanted (system) reflex
+        cells are INVISIBLE to this route — a system-wide
+        admin composer is a future patch.
+
+        ## Trust
+
+        The returned `cell.trust_score` is Patch 22's arithmetic
+        mean of children's stored scores (cheap). For the
+        richer 12-factor folding (P23), call
+        `assess_causal_cell_trust(cell.id)` after composing —
+        same surface shape as claim trust.
+
+        ## Precondition
+
+        The reflex pipeline does NOT auto-create reflex cells
+        today (Patch 28 will). A fresh tenant calling this
+        method immediately gets `HydraNotFoundError` until
+        something seeds reflex cells. The error body echoes
+        the engine's precondition message naming the tenant +
+        expected subjects.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header
+          - 404 → `HydraNotFoundError`: no self-health reflex
+            cells found for the tenant
+        """
+        body = {"actor": str(actor)}
+        raw = await self._http.post(
+            _paths.compose_hydra_health_cell_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return CausalCell.model_validate(raw["cell"])
+
     async def _ingest(
         self,
         event_kind: dict[str, Any],

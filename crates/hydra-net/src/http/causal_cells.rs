@@ -45,33 +45,51 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
-use hydra_core::{CausalCell, CausalCellId, CausalCellKind};
+use hydra_core::{ActorId, CausalCell, CausalCellId, CausalCellKind};
 use serde::{Deserialize, Serialize};
 
 /// Shared HTTP state for the causal-cells routes.
+///
+/// `service` is used by the read-side handlers (Patch 25); the
+/// `runtime` handle is held alongside so the Patch 27 POST
+/// handler can acquire the engine write lock for
+/// `compose_hydra_health_cell`. Storing both is cheap — the
+/// QueryService is a thin Arc wrapper over the same engine.
 #[derive(Clone)]
 pub struct CausalCellsHttpState {
     pub service: QueryService,
+    pub runtime: RuntimeHandle,
 }
 
 impl CausalCellsHttpState {
     pub fn new(runtime: RuntimeHandle) -> Self {
         Self {
             service: QueryService::new(runtime.hydra()),
+            runtime,
         }
     }
 }
 
-/// Build the causal-cells router (Patch 25). Two routes:
-/// `/causal-cells/:cell_id` and `/causal-cells` (with optional
-/// `?kind=` filter and `?after=/?limit=` pagination).
+/// Build the causal-cells router. Routes:
+///
+/// - `GET  /causal-cells/:cell_id` (Patch 25) — single-cell lookup
+/// - `GET  /causal-cells`          (Patch 25) — list w/ optional
+///                                  `?kind=` filter +
+///                                  `?after=/?limit=` pagination
+/// - `POST /causal-cells/hydra-health/compose` (Patch 27) —
+///   compose the canonical `hydra.health` parent cell from the
+///   tenant's latest self-health reflex cells
 pub fn causal_cells_router(runtime: RuntimeHandle) -> Router {
     Router::new()
         .route("/causal-cells/:cell_id", get(get_causal_cell))
         .route("/causal-cells", get(list_causal_cells))
+        .route(
+            "/causal-cells/hydra-health/compose",
+            post(compose_hydra_health_cell),
+        )
         .with_state(CausalCellsHttpState::new(runtime))
 }
 
@@ -233,6 +251,77 @@ async fn list_causal_cells(
         next_cursor,
     })
     .into_response()
+}
+
+/// Request body for `POST /causal-cells/hydra-health/compose`
+/// (Patch 27). `actor` is the operator/agent that initiated the
+/// composition; it appears as `cell.created_by` on the composed
+/// `hydra.health` parent.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ComposeHydraHealthCellRequest {
+    pub actor: String,
+}
+
+/// `POST /causal-cells/hydra-health/compose` — Patch 27.
+///
+/// Exposes the Patch 26 engine helper
+/// `Hydra::compose_hydra_health_cell` over HTTP. Composes the
+/// canonical `hydra.health` parent cell from the calling
+/// tenant's latest self-health reflex cells (commit-rate,
+/// replication-lag, agent-loop-storm, action-failure-rate).
+///
+/// ## Tenant scoping (strict)
+///
+/// `X-Hydra-Tenant` is REQUIRED; missing → 400. The header
+/// value is passed to the engine as `Some(tenant)` so only
+/// THAT tenant's reflex cells participate. `None`-tenanted
+/// (system) reflex cells are INVISIBLE to this route — a
+/// system-wide admin route is a future patch.
+///
+/// ## Status mapping
+///
+/// - 200 + `{cell: CausalCell}` — composed (1-4 children found)
+/// - 400                         — missing `X-Hydra-Tenant`
+/// - 404 + engine error message  — zero reflex cells found for
+///                                 the tenant (precondition
+///                                 absent, not a server error)
+/// - 500                         — any other engine error
+///
+/// ## Precondition
+///
+/// The reflex pipeline does NOT auto-create reflex cells today
+/// (`create_reflex_causal_cell_from_claim` is explicit — Patch
+/// 21). A fresh tenant calling this route immediately gets 404
+/// until something seeds reflex cells. Patch 28 (auto-create
+/// during model evaluation) is what removes this manual step.
+async fn compose_hydra_health_cell(
+    State(state): State<CausalCellsHttpState>,
+    headers: HeaderMap,
+    Json(req): Json<ComposeHydraHealthCellRequest>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(err) => return tenant_error_response(err),
+    };
+    let actor = ActorId::from_str(&req.actor);
+    let hydra = state.runtime.hydra();
+    let mut hydra = hydra.write().await;
+    match hydra.compose_hydra_health_cell(actor, Some(tenant)) {
+        Ok(cell) => (StatusCode::OK, Json(CausalCellResponse { cell }))
+            .into_response(),
+        Err(hydra_core::error::HydraError::QueryError(msg))
+            if msg.contains("no self-health reflex cells found") =>
+        {
+            // Precondition absent. Echo the engine message
+            // verbatim so operators see WHICH tenant + expected
+            // subjects in the body, not a generic "not found".
+            error_response(StatusCode::NOT_FOUND, msg)
+        }
+        Err(other) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("compose_hydra_health_cell failed: {other}"),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -720,5 +809,291 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list.status(), StatusCode::OK);
+    }
+
+    // === Patch 27 — HydraHealthCell HTTP surface ===
+
+    /// POST helper with default tenant header set.
+    fn json_post(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("X-Hydra-Tenant", TEST_TENANT)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn json_post_for_tenant(
+        uri: &str,
+        tenant: &str,
+        body: serde_json::Value,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("X-Hydra-Tenant", tenant)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn json_post_without_tenant(
+        uri: &str,
+        body: serde_json::Value,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    /// Seed a Reflex cell at one of the canonical self-health
+    /// subjects so P27 tests can drive partial / full / wrong-
+    /// tenant compositions without rebuilding the full reflex
+    /// chain.
+    async fn ingest_self_health_reflex(
+        runtime: &crate::runtime::RuntimeHandle,
+        tenant: Option<TenantId>,
+        subject: &str,
+    ) -> CausalCell {
+        ingest_cell(runtime, tenant, CausalCellKind::Reflex, subject).await
+    }
+
+    /// Seed all 4 self-health reflex subjects under a single
+    /// tenant. Mirrors the engine-side
+    /// `seed_all_four_self_health_reflexes` test helper.
+    async fn seed_all_four(
+        runtime: &crate::runtime::RuntimeHandle,
+        tenant: Option<TenantId>,
+    ) -> [CausalCell; 4] {
+        [
+            ingest_self_health_reflex(
+                runtime,
+                tenant.clone(),
+                "hydra/under_abnormal_load",
+            )
+            .await,
+            ingest_self_health_reflex(
+                runtime,
+                tenant.clone(),
+                "hydra.replication/replica_lagging",
+            )
+            .await,
+            ingest_self_health_reflex(
+                runtime,
+                tenant.clone(),
+                "hydra.agents/agent_loop_storm",
+            )
+            .await,
+            ingest_self_health_reflex(
+                runtime,
+                tenant,
+                "hydra.actions/action_failure_rate_high",
+            )
+            .await,
+        ]
+    }
+
+    #[tokio::test]
+    async fn compose_hydra_health_cell_returns_cell() {
+        // Happy path: seed 4 reflex cells, POST → 200 with the
+        // composed `hydra.health` cell in `{cell: ...}` envelope.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let _children = seed_all_four(&runtime, Some(tenant.clone())).await;
+        let app = causal_cells_router(runtime.clone());
+        let response = app
+            .oneshot(json_post(
+                "/causal-cells/hydra-health/compose",
+                serde_json::json!({"actor": "actor_ops"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: CausalCellResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.cell.kind, CausalCellKind::Health);
+        assert_eq!(body.cell.subject, "hydra.health");
+        assert_eq!(body.cell.tenant_id, Some(tenant));
+        assert_eq!(body.cell.child_cell_ids.len(), 4);
+        let summary = body.cell.summary.as_ref().expect("summary set");
+        assert!(
+            summary.contains("4 of 4 self-health reflexes"),
+            "summary: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_hydra_health_cell_requires_tenant_header() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = causal_cells_router(runtime.clone());
+        let response = app
+            .oneshot(json_post_without_tenant(
+                "/causal-cells/hydra-health/compose",
+                serde_json::json!({"actor": "actor_ops"}),
+            ))
+            .await
+            .unwrap();
+        // Missing X-Hydra-Tenant → 400 from tenant_error_response.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn compose_hydra_health_cell_zero_found_returns_404() {
+        // No reflex cells in the store → engine returns
+        // QueryError("no self-health reflex cells found ..."),
+        // mapped to 404 with the engine message in the body
+        // (precondition explainer — operator sees WHY).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = causal_cells_router(runtime.clone());
+        let response = app
+            .oneshot(json_post(
+                "/causal-cells/hydra-health/compose",
+                serde_json::json!({"actor": "actor_ops"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(
+            body.error.contains("no self-health reflex cells found"),
+            "error: {}",
+            body.error
+        );
+        // Engine message names the tenant — pin so the operator-
+        // friendly body shape doesn't drift to generic "not found".
+        assert!(
+            body.error.contains(TEST_TENANT),
+            "tenant should appear in 404 body: {}",
+            body.error
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_hydra_health_cell_partial_returns_200() {
+        // Seed 2 of 4 reflex subjects → 200 with a partial
+        // health cell. Summary calls out the missing subjects.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let _a = ingest_self_health_reflex(
+            &runtime,
+            Some(tenant.clone()),
+            "hydra/under_abnormal_load",
+        )
+        .await;
+        let _b = ingest_self_health_reflex(
+            &runtime,
+            Some(tenant.clone()),
+            "hydra.actions/action_failure_rate_high",
+        )
+        .await;
+        let app = causal_cells_router(runtime.clone());
+        let response = app
+            .oneshot(json_post(
+                "/causal-cells/hydra-health/compose",
+                serde_json::json!({"actor": "actor_ops"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: CausalCellResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.cell.child_cell_ids.len(), 2);
+        let summary = body.cell.summary.as_ref().unwrap();
+        assert!(
+            summary.contains("2 of 4 self-health reflexes"),
+            "summary: {summary}"
+        );
+        assert!(
+            summary.contains("Missing: replication-lag, agent-loop-storm"),
+            "summary: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_hydra_health_cell_uses_tenant_scoped_reflex_cells_only() {
+        // LOAD-BEARING isolation pin: reflex cells exist for
+        // BOTH tenant_a and tenant_b. POSTing as tenant_a must
+        // produce a parent that references ONLY tenant_a's
+        // children — tenant_b's cells must be invisible.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant_a = TenantId::from_str("tenant_a_health");
+        let tenant_b = TenantId::from_str("tenant_b_health");
+        let theirs =
+            seed_all_four(&runtime, Some(tenant_b.clone())).await;
+        let ours =
+            seed_all_four(&runtime, Some(tenant_a.clone())).await;
+        let theirs_ids: Vec<&str> =
+            theirs.iter().map(|c| c.id.as_str()).collect();
+        let ours_ids: Vec<&str> =
+            ours.iter().map(|c| c.id.as_str()).collect();
+        let app = causal_cells_router(runtime.clone());
+        let response = app
+            .oneshot(json_post_for_tenant(
+                "/causal-cells/hydra-health/compose",
+                tenant_a.as_str(),
+                serde_json::json!({"actor": "actor_ops"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: CausalCellResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.cell.tenant_id, Some(tenant_a));
+        for child_id in &body.cell.child_cell_ids {
+            let id_str = child_id.as_str();
+            assert!(
+                ours_ids.contains(&id_str),
+                "child {id_str} must belong to tenant_a"
+            );
+            assert!(
+                !theirs_ids.contains(&id_str),
+                "child {id_str} leaked from tenant_b"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compose_hydra_health_cell_none_tenanted_reflexes_invisible() {
+        // Mirror of the engine `none_tenanted_only` pin from the
+        // OTHER direction. `None`-tenanted reflex cells with
+        // matching subjects must NOT be composed via a tenanted
+        // POST. Seed all 4 system-wide cells; then POST as a
+        // tenant → 404 (no tenant-owned cells exist).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let _system = seed_all_four(&runtime, None).await;
+        let app = causal_cells_router(runtime.clone());
+        let response = app
+            .oneshot(json_post(
+                "/causal-cells/hydra-health/compose",
+                serde_json::json!({"actor": "actor_ops"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn compose_hydra_health_cell_route_lives_in_causal_cells_router() {
+        // Sanity: the new POST is mounted by the existing
+        // causal_cells_router. If a future refactor moves it
+        // elsewhere, this fires.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let _children =
+            seed_all_four(&runtime, Some(tenant.clone())).await;
+        let app = causal_cells_router(runtime.clone());
+        let response = app
+            .oneshot(json_post(
+                "/causal-cells/hydra-health/compose",
+                serde_json::json!({"actor": "actor_ops"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

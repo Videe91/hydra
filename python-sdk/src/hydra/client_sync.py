@@ -492,6 +492,27 @@ class HydraSync:
         )
         return [CausalCell.model_validate(c) for c in raw["cells"]]
 
+    def compose_hydra_health_cell(
+        self,
+        *,
+        actor: ActorId,
+        tenant: TenantId | None = None,
+    ) -> CausalCell:
+        """Sync mirror of `Hydra.compose_hydra_health_cell` (Patch
+        27). Composes the canonical `hydra.health` parent cell
+        from the calling tenant's latest self-health reflex
+        cells. See the async docstring for the full Patch 26+27
+        contract — trust semantics, partial-composition, strict
+        tenant scoping, and the auto-create-reflex-cells
+        precondition (Patch 28+) all carry."""
+        body = {"actor": str(actor)}
+        raw = self._http.post(
+            _paths.compose_hydra_health_cell_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return CausalCell.model_validate(raw["cell"])
+
     def _ingest(
         self,
         event_kind: dict[str, Any],

@@ -367,6 +367,18 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
         if path == "/replication" || path.starts_with("/replication/") {
             return vec!["admin:replication"];
         }
+        // Patch 27 — POSTs under `/causal-cells/*` mutate the
+        // causal-cell store (today: `compose_hydra_health_cell`;
+        // tomorrow: scheduled health auto-fire, manual reflex
+        // seeding, etc.). Prefix-based so future POST routes
+        // inherit the same scope automatically. GETs under the
+        // same prefix stay at `read:query` (see the reads block
+        // below). The two clauses keep the namespace honest:
+        // reading cells is graph-query; mutating cells is its
+        // own write authority.
+        if path == "/causal-cells" || path.starts_with("/causal-cells/") {
+            return vec!["write:causal-cells"];
+        }
         return Vec::new();
     }
     // Reads.
@@ -1086,6 +1098,20 @@ mod tests {
         assert_eq!(
             required_scopes_for(&Method::GET, "/causal-cells/cell_abc"),
             vec!["read:query"]
+        );
+        // Patch 27 — POSTs under /causal-cells/* are gated by
+        // the new `write:causal-cells` scope. The prefix clause
+        // covers `POST /causal-cells/hydra-health/compose` and
+        // any future POST routes (scheduled health auto-fire,
+        // manual reflex seeding, etc.). This pin keeps GET vs
+        // POST scopes visibly separate so a future refactor
+        // can't collapse them silently.
+        assert_eq!(
+            required_scopes_for(
+                &Method::POST,
+                "/causal-cells/hydra-health/compose"
+            ),
+            vec!["write:causal-cells"]
         );
         // OPTIONS always has no scope requirement (CORS preflight).
         assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());

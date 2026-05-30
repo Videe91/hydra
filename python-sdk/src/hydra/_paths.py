@@ -341,6 +341,17 @@ def causal_cell_path(cell_id: str) -> str:
     return f"/causal-cells/{_seg(cell_id)}"
 
 
+def compose_hydra_health_cell_path() -> str:
+    """`POST /causal-cells/hydra-health/compose` — Patch 27.
+    Composes the canonical `hydra.health` parent cell from the
+    calling tenant's latest self-health reflex cells. Body:
+    `{actor: ActorId}`. Requires `X-Hydra-Tenant`; missing → 400.
+    Zero reflex cells available for the tenant → 404 with the
+    engine's precondition message (NOT a generic "not found"
+    — operators see WHICH tenant + expected subjects)."""
+    return "/causal-cells/hydra-health/compose"
+
+
 def causal_cells_list_path() -> str:
     """`GET /causal-cells` — paginated list (or `?kind=<discriminant>`
     filter) for the caller's tenant (Patch 25).
