@@ -153,6 +153,47 @@ pub fn is_hydra_automation_actor(actor: &ActorId) -> bool {
     s == HYDRA_POLICY_AGENT_ACTOR || s == HYDRA_TRUST_GATE_ACTOR
 }
 
+/// True for ANY Hydra-internal actor — a strict superset of
+/// `is_hydra_automation_actor`. Patch 18's `AgentLoopStormModel`
+/// uses this to filter out Hydra's own structural activity from
+/// the per-window event tally so the storm signal reflects
+/// non-Hydra agent activity only.
+///
+/// **Why not extend `is_hydra_automation_actor`?** That helper has
+/// narrower load-bearing semantics: actors whose *approvals* must
+/// not count as human endorsement. Broadening it to include
+/// non-approver internals (verification agent, model auto-register
+/// actors, etc.) would silently change the trust-spiral filter's
+/// meaning across Patches 12, 15, and any future calibration
+/// patches. Two helpers with two purposes is the safer split.
+///
+/// The list is currently inlined for v0 to keep the patch focused.
+/// When the list grows or starts to need lookup in non-engine
+/// crates, a const registry will make sense — until then, the
+/// inline match is honest about the scope.
+pub fn is_hydra_system_actor(actor: &ActorId) -> bool {
+    let s = actor.as_str();
+    matches!(
+        s,
+        // Approvers (cascade + trust-gate). Also covered by
+        // `is_hydra_automation_actor`; included here for a single
+        // authoritative answer to "is this Hydra acting?".
+        "actor_hydra_policy"
+            | "actor_hydra_trust_gate"
+            // Belief / outcome / remediation / approver agents
+            // wired in `Hydra::new`.
+            | "actor_hydra_verifier"
+            | "actor_hydra_prometheus"
+            | "actor_hydra_sentinel"
+            | "actor_hydra_approver"
+            // Built-in micro-model auto-register actors. Each new
+            // built-in model adds one entry here.
+            | "actor_hydra_commit_rate_model"
+            | "actor_hydra_replication_lag_model"
+            | "actor_hydra_agent_loop_storm_model"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +261,68 @@ mod tests {
         assert!(!is_hydra_automation_actor(&ActorId::from_str(
             "actor_hydra_trust_gate_v2"
         )));
+    }
+
+    #[test]
+    fn is_hydra_system_actor_recognizes_all_internal_actors() {
+        // Patch 18 storm filter — every Hydra-wired internal actor
+        // must register so the storm signal reflects non-Hydra
+        // activity only. If a future patch wires a new internal
+        // actor (e.g., a new model's auto-register actor) and
+        // forgets to add it here, that actor's events will show up
+        // as agent storm activity. This test catches the omission.
+        for actor in [
+            "actor_hydra_policy",
+            "actor_hydra_trust_gate",
+            "actor_hydra_verifier",
+            "actor_hydra_prometheus",
+            "actor_hydra_sentinel",
+            "actor_hydra_approver",
+            "actor_hydra_commit_rate_model",
+            "actor_hydra_replication_lag_model",
+            "actor_hydra_agent_loop_storm_model",
+        ] {
+            assert!(
+                is_hydra_system_actor(&ActorId::from_str(actor)),
+                "{actor} must be recognized as a Hydra system actor"
+            );
+        }
+    }
+
+    #[test]
+    fn is_hydra_system_actor_does_not_match_operator_or_arbitrary_actors() {
+        // Real operator actors (alice, ops, etc.) must NOT register
+        // — their events are exactly what the storm model is
+        // counting.
+        assert!(!is_hydra_system_actor(&ActorId::from_str(
+            "actor_oncall_alice"
+        )));
+        assert!(!is_hydra_system_actor(&ActorId::from_str("actor_ops")));
+        assert!(!is_hydra_system_actor(&ActorId::from_str(
+            "actor_data_quality_agent"
+        )));
+        // Substring/prefix-match guards.
+        assert!(!is_hydra_system_actor(&ActorId::from_str(
+            "actor_hydra_policy_admin"
+        )));
+        assert!(!is_hydra_system_actor(&ActorId::from_str(
+            "actor_hydra_external_collaborator"
+        )));
+    }
+
+    #[test]
+    fn is_hydra_system_actor_is_strict_superset_of_automation_actor() {
+        // Every automation actor (approvers) must also be a system
+        // actor. The inverse is NOT true — verification agent etc.
+        // are system actors but not automation actors.
+        for actor in [HYDRA_POLICY_AGENT_ACTOR, HYDRA_TRUST_GATE_ACTOR] {
+            let a = ActorId::from_str(actor);
+            assert!(is_hydra_automation_actor(&a));
+            assert!(
+                is_hydra_system_actor(&a),
+                "system-actor set must be a superset of automation-actor set"
+            );
+        }
     }
 
     #[test]

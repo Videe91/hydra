@@ -18,6 +18,7 @@ from ._http import HydraHttpClient, HydraHttpClientSync
 from ._types import (
     ActionId,
     ActorId,
+    AgentLoopStormAssessment,
     AnomalyResponse,
     CommitRateAnomalyAssessment,
     CounterfactualDiagnosticsResponse,
@@ -226,6 +227,55 @@ class _Diagnostics:
             tenant=tenant,
         )
         return ReplicationLagAnomalyAssessment.model_validate(raw)
+
+    async def agent_loop_storm(
+        self,
+        *,
+        requested_by: ActorId,
+        mode: EvaluationMode = "action",
+        tenant: TenantId | None = None,
+    ) -> AgentLoopStormAssessment:
+        """Drive the built-in agent-loop-storm micro-model
+        (MicroModel Patch 18) from outside the engine.
+
+        Hydra's first safety reflex: it watches whether the
+        system is producing too many self-triggered events /
+        actions / claims in a short window — i.e. agents chasing
+        their own tail. Hydra-internal actors (cascade,
+        trust-gate, verification agent, model auto-register
+        actors) are filtered out server-side so the storm signal
+        reflects non-Hydra agent activity only.
+
+        Default thresholds (60s window): 50 / 200 agent events,
+        10 / 50 actions, 30 / 100 same-actor events. Stateless
+        threshold detector — no warmup, no EWMA.
+
+        `mode` controls how far down the reflex chain the engine
+        walks:
+
+          - `"prediction_only"` — record only the prediction event
+          - `"claim"` — prediction + (Warning/Critical) evidence + claim
+          - `"action"` (default) — full chain through the Notify
+            action targeting `System("hydra.agents")`. Action
+            payload carries `top_actor` and `window_secs`.
+
+        **Auto-approval safety**: the storm model has no
+        operator-approved history at launch, so Patch 15's
+        trust-gated auto-approval is structurally blocked until a
+        human has explicitly approved at least one prior storm
+        action. Storm response is operator judgment in v0 — no
+        throttle or quarantine action kind ships in Patch 18.
+        """
+        body: dict[str, Any] = {
+            "mode": mode,
+            "requested_by": requested_by,
+        }
+        raw = await self._http.post(
+            _paths.diagnostics_micromodels_agent_loop_storm_evaluate_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return AgentLoopStormAssessment.model_validate(raw)
 
     async def record_observation_from_outcome(
         self,
@@ -467,6 +517,29 @@ class _DiagnosticsSync:
             tenant=tenant,
         )
         return ReplicationLagAnomalyAssessment.model_validate(raw)
+
+    def agent_loop_storm(
+        self,
+        *,
+        requested_by: ActorId,
+        mode: EvaluationMode = "action",
+        tenant: TenantId | None = None,
+    ) -> AgentLoopStormAssessment:
+        """Sync mirror of the async `agent_loop_storm` — drives
+        the built-in agent-loop-storm micro-model (Patch 18) via
+        `POST /diagnostics/micromodels/agent-loop-storm/evaluate`.
+        See the async docstring for full semantics, thresholds,
+        and the auto-approval safety note."""
+        body: dict[str, Any] = {
+            "mode": mode,
+            "requested_by": requested_by,
+        }
+        raw = self._http.post(
+            _paths.diagnostics_micromodels_agent_loop_storm_evaluate_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return AgentLoopStormAssessment.model_validate(raw)
 
     def record_observation_from_outcome(
         self,

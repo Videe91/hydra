@@ -14,21 +14,21 @@
 //! ## Routes
 //!
 //! ```text
-//! POST /diagnostics/micromodels/commit-rate/evaluate     (Patch 5)
-//! POST /diagnostics/micromodels/replication-lag/evaluate (Patch 16)
+//! POST /diagnostics/micromodels/commit-rate/evaluate       (Patch 5)
+//! POST /diagnostics/micromodels/replication-lag/evaluate   (Patch 16)
+//! POST /diagnostics/micromodels/agent-loop-storm/evaluate  (Patch 18)
 //! ```
 //!
-//! Patch 16 introduces the second model surface. The route shape is
-//! identical to Patch 5's — only the request adds `peer_id` and the
-//! response embeds it back so callers don't have to keep their own
-//! mapping. The response's `level` is also a SUPERSET wire string —
-//! commit-rate emits `warming_up`/`normal`/`warning`/`critical`;
-//! replication-lag never emits `warming_up` (it's a threshold model
-//! with no warmup). SDKs treat the union as the allowed set.
+//! Each model uses the same dispatch (`mode = prediction_only |
+//! claim | action`) but its own typed request + response. The
+//! `level` wire string union across all models is
+//! `{warming_up, normal, warning, critical}`; only commit-rate
+//! emits `warming_up`. Storm + replication-lag are threshold
+//! models with no warmup. SDKs treat the union as the allowed set.
 //!
 //! ## Auth
 //!
-//! Both routes are POSTs under `/diagnostics/` and pick up
+//! All routes are POSTs under `/diagnostics/` and pick up
 //! `write:diagnostics` from the existing prefix clause in
 //! `hydra-api::auth`. No new scope.
 //!
@@ -54,7 +54,9 @@ use hydra_core::{
     ActionId, ActorId, ClaimId, EventId, EvidenceId, MicroModelPrediction,
     ReplicaId,
 };
-use hydra_engine::micromodels::{AnomalyLevel, ReplicationLagAnomalyLevel};
+use hydra_engine::micromodels::{
+    AgentLoopStormLevel, AnomalyLevel, ReplicationLagAnomalyLevel,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -82,6 +84,10 @@ pub fn micromodels_router(runtime: RuntimeHandle) -> Router {
         .route(
             "/diagnostics/micromodels/replication-lag/evaluate",
             post(evaluate_replication_lag),
+        )
+        .route(
+            "/diagnostics/micromodels/agent-loop-storm/evaluate",
+            post(evaluate_agent_loop_storm),
         )
         .with_state(MicroModelsHttpState::new(runtime))
 }
@@ -628,6 +634,226 @@ fn render_replication_lag_summary(
     }
 }
 
+// === MicroModel Patch 18 — agent-loop-storm evaluation surface ===
+//
+// Third model surface. Same dispatch + envelope shape as Patches 5
+// + 16; differs in level vocabulary (no `warming_up`) and the
+// per-model output fields (top_actor, agent_event_count, etc.).
+
+/// Request body for `POST /diagnostics/micromodels/agent-loop-storm/evaluate`.
+///
+/// No `peer_id` or other per-instance selector — the storm model
+/// watches the global recent event log, not a specific replica.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluateAgentLoopStormRequest {
+    #[serde(default)]
+    pub mode: EvaluationMode,
+    pub requested_by: ActorId,
+}
+
+/// Response body for the storm evaluate endpoint. Same envelope
+/// shape as the other two models, minus per-instance fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluateAgentLoopStormResponse {
+    /// Snake-case anomaly level: `"normal"`, `"warning"`, or
+    /// `"critical"`. NEVER `"warming_up"` for this model.
+    pub level: String,
+    pub prediction: MicroModelPrediction,
+    pub prediction_event_id: EventId,
+    pub evidence_id: Option<EvidenceId>,
+    pub evidence_event_id: Option<EventId>,
+    pub claim_id: Option<ClaimId>,
+    pub claim_event_id: Option<EventId>,
+    /// One-element vec on Warning/Critical (Notify only).
+    pub action_ids: Vec<ActionId>,
+    /// Deterministic prose summary keyed off `(level, has_claim,
+    /// has_action)`.
+    pub summary: String,
+    pub lineage_url: String,
+}
+
+async fn evaluate_agent_loop_storm(
+    State(state): State<MicroModelsHttpState>,
+    request: Result<Json<EvaluateAgentLoopStormRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Json(req)) => req,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid request body: {err}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let hydra = state.runtime.hydra();
+    let mut hydra = hydra.write().await;
+
+    let outcome = match request.mode {
+        EvaluationMode::PredictionOnly => {
+            match hydra
+                .record_agent_loop_storm_prediction(request.requested_by.clone())
+            {
+                Ok((prediction, event_id, output)) => {
+                    AgentLoopStormEvaluationOutcome::from_prediction_only(
+                        prediction,
+                        event_id,
+                        output.level,
+                    )
+                }
+                Err(err) => return engine_error_response(err),
+            }
+        }
+        EvaluationMode::Claim => {
+            match hydra
+                .evaluate_agent_loop_storm_and_propose_claim(request.requested_by.clone())
+            {
+                Ok(assessment) => {
+                    AgentLoopStormEvaluationOutcome::from_claim_assessment(assessment)
+                }
+                Err(err) => return engine_error_response(err),
+            }
+        }
+        EvaluationMode::Action => {
+            match hydra
+                .evaluate_agent_loop_storm_and_propose_action(request.requested_by.clone())
+            {
+                Ok(assessment) => {
+                    AgentLoopStormEvaluationOutcome::from_action_assessment(assessment)
+                }
+                Err(err) => return engine_error_response(err),
+            }
+        }
+    };
+
+    let response = build_agent_loop_storm_response(outcome);
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+struct AgentLoopStormEvaluationOutcome {
+    level: AgentLoopStormLevel,
+    prediction: MicroModelPrediction,
+    prediction_event_id: EventId,
+    evidence_id: Option<EvidenceId>,
+    evidence_event_id: Option<EventId>,
+    claim_id: Option<ClaimId>,
+    claim_event_id: Option<EventId>,
+    action_ids: Vec<ActionId>,
+}
+
+impl AgentLoopStormEvaluationOutcome {
+    fn from_prediction_only(
+        prediction: MicroModelPrediction,
+        prediction_event_id: EventId,
+        level: AgentLoopStormLevel,
+    ) -> Self {
+        Self {
+            level,
+            prediction,
+            prediction_event_id,
+            evidence_id: None,
+            evidence_event_id: None,
+            claim_id: None,
+            claim_event_id: None,
+            action_ids: vec![],
+        }
+    }
+
+    fn from_claim_assessment(
+        assessment: hydra_engine::micromodels::AgentLoopStormAssessment,
+    ) -> Self {
+        Self {
+            level: assessment.level,
+            prediction: assessment.prediction,
+            prediction_event_id: assessment.prediction_event_id,
+            evidence_id: assessment.evidence_id,
+            evidence_event_id: assessment.evidence_event_id,
+            claim_id: assessment.claim_id,
+            claim_event_id: assessment.claim_event_id,
+            action_ids: vec![],
+        }
+    }
+
+    fn from_action_assessment(
+        assessment: hydra_engine::micromodels::AgentLoopStormActionAssessment,
+    ) -> Self {
+        Self {
+            level: assessment.level,
+            prediction: assessment.prediction,
+            prediction_event_id: assessment.prediction_event_id,
+            evidence_id: assessment.evidence_id,
+            evidence_event_id: None,
+            claim_id: assessment.claim_id,
+            claim_event_id: assessment.claim_event_id,
+            action_ids: assessment.action_ids,
+        }
+    }
+}
+
+fn build_agent_loop_storm_response(
+    outcome: AgentLoopStormEvaluationOutcome,
+) -> EvaluateAgentLoopStormResponse {
+    let summary = render_agent_loop_storm_summary(
+        outcome.level,
+        outcome.claim_id.is_some(),
+        !outcome.action_ids.is_empty(),
+    );
+    let lineage_url = format!("/lineage/{}", outcome.prediction_event_id);
+    EvaluateAgentLoopStormResponse {
+        level: outcome.level.wire_name().to_string(),
+        prediction: outcome.prediction,
+        prediction_event_id: outcome.prediction_event_id,
+        evidence_id: outcome.evidence_id,
+        evidence_event_id: outcome.evidence_event_id,
+        claim_id: outcome.claim_id,
+        claim_event_id: outcome.claim_event_id,
+        action_ids: outcome.action_ids,
+        summary,
+        lineage_url,
+    }
+}
+
+/// Deterministic 6-case summary (no `warming_up` row).
+fn render_agent_loop_storm_summary(
+    level: AgentLoopStormLevel,
+    has_claim: bool,
+    has_action: bool,
+) -> String {
+    match (level, has_claim, has_action) {
+        (AgentLoopStormLevel::Normal, _, _) => {
+            "Agent activity within thresholds; no claim or action.".to_string()
+        }
+        (AgentLoopStormLevel::Warning, false, _) => {
+            "Warning: agent activity elevated; no claim or action recorded.".to_string()
+        }
+        (AgentLoopStormLevel::Warning, true, false) => {
+            "Warning: agent activity elevated; claim recorded, action not \
+             proposed under current verification threshold."
+                .to_string()
+        }
+        (AgentLoopStormLevel::Warning, true, true) => {
+            "Warning: agent activity elevated; claim recorded and Notify \
+             action proposed."
+                .to_string()
+        }
+        (AgentLoopStormLevel::Critical, false, _) => {
+            "Critical: agent loop storm detected; no claim or action recorded."
+                .to_string()
+        }
+        (AgentLoopStormLevel::Critical, true, false) => {
+            "Critical: agent loop storm detected; claim recorded, action \
+             not proposed."
+                .to_string()
+        }
+        (AgentLoopStormLevel::Critical, true, true) => {
+            "Critical: agent loop storm detected; Notify action proposed.".to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,6 +1298,180 @@ mod tests {
         .contains("within thresholds"));
         assert!(render_replication_lag_summary(
             ReplicationLagAnomalyLevel::Critical,
+            true,
+            true
+        )
+        .contains("Notify action proposed"));
+    }
+
+    // === Patch 18 — agent-loop-storm HTTP tests ===
+
+    fn storm_request(body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/diagnostics/micromodels/agent-loop-storm/evaluate")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    /// Ingest `n` ActionProposed events with `proposed_by` so the
+    /// engine's storm window walk counts them.
+    async fn drive_storm(
+        runtime: &crate::runtime::RuntimeHandle,
+        n: u64,
+        proposed_by: &str,
+    ) {
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        for _ in 0..n {
+            let now = chrono::Utc::now();
+            let action = hydra_core::Action {
+                id: hydra_core::ActionId::new(),
+                tenant_id: None,
+                kind: hydra_core::ActionKind::Notify,
+                status: hydra_core::action::ActionStatus::Proposed,
+                targets: vec![hydra_core::action::ActionTarget::System(
+                    "hydra".to_string(),
+                )],
+                related_claims: vec![],
+                supporting_evidence: vec![],
+                proposed_by: hydra_core::ActorId::from_str(proposed_by),
+                approved_by: None,
+                rejected_by: None,
+                policy_id: None,
+                payload: std::collections::HashMap::new(),
+                created_at: now,
+                updated_at: now,
+                approved_at: None,
+                rejected_at: None,
+                executed_at: None,
+                caused_by: None,
+            };
+            hydra
+                .ingest(EventKind::ActionProposed { action })
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn storm_evaluate_empty_engine_is_normal() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(storm_request(serde_json::json!({
+                "requested_by": actor(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateAgentLoopStormResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "normal");
+        assert!(body.summary.contains("within thresholds"));
+        assert!(body.claim_id.is_none());
+        assert!(body.action_ids.is_empty());
+        assert!(body.lineage_url.starts_with("/lineage/"));
+    }
+
+    #[tokio::test]
+    async fn storm_evaluate_critical_with_default_action_mode() {
+        // 60 ActionProposed by one external agent → Critical via
+        // the actions_proposed threshold. Full chain fires.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        drive_storm(&runtime, 60, "actor_data_quality_agent").await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(storm_request(serde_json::json!({
+                "requested_by": actor(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateAgentLoopStormResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        assert!(body.summary.contains("Critical"));
+        assert!(body.claim_id.is_some());
+        assert_eq!(body.action_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn storm_evaluate_prediction_only_skips_claim_and_action() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        drive_storm(&runtime, 60, "actor_chatty_agent").await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(storm_request(serde_json::json!({
+                "requested_by": actor(),
+                "mode": "prediction_only",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateAgentLoopStormResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        assert!(body.claim_id.is_none());
+        assert!(body.evidence_id.is_none());
+        assert!(body.action_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn storm_evaluate_claim_mode_skips_action() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        drive_storm(&runtime, 60, "actor_chatty_agent").await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(storm_request(serde_json::json!({
+                "requested_by": actor(),
+                "mode": "claim",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateAgentLoopStormResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        assert!(body.claim_id.is_some());
+        assert!(body.evidence_id.is_some());
+        // Mode=claim → no action even on Critical.
+        assert!(body.action_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn storm_evaluate_filters_hydra_system_actors_via_http() {
+        // 80 ActionProposed by actor_hydra_policy (Hydra-system).
+        // The HTTP surface should see Normal — the storm filter
+        // works end-to-end through the route.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        drive_storm(&runtime, 80, "actor_hydra_policy").await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(storm_request(serde_json::json!({
+                "requested_by": actor(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateAgentLoopStormResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(
+            body.level, "normal",
+            "Hydra-system actor activity must NOT trigger storms via HTTP"
+        );
+    }
+
+    #[test]
+    fn storm_summary_table_pinned() {
+        assert!(render_agent_loop_storm_summary(
+            AgentLoopStormLevel::Normal,
+            false,
+            false
+        )
+        .contains("within thresholds"));
+        assert!(render_agent_loop_storm_summary(
+            AgentLoopStormLevel::Critical,
             true,
             true
         )

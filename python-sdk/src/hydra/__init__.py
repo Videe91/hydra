@@ -66,6 +66,8 @@ from ._types import (
     ActionTransitionResponse,
     ActionTransitionStatus,
     ActorId,
+    AgentLoopStormAssessment,
+    AgentLoopStormLevel,
     AutoApprovalDecision,
     AutoExecutionDecision,
     Anomaly,
@@ -270,6 +272,9 @@ __all__ = [
     # MicroModel Patch 16 — replication-lag anomaly
     "ReplicationLagAnomalyAssessment",
     "ReplicationLagAnomalyLevel",
+    # MicroModel Patch 18 — agent-loop storm
+    "AgentLoopStormAssessment",
+    "AgentLoopStormLevel",
     "ReplicationLagResponse",
     "ReplicationMode",
     "ReplicationOffset",

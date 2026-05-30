@@ -65,6 +65,19 @@ pub const BUILTIN_REPLICATION_LAG_MODEL_ID: &str = "mm_builtin_replication_lag_v
 pub const BUILTIN_REPLICATION_LAG_ACTOR_ID: &str =
     "actor_hydra_replication_lag_model";
 
+// === MicroModel Patch 18 — built-in AgentLoopStormModel identity ===
+//
+// Third built-in model. Same convention as Patches 2 + 16. The
+// actor id is also referenced by
+// `hydra_core::is_hydra_system_actor` so this model's own
+// auto-register event is filtered out of the next storm
+// evaluation. The model itself never approves anything, so it
+// is NOT in `is_hydra_automation_actor`.
+pub const BUILTIN_AGENT_LOOP_STORM_MODEL_ID: &str =
+    "mm_builtin_agent_loop_storm_v0";
+pub const BUILTIN_AGENT_LOOP_STORM_ACTOR_ID: &str =
+    "actor_hydra_agent_loop_storm_model";
+
 pub struct Hydra {
     projection: Projection,
     event_log: EventLog,
@@ -3910,6 +3923,249 @@ impl Hydra {
         Ok((prediction, prediction_event_id, output))
     }
 
+    // === MicroModel Patch 18 — built-in AgentLoopStormModel ===
+
+    /// Evaluate the built-in agent-loop-storm model against the
+    /// recent event log and record a `MicroModelPredictionRecorded`
+    /// event. Patch 18's bottom surface — mirrors Patch 2's
+    /// `evaluate_commit_rate_anomaly` and Patch 16's
+    /// `evaluate_replication_lag_anomaly` shape.
+    ///
+    /// The model itself is stateless (threshold detector); the
+    /// per-window event-log walk + actor extraction lives in the
+    /// `record_*` helper. Hydra-internal actors are filtered via
+    /// `is_hydra_system_actor` so the storm signal reflects
+    /// non-Hydra agent activity only.
+    pub fn evaluate_agent_loop_storm(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::MicroModelPrediction> {
+        let (prediction, _event_id, _output) =
+            self.record_agent_loop_storm_prediction(actor)?;
+        Ok(prediction)
+    }
+
+    /// Evaluate + (on Warning/Critical) propose Evidence + Claim
+    /// linked back to the prediction event. Mirrors the Patch 3
+    /// commit-rate analog and Patch 16 replication-lag analog —
+    /// all three drive through the Patch 17 shared spine.
+    ///
+    /// Claim shape (Patch 18):
+    /// ```text
+    ///   kind       = AnomalyFinding
+    ///   subject    = ClaimSubject::System("hydra.agents")
+    ///   predicate  = "agent_loop_storm"
+    ///   object     = ClaimObject::Value(Value::Bool(true))
+    /// ```
+    pub fn evaluate_agent_loop_storm_and_propose_claim(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<
+        crate::micromodels::AgentLoopStormAssessment,
+    > {
+        let (prediction, prediction_event_id, output) =
+            self.record_agent_loop_storm_prediction(actor.clone())?;
+
+        let parts = agent_loop_storm_reflex_parts(&prediction, &output);
+        let bridge = crate::micromodels::reflex::propose_claim_from_reflex(
+            self,
+            &prediction,
+            prediction_event_id.clone(),
+            &parts,
+            actor,
+        )?;
+
+        Ok(crate::micromodels::AgentLoopStormAssessment {
+            level: output.level,
+            prediction,
+            prediction_event_id,
+            evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
+            evidence_event_id: bridge
+                .as_ref()
+                .map(|b| b.evidence_event_id.clone()),
+            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
+        })
+    }
+
+    /// Evaluate + (on Warning/Critical AND gate-pass) propose a
+    /// Notify action targeting `System("hydra.agents")`. Action
+    /// payload carries `top_actor` and `window_secs` so the
+    /// Patch 14 delivery adapter / operator dashboards can route
+    /// per-actor or per-window if useful.
+    ///
+    /// **No throttle / quarantine action in v0** — Notify only.
+    /// Storm response is operator judgment.
+    pub fn evaluate_agent_loop_storm_and_propose_action(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<
+        crate::micromodels::AgentLoopStormActionAssessment,
+    > {
+        let (prediction, prediction_event_id, output) =
+            self.record_agent_loop_storm_prediction(actor.clone())?;
+
+        let parts = agent_loop_storm_reflex_parts(&prediction, &output);
+        let bridge = crate::micromodels::reflex::propose_claim_from_reflex(
+            self,
+            &prediction,
+            prediction_event_id.clone(),
+            &parts,
+            actor.clone(),
+        )?;
+
+        let mut action_ids: Vec<hydra_core::ActionId> = Vec::new();
+        if let Some(b) = bridge.as_ref() {
+            if let Some(action_id) =
+                crate::micromodels::reflex::propose_action_from_reflex(
+                    self,
+                    &prediction,
+                    b,
+                    &parts,
+                    actor,
+                )?
+            {
+                action_ids.push(action_id);
+            }
+        }
+
+        Ok(crate::micromodels::AgentLoopStormActionAssessment {
+            level: output.level,
+            prediction,
+            prediction_event_id,
+            evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
+            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
+            action_ids,
+        })
+    }
+
+    /// Shared helper: auto-register the built-in model definition
+    /// if missing, walk the recent event log, extract per-actor
+    /// counts (filtering Hydra-system actors), evaluate the pure
+    /// model, record the prediction event, and return the typed
+    /// triple. Public so the HTTP layer can drive
+    /// `mode = "prediction_only"` evaluations.
+    pub fn record_agent_loop_storm_prediction(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<(
+        hydra_core::MicroModelPrediction,
+        hydra_core::EventId,
+        crate::micromodels::AgentLoopStormOutput,
+    )> {
+        // Step 1 — auto-register via the Patch 17 shared helper.
+        let model_id = hydra_core::MicroModelId::from_str(
+            BUILTIN_AGENT_LOOP_STORM_MODEL_ID,
+        );
+        crate::micromodels::reflex::ensure_builtin_model_registered(
+            self,
+            &model_id,
+            hydra_core::MicroModelKind::AgentLoopStorm,
+            "builtin_agent_loop_storm_v0",
+            &hydra_core::ActorId::from_str(BUILTIN_AGENT_LOOP_STORM_ACTOR_ID),
+        )?;
+
+        // Step 2 — walk the event log over the configured window,
+        // tally per-actor counts excluding Hydra-system actors,
+        // build the model inputs.
+        let model = crate::micromodels::AgentLoopStormModel::default();
+        let window_secs = model.config().window_secs;
+        let now = chrono::Utc::now();
+        let window_start =
+            now - chrono::Duration::seconds(window_secs as i64);
+
+        let mut agent_event_count: u64 = 0;
+        let mut action_proposed_count: u64 = 0;
+        let mut claim_proposed_count: u64 = 0;
+        let mut per_actor: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+
+        // The event log is in-order; walk from the end and stop
+        // when we leave the window. (Linear v0 — good enough at
+        // engine scale; future patches can add an indexed window.)
+        for event in self.event_log.iter_rev() {
+            if event.timestamp < window_start {
+                break;
+            }
+            let actor_opt = extract_event_actor(&event.kind);
+            let actor_ref = match actor_opt {
+                Some(a) => a,
+                None => continue,
+            };
+            if hydra_core::is_hydra_system_actor(actor_ref) {
+                continue;
+            }
+            agent_event_count += 1;
+            match &event.kind {
+                hydra_core::EventKind::ActionProposed { .. } => {
+                    action_proposed_count += 1;
+                }
+                hydra_core::EventKind::ClaimProposed { .. } => {
+                    claim_proposed_count += 1;
+                }
+                _ => {}
+            }
+            *per_actor.entry(actor_ref.as_str().to_string()).or_insert(0) += 1;
+        }
+
+        let (top_actor, top_actor_event_count) = per_actor
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(actor_id, count)| (Some(actor_id), count))
+            .unwrap_or((None, 0));
+
+        // Step 3 — evaluate the pure model.
+        let output = model.evaluate_observation(
+            agent_event_count,
+            action_proposed_count,
+            claim_proposed_count,
+            top_actor.clone(),
+            top_actor_event_count,
+        );
+
+        // Step 4 — build the typed prediction.
+        let prediction = hydra_core::MicroModelPrediction {
+            model_id: model_id.clone(),
+            run_id: hydra_core::MicroModelRunId::new(),
+            input: serde_json::json!({
+                "observed_at": now.to_rfc3339(),
+                "window_secs": window_secs,
+                "agent_event_count": agent_event_count,
+                "action_proposed_count": action_proposed_count,
+                "claim_proposed_count": claim_proposed_count,
+                "top_actor": top_actor,
+                "top_actor_event_count": top_actor_event_count,
+                "warning_agent_events": model.config().warning_agent_events,
+                "critical_agent_events": model.config().critical_agent_events,
+            }),
+            output: serde_json::to_value(&output).expect(
+                "AgentLoopStormOutput is serde-derived; cannot fail",
+            ),
+            confidence: output.level.confidence(),
+            explanation: Some(output.reason.clone()),
+            created_at: now,
+        };
+
+        // Step 5 — record through ingest, capture event id.
+        let cascade = self.ingest(
+            hydra_core::EventKind::MicroModelPredictionRecorded {
+                prediction: prediction.clone(),
+            },
+        )?;
+        let prediction_event_id = cascade
+            .events
+            .first()
+            .map(|event| event.id.clone())
+            .expect(
+                "ingest produces at least the trigger event for \
+                 MicroModelPredictionRecorded",
+            );
+
+        let _ = actor;
+        Ok((prediction, prediction_event_id, output))
+    }
+
     // === Schema registry ===
 
     /// Read access to the schema registry store.
@@ -4941,6 +5197,141 @@ fn replication_lag_reflex_parts(
             "hydra.replication".to_string(),
         ),
         action_payload,
+    }
+}
+
+/// Convert an agent-loop-storm `(prediction, output)` pair into
+/// the shared reflex parts. The action payload carries
+/// `top_actor` and `window_secs` so the receiving operator (or
+/// Patch 14 delivery adapter) can route per-actor.
+fn agent_loop_storm_reflex_parts(
+    prediction: &hydra_core::MicroModelPrediction,
+    output: &crate::micromodels::AgentLoopStormOutput,
+) -> crate::micromodels::reflex::MicroModelReflexParts {
+    let mut evidence_data: std::collections::HashMap<String, hydra_core::Value> =
+        std::collections::HashMap::new();
+    evidence_data.insert(
+        "model_id".to_string(),
+        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
+    );
+    evidence_data.insert(
+        "run_id".to_string(),
+        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
+    );
+    evidence_data.insert(
+        "level".to_string(),
+        hydra_core::Value::String(output.level.wire_name().to_string()),
+    );
+    evidence_data.insert(
+        "window_secs".to_string(),
+        hydra_core::Value::Int(output.window_secs as i64),
+    );
+    evidence_data.insert(
+        "agent_event_count".to_string(),
+        hydra_core::Value::Int(output.agent_event_count as i64),
+    );
+    evidence_data.insert(
+        "action_proposed_count".to_string(),
+        hydra_core::Value::Int(output.action_proposed_count as i64),
+    );
+    evidence_data.insert(
+        "claim_proposed_count".to_string(),
+        hydra_core::Value::Int(output.claim_proposed_count as i64),
+    );
+    if let Some(top) = output.top_actor.as_deref() {
+        evidence_data.insert(
+            "top_actor".to_string(),
+            hydra_core::Value::String(top.to_string()),
+        );
+    }
+    evidence_data.insert(
+        "top_actor_event_count".to_string(),
+        hydra_core::Value::Int(output.top_actor_event_count as i64),
+    );
+    evidence_data.insert(
+        "reason".to_string(),
+        hydra_core::Value::String(output.reason.clone()),
+    );
+
+    let mut action_payload: std::collections::HashMap<String, hydra_core::Value> =
+        std::collections::HashMap::new();
+    action_payload.insert(
+        "severity".to_string(),
+        hydra_core::Value::String(output.level.wire_name().to_string()),
+    );
+    action_payload.insert(
+        "reason".to_string(),
+        hydra_core::Value::String(
+            prediction.explanation.clone().unwrap_or_default(),
+        ),
+    );
+    action_payload.insert(
+        "model_id".to_string(),
+        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
+    );
+    action_payload.insert(
+        "run_id".to_string(),
+        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
+    );
+    action_payload.insert(
+        "window_secs".to_string(),
+        hydra_core::Value::Int(output.window_secs as i64),
+    );
+    if let Some(top) = output.top_actor.as_deref() {
+        action_payload.insert(
+            "top_actor".to_string(),
+            hydra_core::Value::String(top.to_string()),
+        );
+    }
+
+    crate::micromodels::reflex::MicroModelReflexParts {
+        actionable: output.level.is_actionable(),
+        confidence: prediction.confidence,
+        claim_subject: hydra_core::epistemic::ClaimSubject::System(
+            "hydra.agents".to_string(),
+        ),
+        claim_predicate: "agent_loop_storm".to_string(),
+        claim_object: hydra_core::epistemic::ClaimObject::Value(
+            hydra_core::Value::Bool(true),
+        ),
+        evidence_payload_data: evidence_data,
+        action_target: hydra_core::action::ActionTarget::System(
+            "hydra.agents".to_string(),
+        ),
+        action_payload,
+    }
+}
+
+/// Extract the actor associated with an `EventKind` variant, if
+/// any. Used by Patch 18's storm window walk + future audit
+/// surfaces. Returns `None` for variants without a clear actor
+/// (sensor lifecycle, replication topology, snapshots, etc.).
+///
+/// Each new actor-bearing variant should be added here. Variants
+/// that LOOK actor-bearing but represent purely-system activity
+/// (sensor runs, replication runs, snapshot taking) are
+/// deliberately excluded so storm counting reflects agent /
+/// operator activity, not infra signals.
+fn extract_event_actor(
+    kind: &hydra_core::EventKind,
+) -> Option<&hydra_core::ActorId> {
+    use hydra_core::EventKind as E;
+    match kind {
+        E::ClaimProposed { claim } => Some(&claim.created_by),
+        E::ClaimVerified { verified_by, .. } => Some(verified_by),
+        E::ClaimRetracted { retracted_by, .. } => Some(retracted_by),
+        E::ActionProposed { action } => Some(&action.proposed_by),
+        E::ActionApproved { approved_by, .. } => Some(approved_by),
+        E::ActionRejected { rejected_by, .. } => Some(rejected_by),
+        E::ActionCancelled { cancelled_by, .. } => Some(cancelled_by),
+        E::PolicyDisabled { disabled_by, .. } => Some(disabled_by),
+        E::EvidenceAdded { evidence } => match &evidence.source {
+            hydra_core::epistemic::EvidenceSource::Human { actor_id } => {
+                Some(actor_id)
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -13382,4 +13773,259 @@ mod sprint1_tests {
         );
     }
 
+    // === MicroModel Patch 18 — Agent-loop-storm engine wiring ===
+
+    /// Ingest `n` `ActionProposed` events with the supplied
+    /// `proposed_by`. Each action lands in Hydra's normal cascade
+    /// (which may auto-approve via `actor_hydra_policy` — those
+    /// cascade-emitted ActionApproved events have a Hydra-system
+    /// actor and are filtered out of the storm count).
+    fn ingest_n_action_proposed(
+        hydra: &mut Hydra,
+        n: u64,
+        proposed_by: &hydra_core::ActorId,
+    ) {
+        for _ in 0..n {
+            let now = chrono::Utc::now();
+            let action = hydra_core::Action {
+                id: hydra_core::ActionId::new(),
+                tenant_id: None,
+                kind: hydra_core::ActionKind::Notify,
+                status: hydra_core::action::ActionStatus::Proposed,
+                targets: vec![hydra_core::action::ActionTarget::System(
+                    "hydra".to_string(),
+                )],
+                related_claims: vec![],
+                supporting_evidence: vec![],
+                proposed_by: proposed_by.clone(),
+                approved_by: None,
+                rejected_by: None,
+                policy_id: None,
+                payload: std::collections::HashMap::new(),
+                created_at: now,
+                updated_at: now,
+                approved_at: None,
+                rejected_at: None,
+                executed_at: None,
+                caused_by: None,
+            };
+            hydra
+                .ingest(hydra_core::EventKind::ActionProposed { action })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn evaluate_agent_loop_storm_empty_engine_is_normal() {
+        let mut hydra = Hydra::new();
+        let assessment = hydra
+            .evaluate_agent_loop_storm_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::AgentLoopStormLevel::Normal
+        );
+        // Normal → no claim, no action.
+        assert!(assessment.claim_id.is_none());
+        assert!(assessment.evidence_id.is_none());
+        assert!(assessment.action_ids.is_empty());
+    }
+
+    #[test]
+    fn evaluate_agent_loop_storm_auto_registers_builtin_model() {
+        let mut hydra = Hydra::new();
+        let model_id = hydra_core::MicroModelId::from_str(
+            BUILTIN_AGENT_LOOP_STORM_MODEL_ID,
+        );
+        assert!(hydra.micro_model(&model_id).is_none());
+        let _ = hydra
+            .evaluate_agent_loop_storm(hydra_core::ActorId::from_str(
+                "actor_ops",
+            ))
+            .unwrap();
+        assert!(
+            hydra.micro_model(&model_id).is_some(),
+            "first evaluate must auto-register the built-in"
+        );
+    }
+
+    #[test]
+    fn evaluate_agent_loop_storm_critical_when_actions_cross_threshold() {
+        let mut hydra = Hydra::new();
+        let agent = hydra_core::ActorId::from_str("actor_data_quality_agent");
+        // 60 ActionProposed events by the same external agent →
+        // action_proposed_count=60 (>= critical_actions 50) →
+        // Critical.
+        ingest_n_action_proposed(&mut hydra, 60, &agent);
+
+        let assessment = hydra
+            .evaluate_agent_loop_storm_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::AgentLoopStormLevel::Critical
+        );
+        // Critical → evidence + claim + action all fired.
+        assert!(assessment.evidence_id.is_some());
+        assert!(assessment.claim_id.is_some());
+        assert_eq!(assessment.action_ids.len(), 1);
+
+        // Claim shape: subject=System("hydra.agents"),
+        // predicate="agent_loop_storm".
+        let claim = hydra.claim(assessment.claim_id.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            claim.subject,
+            hydra_core::ClaimSubject::System("hydra.agents".to_string())
+        );
+        assert_eq!(claim.predicate, "agent_loop_storm");
+        assert_eq!(claim.kind, hydra_core::ClaimKind::AnomalyFinding);
+
+        // Action shape: target=System("hydra.agents"), payload
+        // carries top_actor.
+        let action = hydra
+            .action(&assessment.action_ids[0])
+            .unwrap();
+        assert_eq!(
+            action.targets,
+            vec![hydra_core::action::ActionTarget::System(
+                "hydra.agents".to_string()
+            )]
+        );
+        match action.payload.get("top_actor") {
+            Some(hydra_core::Value::String(s)) => {
+                assert_eq!(s, agent.as_str());
+            }
+            other => panic!("expected action.top_actor, got {other:?}"),
+        }
+        match action.payload.get("severity") {
+            Some(hydra_core::Value::String(s)) => assert_eq!(s, "critical"),
+            other => panic!("expected severity=critical, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_agent_loop_storm_filters_hydra_system_actors() {
+        // Ingest 80 ActionProposed events with proposed_by =
+        // actor_hydra_policy (a Hydra-system actor). The storm
+        // counter must filter ALL of these out and report Normal.
+        // This is the LOAD-BEARING test: it proves Hydra's own
+        // cascade activity can't trigger its own storm reflex.
+        let mut hydra = Hydra::new();
+        let policy = hydra_core::ActorId::from_str("actor_hydra_policy");
+        ingest_n_action_proposed(&mut hydra, 80, &policy);
+
+        let assessment = hydra
+            .evaluate_agent_loop_storm_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        // Even at 80 events, Normal — every proposer is filtered.
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::AgentLoopStormLevel::Normal,
+            "Hydra-system actor activity must NOT trigger storms"
+        );
+        assert!(assessment.action_ids.is_empty());
+
+        // The recorded prediction output should show
+        // agent_event_count == 0 (everything filtered).
+        let pred_output = &assessment.prediction.output;
+        assert_eq!(pred_output["agent_event_count"], serde_json::json!(0));
+        assert!(pred_output["top_actor"].is_null());
+    }
+
+    #[test]
+    fn evaluate_agent_loop_storm_top_actor_reflects_busiest_external_actor() {
+        // Mix two external actors with different volumes —
+        // top_actor must be the busier one.
+        let mut hydra = Hydra::new();
+        let busy = hydra_core::ActorId::from_str("actor_chatty_agent");
+        let quiet = hydra_core::ActorId::from_str("actor_calm_agent");
+        ingest_n_action_proposed(&mut hydra, 35, &busy);
+        ingest_n_action_proposed(&mut hydra, 8, &quiet);
+
+        let (prediction, _, output) = hydra
+            .record_agent_loop_storm_prediction(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        // 43 actions total — over critical_actions=50? No, 43 < 50.
+        // But same_actor_warning=30, busy=35 ≥ 30 → Warning.
+        assert_eq!(
+            output.level,
+            crate::micromodels::AgentLoopStormLevel::Warning
+        );
+        assert_eq!(output.top_actor.as_deref(), Some(busy.as_str()));
+        assert_eq!(output.top_actor_event_count, 35);
+        assert_eq!(output.agent_event_count, 43);
+        assert_eq!(output.action_proposed_count, 43);
+        // Pin the prediction was actually recorded (not dry-run).
+        assert_eq!(
+            prediction.model_id.as_str(),
+            BUILTIN_AGENT_LOOP_STORM_MODEL_ID
+        );
+    }
+
+    #[test]
+    fn evaluate_agent_loop_storm_action_payload_carries_top_actor_and_window() {
+        // Pin the Patch 18 spec: action payload includes
+        // `top_actor` and `window_secs` so the delivery adapter
+        // can route per-actor.
+        let mut hydra = Hydra::new();
+        let agent = hydra_core::ActorId::from_str("actor_runaway");
+        ingest_n_action_proposed(&mut hydra, 60, &agent);
+
+        let assessment = hydra
+            .evaluate_agent_loop_storm_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let action_id = assessment
+            .action_ids
+            .into_iter()
+            .next()
+            .expect("Critical chain must propose one action");
+        let action = hydra.action(&action_id).unwrap();
+        match action.payload.get("window_secs") {
+            Some(hydra_core::Value::Int(n)) => assert_eq!(*n, 60),
+            other => panic!("expected window_secs=60, got {other:?}"),
+        }
+        match action.payload.get("top_actor") {
+            Some(hydra_core::Value::String(s)) => {
+                assert_eq!(s, agent.as_str());
+            }
+            other => panic!("expected top_actor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_agent_loop_storm_prediction_only_skips_claim_and_action() {
+        // Even on Critical level, prediction-only mode emits ONLY
+        // the prediction event — no Evidence, no Claim, no Action.
+        // Mirrors the Patch 5 commit-rate / Patch 16
+        // replication-lag prediction_only contract.
+        let mut hydra = Hydra::new();
+        let agent = hydra_core::ActorId::from_str("actor_pred_only_check");
+        ingest_n_action_proposed(&mut hydra, 60, &agent);
+
+        let (_, _, output) = hydra
+            .record_agent_loop_storm_prediction(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            output.level,
+            crate::micromodels::AgentLoopStormLevel::Critical
+        );
+        let storm_claims: Vec<_> = hydra
+            .epistemic_store
+            .all_claims()
+            .filter(|c| c.predicate == "agent_loop_storm")
+            .collect();
+        assert!(storm_claims.is_empty());
+    }
 }

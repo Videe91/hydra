@@ -1423,6 +1423,54 @@ ReplicationLagAnomalyLevel = Literal["normal", "warning", "critical"]
 """Subset of `AnomalyLevel` (no `warming_up`)."""
 
 
+# === MicroModel Patch 18 — agent-loop-storm anomaly ===
+#
+# Same `level` vocabulary as replication-lag (Normal/Warning/
+# Critical — no `warming_up`). Distinct envelope so callers can
+# tell which model produced which assessment without inspecting
+# `prediction.model_id`.
+
+AgentLoopStormLevel = Literal["normal", "warning", "critical"]
+"""Subset of `AnomalyLevel` (no `warming_up`). Same shape as
+`ReplicationLagAnomalyLevel` but kept as a distinct alias so
+SDK consumers can pin the model-specific level type."""
+
+
+class AgentLoopStormAssessment(BaseModel):
+    """Response shape of `hy.diagnostics.agent_loop_storm(...)`
+    (Patch 18). Same envelope as the other two micro-model
+    assessments (commit-rate, replication-lag) — no per-instance
+    selector, since the storm model watches the global recent
+    event log.
+
+    The Patch 18 model emits Hydra's first safety reflex: when
+    non-Hydra-system actors are producing too many actions /
+    claims / events in a short window, the model fires a
+    Critical assessment, which fans out to evidence → claim →
+    Notify action via the same shared reflex spine commit-rate
+    and replication-lag use.
+
+    Auto-approval is structurally blocked for new storm models
+    until operator-endorsed history exists (Patch 15's
+    `model_operator_approved_historically` factor). A future
+    hardening patch may add per-predicate auto-approval
+    exclusions if needed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    level: AgentLoopStormLevel
+    prediction: MicroModelPrediction
+    prediction_event_id: EventId
+    evidence_id: EvidenceId | None = None
+    evidence_event_id: EventId | None = None
+    claim_id: ClaimId | None = None
+    claim_event_id: EventId | None = None
+    action_ids: list[ActionId] = Field(default_factory=list)
+    summary: str
+    lineage_url: str
+
+
 class ReplicationLagAnomalyAssessment(BaseModel):
     """Response shape of `hy.diagnostics.replication_lag_anomaly(...)`
     (Patch 16). Same envelope as `CommitRateAnomalyAssessment` with

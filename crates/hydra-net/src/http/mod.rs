@@ -29,7 +29,8 @@ pub use commit_stream::{
 };
 pub use commits::{commits_router, CommitsHttpState};
 pub use micromodels::{
-    micromodels_router, EvaluateCommitRateRequest, EvaluateCommitRateResponse,
+    micromodels_router, EvaluateAgentLoopStormRequest, EvaluateAgentLoopStormResponse,
+    EvaluateCommitRateRequest, EvaluateCommitRateResponse,
     EvaluateReplicationLagRequest, EvaluateReplicationLagResponse,
     EvaluationMode, MicroModelsHttpState,
 };

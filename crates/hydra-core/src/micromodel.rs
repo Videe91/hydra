@@ -77,6 +77,12 @@ pub enum MicroModelKind {
     /// Learned-index head — the eventual replacement for B-tree
     /// page lookups inside the storage layer. Wire-only in v0.
     LearnedIndex,
+    /// Patch 18 safety reflex: watches whether the system is
+    /// producing too many self-triggered events / actions / claims
+    /// in a short window — i.e. agents chasing their own tail.
+    /// Stateless threshold detector; counts non-Hydra-system
+    /// actor activity per window.
+    AgentLoopStorm,
 }
 
 impl MicroModelKind {
@@ -90,6 +96,7 @@ impl MicroModelKind {
             MicroModelKind::CardinalityEstimator => "cardinality_estimator",
             MicroModelKind::AutoTuner => "auto_tuner",
             MicroModelKind::LearnedIndex => "learned_index",
+            MicroModelKind::AgentLoopStorm => "agent_loop_storm",
         }
     }
 }

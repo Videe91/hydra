@@ -162,6 +162,30 @@ def diagnostics_micromodels_replication_lag_evaluate_path() -> str:
     return "/diagnostics/micromodels/replication-lag/evaluate"
 
 
+def diagnostics_micromodels_agent_loop_storm_evaluate_path() -> str:
+    """`POST /diagnostics/micromodels/agent-loop-storm/evaluate` —
+    drive the built-in AgentLoopStormModel (Patch 18) from outside
+    the engine.
+
+    Patch 18 is Hydra's safety reflex: it watches whether the
+    system is producing too many self-triggered events / actions
+    / claims in a short window — i.e. agents chasing their own
+    tail. Hydra-internal actors (cascade, trust-gate, verification
+    agent, model auto-registers) are filtered out server-side so
+    the storm signal reflects non-Hydra agent activity only.
+
+    Body carries `mode` ("prediction_only" / "claim" / "action")
+    and `requested_by` (ActorId). No per-instance selector — the
+    model watches the global recent event log.
+
+    Returns `AgentLoopStormAssessment` with the prediction,
+    optional evidence/claim/action ids, a server-rendered
+    `summary`, and a `lineage_url`. Storm action target is
+    `System("hydra.agents")`, payload carries `top_actor` and
+    `window_secs`."""
+    return "/diagnostics/micromodels/agent-loop-storm/evaluate"
+
+
 def diagnostics_micromodels_observation_from_outcome_path(outcome_id: str) -> str:
     """`POST /diagnostics/micromodels/observations/from-outcome/{outcome_id}`
     — Patch 8 outcome learning loop. Walks the causal chain from a
