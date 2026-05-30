@@ -14,9 +14,10 @@
 //! ## Routes
 //!
 //! ```text
-//! POST /diagnostics/micromodels/commit-rate/evaluate       (Patch 5)
-//! POST /diagnostics/micromodels/replication-lag/evaluate   (Patch 16)
-//! POST /diagnostics/micromodels/agent-loop-storm/evaluate  (Patch 18)
+//! POST /diagnostics/micromodels/commit-rate/evaluate         (Patch 5)
+//! POST /diagnostics/micromodels/replication-lag/evaluate     (Patch 16)
+//! POST /diagnostics/micromodels/agent-loop-storm/evaluate    (Patch 18)
+//! POST /diagnostics/micromodels/action-failure-rate/evaluate (Patch 19)
 //! ```
 //!
 //! Each model uses the same dispatch (`mode = prediction_only |
@@ -55,7 +56,8 @@ use hydra_core::{
     ReplicaId,
 };
 use hydra_engine::micromodels::{
-    AgentLoopStormLevel, AnomalyLevel, ReplicationLagAnomalyLevel,
+    ActionFailureRateLevel, AgentLoopStormLevel, AnomalyLevel,
+    ReplicationLagAnomalyLevel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +90,10 @@ pub fn micromodels_router(runtime: RuntimeHandle) -> Router {
         .route(
             "/diagnostics/micromodels/agent-loop-storm/evaluate",
             post(evaluate_agent_loop_storm),
+        )
+        .route(
+            "/diagnostics/micromodels/action-failure-rate/evaluate",
+            post(evaluate_action_failure_rate),
         )
         .with_state(MicroModelsHttpState::new(runtime))
 }
@@ -854,6 +860,223 @@ fn render_agent_loop_storm_summary(
     }
 }
 
+// === MicroModel Patch 19 — action-failure-rate evaluation surface ===
+//
+// Fourth model surface. Same dispatch shape as agent-loop-storm
+// (no per-instance selector — the model watches Hydra's global
+// recent action lifecycle).
+
+/// Request body for `POST /diagnostics/micromodels/action-failure-rate/evaluate`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluateActionFailureRateRequest {
+    #[serde(default)]
+    pub mode: EvaluationMode,
+    pub requested_by: ActorId,
+}
+
+/// Response body. Same envelope shape as Patches 5 + 16 + 18,
+/// minus per-instance fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluateActionFailureRateResponse {
+    /// Snake-case anomaly level: `"normal"`, `"warning"`, or
+    /// `"critical"`. NEVER `"warming_up"`.
+    pub level: String,
+    pub prediction: MicroModelPrediction,
+    pub prediction_event_id: EventId,
+    pub evidence_id: Option<EvidenceId>,
+    pub evidence_event_id: Option<EventId>,
+    pub claim_id: Option<ClaimId>,
+    pub claim_event_id: Option<EventId>,
+    pub action_ids: Vec<ActionId>,
+    pub summary: String,
+    pub lineage_url: String,
+}
+
+async fn evaluate_action_failure_rate(
+    State(state): State<MicroModelsHttpState>,
+    request: Result<Json<EvaluateActionFailureRateRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Json(req)) => req,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid request body: {err}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let hydra = state.runtime.hydra();
+    let mut hydra = hydra.write().await;
+
+    let outcome = match request.mode {
+        EvaluationMode::PredictionOnly => {
+            match hydra.record_action_failure_rate_prediction(
+                request.requested_by.clone(),
+            ) {
+                Ok((prediction, event_id, output)) => {
+                    ActionFailureRateEvaluationOutcome::from_prediction_only(
+                        prediction,
+                        event_id,
+                        output.level,
+                    )
+                }
+                Err(err) => return engine_error_response(err),
+            }
+        }
+        EvaluationMode::Claim => {
+            match hydra.evaluate_action_failure_rate_and_propose_claim(
+                request.requested_by.clone(),
+            ) {
+                Ok(assessment) => {
+                    ActionFailureRateEvaluationOutcome::from_claim_assessment(
+                        assessment,
+                    )
+                }
+                Err(err) => return engine_error_response(err),
+            }
+        }
+        EvaluationMode::Action => {
+            match hydra.evaluate_action_failure_rate_and_propose_action(
+                request.requested_by.clone(),
+            ) {
+                Ok(assessment) => {
+                    ActionFailureRateEvaluationOutcome::from_action_assessment(
+                        assessment,
+                    )
+                }
+                Err(err) => return engine_error_response(err),
+            }
+        }
+    };
+
+    let response = build_action_failure_rate_response(outcome);
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+struct ActionFailureRateEvaluationOutcome {
+    level: ActionFailureRateLevel,
+    prediction: MicroModelPrediction,
+    prediction_event_id: EventId,
+    evidence_id: Option<EvidenceId>,
+    evidence_event_id: Option<EventId>,
+    claim_id: Option<ClaimId>,
+    claim_event_id: Option<EventId>,
+    action_ids: Vec<ActionId>,
+}
+
+impl ActionFailureRateEvaluationOutcome {
+    fn from_prediction_only(
+        prediction: MicroModelPrediction,
+        prediction_event_id: EventId,
+        level: ActionFailureRateLevel,
+    ) -> Self {
+        Self {
+            level,
+            prediction,
+            prediction_event_id,
+            evidence_id: None,
+            evidence_event_id: None,
+            claim_id: None,
+            claim_event_id: None,
+            action_ids: vec![],
+        }
+    }
+
+    fn from_claim_assessment(
+        assessment: hydra_engine::micromodels::ActionFailureRateAssessment,
+    ) -> Self {
+        Self {
+            level: assessment.level,
+            prediction: assessment.prediction,
+            prediction_event_id: assessment.prediction_event_id,
+            evidence_id: assessment.evidence_id,
+            evidence_event_id: assessment.evidence_event_id,
+            claim_id: assessment.claim_id,
+            claim_event_id: assessment.claim_event_id,
+            action_ids: vec![],
+        }
+    }
+
+    fn from_action_assessment(
+        assessment: hydra_engine::micromodels::ActionFailureRateActionAssessment,
+    ) -> Self {
+        Self {
+            level: assessment.level,
+            prediction: assessment.prediction,
+            prediction_event_id: assessment.prediction_event_id,
+            evidence_id: assessment.evidence_id,
+            evidence_event_id: None,
+            claim_id: assessment.claim_id,
+            claim_event_id: assessment.claim_event_id,
+            action_ids: assessment.action_ids,
+        }
+    }
+}
+
+fn build_action_failure_rate_response(
+    outcome: ActionFailureRateEvaluationOutcome,
+) -> EvaluateActionFailureRateResponse {
+    let summary = render_action_failure_rate_summary(
+        outcome.level,
+        outcome.claim_id.is_some(),
+        !outcome.action_ids.is_empty(),
+    );
+    let lineage_url = format!("/lineage/{}", outcome.prediction_event_id);
+    EvaluateActionFailureRateResponse {
+        level: outcome.level.wire_name().to_string(),
+        prediction: outcome.prediction,
+        prediction_event_id: outcome.prediction_event_id,
+        evidence_id: outcome.evidence_id,
+        evidence_event_id: outcome.evidence_event_id,
+        claim_id: outcome.claim_id,
+        claim_event_id: outcome.claim_event_id,
+        action_ids: outcome.action_ids,
+        summary,
+        lineage_url,
+    }
+}
+
+fn render_action_failure_rate_summary(
+    level: ActionFailureRateLevel,
+    has_claim: bool,
+    has_action: bool,
+) -> String {
+    match (level, has_claim, has_action) {
+        (ActionFailureRateLevel::Normal, _, _) => {
+            "Action delivery within thresholds; no claim or action.".to_string()
+        }
+        (ActionFailureRateLevel::Warning, false, _) => {
+            "Warning: action failure rate elevated; no claim or action recorded.".to_string()
+        }
+        (ActionFailureRateLevel::Warning, true, false) => {
+            "Warning: action failure rate elevated; claim recorded, action \
+             not proposed under current verification threshold."
+                .to_string()
+        }
+        (ActionFailureRateLevel::Warning, true, true) => {
+            "Warning: action failure rate elevated; claim recorded and Notify \
+             action proposed."
+                .to_string()
+        }
+        (ActionFailureRateLevel::Critical, false, _) => {
+            "Critical: action failure rate anomalous; no claim or action recorded."
+                .to_string()
+        }
+        (ActionFailureRateLevel::Critical, true, false) => {
+            "Critical: action failure rate anomalous; claim recorded, action \
+             not proposed."
+                .to_string()
+        }
+        (ActionFailureRateLevel::Critical, true, true) => {
+            "Critical: action failure rate anomalous; Notify action proposed.".to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1472,6 +1695,211 @@ mod tests {
         .contains("within thresholds"));
         assert!(render_agent_loop_storm_summary(
             AgentLoopStormLevel::Critical,
+            true,
+            true
+        )
+        .contains("Notify action proposed"));
+    }
+
+    // === Patch 19 — action-failure-rate HTTP tests ===
+
+    fn failure_rate_request(body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/diagnostics/micromodels/action-failure-rate/evaluate")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    /// Drive `success_count` successes and `failure_count` failures
+    /// through Hydra's real Patch 7 / Patch 14 paths.
+    async fn drive_action_outcomes_via_http(
+        runtime: &crate::runtime::RuntimeHandle,
+        success_count: u64,
+        failure_count: u64,
+    ) {
+        let actor_id = hydra_core::ActorId::from_str("actor_ops");
+
+        // Ingest + execute success actions.
+        for _ in 0..success_count {
+            let action_id = hydra_core::ActionId::new();
+            let now = chrono::Utc::now();
+            let action = hydra_core::Action {
+                id: action_id.clone(),
+                tenant_id: None,
+                kind: hydra_core::ActionKind::Notify,
+                status: hydra_core::action::ActionStatus::Proposed,
+                targets: vec![hydra_core::action::ActionTarget::System(
+                    "hydra".to_string(),
+                )],
+                related_claims: vec![],
+                supporting_evidence: vec![],
+                proposed_by: actor_id.clone(),
+                approved_by: None,
+                rejected_by: None,
+                policy_id: None,
+                payload: std::collections::HashMap::new(),
+                created_at: now,
+                updated_at: now,
+                approved_at: None,
+                rejected_at: None,
+                executed_at: None,
+                caused_by: None,
+            };
+            {
+                let hydra = runtime.hydra();
+                let mut hydra = hydra.write().await;
+                hydra
+                    .ingest(EventKind::ActionProposed { action })
+                    .unwrap();
+                hydra
+                    .execute_notify_action(action_id, actor_id.clone())
+                    .unwrap();
+            }
+        }
+        // Ingest + fail failure actions.
+        for _ in 0..failure_count {
+            let action_id = hydra_core::ActionId::new();
+            let now = chrono::Utc::now();
+            let action = hydra_core::Action {
+                id: action_id.clone(),
+                tenant_id: None,
+                kind: hydra_core::ActionKind::Notify,
+                status: hydra_core::action::ActionStatus::Proposed,
+                targets: vec![hydra_core::action::ActionTarget::System(
+                    "hydra".to_string(),
+                )],
+                related_claims: vec![],
+                supporting_evidence: vec![],
+                proposed_by: actor_id.clone(),
+                approved_by: None,
+                rejected_by: None,
+                policy_id: None,
+                payload: std::collections::HashMap::new(),
+                created_at: now,
+                updated_at: now,
+                approved_at: None,
+                rejected_at: None,
+                executed_at: None,
+                caused_by: None,
+            };
+            let delivery = hydra_core::DeliveryOutcome::Failed {
+                adapter: "webhook".to_string(),
+                reason: "test-induced".to_string(),
+                status_code: Some(500),
+                latency_ms: 42,
+            };
+            {
+                let hydra = runtime.hydra();
+                let mut hydra = hydra.write().await;
+                hydra
+                    .ingest(EventKind::ActionProposed { action })
+                    .unwrap();
+                hydra
+                    .execute_notify_action_with_delivery(
+                        action_id,
+                        actor_id.clone(),
+                        delivery,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_rate_evaluate_empty_engine_is_normal() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(failure_rate_request(serde_json::json!({
+                "requested_by": actor(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateActionFailureRateResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "normal");
+        assert!(body.summary.contains("within thresholds"));
+        assert!(body.claim_id.is_none());
+        assert!(body.action_ids.is_empty());
+        assert!(body.lineage_url.starts_with("/lineage/"));
+    }
+
+    #[tokio::test]
+    async fn failure_rate_evaluate_critical_with_default_action_mode() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        drive_action_outcomes_via_http(&runtime, 5, 10).await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(failure_rate_request(serde_json::json!({
+                "requested_by": actor(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateActionFailureRateResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        assert!(body.summary.contains("Critical"));
+        assert!(body.claim_id.is_some());
+        assert_eq!(body.action_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failure_rate_evaluate_prediction_only_skips_claim_and_action() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        drive_action_outcomes_via_http(&runtime, 5, 10).await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(failure_rate_request(serde_json::json!({
+                "requested_by": actor(),
+                "mode": "prediction_only",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateActionFailureRateResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        assert!(body.claim_id.is_none());
+        assert!(body.evidence_id.is_none());
+        assert!(body.action_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failure_rate_evaluate_one_of_one_does_not_trigger_critical() {
+        // Load-bearing pin: a single failure mustn't fire
+        // Critical via 100% ratio on a 1-sample window. The HTTP
+        // surface must inherit the engine's min_actions_for_ratio
+        // suppression.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        drive_action_outcomes_via_http(&runtime, 0, 1).await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(failure_rate_request(serde_json::json!({
+                "requested_by": actor(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateActionFailureRateResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "normal");
+        assert!(body.action_ids.is_empty());
+    }
+
+    #[test]
+    fn failure_rate_summary_table_pinned() {
+        assert!(render_action_failure_rate_summary(
+            ActionFailureRateLevel::Normal,
+            false,
+            false
+        )
+        .contains("within thresholds"));
+        assert!(render_action_failure_rate_summary(
+            ActionFailureRateLevel::Critical,
             true,
             true
         )

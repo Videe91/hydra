@@ -65,6 +65,8 @@ from ._types import (
     ActionTarget,
     ActionTransitionResponse,
     ActionTransitionStatus,
+    ActionFailureRateAssessment,
+    ActionFailureRateLevel,
     ActorId,
     AgentLoopStormAssessment,
     AgentLoopStormLevel,
@@ -275,6 +277,9 @@ __all__ = [
     # MicroModel Patch 18 — agent-loop storm
     "AgentLoopStormAssessment",
     "AgentLoopStormLevel",
+    # MicroModel Patch 19 — action-failure rate
+    "ActionFailureRateAssessment",
+    "ActionFailureRateLevel",
     "ReplicationLagResponse",
     "ReplicationMode",
     "ReplicationOffset",

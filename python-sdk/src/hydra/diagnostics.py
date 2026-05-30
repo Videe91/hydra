@@ -16,6 +16,7 @@ from typing import Any
 from . import _paths
 from ._http import HydraHttpClient, HydraHttpClientSync
 from ._types import (
+    ActionFailureRateAssessment,
     ActionId,
     ActorId,
     AgentLoopStormAssessment,
@@ -276,6 +277,66 @@ class _Diagnostics:
             tenant=tenant,
         )
         return AgentLoopStormAssessment.model_validate(raw)
+
+    async def action_failure_rate(
+        self,
+        *,
+        requested_by: ActorId,
+        mode: EvaluationMode = "action",
+        tenant: TenantId | None = None,
+    ) -> ActionFailureRateAssessment:
+        """Drive the built-in action-failure-rate micro-model
+        (MicroModel Patch 19) from outside the engine.
+
+        Hydra's self-health reflex: it watches whether Hydra's
+        OWN actions are completing successfully. The Patch 14
+        delivery adapter records `ActionExecuted` on success and
+        `ActionFailed` on non-2xx / timeout / network errors;
+        this model walks the recent action lifecycle (default
+        300s window) and fires Warning/Critical when failure
+        counts or failure ratios cross thresholds.
+
+        Default thresholds:
+
+          - 5-minute window
+          - Warning: >= 3 failures, OR >= 25% failure ratio
+            (gated by min_actions_for_ratio = 5)
+          - Critical: >= 10 failures, OR >= 50% failure ratio
+
+        Small-sample suppression: the ratio gate is disabled when
+        fewer than `min_actions_for_ratio` actions have reached a
+        terminal state — prevents 1-of-1 = 100% false positives.
+        The absolute failure-count gates are NOT suppressed.
+
+        `mode` controls how far down the reflex chain the engine
+        walks:
+
+          - `"prediction_only"` — record only the prediction event
+          - `"claim"` — prediction + (Warning/Critical) evidence + claim
+          - `"action"` (default) — full chain through the Notify
+            action targeting `System("hydra.actions")`. Action
+            payload carries `failed_actions`, `failure_ratio`,
+            and `top_failed_kind?`.
+
+        **Auto-approval safety**: same as Patch 18 — structurally
+        blocked until a human approves at least one storm
+        action manually, because Patch 15 requires
+        `model_operator_approved_historically` and a new model
+        has no history.
+
+        v0 boundary: Notify only, no auto-retry / DLQ / adapter
+        quarantine. Operator decides how to respond.
+        """
+        body: dict[str, Any] = {
+            "mode": mode,
+            "requested_by": requested_by,
+        }
+        raw = await self._http.post(
+            _paths.diagnostics_micromodels_action_failure_rate_evaluate_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return ActionFailureRateAssessment.model_validate(raw)
 
     async def record_observation_from_outcome(
         self,
@@ -540,6 +601,29 @@ class _DiagnosticsSync:
             tenant=tenant,
         )
         return AgentLoopStormAssessment.model_validate(raw)
+
+    def action_failure_rate(
+        self,
+        *,
+        requested_by: ActorId,
+        mode: EvaluationMode = "action",
+        tenant: TenantId | None = None,
+    ) -> ActionFailureRateAssessment:
+        """Sync mirror of the async `action_failure_rate` —
+        drives the built-in action-failure-rate micro-model
+        (Patch 19) via `POST /diagnostics/micromodels/action-failure-rate/evaluate`.
+        See the async docstring for full semantics, thresholds,
+        and the small-sample-suppression safety property."""
+        body: dict[str, Any] = {
+            "mode": mode,
+            "requested_by": requested_by,
+        }
+        raw = self._http.post(
+            _paths.diagnostics_micromodels_action_failure_rate_evaluate_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return ActionFailureRateAssessment.model_validate(raw)
 
     def record_observation_from_outcome(
         self,

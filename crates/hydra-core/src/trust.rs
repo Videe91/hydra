@@ -191,6 +191,7 @@ pub fn is_hydra_system_actor(actor: &ActorId) -> bool {
             | "actor_hydra_commit_rate_model"
             | "actor_hydra_replication_lag_model"
             | "actor_hydra_agent_loop_storm_model"
+            | "actor_hydra_action_failure_rate_model"
     )
 }
 
@@ -281,6 +282,7 @@ mod tests {
             "actor_hydra_commit_rate_model",
             "actor_hydra_replication_lag_model",
             "actor_hydra_agent_loop_storm_model",
+            "actor_hydra_action_failure_rate_model",
         ] {
             assert!(
                 is_hydra_system_actor(&ActorId::from_str(actor)),

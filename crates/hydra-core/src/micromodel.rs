@@ -83,6 +83,13 @@ pub enum MicroModelKind {
     /// Stateless threshold detector; counts non-Hydra-system
     /// actor activity per window.
     AgentLoopStorm,
+    /// Patch 19 self-health model: watches whether Hydra's own
+    /// actions are completing successfully. Combines absolute
+    /// failure counts with a failure-rate ratio over a 5-minute
+    /// default window; fires Warning/Critical Notify alerts when
+    /// the delivery layer (Patch 14 webhooks etc.) starts
+    /// degrading. Stateless.
+    ActionFailureRate,
 }
 
 impl MicroModelKind {
@@ -97,6 +104,7 @@ impl MicroModelKind {
             MicroModelKind::AutoTuner => "auto_tuner",
             MicroModelKind::LearnedIndex => "learned_index",
             MicroModelKind::AgentLoopStorm => "agent_loop_storm",
+            MicroModelKind::ActionFailureRate => "action_failure_rate",
         }
     }
 }

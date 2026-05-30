@@ -33,6 +33,7 @@
 pub mod commit_rate;
 pub mod replication_lag;
 pub mod agent_loop_storm;
+pub mod action_failure_rate;
 
 // Patch 17 — shared bridge spine for all reflex micro-models.
 // Internal-only: no re-export here, no public surface, no
@@ -54,4 +55,9 @@ pub use agent_loop_storm::{
     AgentLoopStormActionAssessment, AgentLoopStormAssessment,
     AgentLoopStormConfig, AgentLoopStormLevel, AgentLoopStormModel,
     AgentLoopStormOutput,
+};
+pub use action_failure_rate::{
+    ActionFailureRateActionAssessment, ActionFailureRateAssessment,
+    ActionFailureRateConfig, ActionFailureRateLevel,
+    ActionFailureRateModel, ActionFailureRateOutput,
 };

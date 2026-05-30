@@ -25,6 +25,7 @@ pub mod prelude {
         AutoExecuteActionResponse, CommitBroadcaster,
         CommitStreamHttpState, CommitsHttpState, CounterfactualDiagnosticsResponse,
         CoverageDiagnosticsResponse, DiagnosticsHttpState,
+        EvaluateActionFailureRateRequest, EvaluateActionFailureRateResponse,
         EvaluateAgentLoopStormRequest, EvaluateAgentLoopStormResponse,
         EvaluateCommitRateRequest, EvaluateCommitRateResponse,
         EvaluateReplicationLagRequest, EvaluateReplicationLagResponse,

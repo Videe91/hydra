@@ -162,6 +162,31 @@ def diagnostics_micromodels_replication_lag_evaluate_path() -> str:
     return "/diagnostics/micromodels/replication-lag/evaluate"
 
 
+def diagnostics_micromodels_action_failure_rate_evaluate_path() -> str:
+    """`POST /diagnostics/micromodels/action-failure-rate/evaluate`
+    — drive the built-in ActionFailureRateModel (Patch 19) from
+    outside the engine.
+
+    Patch 19 is Hydra's self-health reflex: it watches whether
+    Hydra's OWN actions are completing successfully. The Patch 14
+    delivery adapter records `ActionExecuted` on success and
+    `ActionFailed` on non-2xx / timeout / network errors; this
+    model walks the recent action lifecycle (default 300s window)
+    and fires Warning/Critical when failure counts or failure
+    ratios cross thresholds.
+
+    Body carries `mode` ("prediction_only" / "claim" / "action")
+    and `requested_by` (ActorId). No per-instance selector — the
+    model watches the global recent action lifecycle.
+
+    Returns `ActionFailureRateAssessment` with the prediction,
+    optional evidence/claim/action ids, a server-rendered
+    `summary`, and a `lineage_url`. Storm action target is
+    `System("hydra.actions")`, payload carries `failed_actions`,
+    `failure_ratio`, and `top_failed_kind?`."""
+    return "/diagnostics/micromodels/action-failure-rate/evaluate"
+
+
 def diagnostics_micromodels_agent_loop_storm_evaluate_path() -> str:
     """`POST /diagnostics/micromodels/agent-loop-storm/evaluate` —
     drive the built-in AgentLoopStormModel (Patch 18) from outside

@@ -78,6 +78,19 @@ pub const BUILTIN_AGENT_LOOP_STORM_MODEL_ID: &str =
 pub const BUILTIN_AGENT_LOOP_STORM_ACTOR_ID: &str =
     "actor_hydra_agent_loop_storm_model";
 
+// === MicroModel Patch 19 — built-in ActionFailureRateModel identity ===
+//
+// Fourth built-in model. Self-health detector: watches Hydra's
+// own action delivery for degraded success rate. Actor is in
+// `hydra_core::is_hydra_system_actor` so this model's own
+// auto-register event is filtered out of the Patch 18 storm
+// count. Does NOT approve anything, so NOT in
+// `is_hydra_automation_actor`.
+pub const BUILTIN_ACTION_FAILURE_RATE_MODEL_ID: &str =
+    "mm_builtin_action_failure_rate_v0";
+pub const BUILTIN_ACTION_FAILURE_RATE_ACTOR_ID: &str =
+    "actor_hydra_action_failure_rate_model";
+
 pub struct Hydra {
     projection: Projection,
     event_log: EventLog,
@@ -4166,6 +4179,259 @@ impl Hydra {
         Ok((prediction, prediction_event_id, output))
     }
 
+    // === MicroModel Patch 19 — built-in ActionFailureRateModel ===
+
+    /// Evaluate the built-in action-failure-rate model over the
+    /// recent action lifecycle and record a
+    /// `MicroModelPredictionRecorded` event. Mirrors Patch
+    /// 16/18's `evaluate_X` shape — returns the prediction,
+    /// hides the typed output for callers that only want the
+    /// prediction.
+    ///
+    /// The model itself is stateless threshold + ratio detector;
+    /// the per-window event-log walk + action-kind lookup lives
+    /// in `record_*`. Includes Hydra-internal-actor failures by
+    /// design — if Hydra's own actions are failing, the
+    /// operator should know.
+    pub fn evaluate_action_failure_rate(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::MicroModelPrediction> {
+        let (prediction, _event_id, _output) =
+            self.record_action_failure_rate_prediction(actor)?;
+        Ok(prediction)
+    }
+
+    /// Evaluate + (on Warning/Critical) propose Evidence + Claim
+    /// linked back to the prediction event. Routes through the
+    /// Patch 17 shared spine.
+    ///
+    /// Claim shape (Patch 19):
+    /// ```text
+    ///   kind       = AnomalyFinding
+    ///   subject    = ClaimSubject::System("hydra.actions")
+    ///   predicate  = "action_failure_rate_high"
+    ///   object     = ClaimObject::Value(Value::Bool(true))
+    /// ```
+    pub fn evaluate_action_failure_rate_and_propose_claim(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<
+        crate::micromodels::ActionFailureRateAssessment,
+    > {
+        let (prediction, prediction_event_id, output) =
+            self.record_action_failure_rate_prediction(actor.clone())?;
+
+        let parts = action_failure_rate_reflex_parts(&prediction, &output);
+        let bridge = crate::micromodels::reflex::propose_claim_from_reflex(
+            self,
+            &prediction,
+            prediction_event_id.clone(),
+            &parts,
+            actor,
+        )?;
+
+        Ok(crate::micromodels::ActionFailureRateAssessment {
+            level: output.level,
+            prediction,
+            prediction_event_id,
+            evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
+            evidence_event_id: bridge
+                .as_ref()
+                .map(|b| b.evidence_event_id.clone()),
+            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
+        })
+    }
+
+    /// Evaluate + (on Warning/Critical AND gate-pass) propose a
+    /// Notify action targeting `System("hydra.actions")`. The
+    /// action payload carries the failure ratio, failure count,
+    /// and top failing action kind so operators can route the
+    /// alert intelligently.
+    ///
+    /// **No auto-retry / quarantine / DLQ in v0** — Notify only.
+    /// Operator decides how to respond.
+    pub fn evaluate_action_failure_rate_and_propose_action(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<
+        crate::micromodels::ActionFailureRateActionAssessment,
+    > {
+        let (prediction, prediction_event_id, output) =
+            self.record_action_failure_rate_prediction(actor.clone())?;
+
+        let parts = action_failure_rate_reflex_parts(&prediction, &output);
+        let bridge = crate::micromodels::reflex::propose_claim_from_reflex(
+            self,
+            &prediction,
+            prediction_event_id.clone(),
+            &parts,
+            actor.clone(),
+        )?;
+
+        let mut action_ids: Vec<hydra_core::ActionId> = Vec::new();
+        if let Some(b) = bridge.as_ref() {
+            if let Some(action_id) =
+                crate::micromodels::reflex::propose_action_from_reflex(
+                    self,
+                    &prediction,
+                    b,
+                    &parts,
+                    actor,
+                )?
+            {
+                action_ids.push(action_id);
+            }
+        }
+
+        Ok(crate::micromodels::ActionFailureRateActionAssessment {
+            level: output.level,
+            prediction,
+            prediction_event_id,
+            evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
+            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
+            action_ids,
+        })
+    }
+
+    /// Shared helper: auto-register the built-in model, walk the
+    /// recent event log over the configured window, tally
+    /// `actions_seen` (terminal-state actions) and
+    /// `failed_actions` (`ActionFailed` events), look up the
+    /// failing action's `kind` per failure to compute
+    /// `top_failed_kind`, evaluate the pure model, record the
+    /// prediction event.
+    ///
+    /// Public so the HTTP layer can drive `mode = "prediction_only"`.
+    pub fn record_action_failure_rate_prediction(
+        &mut self,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<(
+        hydra_core::MicroModelPrediction,
+        hydra_core::EventId,
+        crate::micromodels::ActionFailureRateOutput,
+    )> {
+        // Step 1 — auto-register via the Patch 17 shared helper.
+        let model_id = hydra_core::MicroModelId::from_str(
+            BUILTIN_ACTION_FAILURE_RATE_MODEL_ID,
+        );
+        crate::micromodels::reflex::ensure_builtin_model_registered(
+            self,
+            &model_id,
+            hydra_core::MicroModelKind::ActionFailureRate,
+            "builtin_action_failure_rate_v0",
+            &hydra_core::ActorId::from_str(
+                BUILTIN_ACTION_FAILURE_RATE_ACTOR_ID,
+            ),
+        )?;
+
+        // Step 2 — walk the event log over the configured window,
+        // tally terminal-state action events (`actions_seen`) and
+        // failures (`failed_actions`), and per-kind failure
+        // counts for the top-kind aggregation.
+        let model = crate::micromodels::ActionFailureRateModel::default();
+        let window_secs = model.config().window_secs;
+        let now = chrono::Utc::now();
+        let window_start =
+            now - chrono::Duration::seconds(window_secs as i64);
+
+        let mut actions_seen: u64 = 0;
+        let mut failed_actions: u64 = 0;
+        let mut per_kind_failures: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+
+        // Collect failed action_ids first so we can look up kinds
+        // without holding a borrow on the event log.
+        let mut failed_action_ids: Vec<hydra_core::ActionId> = Vec::new();
+
+        for event in self.event_log.iter_rev() {
+            if event.timestamp < window_start {
+                break;
+            }
+            match &event.kind {
+                hydra_core::EventKind::ActionExecuted { .. } => {
+                    actions_seen += 1;
+                }
+                hydra_core::EventKind::ActionFailed { action_id, .. } => {
+                    actions_seen += 1;
+                    failed_actions += 1;
+                    failed_action_ids.push(action_id.clone());
+                }
+                _ => {}
+            }
+        }
+
+        // Step 3 — look up each failed action's kind. Actions
+        // that were purged or never recorded fall through and
+        // simply don't contribute to top_failed_kind (they still
+        // count in failed_actions, which is the load-bearing
+        // signal).
+        for action_id in &failed_action_ids {
+            if let Some(action) = self.action_store.action(action_id) {
+                let kind_name = action_kind_wire_name(&action.kind);
+                *per_kind_failures
+                    .entry(kind_name.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+
+        let top_failed_kind = per_kind_failures
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(kind, _)| kind);
+
+        // Step 4 — evaluate the pure model.
+        let output = model.evaluate_observation(
+            actions_seen,
+            failed_actions,
+            top_failed_kind.clone(),
+        );
+
+        // Step 5 — build the typed prediction.
+        let prediction = hydra_core::MicroModelPrediction {
+            model_id: model_id.clone(),
+            run_id: hydra_core::MicroModelRunId::new(),
+            input: serde_json::json!({
+                "observed_at": now.to_rfc3339(),
+                "window_secs": window_secs,
+                "actions_seen": actions_seen,
+                "failed_actions": failed_actions,
+                "top_failed_kind": top_failed_kind,
+                "min_actions_for_ratio": model.config().min_actions_for_ratio,
+                "warning_failure_count": model.config().warning_failure_count,
+                "critical_failure_count": model.config().critical_failure_count,
+                "warning_failure_ratio": model.config().warning_failure_ratio,
+                "critical_failure_ratio": model.config().critical_failure_ratio,
+            }),
+            output: serde_json::to_value(&output).expect(
+                "ActionFailureRateOutput is serde-derived; cannot fail",
+            ),
+            confidence: output.level.confidence(),
+            explanation: Some(output.reason.clone()),
+            created_at: now,
+        };
+
+        // Step 6 — record through ingest, capture event id.
+        let cascade = self.ingest(
+            hydra_core::EventKind::MicroModelPredictionRecorded {
+                prediction: prediction.clone(),
+            },
+        )?;
+        let prediction_event_id = cascade
+            .events
+            .first()
+            .map(|event| event.id.clone())
+            .expect(
+                "ingest produces at least the trigger event for \
+                 MicroModelPredictionRecorded",
+            );
+
+        let _ = actor;
+        Ok((prediction, prediction_event_id, output))
+    }
+
     // === Schema registry ===
 
     /// Read access to the schema registry store.
@@ -5299,6 +5565,132 @@ fn agent_loop_storm_reflex_parts(
             "hydra.agents".to_string(),
         ),
         action_payload,
+    }
+}
+
+/// Convert an action-failure-rate `(prediction, output)` pair
+/// into the shared reflex parts. The action payload carries
+/// `failed_actions`, `failure_ratio`, and `top_failed_kind?` so
+/// receivers can route the alert per-kind.
+fn action_failure_rate_reflex_parts(
+    prediction: &hydra_core::MicroModelPrediction,
+    output: &crate::micromodels::ActionFailureRateOutput,
+) -> crate::micromodels::reflex::MicroModelReflexParts {
+    let mut evidence_data: std::collections::HashMap<String, hydra_core::Value> =
+        std::collections::HashMap::new();
+    evidence_data.insert(
+        "model_id".to_string(),
+        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
+    );
+    evidence_data.insert(
+        "run_id".to_string(),
+        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
+    );
+    evidence_data.insert(
+        "level".to_string(),
+        hydra_core::Value::String(output.level.wire_name().to_string()),
+    );
+    evidence_data.insert(
+        "window_secs".to_string(),
+        hydra_core::Value::Int(output.window_secs as i64),
+    );
+    evidence_data.insert(
+        "actions_seen".to_string(),
+        hydra_core::Value::Int(output.actions_seen as i64),
+    );
+    evidence_data.insert(
+        "failed_actions".to_string(),
+        hydra_core::Value::Int(output.failed_actions as i64),
+    );
+    evidence_data.insert(
+        "failure_ratio".to_string(),
+        hydra_core::Value::Float(output.failure_ratio),
+    );
+    if let Some(top) = output.top_failed_kind.as_deref() {
+        evidence_data.insert(
+            "top_failed_kind".to_string(),
+            hydra_core::Value::String(top.to_string()),
+        );
+    }
+    evidence_data.insert(
+        "reason".to_string(),
+        hydra_core::Value::String(output.reason.clone()),
+    );
+
+    let mut action_payload: std::collections::HashMap<String, hydra_core::Value> =
+        std::collections::HashMap::new();
+    action_payload.insert(
+        "severity".to_string(),
+        hydra_core::Value::String(output.level.wire_name().to_string()),
+    );
+    action_payload.insert(
+        "reason".to_string(),
+        hydra_core::Value::String(
+            prediction.explanation.clone().unwrap_or_default(),
+        ),
+    );
+    action_payload.insert(
+        "model_id".to_string(),
+        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
+    );
+    action_payload.insert(
+        "run_id".to_string(),
+        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
+    );
+    action_payload.insert(
+        "failed_actions".to_string(),
+        hydra_core::Value::Int(output.failed_actions as i64),
+    );
+    action_payload.insert(
+        "failure_ratio".to_string(),
+        hydra_core::Value::Float(output.failure_ratio),
+    );
+    if let Some(top) = output.top_failed_kind.as_deref() {
+        action_payload.insert(
+            "top_failed_kind".to_string(),
+            hydra_core::Value::String(top.to_string()),
+        );
+    }
+
+    crate::micromodels::reflex::MicroModelReflexParts {
+        actionable: output.level.is_actionable(),
+        confidence: prediction.confidence,
+        claim_subject: hydra_core::epistemic::ClaimSubject::System(
+            "hydra.actions".to_string(),
+        ),
+        claim_predicate: "action_failure_rate_high".to_string(),
+        claim_object: hydra_core::epistemic::ClaimObject::Value(
+            hydra_core::Value::Bool(true),
+        ),
+        evidence_payload_data: evidence_data,
+        action_target: hydra_core::action::ActionTarget::System(
+            "hydra.actions".to_string(),
+        ),
+        action_payload,
+    }
+}
+
+/// Wire-form name for an `ActionKind`. Mirrors the default serde
+/// representation (PascalCase for unit variants; `"Custom(...)"`
+/// is collapsed to the user label for readability in evidence /
+/// action payloads). Used by Patch 19's `top_failed_kind`
+/// aggregation.
+fn action_kind_wire_name(kind: &hydra_core::action::ActionKind) -> String {
+    use hydra_core::action::ActionKind as K;
+    match kind {
+        K::Notify => "Notify".to_string(),
+        K::CreateTicket => "CreateTicket".to_string(),
+        K::AssignOwner => "AssignOwner".to_string(),
+        K::RequestEvidence => "RequestEvidence".to_string(),
+        K::Quarantine => "Quarantine".to_string(),
+        K::Backfill => "Backfill".to_string(),
+        K::Repair => "Repair".to_string(),
+        K::Approve => "Approve".to_string(),
+        K::Reject => "Reject".to_string(),
+        K::ExecuteWorkflow => "ExecuteWorkflow".to_string(),
+        K::PostLedgerEntry => "PostLedgerEntry".to_string(),
+        K::RunPayroll => "RunPayroll".to_string(),
+        K::Custom(label) => label.clone(),
     }
 }
 
@@ -14027,5 +14419,278 @@ mod sprint1_tests {
             .filter(|c| c.predicate == "agent_loop_storm")
             .collect();
         assert!(storm_claims.is_empty());
+    }
+
+    // === MicroModel Patch 19 — Action-failure-rate engine wiring ===
+
+    /// Ingest an `ActionProposed` for a Notify action. Cascade
+    /// auto-approves (no HumanApproval policy registered) so the
+    /// action lands in `Approved` status, ready for execute.
+    fn ingest_approved_notify_action(
+        hydra: &mut Hydra,
+    ) -> hydra_core::ActionId {
+        let action_id = hydra_core::ActionId::new();
+        let now = chrono::Utc::now();
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Notify,
+            status: hydra_core::action::ActionStatus::Proposed,
+            targets: vec![hydra_core::action::ActionTarget::System(
+                "hydra".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: hydra_core::ActorId::from_str("actor_ops"),
+            approved_by: None,
+            rejected_by: None,
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            rejected_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        // Sanity: cascade auto-approved (no HumanApproval policy).
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::action::ActionStatus::Approved
+        );
+        action_id
+    }
+
+    /// Drive `success_count` Notify actions to `Executed` and
+    /// `failure_count` Notify actions to `Failed` via Hydra's
+    /// real Patch 7 + Patch 14 paths. Returns the engine ready
+    /// for an action-failure-rate evaluation.
+    fn drive_action_outcomes(
+        hydra: &mut Hydra,
+        success_count: u64,
+        failure_count: u64,
+    ) {
+        let actor = hydra_core::ActorId::from_str("actor_ops");
+        for _ in 0..success_count {
+            let action_id = ingest_approved_notify_action(hydra);
+            hydra
+                .execute_notify_action(action_id, actor.clone())
+                .unwrap();
+        }
+        for _ in 0..failure_count {
+            let action_id = ingest_approved_notify_action(hydra);
+            let delivery = hydra_core::DeliveryOutcome::Failed {
+                adapter: "webhook".to_string(),
+                reason: "test-induced failure".to_string(),
+                status_code: Some(500),
+                latency_ms: 42,
+            };
+            hydra
+                .execute_notify_action_with_delivery(
+                    action_id,
+                    actor.clone(),
+                    delivery,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn evaluate_action_failure_rate_empty_engine_is_normal() {
+        let mut hydra = Hydra::new();
+        let assessment = hydra
+            .evaluate_action_failure_rate_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::ActionFailureRateLevel::Normal
+        );
+        assert!(assessment.claim_id.is_none());
+        assert!(assessment.action_ids.is_empty());
+        // Prediction output records 0 actions seen.
+        let out = &assessment.prediction.output;
+        assert_eq!(out["actions_seen"], serde_json::json!(0));
+        assert_eq!(out["failed_actions"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn evaluate_action_failure_rate_auto_registers_builtin() {
+        let mut hydra = Hydra::new();
+        let model_id = hydra_core::MicroModelId::from_str(
+            BUILTIN_ACTION_FAILURE_RATE_MODEL_ID,
+        );
+        assert!(hydra.micro_model(&model_id).is_none());
+        let _ = hydra
+            .evaluate_action_failure_rate(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert!(hydra.micro_model(&model_id).is_some());
+    }
+
+    #[test]
+    fn evaluate_action_failure_rate_critical_via_absolute_count() {
+        // 5 successful + 10 failed = 15 actions, 10 failures.
+        // 10 >= critical_failure_count (10) → Critical via count.
+        // (Ratio is 10/15 = 67%, also over critical 50%, but the
+        // absolute count fires first.)
+        let mut hydra = Hydra::new();
+        drive_action_outcomes(&mut hydra, 5, 10);
+
+        let assessment = hydra
+            .evaluate_action_failure_rate_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::ActionFailureRateLevel::Critical
+        );
+        assert!(assessment.evidence_id.is_some());
+        assert!(assessment.claim_id.is_some());
+        assert_eq!(assessment.action_ids.len(), 1);
+
+        // Claim shape: subject=System("hydra.actions"),
+        // predicate="action_failure_rate_high".
+        let claim = hydra.claim(assessment.claim_id.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            claim.subject,
+            hydra_core::ClaimSubject::System("hydra.actions".to_string())
+        );
+        assert_eq!(claim.predicate, "action_failure_rate_high");
+        assert_eq!(claim.kind, hydra_core::ClaimKind::AnomalyFinding);
+
+        // Action shape: target=System("hydra.actions"), payload
+        // carries failure_ratio and top_failed_kind.
+        let action = hydra.action(&assessment.action_ids[0]).unwrap();
+        assert_eq!(
+            action.targets,
+            vec![hydra_core::action::ActionTarget::System(
+                "hydra.actions".to_string()
+            )]
+        );
+        match action.payload.get("top_failed_kind") {
+            Some(hydra_core::Value::String(s)) => assert_eq!(s, "Notify"),
+            other => panic!("expected top_failed_kind=Notify, got {other:?}"),
+        }
+        match action.payload.get("failed_actions") {
+            Some(hydra_core::Value::Int(n)) => assert_eq!(*n, 10),
+            other => panic!("expected failed_actions=10, got {other:?}"),
+        }
+        match action.payload.get("severity") {
+            Some(hydra_core::Value::String(s)) => assert_eq!(s, "critical"),
+            other => panic!("expected severity=critical, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_action_failure_rate_critical_via_ratio_with_low_absolute() {
+        // 3 successful + 5 failed = 8 actions, 5 failures.
+        // 5 failures < critical_count (10) but ratio 5/8 = 62.5%
+        // >= critical_ratio (50%) AND actions_seen (8) >= 5 →
+        // Critical via ratio.
+        let mut hydra = Hydra::new();
+        drive_action_outcomes(&mut hydra, 3, 5);
+
+        let assessment = hydra
+            .evaluate_action_failure_rate_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::ActionFailureRateLevel::Critical
+        );
+        let action = hydra.action(&assessment.action_ids[0]).unwrap();
+        match action.payload.get("failure_ratio") {
+            Some(hydra_core::Value::Float(f)) => {
+                assert!(
+                    (*f - (5.0 / 8.0)).abs() < 1e-9,
+                    "expected 5/8 = 0.625, got {f}"
+                );
+            }
+            other => panic!("expected failure_ratio float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_action_failure_rate_no_false_positive_on_one_of_one_failure() {
+        // LOAD-BEARING small-sample suppression: 0 successful +
+        // 1 failed. ratio = 100% but actions_seen (1) < min (5),
+        // so ratio gate is disabled. Absolute count (1) is under
+        // warning (3) → Normal.
+        //
+        // This pin matters because without the
+        // min_actions_for_ratio gate, a single early webhook
+        // failure (e.g., warm-up misconfiguration) would
+        // immediately fire Critical via ratio.
+        let mut hydra = Hydra::new();
+        drive_action_outcomes(&mut hydra, 0, 1);
+
+        let assessment = hydra
+            .evaluate_action_failure_rate_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::ActionFailureRateLevel::Normal,
+            "1-of-1 failure must NOT trigger Critical via ratio"
+        );
+        assert!(assessment.action_ids.is_empty());
+        // The prediction's failure_ratio is still 1.0 (honest)
+        // but level stayed Normal because the gate is disabled
+        // below min_actions_for_ratio.
+        let out = &assessment.prediction.output;
+        assert_eq!(out["failure_ratio"], serde_json::json!(1.0));
+        assert_eq!(out["level"], serde_json::json!("normal"));
+    }
+
+    #[test]
+    fn evaluate_action_failure_rate_warning_via_absolute_count_under_min_actions() {
+        // 0 successful + 4 failed → ratio 100% but suppressed
+        // (actions_seen 4 < min 5). However absolute count 4 >=
+        // warning_count (3) → Warning. The absolute gate is NOT
+        // blocked by min_actions_for_ratio.
+        let mut hydra = Hydra::new();
+        drive_action_outcomes(&mut hydra, 0, 4);
+
+        let assessment = hydra
+            .evaluate_action_failure_rate_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            assessment.level,
+            crate::micromodels::ActionFailureRateLevel::Warning
+        );
+    }
+
+    #[test]
+    fn evaluate_action_failure_rate_prediction_only_skips_claim_and_action() {
+        // Even on Critical level, prediction-only mode emits ONLY
+        // the prediction event — no Evidence/Claim/Action.
+        let mut hydra = Hydra::new();
+        drive_action_outcomes(&mut hydra, 5, 10);
+        let (_, _, output) = hydra
+            .record_action_failure_rate_prediction(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert_eq!(
+            output.level,
+            crate::micromodels::ActionFailureRateLevel::Critical
+        );
+        let failure_claims: Vec<_> = hydra
+            .epistemic_store
+            .all_claims()
+            .filter(|c| c.predicate == "action_failure_rate_high")
+            .collect();
+        assert!(failure_claims.is_empty());
     }
 }

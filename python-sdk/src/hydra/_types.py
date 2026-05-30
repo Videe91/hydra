@@ -1436,6 +1436,50 @@ AgentLoopStormLevel = Literal["normal", "warning", "critical"]
 SDK consumers can pin the model-specific level type."""
 
 
+# === MicroModel Patch 19 — action-failure-rate ===
+
+ActionFailureRateLevel = Literal["normal", "warning", "critical"]
+"""Subset of `AnomalyLevel` (no `warming_up`). Same shape as the
+other threshold models — Patch 19 inherits the union."""
+
+
+class ActionFailureRateAssessment(BaseModel):
+    """Response shape of `hy.diagnostics.action_failure_rate(...)`
+    (Patch 19). Same envelope as the other micro-model
+    assessments — no per-instance selector, since the model
+    watches the global recent action lifecycle.
+
+    Patch 19 is Hydra's self-health reflex: it watches whether
+    Hydra's OWN actions are completing successfully. The Patch 14
+    delivery adapter records `ActionExecuted` on success and
+    `ActionFailed` on non-2xx / timeout / network errors; this
+    model fires Warning/Critical when failure counts or failure
+    ratios cross thresholds over a 5-minute default window.
+
+    The action payload (when an action fires) carries
+    `failed_actions`, `failure_ratio`, and `top_failed_kind?` so
+    operators / delivery adapters can route the alert with
+    context.
+
+    Auto-approval safety is structurally blocked the same way as
+    Patch 18 (no operator-endorsed history at launch). See the
+    Patch 18 docstring for the full rationale.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    level: ActionFailureRateLevel
+    prediction: MicroModelPrediction
+    prediction_event_id: EventId
+    evidence_id: EvidenceId | None = None
+    evidence_event_id: EventId | None = None
+    claim_id: ClaimId | None = None
+    claim_event_id: EventId | None = None
+    action_ids: list[ActionId] = Field(default_factory=list)
+    summary: str
+    lineage_url: str
+
+
 class AgentLoopStormAssessment(BaseModel):
     """Response shape of `hy.diagnostics.agent_loop_storm(...)`
     (Patch 18). Same envelope as the other two micro-model
