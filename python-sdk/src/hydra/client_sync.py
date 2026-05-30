@@ -50,6 +50,9 @@ from ._types import (
     EvidenceId,
     IngestResponse,
     LineageResponse,
+    CausalCellChildTrust,
+    CausalCellId,
+    CausalCellTrustAssessment,
     Node,
     NodeId,
     Outcome,
@@ -415,6 +418,25 @@ class HydraSync:
             tenant=tenant,
         )
         return TrustAssessment.model_validate(raw)
+
+    def assess_causal_cell_trust(
+        self,
+        cell_id: CausalCellId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> CausalCellTrustAssessment:
+        """Sync mirror of `Hydra.assess_causal_cell_trust` (Patch
+        24). Same wire contract, same strict-tenant isolation
+        (including `None`-tenanted cells invisible to tenanted
+        queries), same error mapping (400 missing tenant, 404
+        unknown / wrong tenant / system-cell, 500 dangling child).
+        See the async docstring for the full Patch 23 factor
+        algorithm."""
+        raw = self._http.get(
+            _paths.trust_cell_path(cell_id),
+            tenant=tenant,
+        )
+        return CausalCellTrustAssessment.model_validate(raw)
 
     def _ingest(
         self,

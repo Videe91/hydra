@@ -82,6 +82,9 @@ from ._types import (
     ClaimKind,
     ClaimObject,
     ClaimPredicateSchema,
+    CausalCellChildTrust,
+    CausalCellId,
+    CausalCellTrustAssessment,
     ClaimStatus,
     ClaimSubject,
     CommitBatchLite,
@@ -244,6 +247,11 @@ __all__ = [
     "TrustAssessment",
     "TrustFactor",
     "TrustLevel",
+    # Cell trust HTTP/SDK (Patch 24) — surfaces Patch 23's
+    # CausalCell trust folding via `assess_causal_cell_trust`.
+    "CausalCellId",
+    "CausalCellChildTrust",
+    "CausalCellTrustAssessment",
     # Automation layer (Patch 11 + Patch 15)
     "AutoExecutionDecision",
     "AutoApprovalDecision",

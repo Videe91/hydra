@@ -34,6 +34,9 @@ from ._types import (
     ActorId,
     AutoApprovalDecision,
     AutoExecutionDecision,
+    CausalCellChildTrust,
+    CausalCellId,
+    CausalCellTrustAssessment,
     Claim,
     ClaimId,
     ClaimKind,
@@ -583,6 +586,55 @@ class Hydra:
             tenant=tenant,
         )
         return TrustAssessment.model_validate(raw)
+
+    async def assess_causal_cell_trust(
+        self,
+        cell_id: CausalCellId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> CausalCellTrustAssessment:
+        """Read the trust assessment for one CausalCell
+        (`GET /trust/cells/{cell_id}` — Patch 24).
+
+        Folds Patch 23's 12-factor cell trust over the cell + its
+        direct children. For composed cells, the base score is
+        the arithmetic mean of known direct-child `trust_score`
+        values; for leaf cells, the cell's OWN `trust_score`
+        acts as the single "child" for averaging. Modifiers
+        from the 12-factor table (outcomes recorded, observations
+        present, executed actions, failed outcomes, rejected
+        actions, contradicting claims, etc.) push the score up
+        or down; the result is clamped to `[0.0, 1.0]` and
+        bucketed into `TrustLevel`.
+
+        Read-only — the engine method emits no events; the
+        cell's stored `trust_score` (set by Patch 22's naïve
+        mean at composition time) is NOT updated.
+
+        Strict tenant isolation: requires `X-Hydra-Tenant`
+        (propagated automatically). A cell that exists but
+        belongs to a different tenant — OR a `None`-tenanted
+        (system-wide) cell queried with a tenant header — both
+        surface as `HydraNotFoundError`, indistinguishable from
+        a missing id.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header
+          - 404 → `HydraNotFoundError`: unknown cell, wrong
+            tenant, or `None`-tenanted cell under a tenanted
+            query
+          - 500 → defensive: composed cell with a dangling
+            child id (indicates store corruption — Patch 22
+            normally prevents this at create time)
+
+        Top-level method (not under `hy.diagnostics` or
+        `hy.trust`) for v0, matching `assess_claim_trust`.
+        """
+        raw = await self._http.get(
+            _paths.trust_cell_path(cell_id),
+            tenant=tenant,
+        )
+        return CausalCellTrustAssessment.model_validate(raw)
 
     async def _ingest(
         self,

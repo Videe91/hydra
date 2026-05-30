@@ -322,6 +322,20 @@ def trust_claim_path(claim_id: str) -> str:
     return f"/trust/claims/{_seg(claim_id)}"
 
 
+def trust_cell_path(cell_id: str) -> str:
+    """`GET /trust/cells/{cell_id}` — read-only trust assessment
+    of one CausalCell (Patch 24). Folds the Patch 23 12-factor
+    cell trust over the cell + its direct children, returns a
+    `CausalCellTrustAssessment`.
+
+    Strict tenant-scoped: requires `X-Hydra-Tenant`; missing →
+    400. Wrong tenant, unknown id, OR `None`-tenanted (system)
+    cell queried with a tenant header → 404 (indistinguishable
+    — no cross-tenant leakage). Dangling child id inside a
+    composed cell (rare, indicates store corruption) → 500."""
+    return f"/trust/cells/{_seg(cell_id)}"
+
+
 # === /schemas/* — read ===
 
 

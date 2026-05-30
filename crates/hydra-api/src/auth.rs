@@ -1058,6 +1058,14 @@ mod tests {
             required_scopes_for(&Method::GET, "/trust/claims/claim_abc"),
             vec!["read:trust"]
         );
+        // Patch 24 — cell trust inherits the same `read:trust`
+        // scope automatically via the `/trust/*` prefix clause.
+        // This pin catches a regression where a future refactor
+        // accidentally narrows the prefix or splits the namespace.
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/trust/cells/cell_abc"),
+            vec!["read:trust"]
+        );
         // OPTIONS always has no scope requirement (CORS preflight).
         assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());
         // Routes with no entry don't require any scope.

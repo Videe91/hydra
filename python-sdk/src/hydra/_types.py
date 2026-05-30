@@ -68,6 +68,9 @@ ApprovalId = str
 TypeId = str
 CommitId = str
 SnapshotId = str
+# Patch 20+ CausalCell — fractal-layer primitive (P20), reflex
+# converter (P21), composition (P22), trust folding (P23+).
+CausalCellId = str
 
 
 # === Confidence — [0.0, 1.0] clamp ===
@@ -1692,6 +1695,80 @@ class TrustAssessment(BaseModel):
     related_action_ids: list[ActionId] = Field(default_factory=list)
     related_outcome_ids: list[OutcomeId] = Field(default_factory=list)
     observation_run_ids: list[MicroModelRunId] = Field(default_factory=list)
+    assessed_at: str
+
+
+# === Patch 24 — CausalCell trust folding wire types ===
+#
+# Reuses the existing `TrustLevel` Literal and `TrustFactor`
+# model. The cell trust envelope adds `cell_id` and a
+# `child_scores` list surfacing each direct child's
+# contribution so dashboards can render a composition tree
+# without re-walking the cell store.
+
+
+class CausalCellChildTrust(BaseModel):
+    """One direct child cell's contribution to a parent's
+    trust assessment (Patch 23 engine, Patch 24 wire).
+
+    `trust_score` is the child's STORED `cell.trust_score` (set
+    by Patch 22's naïve mean at composition time). Patch 23 v0
+    does NOT recompute child trust; it folds over already-stored
+    values. Patch 25+ may add a `recompute` mode.
+
+    `claim_ids` and `outcome_ids` are surfaced from the child
+    cell so callers can render a tree of "what this branch is
+    about" without a follow-up cell-detail query.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cell_id: CausalCellId
+    trust_score: float | None = None
+    claim_ids: list[ClaimId] = Field(default_factory=list)
+    outcome_ids: list[OutcomeId] = Field(default_factory=list)
+
+
+class CausalCellTrustAssessment(BaseModel):
+    """Response wire form of `GET /trust/cells/:cell_id` (Patch
+    24) and the typed return of `Hydra.assess_causal_cell_trust`.
+
+    Read-only. The engine computes this on-demand; the result is
+    NOT persisted and `cell.trust_score` (the Patch 22 naïve
+    mean) stays unchanged. Patch 24 just exposes the existing
+    Patch 23 compute over HTTP.
+
+    `score` is the clamped `[0.0, 1.0]` result of:
+        base (avg known child trust, or own trust_score for leaf)
+        + 12 Patch 23 factor modifiers
+        clamped
+
+    `level` uses the same threshold table as claim trust
+    (`>=0.80 High`, `>=0.50 Medium`, `>=0.20 Low`, else
+    `Unknown`).
+
+    `factors` always includes ALL 12 factors — applied AND
+    unapplied — so the explanation is honest about what was
+    checked. Don't filter `applied=false` entries client-side.
+
+    `child_scores` is empty for leaf cells (the cell itself acts
+    as the single "child" for averaging but doesn't appear in
+    `child_scores`).
+
+    Strict tenant isolation on the HTTP route: `None`-tenanted
+    cells are INVISIBLE to tenanted queries (no cross-tenant
+    leakage). Unknown id and wrong-tenant both surface as
+    `HydraNotFoundError`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cell_id: CausalCellId
+    score: float
+    level: TrustLevel
+    explanation: str
+    factors: list[TrustFactor]
+    child_scores: list[CausalCellChildTrust] = Field(default_factory=list)
     assessed_at: str
 
 
