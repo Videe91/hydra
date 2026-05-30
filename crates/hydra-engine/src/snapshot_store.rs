@@ -156,6 +156,7 @@ mod tests {
             micro_models: vec![],
             micro_model_predictions: vec![],
             micro_model_observations: vec![],
+            causal_cells: vec![],
             metadata: HashMap::new(),
         }
     }

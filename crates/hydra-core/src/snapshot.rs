@@ -71,6 +71,10 @@ pub struct SnapshotManifest {
     pub total_micro_model_predictions: usize,
     #[serde(default)]
     pub total_micro_model_observations: usize,
+    /// Patch 20 — CausalCell vocabulary count. `#[serde(default)]`
+    /// so manifests written before Patch 20 deserialize as zero.
+    #[serde(default)]
+    pub total_causal_cells: usize,
     pub metadata: HashMap<String, Value>,
 }
 
@@ -117,6 +121,11 @@ pub struct SnapshotBody {
     pub micro_model_predictions: Vec<MicroModelPrediction>,
     #[serde(default)]
     pub micro_model_observations: Vec<MicroModelObservation>,
+    /// Patch 20 — CausalCell vocabulary state. `#[serde(default)]`
+    /// so bodies written before Patch 20 deserialize with an
+    /// empty vector.
+    #[serde(default)]
+    pub causal_cells: Vec<crate::causal_cell::CausalCell>,
     pub metadata: HashMap<String, Value>,
 }
 
@@ -176,6 +185,9 @@ impl SnapshotManifest {
             total_micro_models: 0,
             total_micro_model_predictions: 0,
             total_micro_model_observations: 0,
+            // Patch 20: same pattern — defaults to zero, engine
+            // attaches via `with_causal_cell_count(...)`.
+            total_causal_cells: 0,
             metadata: HashMap::new(),
         }
     }
@@ -208,6 +220,21 @@ impl SnapshotManifest {
         self.total_micro_models = models;
         self.total_micro_model_predictions = predictions;
         self.total_micro_model_observations = observations;
+        self
+    }
+
+    /// Attach the Patch 20 causal-cell count. Chainable; mirrors
+    /// `with_micro_model_counts` so the engine's snapshot path
+    /// can stack the setters:
+    ///
+    /// ```ignore
+    /// SnapshotManifest::committed(...)
+    ///     .with_replication_counts(peers, runs)
+    ///     .with_micro_model_counts(models, predictions, observations)
+    ///     .with_causal_cell_count(cells)
+    /// ```
+    pub fn with_causal_cell_count(mut self, cells: usize) -> Self {
+        self.total_causal_cells = cells;
         self
     }
 
@@ -383,6 +410,7 @@ mod tests {
             micro_models: vec![],
             micro_model_predictions: vec![],
             micro_model_observations: vec![],
+            causal_cells: vec![],
             metadata: HashMap::new(),
         };
         let json = serde_json::to_string(&body).unwrap();
@@ -393,5 +421,82 @@ mod tests {
         assert_eq!(restored.node_count(), 0);
         assert_eq!(restored.edge_count(), 0);
         assert_eq!(restored.schema_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_manifest_with_causal_cell_count_chainable() {
+        // Patch 20 chainable setter must compose with the other
+        // two without touching them.
+        let manifest = SnapshotManifest::committed(
+            SnapshotId::from_str("snap_x"),
+            None,
+            42,
+            None,
+            None,
+            ActorId::from_str("actor_ops"),
+            chrono::Utc::now(),
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        )
+        .with_replication_counts(2, 3)
+        .with_micro_model_counts(4, 5, 6)
+        .with_causal_cell_count(7);
+        assert_eq!(manifest.total_replication_peers, 2);
+        assert_eq!(manifest.total_replication_runs, 3);
+        assert_eq!(manifest.total_micro_models, 4);
+        assert_eq!(manifest.total_micro_model_predictions, 5);
+        assert_eq!(manifest.total_micro_model_observations, 6);
+        assert_eq!(manifest.total_causal_cells, 7);
+    }
+
+    #[test]
+    fn snapshot_body_backcompat_defaults_causal_cells_to_empty() {
+        // Manifests + bodies written before Patch 20 don't carry
+        // a `causal_cells` field. Pin that `#[serde(default)]`
+        // makes them deserialize cleanly with an empty vec.
+        let pre_patch20_json = serde_json::json!({
+            "manifest": {
+                "id": "snap_old",
+                "tenant_id": null,
+                "sequence": 0,
+                "head_commit_id": null,
+                "head_commit_hash": null,
+                "status": "Committed",
+                "created_by": "actor_ops",
+                "created_at": "2026-05-29T00:00:00Z",
+                "total_events": 0,
+                "total_commits": 0,
+                "total_nodes": 0,
+                "total_edges": 0,
+                "total_claims": 0,
+                "total_evidence": 0,
+                "total_actions": 0,
+                "total_outcomes": 0,
+                "total_policies": 0,
+                "total_policy_decisions": 0,
+                "total_approval_requests": 0,
+                "total_sensor_checkpoints": 0,
+                "total_schemas": 0,
+                "metadata": {}
+            },
+            "nodes": [],
+            "edges": [],
+            "events": [],
+            "commit_records": [],
+            "claims": [],
+            "evidence": [],
+            "actions": [],
+            "outcomes": [],
+            "policies": [],
+            "policy_decisions": [],
+            "approval_requests": [],
+            "sensor_runs": [],
+            "sensor_checkpoints": [],
+            "schemas": [],
+            "metadata": {}
+        });
+        let body: SnapshotBody =
+            serde_json::from_value(pre_patch20_json).unwrap();
+        assert!(body.causal_cells.is_empty());
+        assert_eq!(body.manifest.total_causal_cells, 0);
     }
 }

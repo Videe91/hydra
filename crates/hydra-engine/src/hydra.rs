@@ -9,6 +9,7 @@ use crate::snapshot_store::SnapshotStore;
 use crate::schema_validator::SchemaValidator;
 use crate::sensor_checkpoint_store::SensorCheckpointStore;
 use crate::replication_store::ReplicationStore;
+use crate::causal_cell_store::CausalCellStore;
 use crate::action_store::ActionStore;
 use crate::epistemic_store::EpistemicStore;
 use crate::event_log::EventLog;
@@ -122,6 +123,12 @@ pub struct Hydra {
     /// MicroModel Patch 1 — registry + audit only. Inference and
     /// background runner land in Patch 2+.
     micromodel_store: MicroModelStore,
+    /// Patch 20 — CausalCell vocabulary store. Holds bounded
+    /// causal units (one reflex chain, one incident, etc.) as
+    /// passive containers. Nothing in the engine creates cells
+    /// automatically yet — Patch 21+ will add reflex→cell
+    /// converters.
+    causal_cell_store: CausalCellStore,
     /// MicroModel Patch 2 — built-in `CommitRateAnomalyModel`.
     /// Transient by design (cold restart re-enters WarmingUp).
     /// `None` until the first call to `evaluate_commit_rate_anomaly`,
@@ -262,6 +269,7 @@ impl Hydra {
             replication_store: ReplicationStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
             micromodel_store: MicroModelStore::new(),
+            causal_cell_store: CausalCellStore::new(),
             commit_rate_anomaly_model: None,
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
@@ -312,6 +320,7 @@ impl Hydra {
             replication_store: ReplicationStore::new(),
             schema_registry_store: SchemaRegistryStore::new(),
             micromodel_store: MicroModelStore::new(),
+            causal_cell_store: CausalCellStore::new(),
             commit_rate_anomaly_model: None,
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
@@ -555,6 +564,7 @@ impl Hydra {
             self.replication_store.apply_event(event)?;
             self.schema_registry_store.apply_event(event)?;
             self.micromodel_store.apply_event(event)?;
+            self.causal_cell_store.apply_event(event)?;
         }
 
         // Record an atomic commit batch for this cascade. v0 ledger is
@@ -695,6 +705,7 @@ impl Hydra {
         self.replication_store.apply_event(event)?;
         self.schema_registry_store.apply_event(event)?;
         self.micromodel_store.apply_event(event)?;
+        self.causal_cell_store.apply_event(event)?;
         Ok(())
     }
 
@@ -881,6 +892,7 @@ impl Hydra {
         self.replication_store = ReplicationStore::new();
         self.schema_registry_store = SchemaRegistryStore::new();
         self.micromodel_store = MicroModelStore::new();
+        self.causal_cell_store = CausalCellStore::new();
         // MicroModel Patch 2 — transient by design; cold restart
         // re-enters WarmingUp on the next evaluation.
         self.commit_rate_anomaly_model = None;
@@ -2248,6 +2260,64 @@ impl Hydra {
         run_id: &hydra_core::MicroModelRunId,
     ) -> Option<&hydra_core::MicroModelObservation> {
         self.micromodel_store.observation(run_id)
+    }
+
+    // === Patch 20 — CausalCell vocabulary ====================
+    //
+    // Vocabulary + store + snapshot only. Patch 20 does not
+    // auto-create cells from reflex chains, compose cells, or
+    // expose any HTTP / SDK surface — those land in later
+    // patches. The engine method `create_causal_cell` is the
+    // one mutation entry point; read accessors mirror the
+    // pattern every other storefront uses.
+
+    /// Read access to the causal-cell store.
+    pub fn causal_cell_store(&self) -> &crate::causal_cell_store::CausalCellStore {
+        &self.causal_cell_store
+    }
+
+    /// Create a causal cell. Emits `EventKind::CausalCellCreated`
+    /// through `ingest(...)` so the creation is durable,
+    /// auditable, and replicable. Returns the stored cell (the
+    /// caller's `cell.id` is preserved — Patch 20 does not
+    /// regenerate ids server-side).
+    ///
+    /// Caller fully populates the cell, including any
+    /// `caused_by` event-id back-link. v0 stores whatever the
+    /// caller hands in; future patches that auto-create cells
+    /// from reflex chains will fill out the back-link
+    /// systematically.
+    pub fn create_causal_cell(
+        &mut self,
+        cell: hydra_core::CausalCell,
+    ) -> hydra_core::error::Result<hydra_core::CausalCell> {
+        let stored = cell.clone();
+        self.ingest(hydra_core::EventKind::CausalCellCreated { cell })?;
+        Ok(stored)
+    }
+
+    /// Look up one cell by id.
+    pub fn causal_cell(
+        &self,
+        id: &hydra_core::CausalCellId,
+    ) -> Option<&hydra_core::CausalCell> {
+        self.causal_cell_store.cell(id)
+    }
+
+    /// All cells in the store. Order is HashMap-iteration order
+    /// (unspecified); callers needing stable ordering should
+    /// sort by `id`.
+    pub fn causal_cells(&self) -> impl Iterator<Item = &hydra_core::CausalCell> {
+        self.causal_cell_store.all_cells()
+    }
+
+    /// All cells matching the given kind (via
+    /// `CausalCellKind::discriminant()`).
+    pub fn causal_cells_by_kind(
+        &self,
+        kind: &hydra_core::CausalCellKind,
+    ) -> Vec<&hydra_core::CausalCell> {
+        self.causal_cell_store.cells_with_kind(kind)
     }
 
     // === MicroModel Patch 8 — outcome learning loop ============
@@ -4990,6 +5060,11 @@ impl Hydra {
             .all_observations()
             .cloned()
             .collect::<Vec<_>>();
+        let causal_cells = self
+            .causal_cell_store
+            .all_cells()
+            .cloned()
+            .collect::<Vec<_>>();
 
         let manifest = hydra_core::SnapshotManifest::committed(
             hydra_core::SnapshotId::new(),
@@ -5018,7 +5093,8 @@ impl Hydra {
             micro_models.len(),
             micro_model_predictions.len(),
             micro_model_observations.len(),
-        );
+        )
+        .with_causal_cell_count(causal_cells.len());
         let body = hydra_core::SnapshotBody {
             manifest: manifest.clone(),
             nodes,
@@ -5040,6 +5116,7 @@ impl Hydra {
             micro_models,
             micro_model_predictions,
             micro_model_observations,
+            causal_cells,
             metadata: std::collections::HashMap::new(),
         };
         // Persist to the backend FIRST so a backend failure aborts the
@@ -14692,5 +14769,137 @@ mod sprint1_tests {
             .filter(|c| c.predicate == "action_failure_rate_high")
             .collect();
         assert!(failure_claims.is_empty());
+    }
+
+    // === Patch 20 — CausalCell engine wiring ===
+
+    #[test]
+    fn create_causal_cell_ingests_event_and_populates_store() {
+        // The headline path: create_causal_cell stores the cell
+        // AND emits a CausalCellCreated event. Both must be
+        // observable.
+        let mut hydra = Hydra::new();
+        let cell = hydra_core::CausalCell::new(
+            hydra_core::CausalCellKind::Reflex,
+            "hydra.commit-rate",
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        let cell_id = cell.id.clone();
+
+        let stored = hydra.create_causal_cell(cell.clone()).unwrap();
+        assert_eq!(stored.id, cell_id);
+
+        // Store populated.
+        assert_eq!(
+            hydra.causal_cell(&cell_id).map(|c| c.id.clone()),
+            Some(cell_id.clone())
+        );
+        assert_eq!(hydra.causal_cells().count(), 1);
+
+        // Event emitted.
+        let found = hydra.events().iter().any(|event| {
+            matches!(
+                &event.kind,
+                hydra_core::EventKind::CausalCellCreated { cell }
+                    if cell.id == cell_id
+            )
+        });
+        assert!(found, "audit log missing CausalCellCreated event");
+    }
+
+    #[test]
+    fn causal_cells_by_kind_filters_correctly_via_engine() {
+        let mut hydra = Hydra::new();
+        let actor = hydra_core::ActorId::from_str("actor_ops");
+        let reflex_a = hydra_core::CausalCell::new(
+            hydra_core::CausalCellKind::Reflex,
+            "hydra.commit-rate",
+            actor.clone(),
+        );
+        let reflex_b = hydra_core::CausalCell::new(
+            hydra_core::CausalCellKind::Reflex,
+            "hydra.replication",
+            actor.clone(),
+        );
+        let incident = hydra_core::CausalCell::new(
+            hydra_core::CausalCellKind::Incident,
+            "incident-1",
+            actor,
+        );
+        hydra.create_causal_cell(reflex_a).unwrap();
+        hydra.create_causal_cell(reflex_b).unwrap();
+        hydra.create_causal_cell(incident).unwrap();
+
+        let reflexes =
+            hydra.causal_cells_by_kind(&hydra_core::CausalCellKind::Reflex);
+        assert_eq!(reflexes.len(), 2);
+        let incidents = hydra
+            .causal_cells_by_kind(&hydra_core::CausalCellKind::Incident);
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].subject, "incident-1");
+    }
+
+    #[test]
+    fn recover_from_events_rebuilds_causal_cell_store() {
+        // Patch 20 cells must replay correctly. The store is
+        // event-sourced — wipe it, replay, store comes back.
+        let mut hydra = Hydra::new();
+        let cell = hydra_core::CausalCell::new(
+            hydra_core::CausalCellKind::Reflex,
+            "hydra.replay-test",
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        let cell_id = cell.id.clone();
+        hydra.create_causal_cell(cell).unwrap();
+        assert_eq!(hydra.causal_cells().count(), 1);
+
+        // Take a full event copy, reset the engine, replay.
+        let events: Vec<_> = hydra.events().into_iter().cloned().collect();
+        hydra.reset_runtime_state_preserving_config();
+        assert_eq!(hydra.causal_cells().count(), 0);
+        hydra.recover_from_events(events).unwrap();
+        assert_eq!(hydra.causal_cells().count(), 1);
+        assert!(hydra.causal_cell(&cell_id).is_some());
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_causal_cells() {
+        // Snapshot path is event-replay based, but the body's
+        // explicit `causal_cells` vec is the audit copy.
+        // Round-trip must preserve both the count AND the cell
+        // contents.
+        let mut hydra = Hydra::new();
+        let actor = hydra_core::ActorId::from_str("actor_ops");
+        let cell = hydra_core::CausalCell::new(
+            hydra_core::CausalCellKind::Health,
+            "hydra.health",
+            actor.clone(),
+        );
+        let cell_id = cell.id.clone();
+        hydra.create_causal_cell(cell).unwrap();
+
+        // Take a snapshot. Patch 1's engine surface uses
+        // `snapshot(actor)` — `take_snapshot` is a future name.
+        let manifest = hydra.snapshot(actor.clone()).unwrap();
+        // Manifest carries the count.
+        assert_eq!(manifest.total_causal_cells, 1);
+        // Body carries the cells.
+        let body = hydra
+            .snapshot_store()
+            .body(&manifest.id)
+            .expect("snapshot body present after take")
+            .clone();
+        assert_eq!(body.causal_cells.len(), 1);
+        assert_eq!(body.causal_cells[0].id, cell_id);
+
+        // Pin: the body's events vec contains the
+        // CausalCellCreated event — the event log is the source
+        // of truth and the `causal_cells` vec is the audit copy.
+        // Replay the events from the body into a fresh engine
+        // and verify the cell comes back.
+        let mut fresh = Hydra::new();
+        fresh.recover_from_events(body.events.clone()).unwrap();
+        assert_eq!(fresh.causal_cells().count(), 1);
+        assert!(fresh.causal_cell(&cell_id).is_some());
     }
 }

@@ -199,6 +199,13 @@ define_id!(ReplicationRunId, "replrun");
 define_id!(MicroModelId, "mm");
 define_id!(MicroModelRunId, "mmrun");
 
+// Patch 20 — CausalCell vocabulary. A CausalCell is a bounded
+// causal unit (one reflex, one incident, one workflow run, etc.)
+// that groups already-existing Hydra ids into a named container.
+// Three-letter prefix `cell` matches the existing convention
+// (`ten`, `pol`, `act`).
+define_id!(CausalCellId, "cell");
+
 #[cfg(test)]
 mod tests {
     use super::*;

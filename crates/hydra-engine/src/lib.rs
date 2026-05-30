@@ -19,6 +19,7 @@ pub mod sensor_checkpoint_store;
 pub mod micromodel_store;
 pub mod micromodels;
 pub mod replication_store;
+pub mod causal_cell_store;
 pub mod schema_registry_store;
 pub mod schema_validator;
 pub mod schema_gate;

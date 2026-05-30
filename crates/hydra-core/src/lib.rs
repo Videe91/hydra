@@ -16,13 +16,15 @@ pub mod automation;
 pub mod micromodel;
 pub mod replication;
 pub mod trust;
+pub mod causal_cell;
 
 pub use id::{
-    ActionId, ActorId, ApprovalId, CascadeId, ClaimId, CommitId, EdgeId, EventId, EvidenceId,
-    MicroModelId, MicroModelRunId, NodeId, OutcomeId, PolicyDecisionId, PolicyId, ReplicaId,
-    ReplicationRunId, SchemaId, SensorCheckpointId, SensorId, SensorRunId, SnapshotId,
+    ActionId, ActorId, ApprovalId, CascadeId, CausalCellId, ClaimId, CommitId, EdgeId, EventId,
+    EvidenceId, MicroModelId, MicroModelRunId, NodeId, OutcomeId, PolicyDecisionId, PolicyId,
+    ReplicaId, ReplicationRunId, SchemaId, SensorCheckpointId, SensorId, SensorRunId, SnapshotId,
     SubscriptionId, TenantId, TypeId,
 };
+pub use causal_cell::{CausalCell, CausalCellKind};
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
     Claim,
@@ -101,11 +103,12 @@ pub use automation::{AutoApprovalDecision, AutoExecutionDecision, DeliveryOutcom
 /// Convenience re-exports for common types
 pub mod prelude {
     pub use crate::id::{
-        ActionId, ActorId, ApprovalId, CascadeId, ClaimId, CommitId, EdgeId, EventId, EvidenceId,
-        MicroModelId, MicroModelRunId, NodeId, OutcomeId, PolicyDecisionId, PolicyId, ReplicaId,
-        ReplicationRunId, SchemaId, SensorCheckpointId, SensorId, SensorRunId, SnapshotId,
-        SubscriptionId, TenantId, TypeId,
+        ActionId, ActorId, ApprovalId, CascadeId, CausalCellId, ClaimId, CommitId, EdgeId,
+        EventId, EvidenceId, MicroModelId, MicroModelRunId, NodeId, OutcomeId, PolicyDecisionId,
+        PolicyId, ReplicaId, ReplicationRunId, SchemaId, SensorCheckpointId, SensorId,
+        SensorRunId, SnapshotId, SubscriptionId, TenantId, TypeId,
     };
+    pub use crate::causal_cell::{CausalCell, CausalCellKind};
     pub use crate::error::{HydraError, Result};
     pub use crate::event::{Event, EventKind, Value};
     pub use crate::epistemic::{

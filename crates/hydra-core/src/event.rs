@@ -322,6 +322,14 @@ pub enum EventKind {
     MicroModelObservationRecorded {
         observation: MicroModelObservation,
     },
+
+    // CausalCell lifecycle (Patch 20 — vocabulary only). One
+    // event variant: cells are immutable once created in v0. No
+    // composition / closure / link events yet — those land in
+    // later patches.
+    CausalCellCreated {
+        cell: crate::causal_cell::CausalCell,
+    },
 }
 
 impl EventKind {
@@ -384,7 +392,8 @@ impl EventKind {
             | EventKind::MicroModelRegistered { .. }
             | EventKind::MicroModelStatusChanged { .. }
             | EventKind::MicroModelPredictionRecorded { .. }
-            | EventKind::MicroModelObservationRecorded { .. } => None,
+            | EventKind::MicroModelObservationRecorded { .. }
+            | EventKind::CausalCellCreated { .. } => None,
         }
     }
 
@@ -444,6 +453,7 @@ impl EventKind {
             EventKind::MicroModelStatusChanged { .. } => "micro_model_status_changed",
             EventKind::MicroModelPredictionRecorded { .. } => "micro_model_prediction_recorded",
             EventKind::MicroModelObservationRecorded { .. } => "micro_model_observation_recorded",
+            EventKind::CausalCellCreated { .. } => "causal_cell_created",
         }
     }
 }
