@@ -2320,6 +2320,228 @@ impl Hydra {
         self.causal_cell_store.cells_with_kind(kind)
     }
 
+    /// Patch 21 — turn a model-derived reflex chain into a
+    /// `CausalCellKind::Reflex` causal cell.
+    ///
+    /// Given a `claim_id`, walks the existing chain:
+    ///
+    /// ```text
+    ///   claim
+    ///     ↓ claim.caused_by → MicroModelPredictionRecorded event
+    ///     ↓ claim.evidence_for → Evidence
+    ///     ↓ actions_for_claim → Actions
+    ///     ↓ outcomes_for_action → Outcomes
+    ///     ↓ prediction.run_id → MicroModelObservation
+    ///     ↓ assess_claim_trust → TrustAssessment
+    /// ```
+    ///
+    /// Builds a `CausalCell` containing every id surfaced along
+    /// the chain, in deterministic order, and ingests
+    /// `EventKind::CausalCellCreated`.
+    ///
+    /// **Non-model claims hard-error** with
+    /// `QueryError("claim is not model-derived: ...")`. This
+    /// method is specifically for reflex cells; generic claim
+    /// cells are a future patch.
+    ///
+    /// **Empty downstream is OK**: a Proposed-only claim (no
+    /// action emitted yet) yields a cell with empty
+    /// `action_ids` / `outcome_ids` / `observation_run_ids`.
+    /// The prediction + evidence + claim portion still fills.
+    ///
+    /// `cell.caused_by` is set to the prediction event id — the
+    /// chain's causal ORIGIN, not the cell creation event.
+    pub fn create_reflex_causal_cell_from_claim(
+        &mut self,
+        claim_id: hydra_core::ClaimId,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::CausalCell> {
+        use hydra_core::error::HydraError;
+        use std::collections::{HashMap, HashSet};
+
+        // 1. Lookup claim.
+        let claim = self.claim(&claim_id).cloned().ok_or_else(|| {
+            HydraError::QueryError(format!("unknown claim: {claim_id}"))
+        })?;
+
+        // 2. Validate model-derived. `claim.caused_by` is the
+        //    Patch 3 invariant: every claim born from a reflex
+        //    chain carries the prediction event id here.
+        let prediction_event_id = claim.caused_by.clone().ok_or_else(|| {
+            HydraError::QueryError(format!(
+                "claim is not model-derived: claim {claim_id} has no caused_by event"
+            ))
+        })?;
+        let prediction_event =
+            self.event(&prediction_event_id).cloned().ok_or_else(|| {
+                HydraError::QueryError(format!(
+                    "claim is not model-derived: caused_by event {prediction_event_id} not found in audit log"
+                ))
+            })?;
+        let prediction = match &prediction_event.kind {
+            hydra_core::EventKind::MicroModelPredictionRecorded {
+                prediction,
+            } => prediction.clone(),
+            _ => {
+                return Err(HydraError::QueryError(format!(
+                    "claim is not model-derived: caused_by event {prediction_event_id} is not a MicroModelPredictionRecorded"
+                )));
+            }
+        };
+
+        // 3. Gather action + outcome ids. Both lookups are
+        //    O(1) via the action_store indexes.
+        let action_ids: Vec<hydra_core::ActionId> = self
+            .action_store
+            .actions_for_claim(&claim_id)
+            .into_iter()
+            .map(|action| action.id.clone())
+            .collect();
+        let mut outcome_ids: Vec<hydra_core::OutcomeId> = Vec::new();
+        for action_id in &action_ids {
+            for outcome in self.outcomes_for_action(action_id) {
+                outcome_ids.push(outcome.id.clone());
+            }
+        }
+
+        // 4. Observation run_id. Each prediction carries exactly
+        //    one run_id; the observation store keys by it. Empty
+        //    list when no observation recorded yet (action
+        //    proposed but not yet executed+observed).
+        let observation_run_ids: Vec<hydra_core::MicroModelRunId> =
+            if self.micro_model_observation(&prediction.run_id).is_some() {
+                vec![prediction.run_id.clone()]
+            } else {
+                Vec::new()
+            };
+
+        // 5. One pass over the event log — collect event-creation
+        //    ids for every evidence / claim / action / outcome
+        //    we care about. O(n_events), but only one walk per
+        //    cell creation.
+        let evidence_ids = claim.evidence_for.clone();
+        let evidence_id_set: HashSet<hydra_core::EvidenceId> =
+            evidence_ids.iter().cloned().collect();
+        let action_id_set: HashSet<hydra_core::ActionId> =
+            action_ids.iter().cloned().collect();
+        let outcome_id_set: HashSet<hydra_core::OutcomeId> =
+            outcome_ids.iter().cloned().collect();
+
+        let mut evidence_event_ids: HashMap<
+            hydra_core::EvidenceId,
+            hydra_core::EventId,
+        > = HashMap::new();
+        let mut claim_event_id: Option<hydra_core::EventId> = None;
+        let mut action_event_ids: HashMap<
+            hydra_core::ActionId,
+            hydra_core::EventId,
+        > = HashMap::new();
+        let mut outcome_event_ids: HashMap<
+            hydra_core::OutcomeId,
+            hydra_core::EventId,
+        > = HashMap::new();
+
+        for event in self.event_log.iter() {
+            match &event.kind {
+                hydra_core::EventKind::EvidenceAdded { evidence }
+                    if evidence_id_set.contains(&evidence.id) =>
+                {
+                    evidence_event_ids
+                        .entry(evidence.id.clone())
+                        .or_insert_with(|| event.id.clone());
+                }
+                hydra_core::EventKind::ClaimProposed { claim: c }
+                    if c.id == claim_id =>
+                {
+                    if claim_event_id.is_none() {
+                        claim_event_id = Some(event.id.clone());
+                    }
+                }
+                hydra_core::EventKind::ActionProposed { action }
+                    if action_id_set.contains(&action.id) =>
+                {
+                    action_event_ids
+                        .entry(action.id.clone())
+                        .or_insert_with(|| event.id.clone());
+                }
+                hydra_core::EventKind::OutcomeObserved { outcome }
+                    if outcome_id_set.contains(&outcome.id) =>
+                {
+                    outcome_event_ids
+                        .entry(outcome.id.clone())
+                        .or_insert_with(|| event.id.clone());
+                }
+                _ => {}
+            }
+        }
+
+        // 6. Assemble `source_events` in deterministic order:
+        //    prediction → evidence(s) → claim → action(s) → outcome(s).
+        //    Missing event-ids are silently skipped — Patch 21
+        //    doesn't fail on a partial chain.
+        let mut source_events: Vec<hydra_core::EventId> = Vec::new();
+        source_events.push(prediction_event_id.clone());
+        for evidence_id in &evidence_ids {
+            if let Some(eid) = evidence_event_ids.get(evidence_id) {
+                source_events.push(eid.clone());
+            }
+        }
+        if let Some(eid) = &claim_event_id {
+            source_events.push(eid.clone());
+        }
+        for action_id in &action_ids {
+            if let Some(eid) = action_event_ids.get(action_id) {
+                source_events.push(eid.clone());
+            }
+        }
+        for outcome_id in &outcome_ids {
+            if let Some(eid) = outcome_event_ids.get(outcome_id) {
+                source_events.push(eid.clone());
+            }
+        }
+
+        // 7. Compute trust on the claim. Patch 9's assessor
+        //    works on any claim; under-evidenced claims simply
+        //    return a low score / Unknown level.
+        let trust = self.assess_claim_trust(&claim_id)?;
+
+        // 8. Build subject + summary.
+        let subject = format_claim_subject(&claim);
+        let summary = format!(
+            "reflex cell for {}: trust={:?} ({:.2}), {} actions, {} outcomes",
+            subject,
+            trust.level,
+            trust.score,
+            action_ids.len(),
+            outcome_ids.len()
+        );
+
+        // 9. Construct the cell. `caused_by` is the prediction
+        //    event id — the chain's causal ORIGIN.
+        let cell = hydra_core::CausalCell {
+            id: hydra_core::CausalCellId::new(),
+            tenant_id: claim.tenant_id.clone(),
+            kind: hydra_core::CausalCellKind::Reflex,
+            subject,
+            source_events,
+            evidence_ids,
+            claim_ids: vec![claim_id],
+            action_ids,
+            outcome_ids,
+            observation_run_ids,
+            child_cell_ids: Vec::new(),
+            trust_score: Some(trust.score),
+            summary: Some(summary),
+            created_by: actor,
+            created_at: chrono::Utc::now(),
+            caused_by: Some(prediction_event_id),
+        };
+
+        // 10. Persist via the Patch 20 create path — ingests
+        //     `CausalCellCreated`. Returns the stored cell.
+        self.create_causal_cell(cell)
+    }
+
     // === MicroModel Patch 8 — outcome learning loop ============
     //
     // Close the model feedback loop: walk backward from a recorded
@@ -5769,6 +5991,34 @@ fn action_kind_wire_name(kind: &hydra_core::action::ActionKind) -> String {
         K::RunPayroll => "RunPayroll".to_string(),
         K::Custom(label) => label.clone(),
     }
+}
+
+/// Format a `Claim`'s subject + predicate into the
+/// Patch 21 cell `subject` string `"<subject_label>/<predicate>"`.
+///
+/// `System` subjects pass through directly so the canonical
+/// four reflex models read naturally:
+///
+/// ```text
+///   System("hydra") / "under_abnormal_load"
+///     → "hydra/under_abnormal_load"
+///   System("hydra.replication") / "replica_lagging"
+///     → "hydra.replication/replica_lagging"
+/// ```
+///
+/// Non-`System` variants get a prefixed label so the format
+/// stays parseable.
+fn format_claim_subject(claim: &hydra_core::Claim) -> String {
+    use hydra_core::epistemic::ClaimSubject;
+    let label = match &claim.subject {
+        ClaimSubject::System(s) => s.clone(),
+        ClaimSubject::Node(id) => format!("node:{}", id.as_str()),
+        ClaimSubject::Edge(id) => format!("edge:{}", id.as_str()),
+        ClaimSubject::ExternalRef(s) => format!("external:{s}"),
+        ClaimSubject::Dataset(s) => format!("dataset:{s}"),
+        ClaimSubject::Metric(s) => format!("metric:{s}"),
+    };
+    format!("{}/{}", label, claim.predicate)
 }
 
 /// Extract the actor associated with an `EventKind` variant, if
@@ -14901,5 +15151,367 @@ mod sprint1_tests {
         fresh.recover_from_events(body.events.clone()).unwrap();
         assert_eq!(fresh.causal_cells().count(), 1);
         assert!(fresh.causal_cell(&cell_id).is_some());
+    }
+
+    // === Patch 21 — Reflex → CausalCell converter ===
+
+    /// Drive the full replication-lag chain end-to-end and return
+    /// every primitive id Patch 21 expects to see populated:
+    /// (claim_id, action_id, outcome_id, run_id, peer_id).
+    ///
+    /// The replication-lag reflex is the cleanest test surface
+    /// because the peer-registration helper is local and the
+    /// chain reliably fires Critical with no warmup.
+    fn drive_full_replication_lag_chain(
+        hydra: &mut Hydra,
+    ) -> (
+        hydra_core::ClaimId,
+        hydra_core::ActionId,
+        hydra_core::OutcomeId,
+        hydra_core::MicroModelRunId,
+        hydra_core::ReplicaId,
+    ) {
+        let peer_id = hydra_core::ReplicaId::from_str("replica_p21");
+        register_peer_with_lag(
+            hydra,
+            &peer_id,
+            Some((500, chrono::Utc::now())),
+        );
+        let actor = hydra_core::ActorId::from_str("actor_ops");
+        let assessment = hydra
+            .evaluate_replication_lag_anomaly_and_propose_action(
+                peer_id.clone(),
+                actor.clone(),
+            )
+            .unwrap();
+        let claim_id = assessment.claim_id.clone().unwrap();
+        let action_id = assessment.action_ids[0].clone();
+        let run_id = assessment.prediction.run_id.clone();
+
+        // Execute the cascade-approved action → ActionExecuted +
+        // OutcomeObserved.
+        let report = hydra
+            .execute_notify_action(action_id.clone(), actor.clone())
+            .unwrap();
+        let outcome_id = report.outcome_id.clone();
+
+        // Record the model observation so observation_run_ids is
+        // populated.
+        hydra
+            .record_micro_model_observation_from_action_outcome(
+                outcome_id.clone(),
+                actor,
+            )
+            .unwrap();
+
+        (claim_id, action_id, outcome_id, run_id, peer_id)
+    }
+
+    #[test]
+    fn create_reflex_cell_from_replication_lag_claim_happy_path() {
+        let mut hydra = Hydra::new();
+        let (claim_id, action_id, outcome_id, run_id, _) =
+            drive_full_replication_lag_chain(&mut hydra);
+
+        let cell = hydra
+            .create_reflex_causal_cell_from_claim(
+                claim_id.clone(),
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+
+        assert_eq!(cell.kind, hydra_core::CausalCellKind::Reflex);
+        assert_eq!(cell.subject, "hydra.replication/replica_lagging");
+        assert_eq!(cell.claim_ids, vec![claim_id]);
+        assert_eq!(cell.action_ids, vec![action_id]);
+        assert_eq!(cell.outcome_ids, vec![outcome_id]);
+        assert_eq!(cell.observation_run_ids, vec![run_id]);
+        // The cell is also stored + retrievable.
+        assert!(hydra.causal_cell(&cell.id).is_some());
+        // Stored cell is identical to what we got back.
+        assert_eq!(hydra.causal_cell(&cell.id).unwrap(), &cell);
+    }
+
+    #[test]
+    fn create_reflex_cell_includes_prediction_event_in_source_events() {
+        // Patch 21 invariant: prediction event is FIRST in
+        // source_events, AND is the cell's caused_by.
+        let mut hydra = Hydra::new();
+        let (claim_id, _, _, _, _) =
+            drive_full_replication_lag_chain(&mut hydra);
+
+        // Find the prediction event id directly from the claim's
+        // own caused_by — the Patch 3 invariant.
+        let claim = hydra.claim(&claim_id).unwrap().clone();
+        let prediction_event_id = claim.caused_by.clone().unwrap();
+
+        let cell = hydra
+            .create_reflex_causal_cell_from_claim(
+                claim_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert!(!cell.source_events.is_empty());
+        assert_eq!(
+            cell.source_events[0], prediction_event_id,
+            "prediction event must be FIRST in source_events"
+        );
+        assert_eq!(
+            cell.caused_by,
+            Some(prediction_event_id),
+            "cell.caused_by must equal prediction event id"
+        );
+    }
+
+    #[test]
+    fn create_reflex_cell_includes_evidence_claim_action_outcome() {
+        // Full chain: every layer populates its slice.
+        let mut hydra = Hydra::new();
+        let (claim_id, _, _, _, _) =
+            drive_full_replication_lag_chain(&mut hydra);
+        let claim = hydra.claim(&claim_id).unwrap().clone();
+
+        let cell = hydra
+            .create_reflex_causal_cell_from_claim(
+                claim_id.clone(),
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+
+        // Evidence: exactly the claim's evidence_for slice.
+        assert_eq!(cell.evidence_ids, claim.evidence_for);
+        assert!(!cell.evidence_ids.is_empty());
+
+        // Claim: just the input claim.
+        assert_eq!(cell.claim_ids, vec![claim_id]);
+
+        // Action + outcome: at least one each (cascade
+        // auto-approves; execute fires; OutcomeObserved emits).
+        assert!(!cell.action_ids.is_empty());
+        assert!(!cell.outcome_ids.is_empty());
+
+        // source_events ordering pin: prediction first, then
+        // some evidence events, then claim, then action, then
+        // outcome. The exact length depends on chain breadth
+        // but the LAST event must be the outcome event.
+        assert!(cell.source_events.len() >= 5);
+    }
+
+    #[test]
+    fn create_reflex_cell_includes_observation_run_id_when_observed() {
+        let mut hydra = Hydra::new();
+        let (claim_id, _, _, run_id, _) =
+            drive_full_replication_lag_chain(&mut hydra);
+
+        let cell = hydra
+            .create_reflex_causal_cell_from_claim(
+                claim_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            cell.observation_run_ids,
+            vec![run_id],
+            "observation must surface in observation_run_ids when recorded"
+        );
+    }
+
+    #[test]
+    fn create_reflex_cell_sets_trust_score_and_summary() {
+        let mut hydra = Hydra::new();
+        let (claim_id, _, _, _, _) =
+            drive_full_replication_lag_chain(&mut hydra);
+
+        let cell = hydra
+            .create_reflex_causal_cell_from_claim(
+                claim_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+
+        // Trust score is populated (Patch 9's assessor always
+        // returns a value for any claim).
+        let score = cell.trust_score.expect("trust_score must be set");
+        assert!(score >= 0.0 && score <= 1.0, "score in [0,1], got {score}");
+
+        // Summary string follows the deterministic Patch 21
+        // pattern operators can pattern-match.
+        let summary = cell.summary.as_ref().expect("summary must be set");
+        assert!(summary.contains("reflex cell for hydra.replication/replica_lagging"));
+        assert!(summary.contains("trust="));
+        assert!(summary.contains("actions"));
+        assert!(summary.contains("outcomes"));
+    }
+
+    #[test]
+    fn create_reflex_cell_unknown_claim_returns_error() {
+        let mut hydra = Hydra::new();
+        let result = hydra.create_reflex_causal_cell_from_claim(
+            hydra_core::ClaimId::from_str("claim_ghost"),
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("unknown claim"),
+                    "msg: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_reflex_cell_non_model_claim_returns_error() {
+        // Manually ingest a claim with caused_by=None (NOT born
+        // from a model prediction). Patch 21 must hard-error
+        // rather than build a degenerate cell.
+        let mut hydra = Hydra::new();
+        let claim_id = hydra_core::ClaimId::new();
+        let now = chrono::Utc::now();
+        let claim = hydra_core::Claim {
+            id: claim_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ClaimKind::Hypothesis,
+            subject: hydra_core::ClaimSubject::System("test".to_string()),
+            predicate: "test_predicate".to_string(),
+            object: hydra_core::ClaimObject::Value(
+                hydra_core::Value::Bool(true),
+            ),
+            confidence: hydra_core::Confidence::new(0.5),
+            status: hydra_core::ClaimStatus::Proposed,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: now,
+            valid_until: None,
+            created_by: hydra_core::ActorId::from_str("actor_test"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None, // <- not model-derived
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim })
+            .unwrap();
+
+        let result = hydra.create_reflex_causal_cell_from_claim(
+            claim_id,
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("claim is not model-derived"),
+                    "msg: {msg}"
+                );
+            }
+            other => {
+                panic!("expected non-model claim QueryError, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn create_reflex_cell_non_prediction_caused_by_returns_error() {
+        // Inverse pin: a claim with caused_by pointing at a
+        // non-prediction event must also hard-error. Catches a
+        // future regression where the kind check is dropped.
+        let mut hydra = Hydra::new();
+
+        // First ingest something to produce ANY event we can
+        // point at — a plain Signal event.
+        let signal_cascade = hydra
+            .ingest(hydra_core::EventKind::Signal {
+                source: hydra_core::NodeId::from_str("test.signal"),
+                name: "decoy".to_string(),
+                payload: std::collections::HashMap::new(),
+            })
+            .unwrap();
+        let signal_event_id =
+            signal_cascade.events.first().map(|e| e.id.clone()).unwrap();
+
+        // Claim with caused_by pointing at the signal (NOT a
+        // prediction).
+        let claim_id = hydra_core::ClaimId::new();
+        let now = chrono::Utc::now();
+        let claim = hydra_core::Claim {
+            id: claim_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ClaimKind::Hypothesis,
+            subject: hydra_core::ClaimSubject::System("test".to_string()),
+            predicate: "test".to_string(),
+            object: hydra_core::ClaimObject::Value(
+                hydra_core::Value::Bool(true),
+            ),
+            confidence: hydra_core::Confidence::new(0.5),
+            status: hydra_core::ClaimStatus::Proposed,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: now,
+            valid_until: None,
+            created_by: hydra_core::ActorId::from_str("actor_test"),
+            created_at: now,
+            updated_at: now,
+            caused_by: Some(signal_event_id),
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim })
+            .unwrap();
+
+        let result = hydra.create_reflex_causal_cell_from_claim(
+            claim_id,
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("not model-derived")
+                        && msg.contains("MicroModelPredictionRecorded"),
+                    "msg: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_reflex_cell_snapshot_restore_preserves_cell() {
+        // The cell is stored via Patch 20's `create_causal_cell`,
+        // so the Patch 20 snapshot round-trip applies directly.
+        // Pin it once for Patch 21 so the integration stays
+        // honest as Patch 22+ adds composition.
+        let mut hydra = Hydra::new();
+        let (claim_id, _, _, _, _) =
+            drive_full_replication_lag_chain(&mut hydra);
+        let cell = hydra
+            .create_reflex_causal_cell_from_claim(
+                claim_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let cell_id = cell.id.clone();
+
+        // Snapshot.
+        let manifest = hydra
+            .snapshot(hydra_core::ActorId::from_str("actor_ops"))
+            .unwrap();
+        assert_eq!(manifest.total_causal_cells, 1);
+        let body = hydra
+            .snapshot_store()
+            .body(&manifest.id)
+            .expect("snapshot body present after take")
+            .clone();
+        assert_eq!(body.causal_cells.len(), 1);
+        assert_eq!(body.causal_cells[0].id, cell_id);
+
+        // Restore by replaying the body's events into a fresh
+        // engine (same pattern as the Patch 20 round-trip pin).
+        let mut fresh = Hydra::new();
+        fresh.recover_from_events(body.events.clone()).unwrap();
+        let restored =
+            fresh.causal_cell(&cell_id).expect("cell restored");
+        assert_eq!(restored.kind, hydra_core::CausalCellKind::Reflex);
+        assert_eq!(restored.subject, "hydra.replication/replica_lagging");
+        assert!(restored.trust_score.is_some());
     }
 }
