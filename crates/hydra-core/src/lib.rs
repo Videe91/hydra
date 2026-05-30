@@ -95,8 +95,8 @@ pub use replication::{
 };
 pub use trust::{
     is_cascade_approver, is_hydra_automation_actor, is_hydra_system_actor,
-    TrustAssessment, TrustFactor, TrustLevel, HYDRA_POLICY_AGENT_ACTOR,
-    HYDRA_TRUST_GATE_ACTOR,
+    CausalCellChildTrust, CausalCellTrustAssessment, TrustAssessment,
+    TrustFactor, TrustLevel, HYDRA_POLICY_AGENT_ACTOR, HYDRA_TRUST_GATE_ACTOR,
 };
 pub use automation::{AutoApprovalDecision, AutoExecutionDecision, DeliveryOutcome};
 
@@ -146,8 +146,8 @@ pub mod prelude {
     };
     pub use crate::trust::{
         is_cascade_approver, is_hydra_automation_actor, is_hydra_system_actor,
-        TrustAssessment, TrustFactor, TrustLevel, HYDRA_POLICY_AGENT_ACTOR,
-        HYDRA_TRUST_GATE_ACTOR,
+        CausalCellChildTrust, CausalCellTrustAssessment, TrustAssessment,
+        TrustFactor, TrustLevel, HYDRA_POLICY_AGENT_ACTOR, HYDRA_TRUST_GATE_ACTOR,
     };
     pub use crate::automation::{AutoApprovalDecision, AutoExecutionDecision, DeliveryOutcome};
     pub use crate::node::{Node, NodeMeta, NodeValidator};

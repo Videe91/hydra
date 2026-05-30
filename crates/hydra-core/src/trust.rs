@@ -22,7 +22,9 @@
 //! may add a lowercase wire alias if HTTP clients prefer; the
 //! engine's typed form stays PascalCase.
 
-use crate::id::{ActionId, ActorId, ClaimId, MicroModelRunId, OutcomeId};
+use crate::id::{
+    ActionId, ActorId, CausalCellId, ClaimId, MicroModelRunId, OutcomeId,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +113,62 @@ impl TrustAssessment {
             TrustLevel::Unknown
         }
     }
+}
+
+// === Patch 23 — CausalCell trust folding ===========================
+//
+// Cell trust is structurally different from claim trust: it walks
+// a (small, single-level in v0) tree of cells rather than a single
+// claim's evidence chain. The fields differ enough that a new
+// envelope reads more clearly than overloading `TrustAssessment`,
+// but the level threshold table is shared (via
+// `TrustAssessment::level_for_score`) and the factor records
+// reuse `TrustFactor`.
+
+/// Top-level result of `Hydra::assess_causal_cell_trust`.
+///
+/// `score` is the base score (average of known child trust scores
+/// in [0.0, 1.0]; falls back to the cell's own `trust_score` for
+/// leaf cells with no children) modified by the Patch 23 factor
+/// table, clamped to `[0.0, 1.0]`.
+///
+/// `factors` includes EVERY factor evaluated — `applied=true` for
+/// the ones that fired, `applied=false` for the ones that were
+/// checked but didn't trigger. Same "explainable trust" pattern
+/// as Patch 9's claim trust.
+///
+/// `child_scores` surfaces each direct child's (cell_id,
+/// trust_score, claim_ids, outcome_ids) so callers can render a
+/// composition tree without re-walking the store. Empty for
+/// leaf cells.
+///
+/// Patch 23 boundary: this is READ-ONLY compute. Nothing in the
+/// engine persists or events this back. `cell.trust_score`
+/// (set by Patch 22's naïve mean) stays as-is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CausalCellTrustAssessment {
+    pub cell_id: CausalCellId,
+    pub score: f64,
+    pub level: TrustLevel,
+    pub explanation: String,
+    pub factors: Vec<TrustFactor>,
+    pub child_scores: Vec<CausalCellChildTrust>,
+    pub assessed_at: DateTime<Utc>,
+}
+
+/// One direct child's contribution to a cell's trust assessment.
+/// Surfaced on the parent's assessment so callers can render the
+/// composition tree's leaves without re-walking the store.
+///
+/// `trust_score` is the child's stored `cell.trust_score` —
+/// Patch 23 v0 does NOT recompute child trust; it folds over
+/// already-stored values. (Patch 24+ may add a recompute mode.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CausalCellChildTrust {
+    pub cell_id: CausalCellId,
+    pub trust_score: Option<f64>,
+    pub claim_ids: Vec<ClaimId>,
+    pub outcome_ids: Vec<OutcomeId>,
 }
 
 /// Stable string identifier used by `Hydra` for the cascade-driven

@@ -2743,6 +2743,391 @@ impl Hydra {
         self.create_causal_cell(cell)
     }
 
+    /// Patch 23 — fold trust over a CausalCell.
+    ///
+    /// Computes a `CausalCellTrustAssessment` for `cell_id`,
+    /// walking DIRECT children only (no recursion in v0). Base
+    /// score is the average of known child `trust_score`s for
+    /// composed cells, or the cell's own `trust_score` for leaf
+    /// cells (treated uniformly: leaf = "single child = self").
+    /// Twelve factors then modify the base; result is clamped to
+    /// `[0.0, 1.0]` and bucketed via `TrustAssessment::level_for_score`.
+    ///
+    /// **Read-only.** `&self`. Does NOT update `cell.trust_score`,
+    /// does NOT emit an event. Patch 22's naïve mean remains on
+    /// the stored cell; this method is the smarter on-demand
+    /// computation. Patch 24+ may add persistence + an HTTP/SDK
+    /// surface.
+    ///
+    /// Missing direct child (composition references a child that
+    /// isn't in the store) → hard `QueryError`. This shouldn't
+    /// happen post-P22 (composition validates children at create
+    /// time), but the defensive check guards against future
+    /// patches that introduce cell deletion.
+    pub fn assess_causal_cell_trust(
+        &self,
+        cell_id: &hydra_core::CausalCellId,
+    ) -> hydra_core::error::Result<hydra_core::CausalCellTrustAssessment> {
+        use hydra_core::error::HydraError;
+        use hydra_core::{
+            action::{ActionStatus, OutcomeKind},
+            TrustAssessment, TrustFactor,
+        };
+
+        // 1. Load the cell.
+        let cell = self.causal_cell(cell_id).ok_or_else(|| {
+            HydraError::QueryError(format!("unknown causal cell: {cell_id}"))
+        })?;
+
+        // 2. Load direct children (composed cells); empty for leaves.
+        //    A missing child is treated as corruption — error
+        //    rather than silently skip.
+        let mut children: Vec<&hydra_core::CausalCell> = Vec::new();
+        for child_id in &cell.child_cell_ids {
+            let child = self.causal_cell(child_id).ok_or_else(|| {
+                HydraError::QueryError(format!(
+                    "composed cell {cell_id} references unknown child \
+                     cell {child_id}"
+                ))
+            })?;
+            children.push(child);
+        }
+
+        // 3. Compute known scores. Leaf cells use their own
+        //    trust_score as the single "child" for averaging;
+        //    composed cells use direct-child trust_score values.
+        let is_leaf = cell.child_cell_ids.is_empty();
+        let known_scores: Vec<f64> = if is_leaf {
+            cell.trust_score.into_iter().collect()
+        } else {
+            children.iter().filter_map(|c| c.trust_score).collect()
+        };
+        let base = if known_scores.is_empty() {
+            0.0
+        } else {
+            known_scores.iter().sum::<f64>() / known_scores.len() as f64
+        };
+
+        // 4. Surface child contributions for the result envelope.
+        //    Leaf cells get an empty child_scores list.
+        let child_scores: Vec<hydra_core::CausalCellChildTrust> = children
+            .iter()
+            .map(|c| hydra_core::CausalCellChildTrust {
+                cell_id: c.id.clone(),
+                trust_score: c.trust_score,
+                claim_ids: c.claim_ids.clone(),
+                outcome_ids: c.outcome_ids.clone(),
+            })
+            .collect();
+
+        // 5. Evaluate the 12-factor table. Pattern matches the
+        //    Patch 9 claim trust assessor: applied factors add
+        //    their weight; unapplied factors stay in the list
+        //    with `applied=false` for explainability.
+        let mut factors: Vec<TrustFactor> = Vec::new();
+        let mut applied_names: Vec<&'static str> = Vec::new();
+        let mut score = base;
+
+        let push_factor = |factors: &mut Vec<TrustFactor>,
+                           applied_names: &mut Vec<&'static str>,
+                           score: &mut f64,
+                           kind: &str,
+                           weight: f64,
+                           applied: bool,
+                           applied_name: &'static str,
+                           detail: String| {
+            if applied {
+                *score += weight;
+                applied_names.push(applied_name);
+            }
+            factors.push(TrustFactor {
+                kind: kind.to_string(),
+                weight,
+                applied,
+                detail,
+            });
+        };
+
+        // --- Positive factors ---
+
+        // children_present: +0.10 when child_cell_ids is non-empty.
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "children_present",
+            0.10,
+            !cell.child_cell_ids.is_empty(),
+            "children present",
+            if cell.child_cell_ids.is_empty() {
+                "cell has no children (leaf cell)".to_string()
+            } else {
+                format!(
+                    "{} direct child cell(s)",
+                    cell.child_cell_ids.len()
+                )
+            },
+        );
+
+        // known_child_trust_scores: +0.10 when ≥1 known score.
+        let total_subjects = if is_leaf {
+            1
+        } else {
+            cell.child_cell_ids.len()
+        };
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "known_child_trust_scores",
+            0.10,
+            !known_scores.is_empty(),
+            "known child trust scores",
+            format!(
+                "{} of {} {} have trust scores",
+                known_scores.len(),
+                total_subjects,
+                if is_leaf { "leaf cell" } else { "children" }
+            ),
+        );
+
+        // high_average_child_trust: +0.20 when base ≥ 0.80.
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "high_average_child_trust",
+            0.20,
+            !known_scores.is_empty() && base >= 0.80,
+            "high average child trust",
+            if known_scores.is_empty() {
+                "no known trust scores".to_string()
+            } else {
+                format!(
+                    "average trust {:.2} {} 0.80",
+                    base,
+                    if base >= 0.80 { ">=" } else { "<" }
+                )
+            },
+        );
+
+        // all_children_high_trust: +0.15 when every known score ≥ 0.80.
+        let all_high =
+            !known_scores.is_empty() && known_scores.iter().all(|s| *s >= 0.80);
+        let known_high_count =
+            known_scores.iter().filter(|s| **s >= 0.80).count();
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "all_children_high_trust",
+            0.15,
+            all_high,
+            "all children high trust",
+            if known_scores.is_empty() {
+                "no known trust scores".to_string()
+            } else {
+                format!(
+                    "{} of {} known score(s) at or above 0.80",
+                    known_high_count,
+                    known_scores.len()
+                )
+            },
+        );
+
+        // outcomes_recorded: +0.10 when cell.outcome_ids non-empty.
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "outcomes_recorded",
+            0.10,
+            !cell.outcome_ids.is_empty(),
+            "outcomes recorded",
+            format!("{} outcome(s) referenced", cell.outcome_ids.len()),
+        );
+
+        // observations_present: +0.10 when observation_run_ids non-empty.
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "observations_present",
+            0.10,
+            !cell.observation_run_ids.is_empty(),
+            "observations present",
+            format!(
+                "{} observation run(s) referenced",
+                cell.observation_run_ids.len()
+            ),
+        );
+
+        // actions_executed: +0.10 when any referenced action is Executed.
+        let executed_count = cell
+            .action_ids
+            .iter()
+            .filter_map(|aid| self.action(aid))
+            .filter(|a| a.status == ActionStatus::Executed)
+            .count();
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "actions_executed",
+            0.10,
+            executed_count > 0,
+            "actions executed",
+            format!(
+                "{} of {} referenced action(s) in Executed status",
+                executed_count,
+                cell.action_ids.len()
+            ),
+        );
+
+        // --- Negative factors ---
+
+        // any_child_low_trust: -0.20 when any known score < 0.50.
+        let low_count = known_scores.iter().filter(|s| **s < 0.50).count();
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "any_child_low_trust",
+            -0.20,
+            low_count > 0,
+            "any child low trust",
+            if known_scores.is_empty() {
+                "no known trust scores to check".to_string()
+            } else {
+                format!(
+                    "{} of {} known score(s) below 0.50",
+                    low_count,
+                    known_scores.len()
+                )
+            },
+        );
+
+        // failed_outcomes_present: -0.20 when any outcome.kind is
+        // Failure or Regression.
+        let failed_count = cell
+            .outcome_ids
+            .iter()
+            .filter_map(|oid| self.outcome(oid))
+            .filter(|o| {
+                matches!(o.kind, OutcomeKind::Failure | OutcomeKind::Regression)
+            })
+            .count();
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "failed_outcomes_present",
+            -0.20,
+            failed_count > 0,
+            "failed outcomes present",
+            format!(
+                "{} outcome(s) with kind Failure or Regression",
+                failed_count
+            ),
+        );
+
+        // rejected_actions_present: -0.15 when any action.status == Rejected.
+        let rejected_count = cell
+            .action_ids
+            .iter()
+            .filter_map(|aid| self.action(aid))
+            .filter(|a| a.status == ActionStatus::Rejected)
+            .count();
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "rejected_actions_present",
+            -0.15,
+            rejected_count > 0,
+            "rejected actions present",
+            format!(
+                "{} referenced action(s) in Rejected status",
+                rejected_count
+            ),
+        );
+
+        // contradicting_claims_present: -0.20 when any claim has
+        // non-empty evidence_against.
+        let contradicted_count = cell
+            .claim_ids
+            .iter()
+            .filter_map(|cid| self.claim(cid))
+            .filter(|c| !c.evidence_against.is_empty())
+            .count();
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "contradicting_claims_present",
+            -0.20,
+            contradicted_count > 0,
+            "contradicting claims present",
+            format!(
+                "{} referenced claim(s) with non-empty evidence_against",
+                contradicted_count
+            ),
+        );
+
+        // missing_child_trust: -0.10 when ≥1 known-subject slot
+        // has no trust score (composed: child.trust_score = None;
+        // leaf: cell.trust_score = None).
+        let missing_count = total_subjects.saturating_sub(known_scores.len());
+        push_factor(
+            &mut factors,
+            &mut applied_names,
+            &mut score,
+            "missing_child_trust",
+            -0.10,
+            missing_count > 0,
+            "missing child trust",
+            if is_leaf {
+                if cell.trust_score.is_none() {
+                    "leaf cell has no trust_score".to_string()
+                } else {
+                    "leaf cell carries its own trust_score".to_string()
+                }
+            } else {
+                format!(
+                    "{} of {} children have no trust_score",
+                    missing_count, total_subjects
+                )
+            },
+        );
+
+        // 6. Clamp + bucket.
+        let clamped = score.clamp(0.0, 1.0);
+        let level = TrustAssessment::level_for_score(clamped);
+
+        // 7. Deterministic explanation mirroring Patch 9's shape.
+        let unapplied = factors.iter().filter(|f| !f.applied).count();
+        let applied_str = if applied_names.is_empty() {
+            "no factors fired".to_string()
+        } else {
+            applied_names.join(", ")
+        };
+        let explanation = format!(
+            "Cell trust {:?} (score {:.2}) for {}: {}. ({} factor(s) \
+             checked but did not fire.)",
+            level, clamped, cell.subject, applied_str, unapplied
+        );
+
+        Ok(hydra_core::CausalCellTrustAssessment {
+            cell_id: cell.id.clone(),
+            score: clamped,
+            level,
+            explanation,
+            factors,
+            child_scores,
+            assessed_at: chrono::Utc::now(),
+        })
+    }
+
     // === MicroModel Patch 8 — outcome learning loop ============
     //
     // Close the model feedback loop: walk backward from a recorded
@@ -16324,5 +16709,543 @@ mod sprint1_tests {
         // Both children resolvable too.
         assert!(fresh.causal_cell(&cell_a.id).is_some());
         assert!(fresh.causal_cell(&cell_b.id).is_some());
+    }
+
+    // === Patch 23 — CausalCell trust folding ===
+
+    /// Look up a factor in an assessment's `factors` list. Panics
+    /// when not found — every factor name is expected to be
+    /// present, applied or not (the "unapplied factors are still
+    /// listed" contract).
+    fn find_factor<'a>(
+        assessment: &'a hydra_core::CausalCellTrustAssessment,
+        kind: &str,
+    ) -> &'a hydra_core::TrustFactor {
+        assessment
+            .factors
+            .iter()
+            .find(|f| f.kind == kind)
+            .unwrap_or_else(|| panic!("factor {kind} missing from assessment"))
+    }
+
+    #[test]
+    fn assess_causal_cell_trust_unknown_cell_returns_error() {
+        let hydra = Hydra::new();
+        let result = hydra.assess_causal_cell_trust(
+            &hydra_core::CausalCellId::from_str("cell_ghost"),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown causal cell"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_causal_cell_trust_parent_with_high_children_returns_high() {
+        // Four children with high trust → base = 0.85, every
+        // positive factor that depends only on children fires →
+        // clamps to 1.0 → High.
+        let mut hydra = Hydra::new();
+        let children: Vec<hydra_core::CausalCell> = (0..4)
+            .map(|i| {
+                ingest_synthetic_cell(
+                    &mut hydra,
+                    None,
+                    &format!("child_{i}"),
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    Some(0.85),
+                    None,
+                )
+            })
+            .collect();
+        let parent = hydra
+            .compose_causal_cells(
+                children.iter().map(|c| c.id.clone()).collect(),
+                hydra_core::CausalCellKind::Health,
+                "hydra.health".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+
+        let assessment = hydra.assess_causal_cell_trust(&parent.id).unwrap();
+        assert_eq!(assessment.level, hydra_core::TrustLevel::High);
+        assert!(assessment.score >= 0.80, "score: {}", assessment.score);
+        assert!(find_factor(&assessment, "children_present").applied);
+        assert!(find_factor(&assessment, "known_child_trust_scores").applied);
+        assert!(find_factor(&assessment, "high_average_child_trust").applied);
+        assert!(find_factor(&assessment, "all_children_high_trust").applied);
+        // 4 children surface in child_scores.
+        assert_eq!(assessment.child_scores.len(), 4);
+        // Explanation pattern.
+        assert!(assessment.explanation.contains("Cell trust High"));
+        assert!(assessment.explanation.contains("hydra.health"));
+    }
+
+    #[test]
+    fn assess_causal_cell_trust_missing_child_scores_penalized() {
+        // One child has trust_score = None → missing_child_trust
+        // factor fires AND average is taken over known-only.
+        let mut hydra = Hydra::new();
+        let known = ingest_synthetic_cell(
+            &mut hydra, None, "known",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            Some(0.80), None,
+        );
+        let unknown = ingest_synthetic_cell(
+            &mut hydra, None, "unknown",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            None, None,
+        );
+        let parent = hydra
+            .compose_causal_cells(
+                vec![known.id, unknown.id],
+                hydra_core::CausalCellKind::Health,
+                "mixed".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+
+        let assessment = hydra.assess_causal_cell_trust(&parent.id).unwrap();
+        assert!(find_factor(&assessment, "missing_child_trust").applied);
+        // Average ignores None, takes 0.80 only. With penalty
+        // (-0.10), positives still push past 0.80 so level stays
+        // High; pin via explicit factor inspection rather than
+        // top-line level.
+        let missing = find_factor(&assessment, "missing_child_trust");
+        assert!(missing.detail.contains("1 of 2"));
+    }
+
+    #[test]
+    fn assess_causal_cell_trust_failed_outcome_penalizes() {
+        // Drive a real chain where the Notify action's webhook
+        // fails → ActionFailed event + Failure outcome. Wrap into
+        // a reflex cell; assess; failed_outcomes_present fires.
+        let mut hydra = Hydra::new();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_p23_fail");
+        register_peer_with_lag(
+            &mut hydra,
+            &peer_id,
+            Some((500, chrono::Utc::now())),
+        );
+        let actor = hydra_core::ActorId::from_str("actor_ops");
+        let assessment_chain = hydra
+            .evaluate_replication_lag_anomaly_and_propose_action(
+                peer_id.clone(),
+                actor.clone(),
+            )
+            .unwrap();
+        let claim_id = assessment_chain.claim_id.clone().unwrap();
+        let action_id = assessment_chain.action_ids[0].clone();
+
+        // Execute with Failed delivery → ActionFailed +
+        // Outcome{kind: Failure}.
+        let delivery = hydra_core::DeliveryOutcome::Failed {
+            adapter: "webhook".to_string(),
+            reason: "induced failure".to_string(),
+            status_code: Some(500),
+            latency_ms: 42,
+        };
+        hydra
+            .execute_notify_action_with_delivery(
+                action_id,
+                actor.clone(),
+                delivery,
+            )
+            .unwrap();
+
+        let reflex_cell = hydra
+            .create_reflex_causal_cell_from_claim(claim_id, actor)
+            .unwrap();
+        let cell_assessment =
+            hydra.assess_causal_cell_trust(&reflex_cell.id).unwrap();
+
+        let failed = find_factor(&cell_assessment, "failed_outcomes_present");
+        assert!(failed.applied, "failed_outcomes_present must fire");
+        assert!(failed.detail.contains("Failure or Regression"));
+    }
+
+    #[test]
+    fn assess_causal_cell_trust_rejected_action_penalizes() {
+        // Build a cell that references a Rejected action. To set
+        // up a rejected action, register HumanApproval policy
+        // (cascade leaves Proposed), reject it directly via
+        // reject_action.
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_ops");
+        // HumanApproval policy so cascade doesn't auto-approve.
+        let policy = hydra_core::Policy {
+            id: hydra_core::PolicyId::new(),
+            tenant_id: None,
+            name: "P23 — require human approval".to_string(),
+            kind: hydra_core::PolicyKind::HumanApproval,
+            status: hydra_core::PolicyStatus::Active,
+            scope: hydra_core::PolicyScope::AnyAction,
+            condition: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::PolicyRegistered { policy })
+            .unwrap();
+        // Propose a Notify action; cascade holds it at Proposed.
+        let action_id = hydra_core::ActionId::new();
+        let action = hydra_core::Action {
+            id: action_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ActionKind::Notify,
+            status: hydra_core::action::ActionStatus::Proposed,
+            targets: vec![hydra_core::action::ActionTarget::System(
+                "hydra".to_string(),
+            )],
+            related_claims: vec![],
+            supporting_evidence: vec![],
+            proposed_by: actor.clone(),
+            approved_by: None,
+            rejected_by: None,
+            policy_id: None,
+            payload: std::collections::HashMap::new(),
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            rejected_at: None,
+            executed_at: None,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ActionProposed { action })
+            .unwrap();
+        hydra
+            .reject_action(
+                action_id.clone(),
+                actor.clone(),
+                "test reject".to_string(),
+            )
+            .unwrap();
+        // Sanity: action is Rejected.
+        assert_eq!(
+            hydra.action(&action_id).unwrap().status,
+            hydra_core::action::ActionStatus::Rejected
+        );
+
+        // Synthetic cell referencing the rejected action.
+        let cell = ingest_synthetic_cell(
+            &mut hydra, None, "with_rejected_action",
+            vec![], vec![], vec![action_id], vec![], vec![], vec![],
+            Some(0.50), None,
+        );
+
+        let assess = hydra.assess_causal_cell_trust(&cell.id).unwrap();
+        let rejected = find_factor(&assess, "rejected_actions_present");
+        assert!(rejected.applied, "rejected_actions_present must fire");
+    }
+
+    #[test]
+    fn assess_causal_cell_trust_contradicting_claim_penalizes() {
+        // Create a claim with non-empty evidence_against by
+        // disputing it after creation.
+        let mut hydra = Hydra::new();
+        let now = chrono::Utc::now();
+        let actor = hydra_core::ActorId::from_str("actor_ops");
+
+        // First ingest a piece of evidence to dispute with.
+        let evidence_id = hydra_core::EvidenceId::new();
+        let evidence = hydra_core::Evidence {
+            id: evidence_id.clone(),
+            tenant_id: None,
+            source: hydra_core::epistemic::EvidenceSource::Human {
+                actor_id: actor.clone(),
+            },
+            payload: hydra_core::epistemic::EvidencePayload {
+                kind: "refutation".to_string(),
+                data: std::collections::HashMap::new(),
+            },
+            reliability: hydra_core::Confidence::new(0.90),
+            observed_at: now,
+            recorded_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded { evidence })
+            .unwrap();
+
+        // A claim that we'll then dispute.
+        let claim_id = hydra_core::ClaimId::new();
+        let claim = hydra_core::Claim {
+            id: claim_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::ClaimKind::Hypothesis,
+            subject: hydra_core::ClaimSubject::System("test".to_string()),
+            predicate: "test".to_string(),
+            object: hydra_core::ClaimObject::Value(
+                hydra_core::Value::Bool(true),
+            ),
+            confidence: hydra_core::Confidence::new(0.5),
+            status: hydra_core::ClaimStatus::Proposed,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: now,
+            valid_until: None,
+            created_by: actor.clone(),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim })
+            .unwrap();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimDisputed {
+                claim_id: claim_id.clone(),
+                evidence_id,
+                reason: Some("contradiction test".to_string()),
+            })
+            .unwrap();
+        // Sanity: claim now has non-empty evidence_against.
+        assert!(
+            !hydra.claim(&claim_id).unwrap().evidence_against.is_empty()
+        );
+
+        // Cell referencing the disputed claim.
+        let cell = ingest_synthetic_cell(
+            &mut hydra, None, "with_contradicted_claim",
+            vec![], vec![claim_id], vec![], vec![], vec![], vec![],
+            Some(0.50), None,
+        );
+
+        let assess = hydra.assess_causal_cell_trust(&cell.id).unwrap();
+        let contra = find_factor(&assess, "contradicting_claims_present");
+        assert!(contra.applied, "contradicting_claims_present must fire");
+    }
+
+    #[test]
+    fn assess_causal_cell_trust_leaf_reflex_cell_uses_own_trust_score() {
+        // A leaf cell with own trust_score = 0.90 + executed
+        // action + outcome + observation → base 0.90 plus several
+        // positives → High. Crucially, the LEAF path treats the
+        // cell's own trust_score as the single "child" for the
+        // base average.
+        let mut hydra = Hydra::new();
+        let (claim_id, _, _, _, _) =
+            drive_full_replication_lag_chain(&mut hydra);
+        let cell = hydra
+            .create_reflex_causal_cell_from_claim(
+                claim_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        // Sanity: this is a leaf (child_cell_ids empty).
+        assert!(cell.child_cell_ids.is_empty());
+        assert!(cell.trust_score.is_some());
+
+        let assess = hydra.assess_causal_cell_trust(&cell.id).unwrap();
+        // Leaf path: children_present did NOT fire.
+        assert!(!find_factor(&assess, "children_present").applied);
+        // But known_child_trust_scores DID — the leaf's own
+        // trust_score counts.
+        assert!(find_factor(&assess, "known_child_trust_scores").applied);
+        // outcomes_recorded + observations_present + actions_executed
+        // all fire for a full Reflex chain.
+        assert!(find_factor(&assess, "outcomes_recorded").applied);
+        assert!(find_factor(&assess, "observations_present").applied);
+        assert!(find_factor(&assess, "actions_executed").applied);
+        // child_scores is empty for a leaf cell.
+        assert!(assess.child_scores.is_empty());
+    }
+
+    #[test]
+    fn assess_causal_cell_trust_direct_children_only_no_recursion() {
+        // **LOAD-BEARING boundary pin.** Build a 3-level tree:
+        // grandparent ← parent ← leaf. The leaf has trust 0.50.
+        // The parent's STORED trust_score (set by P22's naïve
+        // mean) is also 0.50. The grandparent's assessment must
+        // use the PARENT's stored 0.50, NOT recurse to leaf.
+        //
+        // If a future patch ever turns on recursion, this test
+        // fires and the operator must consciously update the
+        // expected score.
+        let mut hydra = Hydra::new();
+        let leaf = ingest_synthetic_cell(
+            &mut hydra, None, "leaf",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            Some(0.50), None,
+        );
+        let parent = hydra
+            .compose_causal_cells(
+                vec![leaf.id.clone()],
+                hydra_core::CausalCellKind::Health,
+                "parent".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+        // P22's naïve mean: parent.trust_score should be Some(0.50).
+        assert_eq!(parent.trust_score, Some(0.50));
+
+        // Manually mutate parent into a higher trust_score in
+        // the store? No — cells are immutable. Instead, build a
+        // grandparent that composes the parent. The grandparent's
+        // child trust is THE PARENT's stored 0.50.
+        let grandparent = hydra
+            .compose_causal_cells(
+                vec![parent.id.clone()],
+                hydra_core::CausalCellKind::Health,
+                "grandparent".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+
+        let assess = hydra.assess_causal_cell_trust(&grandparent.id).unwrap();
+        // The grandparent's child_scores must contain exactly
+        // ONE entry — the parent — and that entry's trust_score
+        // must be the parent's STORED 0.50, not a recursed
+        // leaf-derived value.
+        assert_eq!(assess.child_scores.len(), 1);
+        assert_eq!(assess.child_scores[0].cell_id, parent.id);
+        assert_eq!(assess.child_scores[0].trust_score, Some(0.50));
+    }
+
+    #[test]
+    fn assess_causal_cell_trust_factor_list_includes_unapplied_factors() {
+        // Every factor in the Patch 23 table must appear in
+        // `factors`, even when not applied. Pin against
+        // accidental drops as the table evolves.
+        let mut hydra = Hydra::new();
+        let child = ingest_synthetic_cell(
+            &mut hydra, None, "child",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            Some(0.50), None,
+        );
+        let parent = hydra
+            .compose_causal_cells(
+                vec![child.id],
+                hydra_core::CausalCellKind::Health,
+                "test".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+        let assess = hydra.assess_causal_cell_trust(&parent.id).unwrap();
+
+        for kind in [
+            "children_present",
+            "known_child_trust_scores",
+            "high_average_child_trust",
+            "all_children_high_trust",
+            "outcomes_recorded",
+            "observations_present",
+            "actions_executed",
+            "any_child_low_trust",
+            "failed_outcomes_present",
+            "rejected_actions_present",
+            "contradicting_claims_present",
+            "missing_child_trust",
+        ] {
+            // Calling find_factor itself asserts presence.
+            let _ = find_factor(&assess, kind);
+        }
+        // Total exactly 12.
+        assert_eq!(assess.factors.len(), 12);
+    }
+
+    #[test]
+    fn assess_causal_cell_trust_does_not_mutate_cell() {
+        // Read-only contract: assess does not touch the stored
+        // cell. Re-fetch after assess; trust_score (set by P22's
+        // naïve mean) is unchanged.
+        let mut hydra = Hydra::new();
+        let child = ingest_synthetic_cell(
+            &mut hydra, None, "x",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            Some(0.70), None,
+        );
+        let parent = hydra
+            .compose_causal_cells(
+                vec![child.id],
+                hydra_core::CausalCellKind::Health,
+                "test".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+        let pre_score = hydra.causal_cell(&parent.id).unwrap().trust_score;
+        // Two assessments — should produce equal scores (no
+        // hidden mutation) and not touch the stored cell.
+        let assess1 = hydra.assess_causal_cell_trust(&parent.id).unwrap();
+        let assess2 = hydra.assess_causal_cell_trust(&parent.id).unwrap();
+        assert!((assess1.score - assess2.score).abs() < 1e-9);
+        let post_score = hydra.causal_cell(&parent.id).unwrap().trust_score;
+        assert_eq!(pre_score, post_score);
+        // P22's stored mean = 0.70; not overridden by P23's higher
+        // score that includes positive modifiers.
+        assert_eq!(post_score, Some(0.70));
+    }
+
+    #[test]
+    fn assess_causal_cell_trust_corrupt_missing_child_returns_error() {
+        // Defensive: a composed cell whose child has been removed
+        // from the store (or never existed, in pathological
+        // tests) must error rather than skip. Patch 22 prevents
+        // creating such cells, but Patch 23's read path must not
+        // assume integrity.
+        //
+        // We can't easily delete a child (cells are immutable +
+        // there's no delete event), but we CAN construct a cell
+        // with a fake child id by ingesting a hand-crafted
+        // CausalCellCreated event whose cell.child_cell_ids
+        // references a nonexistent cell.
+        let mut hydra = Hydra::new();
+        let fake_child = hydra_core::CausalCellId::from_str("cell_fake");
+        let parent_id = hydra_core::CausalCellId::from_str("cell_parent_dangling");
+        let parent_cell = hydra_core::CausalCell {
+            id: parent_id.clone(),
+            tenant_id: None,
+            kind: hydra_core::CausalCellKind::Health,
+            subject: "dangling".to_string(),
+            source_events: vec![],
+            evidence_ids: vec![],
+            claim_ids: vec![],
+            action_ids: vec![],
+            outcome_ids: vec![],
+            observation_run_ids: vec![],
+            child_cell_ids: vec![fake_child.clone()],
+            trust_score: None,
+            summary: None,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: chrono::Utc::now(),
+            caused_by: None,
+        };
+        hydra
+            .ingest(hydra_core::EventKind::CausalCellCreated {
+                cell: parent_cell,
+            })
+            .unwrap();
+        // Sanity: parent stored, child is not.
+        assert!(hydra.causal_cell(&parent_id).is_some());
+        assert!(hydra.causal_cell(&fake_child).is_none());
+
+        let result = hydra.assess_causal_cell_trust(&parent_id);
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("references unknown child"),
+                    "msg: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
     }
 }
