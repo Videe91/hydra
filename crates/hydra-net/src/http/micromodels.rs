@@ -52,8 +52,8 @@ use axum::{
     Json, Router,
 };
 use hydra_core::{
-    ActionId, ActorId, ClaimId, EventId, EvidenceId, MicroModelPrediction,
-    ReplicaId,
+    ActionId, ActorId, CausalCellId, ClaimId, EventId, EvidenceId,
+    MicroModelPrediction, ReplicaId,
 };
 use hydra_engine::micromodels::{
     ActionFailureRateLevel, AgentLoopStormLevel, AnomalyLevel,
@@ -160,6 +160,13 @@ pub struct EvaluateCommitRateResponse {
     /// One-element vec for Patch 5 Critical-tier (Notify only).
     /// Patch 6+ may add `snapshot_now`/`throttle_agents` here.
     pub action_ids: Vec<ActionId>,
+    /// Patch 28 — id of the auto-created Reflex `CausalCell`
+    /// minted from this reflex chain. `None` when no claim was
+    /// proposed (WarmingUp/Normal level or prediction_only mode).
+    /// Callers can immediately follow up with
+    /// `GET /causal-cells/<id>` (Patch 25) or
+    /// `GET /trust/cells/<id>` (Patch 24).
+    pub causal_cell_id: Option<CausalCellId>,
     /// Deterministic prose summary keyed off `(level, has_claim,
     /// has_action)`. Agents can pattern-match on it safely.
     pub summary: String,
@@ -254,6 +261,10 @@ struct EvaluationOutcome {
     claim_id: Option<ClaimId>,
     claim_event_id: Option<EventId>,
     action_ids: Vec<ActionId>,
+    /// Patch 28 — auto-created Reflex cell id. `None` for
+    /// prediction_only mode AND for claim/action modes that
+    /// didn't fire a claim (WarmingUp / Normal).
+    causal_cell_id: Option<CausalCellId>,
 }
 
 impl EvaluationOutcome {
@@ -271,6 +282,7 @@ impl EvaluationOutcome {
             claim_id: None,
             claim_event_id: None,
             action_ids: vec![],
+            causal_cell_id: None,
         }
     }
 
@@ -286,6 +298,7 @@ impl EvaluationOutcome {
             claim_id: assessment.claim_id,
             claim_event_id: assessment.claim_event_id,
             action_ids: vec![],
+            causal_cell_id: assessment.causal_cell_id,
         }
     }
 
@@ -310,6 +323,7 @@ impl EvaluationOutcome {
             claim_id: assessment.claim_id,
             claim_event_id: assessment.claim_event_id,
             action_ids: assessment.action_ids,
+            causal_cell_id: assessment.causal_cell_id,
         }
     }
 }
@@ -330,6 +344,7 @@ fn build_response(outcome: EvaluationOutcome) -> EvaluateCommitRateResponse {
         claim_id: outcome.claim_id,
         claim_event_id: outcome.claim_event_id,
         action_ids: outcome.action_ids,
+        causal_cell_id: outcome.causal_cell_id,
         summary,
         lineage_url,
     }
@@ -410,6 +425,10 @@ pub struct EvaluateReplicationLagResponse {
     /// One-element vec for Warning/Critical (Notify only). Patch
     /// 16+ may add `quarantine_peer`/`pause_writes_to_peer` here.
     pub action_ids: Vec<ActionId>,
+    /// Patch 28 — id of the auto-created Reflex `CausalCell`
+    /// minted from this reflex chain. See `EvaluateCommitRateResponse`
+    /// for the semantics. `None` when no claim was proposed.
+    pub causal_cell_id: Option<CausalCellId>,
     /// Peer this evaluation targeted. Echoed from the request so
     /// callers don't have to keep a side mapping when fanning.
     pub peer_id: ReplicaId,
@@ -520,6 +539,8 @@ struct ReplicationLagEvaluationOutcome {
     claim_id: Option<ClaimId>,
     claim_event_id: Option<EventId>,
     action_ids: Vec<ActionId>,
+    /// Patch 28 — auto-created Reflex cell id.
+    causal_cell_id: Option<CausalCellId>,
     peer_id: ReplicaId,
 }
 
@@ -539,6 +560,7 @@ impl ReplicationLagEvaluationOutcome {
             claim_id: None,
             claim_event_id: None,
             action_ids: vec![],
+            causal_cell_id: None,
             peer_id,
         }
     }
@@ -555,6 +577,7 @@ impl ReplicationLagEvaluationOutcome {
             claim_id: assessment.claim_id,
             claim_event_id: assessment.claim_event_id,
             action_ids: vec![],
+            causal_cell_id: assessment.causal_cell_id,
             peer_id: assessment.peer_id,
         }
     }
@@ -574,6 +597,7 @@ impl ReplicationLagEvaluationOutcome {
             claim_id: assessment.claim_id,
             claim_event_id: assessment.claim_event_id,
             action_ids: assessment.action_ids,
+            causal_cell_id: assessment.causal_cell_id,
             peer_id: assessment.peer_id,
         }
     }
@@ -597,6 +621,7 @@ fn build_replication_lag_response(
         claim_id: outcome.claim_id,
         claim_event_id: outcome.claim_event_id,
         action_ids: outcome.action_ids,
+        causal_cell_id: outcome.causal_cell_id,
         peer_id: outcome.peer_id,
         summary,
         lineage_url,
@@ -672,6 +697,10 @@ pub struct EvaluateAgentLoopStormResponse {
     pub claim_event_id: Option<EventId>,
     /// One-element vec on Warning/Critical (Notify only).
     pub action_ids: Vec<ActionId>,
+    /// Patch 28 — id of the auto-created Reflex `CausalCell`
+    /// minted from this reflex chain. `None` when no claim was
+    /// proposed.
+    pub causal_cell_id: Option<CausalCellId>,
     /// Deterministic prose summary keyed off `(level, has_claim,
     /// has_action)`.
     pub summary: String,
@@ -748,6 +777,8 @@ struct AgentLoopStormEvaluationOutcome {
     claim_id: Option<ClaimId>,
     claim_event_id: Option<EventId>,
     action_ids: Vec<ActionId>,
+    /// Patch 28 — auto-created Reflex cell id.
+    causal_cell_id: Option<CausalCellId>,
 }
 
 impl AgentLoopStormEvaluationOutcome {
@@ -765,6 +796,7 @@ impl AgentLoopStormEvaluationOutcome {
             claim_id: None,
             claim_event_id: None,
             action_ids: vec![],
+            causal_cell_id: None,
         }
     }
 
@@ -780,6 +812,7 @@ impl AgentLoopStormEvaluationOutcome {
             claim_id: assessment.claim_id,
             claim_event_id: assessment.claim_event_id,
             action_ids: vec![],
+            causal_cell_id: assessment.causal_cell_id,
         }
     }
 
@@ -795,6 +828,7 @@ impl AgentLoopStormEvaluationOutcome {
             claim_id: assessment.claim_id,
             claim_event_id: assessment.claim_event_id,
             action_ids: assessment.action_ids,
+            causal_cell_id: assessment.causal_cell_id,
         }
     }
 }
@@ -817,6 +851,7 @@ fn build_agent_loop_storm_response(
         claim_id: outcome.claim_id,
         claim_event_id: outcome.claim_event_id,
         action_ids: outcome.action_ids,
+        causal_cell_id: outcome.causal_cell_id,
         summary,
         lineage_url,
     }
@@ -888,6 +923,10 @@ pub struct EvaluateActionFailureRateResponse {
     pub claim_id: Option<ClaimId>,
     pub claim_event_id: Option<EventId>,
     pub action_ids: Vec<ActionId>,
+    /// Patch 28 — id of the auto-created Reflex `CausalCell`
+    /// minted from this reflex chain. `None` when no claim was
+    /// proposed.
+    pub causal_cell_id: Option<CausalCellId>,
     pub summary: String,
     pub lineage_url: String,
 }
@@ -966,6 +1005,8 @@ struct ActionFailureRateEvaluationOutcome {
     claim_id: Option<ClaimId>,
     claim_event_id: Option<EventId>,
     action_ids: Vec<ActionId>,
+    /// Patch 28 — auto-created Reflex cell id.
+    causal_cell_id: Option<CausalCellId>,
 }
 
 impl ActionFailureRateEvaluationOutcome {
@@ -983,6 +1024,7 @@ impl ActionFailureRateEvaluationOutcome {
             claim_id: None,
             claim_event_id: None,
             action_ids: vec![],
+            causal_cell_id: None,
         }
     }
 
@@ -998,6 +1040,7 @@ impl ActionFailureRateEvaluationOutcome {
             claim_id: assessment.claim_id,
             claim_event_id: assessment.claim_event_id,
             action_ids: vec![],
+            causal_cell_id: assessment.causal_cell_id,
         }
     }
 
@@ -1013,6 +1056,7 @@ impl ActionFailureRateEvaluationOutcome {
             claim_id: assessment.claim_id,
             claim_event_id: assessment.claim_event_id,
             action_ids: assessment.action_ids,
+            causal_cell_id: assessment.causal_cell_id,
         }
     }
 }
@@ -1035,6 +1079,7 @@ fn build_action_failure_rate_response(
         claim_id: outcome.claim_id,
         claim_event_id: outcome.claim_event_id,
         action_ids: outcome.action_ids,
+        causal_cell_id: outcome.causal_cell_id,
         summary,
         lineage_url,
     }
@@ -1904,5 +1949,174 @@ mod tests {
             true
         )
         .contains("Notify action proposed"));
+    }
+
+    // === Patch 28 — `causal_cell_id` field on every evaluate response ===
+    //
+    // Each test drives one model into Critical (so a claim
+    // fires), POSTs the corresponding evaluate endpoint, and
+    // pins that `causal_cell_id` is Some — i.e. the engine
+    // auto-created a Reflex cell during the bridge call.
+    // Round-trip is also pinned: the returned id must resolve
+    // via the QueryService back to a real `CausalCell`.
+
+    #[tokio::test]
+    async fn commit_rate_action_response_includes_causal_cell_id() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        prime_critical(&runtime).await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(request_body(serde_json::json!({
+                "requested_by": actor(),
+                "mode": "action",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateCommitRateResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        let cell_id = body
+            .causal_cell_id
+            .as_ref()
+            .expect("expected causal_cell_id");
+        // Auto-created cell exists in the store with the right shape.
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        let cell = hydra
+            .causal_cell(cell_id)
+            .expect("cell resolves in store");
+        assert_eq!(cell.kind, hydra_core::CausalCellKind::Reflex);
+        assert_eq!(cell.subject, "hydra/under_abnormal_load");
+    }
+
+    #[tokio::test]
+    async fn replication_lag_response_includes_causal_cell_id() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_p28_http");
+        register_peer_with_lag(&runtime, &peer_id, Some(500)).await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(replication_lag_request(serde_json::json!({
+                "requested_by": actor(),
+                "peer_id": peer_id.as_str(),
+                "mode": "action",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateReplicationLagResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        let cell_id =
+            body.causal_cell_id.as_ref().expect("expected causal_cell_id");
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        let cell = hydra.causal_cell(cell_id).expect("cell in store");
+        assert_eq!(cell.kind, hydra_core::CausalCellKind::Reflex);
+        assert_eq!(cell.subject, "hydra.replication/replica_lagging");
+    }
+
+    #[tokio::test]
+    async fn agent_loop_storm_response_includes_causal_cell_id() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        drive_storm(&runtime, 60, "actor_data_quality_agent_p28").await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(storm_request(serde_json::json!({
+                "requested_by": actor(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateAgentLoopStormResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        let cell_id =
+            body.causal_cell_id.as_ref().expect("expected causal_cell_id");
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        let cell = hydra.causal_cell(cell_id).expect("cell in store");
+        assert_eq!(cell.subject, "hydra.agents/agent_loop_storm");
+    }
+
+    #[tokio::test]
+    async fn action_failure_rate_response_includes_causal_cell_id() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        // 5 successful + 10 failed → 10 failures >= critical_failure_count.
+        drive_action_outcomes_via_http(&runtime, 5, 10).await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(failure_rate_request(serde_json::json!({
+                "requested_by": actor(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateActionFailureRateResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        let cell_id =
+            body.causal_cell_id.as_ref().expect("expected causal_cell_id");
+        let hydra = runtime.hydra();
+        let hydra = hydra.read().await;
+        let cell = hydra.causal_cell(cell_id).expect("cell in store");
+        assert_eq!(
+            cell.subject,
+            "hydra.actions/action_failure_rate_high"
+        );
+    }
+
+    #[tokio::test]
+    async fn prediction_only_response_has_null_causal_cell_id() {
+        // prediction_only mode never auto-creates a cell —
+        // there's no claim chain to wrap. Confirmed at the HTTP
+        // boundary so a refactor that accidentally populates the
+        // field for prediction_only fires.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        prime_critical(&runtime).await;
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(request_body(serde_json::json!({
+                "requested_by": actor(),
+                "mode": "prediction_only",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateCommitRateResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "critical");
+        // Prediction landed but no claim / no cell.
+        assert!(body.claim_id.is_none());
+        assert!(body.causal_cell_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn warmup_response_has_null_causal_cell_id() {
+        // LOAD-BEARING wire-side pin: claim mode WITHOUT firing
+        // (model still warming up) → no claim → no cell. The
+        // engine pin (`commit_rate_claim_mode_warmup_returns_no_cell`)
+        // covers this in Rust; the HTTP pin confirms the field
+        // serializes as `null` on the wire too.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        // No priming → first eval is WarmingUp.
+        let app = micromodels_router(runtime.clone());
+        let response = app
+            .oneshot(request_body(serde_json::json!({
+                "requested_by": actor(),
+                "mode": "claim",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: EvaluateCommitRateResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.level, "warming_up");
+        assert!(body.claim_id.is_none());
+        assert!(
+            body.causal_cell_id.is_none(),
+            "warmup must serialize causal_cell_id as null"
+        );
     }
 }

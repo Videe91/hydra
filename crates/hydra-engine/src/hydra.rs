@@ -2958,6 +2958,51 @@ impl Hydra {
         )
     }
 
+    /// Patch 28 — auto-create a `Reflex` CausalCell from a
+    /// freshly-proposed model claim, if one exists.
+    ///
+    /// Trigger rule: `claim_id.is_some()` → build the cell;
+    /// `None` → return `Ok(None)`. The MicroModel bridge methods
+    /// (`_and_propose_claim` / `_and_propose_action`) call this
+    /// AFTER the claim (and, in action mode, the action) have
+    /// been ingested. The actual chain walk + cell construction
+    /// is delegated to Patch 21's
+    /// `create_reflex_causal_cell_from_claim` — this helper
+    /// only adds the `Option` plumbing so each bridge method
+    /// shrinks to one line at the callsite.
+    ///
+    /// **Snapshot semantics**: the cell captures the reflex
+    /// state at creation time. Action-mode cells include the
+    /// proposed action ID (action exists before cell minted).
+    /// Execution, outcomes, and observations land later — they
+    /// do NOT enrich the cell post-hoc (cells are immutable in
+    /// v0). Trust assessment via Patch 23
+    /// `assess_causal_cell_trust` is computed on-demand, so
+    /// `actions_executed`, `outcomes_recorded` etc. factors
+    /// always read CURRENT engine state regardless of when the
+    /// cell was minted.
+    ///
+    /// **Fail-fast**: a `QueryError` from the underlying P21
+    /// helper bubbles up. In practice this is unreachable here
+    /// — the claim was just ingested + the prediction event was
+    /// just logged — but if engine state IS inconsistent, the
+    /// caller (typically a micromodel bridge) should surface
+    /// that loudly rather than silently swallow it.
+    fn maybe_create_reflex_cell(
+        &mut self,
+        claim_id: &Option<hydra_core::ClaimId>,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<Option<hydra_core::CausalCellId>> {
+        match claim_id {
+            Some(id) => {
+                let cell =
+                    self.create_reflex_causal_cell_from_claim(id.clone(), actor)?;
+                Ok(Some(cell.id))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Patch 23 — fold trust over a CausalCell.
     ///
     /// Computes a `CausalCellTrustAssessment` for `cell_id`,
@@ -4529,8 +4574,13 @@ impl Hydra {
             &prediction,
             prediction_event_id.clone(),
             &parts,
-            actor,
+            actor.clone(),
         )?;
+
+        // Patch 28 — auto-create the Reflex cell when a claim
+        // was created. Walks chain via P21's helper.
+        let claim_id = bridge.as_ref().map(|b| b.claim_id.clone());
+        let causal_cell_id = self.maybe_create_reflex_cell(&claim_id, actor)?;
 
         Ok(crate::micromodels::CommitRateAnomalyAssessment {
             level: output.level,
@@ -4538,8 +4588,9 @@ impl Hydra {
             prediction_event_id,
             evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
             evidence_event_id: bridge.as_ref().map(|b| b.evidence_event_id.clone()),
-            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_id,
             claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
+            causal_cell_id,
         })
     }
 
@@ -4630,21 +4681,29 @@ impl Hydra {
                     &prediction,
                     b,
                     &parts,
-                    actor,
+                    actor.clone(),
                 )?
             {
                 action_ids.push(action_id);
             }
         }
 
+        // Patch 28 — LOAD-BEARING ordering: cell creation happens
+        // AFTER action proposal so `cell.action_ids` includes the
+        // newly-proposed action. Same actor as the rest of the
+        // chain (model's auto-register actor in production paths).
+        let claim_id = bridge.as_ref().map(|b| b.claim_id.clone());
+        let causal_cell_id = self.maybe_create_reflex_cell(&claim_id, actor)?;
+
         Ok(crate::micromodels::CommitRateAnomalyActionAssessment {
             level: output.level,
             prediction,
             prediction_event_id,
             evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
-            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_id,
             claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
             action_ids,
+            causal_cell_id,
         })
     }
 
@@ -4843,8 +4902,12 @@ impl Hydra {
             &prediction,
             prediction_event_id.clone(),
             &parts,
-            actor,
+            actor.clone(),
         )?;
+
+        // Patch 28 — auto-create Reflex cell when claim exists.
+        let claim_id = bridge.as_ref().map(|b| b.claim_id.clone());
+        let causal_cell_id = self.maybe_create_reflex_cell(&claim_id, actor)?;
 
         Ok(crate::micromodels::ReplicationLagAnomalyAssessment {
             level: output.level,
@@ -4852,8 +4915,9 @@ impl Hydra {
             prediction_event_id,
             evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
             evidence_event_id: bridge.as_ref().map(|b| b.evidence_event_id.clone()),
-            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_id,
             claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
+            causal_cell_id,
             peer_id,
         })
     }
@@ -4914,21 +4978,26 @@ impl Hydra {
                     &prediction,
                     b,
                     &parts,
-                    actor,
+                    actor.clone(),
                 )?
             {
                 action_ids.push(action_id);
             }
         }
 
+        // Patch 28 — LOAD-BEARING ordering: cell after action.
+        let claim_id = bridge.as_ref().map(|b| b.claim_id.clone());
+        let causal_cell_id = self.maybe_create_reflex_cell(&claim_id, actor)?;
+
         Ok(crate::micromodels::ReplicationLagAnomalyActionAssessment {
             level: output.level,
             prediction,
             prediction_event_id,
             evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
-            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_id,
             claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
             action_ids,
+            causal_cell_id,
             peer_id,
         })
     }
@@ -5078,8 +5147,12 @@ impl Hydra {
             &prediction,
             prediction_event_id.clone(),
             &parts,
-            actor,
+            actor.clone(),
         )?;
+
+        // Patch 28 — auto-create Reflex cell when claim exists.
+        let claim_id = bridge.as_ref().map(|b| b.claim_id.clone());
+        let causal_cell_id = self.maybe_create_reflex_cell(&claim_id, actor)?;
 
         Ok(crate::micromodels::AgentLoopStormAssessment {
             level: output.level,
@@ -5089,8 +5162,9 @@ impl Hydra {
             evidence_event_id: bridge
                 .as_ref()
                 .map(|b| b.evidence_event_id.clone()),
-            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_id,
             claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
+            causal_cell_id,
         })
     }
 
@@ -5128,21 +5202,26 @@ impl Hydra {
                     &prediction,
                     b,
                     &parts,
-                    actor,
+                    actor.clone(),
                 )?
             {
                 action_ids.push(action_id);
             }
         }
 
+        // Patch 28 — LOAD-BEARING ordering: cell after action.
+        let claim_id = bridge.as_ref().map(|b| b.claim_id.clone());
+        let causal_cell_id = self.maybe_create_reflex_cell(&claim_id, actor)?;
+
         Ok(crate::micromodels::AgentLoopStormActionAssessment {
             level: output.level,
             prediction,
             prediction_event_id,
             evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
-            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_id,
             claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
             action_ids,
+            causal_cell_id,
         })
     }
 
@@ -5321,8 +5400,12 @@ impl Hydra {
             &prediction,
             prediction_event_id.clone(),
             &parts,
-            actor,
+            actor.clone(),
         )?;
+
+        // Patch 28 — auto-create Reflex cell when claim exists.
+        let claim_id = bridge.as_ref().map(|b| b.claim_id.clone());
+        let causal_cell_id = self.maybe_create_reflex_cell(&claim_id, actor)?;
 
         Ok(crate::micromodels::ActionFailureRateAssessment {
             level: output.level,
@@ -5332,8 +5415,9 @@ impl Hydra {
             evidence_event_id: bridge
                 .as_ref()
                 .map(|b| b.evidence_event_id.clone()),
-            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_id,
             claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
+            causal_cell_id,
         })
     }
 
@@ -5371,21 +5455,26 @@ impl Hydra {
                     &prediction,
                     b,
                     &parts,
-                    actor,
+                    actor.clone(),
                 )?
             {
                 action_ids.push(action_id);
             }
         }
 
+        // Patch 28 — LOAD-BEARING ordering: cell after action.
+        let claim_id = bridge.as_ref().map(|b| b.claim_id.clone());
+        let causal_cell_id = self.maybe_create_reflex_cell(&claim_id, actor)?;
+
         Ok(crate::micromodels::ActionFailureRateActionAssessment {
             level: output.level,
             prediction,
             prediction_event_id,
             evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
-            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_id,
             claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
             action_ids,
+            causal_cell_id,
         })
     }
 
@@ -16281,6 +16370,13 @@ mod sprint1_tests {
         // so the Patch 20 snapshot round-trip applies directly.
         // Pin it once for Patch 21 so the integration stays
         // honest as Patch 22+ adds composition.
+        //
+        // Patch 28 note: `drive_full_replication_lag_chain` now
+        // auto-creates a Reflex cell via the bridge — the
+        // explicit `create_reflex_causal_cell_from_claim` call
+        // below mints a SECOND cell for the same claim. Both
+        // must round-trip; the explicitly-tested one is
+        // `cell_id`.
         let mut hydra = Hydra::new();
         let (claim_id, _, _, _, _) =
             drive_full_replication_lag_chain(&mut hydra);
@@ -16292,18 +16388,24 @@ mod sprint1_tests {
             .unwrap();
         let cell_id = cell.id.clone();
 
-        // Snapshot.
+        // Snapshot. Two cells: 1 auto-created by P28 + 1
+        // explicit. Snapshot manifest counts both.
         let manifest = hydra
             .snapshot(hydra_core::ActorId::from_str("actor_ops"))
             .unwrap();
-        assert_eq!(manifest.total_causal_cells, 1);
+        assert_eq!(manifest.total_causal_cells, 2);
         let body = hydra
             .snapshot_store()
             .body(&manifest.id)
             .expect("snapshot body present after take")
             .clone();
-        assert_eq!(body.causal_cells.len(), 1);
-        assert_eq!(body.causal_cells[0].id, cell_id);
+        assert_eq!(body.causal_cells.len(), 2);
+        // The explicit cell is one of the two; order is
+        // HashMap-iteration so just confirm membership.
+        assert!(
+            body.causal_cells.iter().any(|c| c.id == cell_id),
+            "explicit cell missing from snapshot body"
+        );
 
         // Restore by replaying the body's events into a fresh
         // engine (same pattern as the Patch 20 round-trip pin).
@@ -16901,8 +17003,12 @@ mod sprint1_tests {
         let manifest = hydra
             .snapshot(hydra_core::ActorId::from_str("actor_ops"))
             .unwrap();
-        // Three cells in the manifest count: 2 reflex + 1 health.
-        assert_eq!(manifest.total_causal_cells, 3);
+        // Patch 28 note: each replication-lag chain auto-creates
+        // a Reflex cell in addition to the test's explicit
+        // `create_reflex_causal_cell_from_claim` call. So the
+        // manifest carries 5 cells: 2 auto-created Reflex + 2
+        // explicit Reflex + 1 composed Health parent.
+        assert_eq!(manifest.total_causal_cells, 5);
         let body = hydra
             .snapshot_store()
             .body(&manifest.id)
@@ -17343,6 +17449,289 @@ mod sprint1_tests {
             summary.contains("1 of 4 self-health reflexes"),
             "summary: {summary}"
         );
+    }
+
+    // === Patch 28 — auto-create Reflex CausalCells during evaluation ===
+    //
+    // Every actionable model evaluation in claim or action mode
+    // now auto-creates a `CausalCellKind::Reflex` cell from the
+    // proposed claim and exposes its id on the returned
+    // assessment. Non-actionable levels (WarmingUp / Normal)
+    // skip cell creation because no claim was proposed in the
+    // first place.
+
+    /// Drive the built-in commit-rate model into Critical level.
+    /// Replicates the `primed_hydra` + `ingest_signals` pattern
+    /// from the parent test module (`mod tests`); inlined here
+    /// so the `sprint1_tests` module is self-contained for P28.
+    fn drive_commit_rate_to_critical(hydra: &mut Hydra) {
+        let actor = hydra_core::ActorId::from_str("actor_ops");
+        // First evaluate auto-registers the model.
+        let _ = hydra.evaluate_commit_rate_anomaly(actor.clone()).unwrap();
+        // Overwrite the model state with a baseline past warmup
+        // so the next evaluate observes a real anomaly directly.
+        hydra.commit_rate_anomaly_model = Some(
+            crate::micromodels::CommitRateAnomalyModel::with_state(
+                crate::micromodels::CommitRateAnomalyConfig::default(),
+                crate::micromodels::CommitRateAnomalyState {
+                    ewma_rate: 10.0,
+                    ewma_variance: 1.0,
+                    samples_seen: 10,
+                    last_observed_at: Some(chrono::Utc::now()),
+                },
+            ),
+        );
+        // Ingest 100 signals → window count >> baseline → Critical.
+        for i in 0..100u64 {
+            hydra
+                .ingest(hydra_core::EventKind::Signal {
+                    source: hydra_core::NodeId::from_str("test.bridge"),
+                    name: format!("p28-signal-{i}"),
+                    payload: std::collections::HashMap::new(),
+                })
+                .unwrap();
+        }
+    }
+
+    /// Drive the built-in agent-loop-storm model into Critical
+    /// level by ingesting 60 ActionProposed events from one
+    /// non-system actor (`ingest_n_action_proposed` is the
+    /// existing helper at module scope).
+    fn drive_agent_loop_storm_to_critical(hydra: &mut Hydra) {
+        let agent = hydra_core::ActorId::from_str(
+            "actor_data_quality_agent_p28",
+        );
+        ingest_n_action_proposed(hydra, 60, &agent);
+    }
+
+    /// Drive the built-in action-failure-rate model into Critical
+    /// level via the existing `drive_action_outcomes` helper:
+    /// 5 successful + 10 failed = 15 actions, 10 failures
+    /// >= critical_failure_count (10).
+    fn drive_action_failure_rate_to_critical(hydra: &mut Hydra) {
+        drive_action_outcomes(hydra, 5, 10);
+    }
+
+    #[test]
+    fn commit_rate_action_mode_auto_creates_reflex_cell() {
+        // Drive commit-rate to Critical via the test injector, run
+        // the action-mode bridge, and confirm `causal_cell_id` is
+        // populated on the assessment AND the cell exists in the
+        // store with the expected shape.
+        let mut hydra = Hydra::new();
+        drive_commit_rate_to_critical(&mut hydra);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        // Model fired → claim + action + cell exist.
+        assert!(assessment.claim_id.is_some(), "expected claim");
+        assert!(!assessment.action_ids.is_empty(), "expected action");
+        let cell_id = assessment
+            .causal_cell_id
+            .clone()
+            .expect("expected causal_cell_id");
+        let cell = hydra.causal_cell(&cell_id).expect("cell in store");
+        assert_eq!(cell.kind, hydra_core::CausalCellKind::Reflex);
+        assert_eq!(cell.subject, "hydra/under_abnormal_load");
+    }
+
+    #[test]
+    fn commit_rate_claim_mode_auto_creates_reflex_cell() {
+        // Claim mode (no action stage). Cell still gets created
+        // because a claim exists. `cell.action_ids` is empty
+        // because no action was proposed in claim mode.
+        let mut hydra = Hydra::new();
+        drive_commit_rate_to_critical(&mut hydra);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert!(assessment.claim_id.is_some());
+        let cell_id = assessment.causal_cell_id.clone().unwrap();
+        let cell = hydra.causal_cell(&cell_id).expect("cell in store");
+        assert_eq!(cell.kind, hydra_core::CausalCellKind::Reflex);
+        // Claim mode → no action → cell has empty action_ids.
+        assert!(
+            cell.action_ids.is_empty(),
+            "claim mode cell shouldn't carry action ids: {:?}",
+            cell.action_ids
+        );
+    }
+
+    #[test]
+    fn commit_rate_claim_mode_warmup_returns_no_cell() {
+        // LOAD-BEARING warmup pin. Fresh model → WarmingUp → no
+        // claim → no cell. The rule is "no claim → no cell",
+        // NOT "claim mode always creates a cell".
+        let mut hydra = Hydra::new();
+        // No injector → samples_seen = 0 → WarmingUp.
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert!(assessment.claim_id.is_none(), "expected no claim");
+        assert!(
+            assessment.causal_cell_id.is_none(),
+            "warmup must not auto-create a cell"
+        );
+    }
+
+    #[test]
+    fn replication_lag_action_mode_auto_creates_reflex_cell() {
+        let mut hydra = Hydra::new();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_p28");
+        register_peer_with_lag(
+            &mut hydra,
+            &peer_id,
+            Some((500, chrono::Utc::now())),
+        );
+        let assessment = hydra
+            .evaluate_replication_lag_anomaly_and_propose_action(
+                peer_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert!(assessment.claim_id.is_some());
+        assert!(!assessment.action_ids.is_empty());
+        let cell_id = assessment.causal_cell_id.clone().unwrap();
+        let cell = hydra.causal_cell(&cell_id).expect("cell in store");
+        assert_eq!(cell.kind, hydra_core::CausalCellKind::Reflex);
+        assert_eq!(cell.subject, "hydra.replication/replica_lagging");
+    }
+
+    #[test]
+    fn agent_loop_storm_action_mode_auto_creates_reflex_cell() {
+        let mut hydra = Hydra::new();
+        drive_agent_loop_storm_to_critical(&mut hydra);
+        let assessment = hydra
+            .evaluate_agent_loop_storm_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert!(assessment.claim_id.is_some());
+        assert!(!assessment.action_ids.is_empty());
+        let cell_id = assessment.causal_cell_id.clone().unwrap();
+        let cell = hydra.causal_cell(&cell_id).expect("cell in store");
+        assert_eq!(cell.kind, hydra_core::CausalCellKind::Reflex);
+        assert_eq!(cell.subject, "hydra.agents/agent_loop_storm");
+    }
+
+    #[test]
+    fn action_failure_rate_action_mode_auto_creates_reflex_cell() {
+        let mut hydra = Hydra::new();
+        drive_action_failure_rate_to_critical(&mut hydra);
+        let assessment = hydra
+            .evaluate_action_failure_rate_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert!(assessment.claim_id.is_some());
+        assert!(!assessment.action_ids.is_empty());
+        let cell_id = assessment.causal_cell_id.clone().unwrap();
+        let cell = hydra.causal_cell(&cell_id).expect("cell in store");
+        assert_eq!(cell.kind, hydra_core::CausalCellKind::Reflex);
+        assert_eq!(
+            cell.subject,
+            "hydra.actions/action_failure_rate_high"
+        );
+    }
+
+    #[test]
+    fn auto_created_cell_has_caused_by_prediction_event() {
+        // The cell's `caused_by` points at the prediction event
+        // — the chain's causal origin. Pinned because Patch 23
+        // trust folding + future lineage UIs rely on this.
+        let mut hydra = Hydra::new();
+        drive_commit_rate_to_critical(&mut hydra);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let cell_id = assessment.causal_cell_id.clone().unwrap();
+        let cell = hydra.causal_cell(&cell_id).unwrap();
+        assert_eq!(cell.caused_by, Some(assessment.prediction_event_id));
+    }
+
+    #[test]
+    fn auto_created_cell_has_trust_score() {
+        // P21's create_reflex_causal_cell_from_claim stamps
+        // `cell.trust_score = Some(assess_claim_trust(claim).score)`.
+        // Auto-creation keeps that contract — pinned so a future
+        // refactor doesn't drop the field silently.
+        let mut hydra = Hydra::new();
+        drive_commit_rate_to_critical(&mut hydra);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let cell_id = assessment.causal_cell_id.clone().unwrap();
+        let cell = hydra.causal_cell(&cell_id).unwrap();
+        assert!(
+            cell.trust_score.is_some(),
+            "auto-created cell must carry a trust score"
+        );
+    }
+
+    #[test]
+    fn auto_created_cell_action_mode_includes_action_id() {
+        // LOAD-BEARING ordering pin. Cell creation must happen
+        // AFTER action proposal so `actions_for_claim(claim_id)`
+        // sees the new action and stamps it into
+        // `cell.action_ids`. If a future refactor reorders cell
+        // creation before action proposal, this test fires.
+        let mut hydra = Hydra::new();
+        drive_commit_rate_to_critical(&mut hydra);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        assert!(!assessment.action_ids.is_empty());
+        let cell_id = assessment.causal_cell_id.clone().unwrap();
+        let cell = hydra.causal_cell(&cell_id).unwrap();
+        // Cell sees the action proposed in the same call.
+        assert_eq!(cell.action_ids, assessment.action_ids);
+    }
+
+    #[test]
+    fn auto_created_cell_kind_is_reflex() {
+        // Sanity: every auto-created cell is `Reflex`-kind, NOT
+        // Health or another variant. The compose-side
+        // (`compose_hydra_health_cell`) explicitly filters by
+        // kind=Reflex; if a future refactor swaps the kind, the
+        // fractal pipeline breaks silently. Pin it here.
+        let mut hydra = Hydra::new();
+        drive_commit_rate_to_critical(&mut hydra);
+        let a = hydra
+            .evaluate_commit_rate_anomaly_and_propose_action(
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let cell_a =
+            hydra.causal_cell(&a.causal_cell_id.clone().unwrap()).unwrap();
+        assert_eq!(cell_a.kind, hydra_core::CausalCellKind::Reflex);
+
+        let peer_id = hydra_core::ReplicaId::from_str("replica_p28_b");
+        register_peer_with_lag(
+            &mut hydra,
+            &peer_id,
+            Some((500, chrono::Utc::now())),
+        );
+        let b = hydra
+            .evaluate_replication_lag_anomaly_and_propose_claim(
+                peer_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let cell_b =
+            hydra.causal_cell(&b.causal_cell_id.clone().unwrap()).unwrap();
+        assert_eq!(cell_b.kind, hydra_core::CausalCellKind::Reflex);
     }
 
     // === Patch 23 — CausalCell trust folding ===

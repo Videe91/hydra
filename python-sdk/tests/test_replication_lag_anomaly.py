@@ -219,3 +219,24 @@ def test_replication_lag_sync_mirror_returns_same_envelope(
     assert assessment.level == "critical"
     assert assessment.peer_id == "replica_b"
     assert assessment.action_ids == ["act_replag_crit"]
+
+
+# === Patch 28 — auto-created causal_cell_id ===
+
+
+@pytest.mark.asyncio
+async def test_replication_lag_assessment_has_causal_cell_id(
+    hy: Hydra, respx_mock: respx.MockRouter
+) -> None:
+    """Patch 28 — Critical replication-lag → engine auto-creates
+    a Reflex cell and the SDK surfaces its id."""
+    body = {**CRITICAL_RESPONSE, "causal_cell_id": "cell_reflex_rl"}
+    respx_mock.post(
+        "https://hydra.test/diagnostics/micromodels/replication-lag/evaluate"
+    ).mock(return_value=httpx.Response(200, json=body))
+
+    assessment = await hy.diagnostics.replication_lag_anomaly(
+        peer_id="replica_b",
+        requested_by="actor_ops",
+    )
+    assert assessment.causal_cell_id == "cell_reflex_rl"

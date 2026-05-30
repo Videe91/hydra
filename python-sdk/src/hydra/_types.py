@@ -1405,6 +1405,11 @@ class CommitRateAnomalyAssessment(BaseModel):
     claim_id: ClaimId | None = None
     claim_event_id: EventId | None = None
     action_ids: list[ActionId] = Field(default_factory=list)
+    # Patch 28 — auto-created Reflex CausalCell id. `None` when
+    # no claim was proposed (WarmingUp/Normal level, or
+    # prediction_only mode). Callers can chain `hy.causal_cell(...)`
+    # or `hy.assess_causal_cell_trust(...)` against it.
+    causal_cell_id: CausalCellId | None = None
     summary: str
     lineage_url: str
 
@@ -1479,6 +1484,9 @@ class ActionFailureRateAssessment(BaseModel):
     claim_id: ClaimId | None = None
     claim_event_id: EventId | None = None
     action_ids: list[ActionId] = Field(default_factory=list)
+    # Patch 28 — auto-created Reflex CausalCell id (None when no
+    # claim was proposed).
+    causal_cell_id: CausalCellId | None = None
     summary: str
     lineage_url: str
 
@@ -1514,6 +1522,9 @@ class AgentLoopStormAssessment(BaseModel):
     claim_id: ClaimId | None = None
     claim_event_id: EventId | None = None
     action_ids: list[ActionId] = Field(default_factory=list)
+    # Patch 28 — auto-created Reflex CausalCell id (None when no
+    # claim was proposed).
+    causal_cell_id: CausalCellId | None = None
     summary: str
     lineage_url: str
 
@@ -1543,6 +1554,9 @@ class ReplicationLagAnomalyAssessment(BaseModel):
     claim_id: ClaimId | None = None
     claim_event_id: EventId | None = None
     action_ids: list[ActionId] = Field(default_factory=list)
+    # Patch 28 — auto-created Reflex CausalCell id (None when no
+    # claim was proposed).
+    causal_cell_id: CausalCellId | None = None
     peer_id: str
     summary: str
     lineage_url: str

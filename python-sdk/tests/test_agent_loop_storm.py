@@ -215,3 +215,23 @@ def test_agent_loop_storm_sync_mirror_returns_same_envelope(
     assert isinstance(assessment, AgentLoopStormAssessment)
     assert assessment.level == "critical"
     assert assessment.action_ids == ["act_storm_crit"]
+
+
+# === Patch 28 — auto-created causal_cell_id ===
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_storm_assessment_has_causal_cell_id(
+    hy: Hydra, respx_mock: respx.MockRouter
+) -> None:
+    """Patch 28 — Critical storm → engine auto-creates a Reflex
+    cell and the SDK surfaces its id."""
+    body = {**CRITICAL_RESPONSE, "causal_cell_id": "cell_reflex_als"}
+    respx_mock.post(
+        "https://hydra.test/diagnostics/micromodels/agent-loop-storm/evaluate"
+    ).mock(return_value=httpx.Response(200, json=body))
+
+    assessment = await hy.diagnostics.agent_loop_storm(
+        requested_by="actor_ops",
+    )
+    assert assessment.causal_cell_id == "cell_reflex_als"

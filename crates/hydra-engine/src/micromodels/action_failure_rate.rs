@@ -250,6 +250,9 @@ pub struct ActionFailureRateAssessment {
     pub evidence_event_id: Option<hydra_core::EventId>,
     pub claim_id: Option<hydra_core::ClaimId>,
     pub claim_event_id: Option<hydra_core::EventId>,
+    /// Patch 28 — auto-created Reflex CausalCell id (if a claim
+    /// was created).
+    pub causal_cell_id: Option<hydra_core::CausalCellId>,
     pub level: ActionFailureRateLevel,
 }
 
@@ -262,6 +265,9 @@ pub struct ActionFailureRateActionAssessment {
     pub claim_id: Option<hydra_core::ClaimId>,
     pub claim_event_id: Option<hydra_core::EventId>,
     pub action_ids: Vec<hydra_core::ActionId>,
+    /// Patch 28 — auto-created Reflex CausalCell id, populated
+    /// AFTER the action is proposed.
+    pub causal_cell_id: Option<hydra_core::CausalCellId>,
     pub level: ActionFailureRateLevel,
 }
 

@@ -288,3 +288,46 @@ def test_commit_rate_evaluate_path_pinned() -> None:
         _paths.diagnostics_micromodels_commit_rate_evaluate_path()
         == "/diagnostics/micromodels/commit-rate/evaluate"
     )
+
+
+# === Patch 28 — auto-created causal_cell_id ===
+
+
+@pytest.mark.asyncio
+async def test_commit_rate_assessment_has_causal_cell_id(
+    hy: Hydra, respx_mock: respx.MockRouter
+) -> None:
+    """Patch 28 — when the model fires and a claim chain lands,
+    the engine auto-creates a Reflex `CausalCell` and surfaces
+    its id in the assessment. The SDK round-trips the field via
+    Pydantic without any extra plumbing."""
+    body = {**CRITICAL_RESPONSE, "causal_cell_id": "cell_reflex_xyz"}
+    respx_mock.post(
+        "https://hydra.test/diagnostics/micromodels/commit-rate/evaluate"
+    ).mock(return_value=httpx.Response(200, json=body))
+
+    assessment = await hy.diagnostics.commit_rate_anomaly(
+        requested_by="actor_ops"
+    )
+    assert isinstance(assessment, CommitRateAnomalyAssessment)
+    assert assessment.causal_cell_id == "cell_reflex_xyz"
+
+
+@pytest.mark.asyncio
+async def test_commit_rate_prediction_only_causal_cell_id_is_none(
+    hy: Hydra, respx_mock: respx.MockRouter
+) -> None:
+    """Patch 28 — `prediction_only` mode never auto-creates a
+    cell. The wire `causal_cell_id` is `null`, the SDK parses
+    it as `None`. Also doubles as the warmup pin since the
+    field default is `None` regardless of why it's absent."""
+    # Wire body omits causal_cell_id entirely → Pydantic default fires.
+    respx_mock.post(
+        "https://hydra.test/diagnostics/micromodels/commit-rate/evaluate"
+    ).mock(return_value=httpx.Response(200, json=WARMUP_RESPONSE))
+
+    assessment = await hy.diagnostics.commit_rate_anomaly(
+        requested_by="actor_ops",
+        mode="prediction_only",
+    )
+    assert assessment.causal_cell_id is None
