@@ -92,6 +92,36 @@ pub const BUILTIN_ACTION_FAILURE_RATE_MODEL_ID: &str =
 pub const BUILTIN_ACTION_FAILURE_RATE_ACTOR_ID: &str =
     "actor_hydra_action_failure_rate_model";
 
+// Patch 26 — `HydraHealthCell` composer.
+//
+// The four self-health reflex CELL subjects. Each subject is
+// the `format_claim_subject(claim)` output for the reflex chain
+// of one built-in self-health model:
+//
+//   commit-rate         → CommitRateAnomaly         (P5  / P16-bridge)
+//   replication-lag     → ReplicationLagAnomaly     (P16)
+//   agent-loop-storm    → AgentLoopStormModel       (P18)
+//   action-failure-rate → ActionFailureRateModel    (P19)
+//
+// These are the canonical fractal-layer inputs to the
+// `hydra.health` parent cell composed by
+// `Hydra::compose_hydra_health_cell`. Indexed parallel to
+// `SELF_HEALTH_REFLEX_LABELS` — the labels appear in the
+// composed cell's summary string verbatim.
+pub(crate) const SELF_HEALTH_REFLEX_SUBJECTS: [&str; 4] = [
+    "hydra/under_abnormal_load",
+    "hydra.replication/replica_lagging",
+    "hydra.agents/agent_loop_storm",
+    "hydra.actions/action_failure_rate_high",
+];
+
+pub(crate) const SELF_HEALTH_REFLEX_LABELS: [&str; 4] = [
+    "commit-rate",
+    "replication-lag",
+    "agent-loop-storm",
+    "action-failure-rate",
+];
+
 pub struct Hydra {
     projection: Projection,
     event_log: EventLog,
@@ -2741,6 +2771,191 @@ impl Hydra {
             caused_by,
         };
         self.create_causal_cell(cell)
+    }
+
+    /// Patch 26 — compose `hydra.health` from the latest self-
+    /// health reflex cells.
+    ///
+    /// The canonical fractal example: walk the four built-in
+    /// self-health reflex subjects (commit-rate, replication-lag,
+    /// agent-loop-storm, action-failure-rate), pick the LATEST
+    /// `Reflex`-kind cell per subject (by `created_at`), and
+    /// compose them into a single `Health`-kind parent cell
+    /// with `subject = "hydra.health"`.
+    ///
+    /// ```text
+    ///   CommitRateReflexCell + ReplicationLagReflexCell +
+    ///   AgentLoopStormReflexCell + ActionFailureRateReflexCell
+    ///     = HydraHealthCell (kind = Health)
+    /// ```
+    ///
+    /// ## Tenant scoping (strict)
+    ///
+    /// Only cells whose `tenant_id` matches `tenant` exactly
+    /// participate. `Some(t)` → only `Some(t)` cells;
+    /// `None` → only `None`-tenanted cells. No mixing. The
+    /// composed parent inherits the same tenant via
+    /// `compose_causal_cells`.
+    ///
+    /// ## Partial composition is OK
+    ///
+    /// If 1–3 of the four self-health subjects have a reflex
+    /// cell in the (tenant-filtered) store, this method composes
+    /// those that exist and records the missing subjects in the
+    /// summary. ZERO found → hard `QueryError` (matches the
+    /// `compose_causal_cells` empty-children contract).
+    ///
+    /// ## Summary
+    ///
+    /// Helper-built and explicit — overrides the
+    /// `compose_causal_cells` fallback. Format:
+    ///
+    /// ```text
+    ///   hydra.health composed from N of 4 self-health reflexes.
+    ///   Present: <comma-separated short labels>.
+    ///   Missing: <comma-separated short labels>.          (omitted if none)
+    /// ```
+    ///
+    /// Labels are the stable short forms from
+    /// `SELF_HEALTH_REFLEX_LABELS`, indexed parallel to the
+    /// subject list, so dashboards and operators see consistent
+    /// short names regardless of which subset fired.
+    ///
+    /// ## Trust
+    ///
+    /// `cell.trust_score` is the Patch 22 arithmetic mean of
+    /// children's stored trust scores (inherited from
+    /// `compose_causal_cells`). For the richer 12-factor
+    /// folding (which considers outcomes / observations / action
+    /// status / contradictions / etc.), call
+    /// `assess_causal_cell_trust(cell.id)` after composing — the
+    /// Patch 23 engine compute runs against the parent + its
+    /// direct children.
+    ///
+    /// ## Precondition (Patch 26 boundary)
+    ///
+    /// The reflex pipeline does NOT auto-create cells today —
+    /// `create_reflex_causal_cell_from_claim` is explicit
+    /// (Patch 21). Production callers must seed reflex cells
+    /// before composing `hydra.health`; otherwise this method
+    /// errors. Auto-emission is a future patch.
+    ///
+    /// ## Boundary (NOT in Patch 26)
+    ///
+    /// - No HTTP, no SDK (Patch 27+)
+    /// - No scheduled auto-fire
+    /// - No recursive trust folding (still direct-children-only)
+    /// - No `CausalCellLinked` event
+    /// - No auto-create during model evaluation
+    pub fn compose_hydra_health_cell(
+        &mut self,
+        actor: hydra_core::ActorId,
+        tenant: Option<hydra_core::TenantId>,
+    ) -> hydra_core::error::Result<hydra_core::CausalCell> {
+        use hydra_core::error::HydraError;
+
+        // 1. Walk the full Reflex set once; per-subject pick the
+        //    cell with the largest `created_at`. The store's
+        //    `cells_by_kind` BTreeSet is ULID-ordered (rough
+        //    proxy for time), but `created_at` is the honest
+        //    selector — explicit comparison handles ULIDs minted
+        //    in the same millisecond AND survives any future
+        //    refactor that swaps ULIDs for another id scheme.
+        let reflex_kind = hydra_core::CausalCellKind::Reflex;
+        let mut latest_per_subject: [Option<&hydra_core::CausalCell>; 4] =
+            [None, None, None, None];
+        for cell in self.causal_cells_by_kind(&reflex_kind) {
+            // Strict tenant match — no `None` cells leak into a
+            // tenanted composition, no tenanted cells leak into
+            // a `None` composition.
+            if cell.tenant_id != tenant {
+                continue;
+            }
+            for (idx, target_subject) in
+                SELF_HEALTH_REFLEX_SUBJECTS.iter().enumerate()
+            {
+                if cell.subject == *target_subject {
+                    match latest_per_subject[idx] {
+                        None => latest_per_subject[idx] = Some(cell),
+                        Some(existing)
+                            if cell.created_at > existing.created_at =>
+                        {
+                            latest_per_subject[idx] = Some(cell);
+                        }
+                        _ => {}
+                    }
+                    break;
+                }
+            }
+        }
+
+        // 2. Collect found ids in subject-order; track present /
+        //    missing labels. Subject-order (not insertion order)
+        //    keeps the composed `child_cell_ids` deterministic
+        //    regardless of how the underlying store iterates.
+        let mut child_cell_ids: Vec<hydra_core::CausalCellId> = Vec::new();
+        let mut present_labels: Vec<&'static str> = Vec::new();
+        let mut missing_labels: Vec<&'static str> = Vec::new();
+        for (idx, slot) in latest_per_subject.iter().enumerate() {
+            match slot {
+                Some(cell) => {
+                    child_cell_ids.push(cell.id.clone());
+                    present_labels.push(SELF_HEALTH_REFLEX_LABELS[idx]);
+                }
+                None => {
+                    missing_labels.push(SELF_HEALTH_REFLEX_LABELS[idx]);
+                }
+            }
+        }
+
+        // 3. Zero found → hard error. Mirrors the
+        //    `compose_causal_cells` empty-children contract; the
+        //    error message names the tenant + expected subjects
+        //    so operators can pattern-match the gap.
+        if child_cell_ids.is_empty() {
+            return Err(HydraError::QueryError(format!(
+                "no self-health reflex cells found for tenant {}; \
+                 expected one or more of {:?}",
+                tenant
+                    .as_ref()
+                    .map(|t| t.as_str())
+                    .unwrap_or("None"),
+                SELF_HEALTH_REFLEX_SUBJECTS,
+            )));
+        }
+
+        // 4. Build explicit summary. Stable labels + present/
+        //    missing breakdown so dashboards can pattern-match.
+        //    When nothing is missing, drop the "Missing:" line.
+        let summary = if missing_labels.is_empty() {
+            format!(
+                "hydra.health composed from {} of 4 self-health reflexes. \
+                 Present: {}.",
+                present_labels.len(),
+                present_labels.join(", "),
+            )
+        } else {
+            format!(
+                "hydra.health composed from {} of 4 self-health reflexes. \
+                 Present: {}. \
+                 Missing: {}.",
+                present_labels.len(),
+                present_labels.join(", "),
+                missing_labels.join(", "),
+            )
+        };
+
+        // 5. Delegate to Patch 22's compose. Tenant equality is
+        //    enforced by `compose_causal_cells` but we already
+        //    filtered to a single tenant in step 1, so the
+        //    inner check is a no-op pass.
+        self.compose_causal_cells(
+            child_cell_ids,
+            hydra_core::CausalCellKind::Health,
+            "hydra.health".to_string(),
+            actor,
+            Some(summary),
+        )
     }
 
     /// Patch 23 — fold trust over a CausalCell.
@@ -16709,6 +16924,425 @@ mod sprint1_tests {
         // Both children resolvable too.
         assert!(fresh.causal_cell(&cell_a.id).is_some());
         assert!(fresh.causal_cell(&cell_b.id).is_some());
+    }
+
+    // === Patch 26 — HydraHealthCell composer ===
+    //
+    // Tests live next to the P22 compose tests above; they share
+    // the `ingest_synthetic_cell` helper for setting up reflex
+    // children. A test-local `ingest_synthetic_cell_at` variant
+    // is used by the "latest wins" pin to control `created_at`
+    // explicitly (the default helper stamps `Utc::now()`).
+
+    /// `ingest_synthetic_cell` variant that takes an explicit
+    /// `created_at`. Used by the Patch 26 latest-per-subject
+    /// pin so the time ordering is deterministic regardless of
+    /// the wall clock or how fast the test runs.
+    fn ingest_synthetic_reflex_cell_at(
+        hydra: &mut Hydra,
+        tenant_id: Option<hydra_core::TenantId>,
+        subject: &str,
+        trust_score: Option<f64>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> hydra_core::CausalCell {
+        let cell = hydra_core::CausalCell {
+            id: hydra_core::CausalCellId::new(),
+            tenant_id,
+            kind: hydra_core::CausalCellKind::Reflex,
+            subject: subject.to_string(),
+            source_events: vec![],
+            evidence_ids: vec![],
+            claim_ids: vec![],
+            action_ids: vec![],
+            outcome_ids: vec![],
+            observation_run_ids: vec![],
+            child_cell_ids: vec![],
+            trust_score,
+            summary: None,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at,
+            caused_by: None,
+        };
+        hydra.create_causal_cell(cell).unwrap()
+    }
+
+    /// Convenience: seed one reflex cell per built-in self-health
+    /// subject, all tenant-scoped to the same tenant.
+    fn seed_all_four_self_health_reflexes(
+        hydra: &mut Hydra,
+        tenant_id: Option<hydra_core::TenantId>,
+    ) -> [hydra_core::CausalCell; 4] {
+        let now = chrono::Utc::now();
+        let cells: [hydra_core::CausalCell; 4] = [
+            ingest_synthetic_reflex_cell_at(
+                hydra,
+                tenant_id.clone(),
+                "hydra/under_abnormal_load",
+                Some(0.80),
+                now,
+            ),
+            ingest_synthetic_reflex_cell_at(
+                hydra,
+                tenant_id.clone(),
+                "hydra.replication/replica_lagging",
+                Some(0.70),
+                now,
+            ),
+            ingest_synthetic_reflex_cell_at(
+                hydra,
+                tenant_id.clone(),
+                "hydra.agents/agent_loop_storm",
+                Some(0.60),
+                now,
+            ),
+            ingest_synthetic_reflex_cell_at(
+                hydra,
+                tenant_id,
+                "hydra.actions/action_failure_rate_high",
+                Some(0.50),
+                now,
+            ),
+        ];
+        cells
+    }
+
+    #[test]
+    fn compose_hydra_health_cell_all_four_present() {
+        // Happy path: 4 reflex cells (one per subject) → 1 Health
+        // parent. Every Patch 26 contract fires:
+        //   - kind = Health
+        //   - subject = "hydra.health"
+        //   - child_cell_ids = all four, in subject-order
+        //   - trust_score = mean(0.80, 0.70, 0.60, 0.50) = 0.65
+        //   - summary mentions "4 of 4" and lists all four
+        //     present labels in order; no Missing: clause.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_health_test");
+        let children = seed_all_four_self_health_reflexes(
+            &mut hydra,
+            Some(tenant.clone()),
+        );
+        let parent = hydra
+            .compose_hydra_health_cell(
+                hydra_core::ActorId::from_str("actor_ops"),
+                Some(tenant.clone()),
+            )
+            .unwrap();
+        assert_eq!(parent.kind, hydra_core::CausalCellKind::Health);
+        assert_eq!(parent.subject, "hydra.health");
+        assert_eq!(parent.tenant_id, Some(tenant));
+        assert_eq!(parent.child_cell_ids.len(), 4);
+        // Subject-ordered: commit-rate, replication-lag,
+        // agent-loop-storm, action-failure-rate (parallel to
+        // SELF_HEALTH_REFLEX_SUBJECTS).
+        for (idx, child) in children.iter().enumerate() {
+            assert_eq!(
+                parent.child_cell_ids[idx], child.id,
+                "child {idx} mismatch"
+            );
+        }
+        // Patch 22 mean: (0.80+0.70+0.60+0.50)/4 = 0.65.
+        let score = parent.trust_score.expect("trust_score set");
+        assert!((score - 0.65).abs() < 1e-9, "score = {score}");
+        let summary = parent.summary.as_ref().expect("summary set");
+        assert!(
+            summary.contains("4 of 4 self-health reflexes"),
+            "summary: {summary}"
+        );
+        for label in &[
+            "commit-rate",
+            "replication-lag",
+            "agent-loop-storm",
+            "action-failure-rate",
+        ] {
+            assert!(summary.contains(label), "summary missing {label}");
+        }
+        assert!(
+            !summary.contains("Missing:"),
+            "summary unexpectedly listed missing: {summary}"
+        );
+    }
+
+    #[test]
+    fn compose_hydra_health_cell_partial_present_three_subjects() {
+        // 3 of 4 reflexes present → still composes, summary
+        // calls out the missing one by label.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_health_test");
+        let now = chrono::Utc::now();
+        let a = ingest_synthetic_reflex_cell_at(
+            &mut hydra,
+            Some(tenant.clone()),
+            "hydra/under_abnormal_load",
+            Some(0.80),
+            now,
+        );
+        let b = ingest_synthetic_reflex_cell_at(
+            &mut hydra,
+            Some(tenant.clone()),
+            "hydra.replication/replica_lagging",
+            Some(0.70),
+            now,
+        );
+        // Skip agent-loop-storm.
+        let d = ingest_synthetic_reflex_cell_at(
+            &mut hydra,
+            Some(tenant.clone()),
+            "hydra.actions/action_failure_rate_high",
+            Some(0.50),
+            now,
+        );
+        let parent = hydra
+            .compose_hydra_health_cell(
+                hydra_core::ActorId::from_str("actor_ops"),
+                Some(tenant),
+            )
+            .unwrap();
+        assert_eq!(parent.kind, hydra_core::CausalCellKind::Health);
+        // Children in subject-order — the skip leaves a gap, so
+        // we get commit-rate, replication-lag, action-failure-rate
+        // (NOT agent-loop-storm).
+        assert_eq!(
+            parent.child_cell_ids,
+            vec![a.id.clone(), b.id.clone(), d.id.clone()]
+        );
+        let summary = parent.summary.as_ref().unwrap();
+        assert!(
+            summary.contains("3 of 4 self-health reflexes"),
+            "summary: {summary}"
+        );
+        assert!(summary.contains("Missing: agent-loop-storm"), "summary: {summary}");
+        assert!(summary.contains("Present:"), "summary: {summary}");
+    }
+
+    #[test]
+    fn compose_hydra_health_cell_partial_present_one_subject() {
+        // Single-subject case: 1 reflex present, 3 missing →
+        // still composes, summary lists 1 present + 3 missing.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_health_test");
+        let now = chrono::Utc::now();
+        let only = ingest_synthetic_reflex_cell_at(
+            &mut hydra,
+            Some(tenant.clone()),
+            "hydra.agents/agent_loop_storm",
+            Some(0.40),
+            now,
+        );
+        let parent = hydra
+            .compose_hydra_health_cell(
+                hydra_core::ActorId::from_str("actor_ops"),
+                Some(tenant),
+            )
+            .unwrap();
+        assert_eq!(parent.child_cell_ids, vec![only.id]);
+        let summary = parent.summary.as_ref().unwrap();
+        assert!(
+            summary.contains("1 of 4 self-health reflexes"),
+            "summary: {summary}"
+        );
+        assert!(
+            summary.contains("Present: agent-loop-storm"),
+            "summary: {summary}"
+        );
+        for missing in &["commit-rate", "replication-lag", "action-failure-rate"] {
+            assert!(
+                summary.contains(missing),
+                "summary missing label {missing}: {summary}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_hydra_health_cell_zero_found_returns_error() {
+        // No self-health reflex cells in the store → hard
+        // QueryError. Matches the `compose_causal_cells`
+        // empty-children contract.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_health_test");
+        let result = hydra.compose_hydra_health_cell(
+            hydra_core::ActorId::from_str("actor_ops"),
+            Some(tenant),
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("no self-health reflex cells found"),
+                    "msg: {msg}"
+                );
+                assert!(
+                    msg.contains("tenant_health_test"),
+                    "tenant name should appear in error: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compose_hydra_health_cell_filters_by_tenant() {
+        // Reflex cells in tenant_a + tenant_b. Calling with
+        // tenant_a should compose ONLY tenant_a's cells; tenant_b
+        // ones must be invisible.
+        let mut hydra = Hydra::new();
+        let tenant_a = hydra_core::TenantId::from_str("tenant_a");
+        let tenant_b = hydra_core::TenantId::from_str("tenant_b");
+        let _ours = seed_all_four_self_health_reflexes(
+            &mut hydra,
+            Some(tenant_a.clone()),
+        );
+        let _theirs = seed_all_four_self_health_reflexes(
+            &mut hydra,
+            Some(tenant_b),
+        );
+        let parent = hydra
+            .compose_hydra_health_cell(
+                hydra_core::ActorId::from_str("actor_ops"),
+                Some(tenant_a.clone()),
+            )
+            .unwrap();
+        assert_eq!(parent.tenant_id, Some(tenant_a.clone()));
+        assert_eq!(parent.child_cell_ids.len(), 4);
+        // Every child must belong to tenant_a.
+        for child_id in &parent.child_cell_ids {
+            let child = hydra.causal_cell(child_id).unwrap();
+            assert_eq!(child.tenant_id, Some(tenant_a.clone()));
+        }
+    }
+
+    #[test]
+    fn compose_hydra_health_cell_none_tenanted_only() {
+        // When called with `tenant=None`, only `None`-tenanted
+        // reflex cells participate; any tenant-scoped reflex
+        // cells (even with matching subjects) are excluded.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_health_test");
+        // Seed all 4 subjects under `None` (system cells).
+        let _system = seed_all_four_self_health_reflexes(&mut hydra, None);
+        // Also seed a tenanted cell at one of the subjects — it
+        // must NOT bleed into the None composition.
+        let _tenanted_decoy = ingest_synthetic_reflex_cell_at(
+            &mut hydra,
+            Some(tenant),
+            "hydra/under_abnormal_load",
+            Some(0.99),
+            chrono::Utc::now(),
+        );
+        let parent = hydra
+            .compose_hydra_health_cell(
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(parent.tenant_id, None);
+        assert_eq!(parent.child_cell_ids.len(), 4);
+        for child_id in &parent.child_cell_ids {
+            let child = hydra.causal_cell(child_id).unwrap();
+            assert_eq!(child.tenant_id, None);
+        }
+    }
+
+    #[test]
+    fn compose_hydra_health_cell_latest_wins_per_subject() {
+        // Multiple Reflex cells for the SAME subject in the
+        // store → composer picks the one with the largest
+        // `created_at`. Pinned with explicit timestamps so the
+        // assertion is deterministic regardless of test
+        // wall-clock noise.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_health_test");
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(10);
+        let t2 = t0 + chrono::Duration::seconds(20);
+
+        // Older commit-rate cell (should NOT be picked).
+        let _older = ingest_synthetic_reflex_cell_at(
+            &mut hydra,
+            Some(tenant.clone()),
+            "hydra/under_abnormal_load",
+            Some(0.20),
+            t0,
+        );
+        // Latest commit-rate cell (SHOULD be picked).
+        let latest = ingest_synthetic_reflex_cell_at(
+            &mut hydra,
+            Some(tenant.clone()),
+            "hydra/under_abnormal_load",
+            Some(0.90),
+            t2,
+        );
+        // Mid-time decoy with the same subject — still loses to
+        // `latest`.
+        let _mid = ingest_synthetic_reflex_cell_at(
+            &mut hydra,
+            Some(tenant.clone()),
+            "hydra/under_abnormal_load",
+            Some(0.50),
+            t1,
+        );
+        let parent = hydra
+            .compose_hydra_health_cell(
+                hydra_core::ActorId::from_str("actor_ops"),
+                Some(tenant),
+            )
+            .unwrap();
+        assert_eq!(parent.child_cell_ids, vec![latest.id]);
+        // And the parent's mean should be the latest cell's
+        // score (0.90), proving the latest wins.
+        let score = parent.trust_score.expect("trust_score set");
+        assert!((score - 0.90).abs() < 1e-9, "score = {score}");
+    }
+
+    #[test]
+    fn compose_hydra_health_cell_ignores_non_reflex_cells() {
+        // Non-Reflex cells (e.g., a stray Health-kind cell with a
+        // matching subject) must NOT count toward the composition.
+        // The helper filters by `kind = Reflex` strictly.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_health_test");
+        // A non-Reflex cell with one of the self-health subjects —
+        // must be ignored.
+        let _stray = hydra
+            .create_causal_cell(hydra_core::CausalCell {
+                id: hydra_core::CausalCellId::new(),
+                tenant_id: Some(tenant.clone()),
+                kind: hydra_core::CausalCellKind::Health,
+                subject: "hydra/under_abnormal_load".to_string(),
+                source_events: vec![],
+                evidence_ids: vec![],
+                claim_ids: vec![],
+                action_ids: vec![],
+                outcome_ids: vec![],
+                observation_run_ids: vec![],
+                child_cell_ids: vec![],
+                trust_score: Some(0.99),
+                summary: None,
+                created_by: hydra_core::ActorId::from_str("actor_ops"),
+                created_at: chrono::Utc::now(),
+                caused_by: None,
+            })
+            .unwrap();
+        // Now seed one Reflex cell for a different subject.
+        let reflex = ingest_synthetic_reflex_cell_at(
+            &mut hydra,
+            Some(tenant.clone()),
+            "hydra.actions/action_failure_rate_high",
+            Some(0.40),
+            chrono::Utc::now(),
+        );
+        let parent = hydra
+            .compose_hydra_health_cell(
+                hydra_core::ActorId::from_str("actor_ops"),
+                Some(tenant),
+            )
+            .unwrap();
+        // Only the Reflex cell participated.
+        assert_eq!(parent.child_cell_ids, vec![reflex.id]);
+        let summary = parent.summary.as_ref().unwrap();
+        assert!(
+            summary.contains("1 of 4 self-health reflexes"),
+            "summary: {summary}"
+        );
     }
 
     // === Patch 23 — CausalCell trust folding ===
