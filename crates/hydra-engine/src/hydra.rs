@@ -2542,6 +2542,207 @@ impl Hydra {
         self.create_causal_cell(cell)
     }
 
+    /// Patch 22 — compose multiple existing `CausalCell`s into a
+    /// new parent cell. The first fractal-composition operation.
+    ///
+    /// ```text
+    ///   CommitRateCell + ReplicationLagCell + AgentLoopStormCell +
+    ///   ActionFailureRateCell  =  HydraHealthCell
+    /// ```
+    ///
+    /// The parent carries:
+    ///
+    /// - `child_cell_ids` = deduped child list (first-seen order)
+    /// - the 6 id vectors UNIONED across children, deduped
+    ///   preserving first-seen order
+    /// - `trust_score` = arithmetic mean of child trust scores
+    ///   that are `Some`; `None` when every child is `None`
+    /// - `caused_by` = first child's `caused_by` that is `Some`,
+    ///   walking child order; `None` when no child has one
+    /// - `tenant_id` = inherited from children; all children
+    ///   must share the same `Option<TenantId>` exactly
+    /// - `summary` = caller-supplied if `Some`, else the
+    ///   deterministic Patch 22 pattern
+    ///
+    /// Parent cells are **immutable in v0** — no update / close
+    /// events. Recomposition = create a new parent cell.
+    ///
+    /// **No HTTP, no SDK** — engine-only, like Patch 21.
+    pub fn compose_causal_cells(
+        &mut self,
+        child_cell_ids: Vec<hydra_core::CausalCellId>,
+        kind: hydra_core::CausalCellKind,
+        subject: String,
+        actor: hydra_core::ActorId,
+        summary: Option<String>,
+    ) -> hydra_core::error::Result<hydra_core::CausalCell> {
+        use hydra_core::error::HydraError;
+        use std::collections::HashSet;
+
+        // 1. Empty children → hard error.
+        if child_cell_ids.is_empty() {
+            return Err(HydraError::QueryError(
+                "composition requires at least one child cell"
+                    .to_string(),
+            ));
+        }
+
+        // 2. Dedupe children preserving first-seen order. Idempotent
+        //    under accidental repeats; the parent's `child_cell_ids`
+        //    is the deduped list.
+        let mut deduped_child_ids: Vec<hydra_core::CausalCellId> =
+            Vec::new();
+        let mut child_id_seen: HashSet<hydra_core::CausalCellId> =
+            HashSet::new();
+        for id in child_cell_ids {
+            if child_id_seen.insert(id.clone()) {
+                deduped_child_ids.push(id);
+            }
+        }
+
+        // 3. Load each child; unknown → hard error.
+        let mut children: Vec<hydra_core::CausalCell> = Vec::new();
+        for id in &deduped_child_ids {
+            let child = self.causal_cell(id).cloned().ok_or_else(|| {
+                HydraError::QueryError(format!(
+                    "unknown causal cell: {id}"
+                ))
+            })?;
+            children.push(child);
+        }
+
+        // 4. Validate tenant equality (strict `Option<TenantId>`
+        //    match). None == None and Some(a) == Some(a) only.
+        let tenant_anchor = children[0].tenant_id.clone();
+        for child in &children[1..] {
+            if child.tenant_id != tenant_anchor {
+                return Err(HydraError::QueryError(
+                    "composition requires all child cells to share \
+                     the same tenant_id (Some/None must match exactly)"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // 5. Union + dedupe each of the six id vectors. Order:
+        //    child order outer, child's own id-vec order inner.
+        let mut source_events: Vec<hydra_core::EventId> = Vec::new();
+        let mut source_events_seen: HashSet<hydra_core::EventId> =
+            HashSet::new();
+        let mut evidence_ids: Vec<hydra_core::EvidenceId> = Vec::new();
+        let mut evidence_seen: HashSet<hydra_core::EvidenceId> =
+            HashSet::new();
+        let mut claim_ids: Vec<hydra_core::ClaimId> = Vec::new();
+        let mut claim_seen: HashSet<hydra_core::ClaimId> = HashSet::new();
+        let mut action_ids: Vec<hydra_core::ActionId> = Vec::new();
+        let mut action_seen: HashSet<hydra_core::ActionId> =
+            HashSet::new();
+        let mut outcome_ids: Vec<hydra_core::OutcomeId> = Vec::new();
+        let mut outcome_seen: HashSet<hydra_core::OutcomeId> =
+            HashSet::new();
+        let mut observation_run_ids: Vec<hydra_core::MicroModelRunId> =
+            Vec::new();
+        let mut observation_seen: HashSet<hydra_core::MicroModelRunId> =
+            HashSet::new();
+
+        for child in &children {
+            for id in &child.source_events {
+                if source_events_seen.insert(id.clone()) {
+                    source_events.push(id.clone());
+                }
+            }
+            for id in &child.evidence_ids {
+                if evidence_seen.insert(id.clone()) {
+                    evidence_ids.push(id.clone());
+                }
+            }
+            for id in &child.claim_ids {
+                if claim_seen.insert(id.clone()) {
+                    claim_ids.push(id.clone());
+                }
+            }
+            for id in &child.action_ids {
+                if action_seen.insert(id.clone()) {
+                    action_ids.push(id.clone());
+                }
+            }
+            for id in &child.outcome_ids {
+                if outcome_seen.insert(id.clone()) {
+                    outcome_ids.push(id.clone());
+                }
+            }
+            for id in &child.observation_run_ids {
+                if observation_seen.insert(id.clone()) {
+                    observation_run_ids.push(id.clone());
+                }
+            }
+        }
+
+        // 6. Trust score: arithmetic mean of known child scores.
+        //    All-None → parent None. Patch 22 deliberately does NOT
+        //    weight by # of claims/actions/outcomes — that's
+        //    Patch 23's job.
+        let known_scores: Vec<f64> = children
+            .iter()
+            .filter_map(|c| c.trust_score)
+            .collect();
+        let trust_score = if known_scores.is_empty() {
+            None
+        } else {
+            let sum: f64 = known_scores.iter().sum();
+            Some(sum / known_scores.len() as f64)
+        };
+
+        // 7. caused_by = first child whose own caused_by is Some.
+        //    Walks child order. None when no child has one — keeps
+        //    composed cells causally anchored even when the first
+        //    child in the list lacks an anchor.
+        let caused_by = children
+            .iter()
+            .find_map(|c| c.caused_by.clone());
+
+        // 8. Default summary: deterministic prose operators can
+        //    pattern-match. `kind.discriminant()` gives snake_case
+        //    (matches Patch 21's subject style). Trust shows
+        //    `unknown` when None.
+        let final_summary = summary.unwrap_or_else(|| {
+            let trust_str = trust_score
+                .map(|s| format!("{s:.2}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            format!(
+                "composed {} cell for {}: {} child cells, {} claims, \
+                 {} actions, trust={}",
+                kind.discriminant(),
+                subject,
+                deduped_child_ids.len(),
+                claim_ids.len(),
+                action_ids.len(),
+                trust_str,
+            )
+        });
+
+        // 9. Assemble + persist via the Patch 20 create path.
+        let cell = hydra_core::CausalCell {
+            id: hydra_core::CausalCellId::new(),
+            tenant_id: tenant_anchor,
+            kind,
+            subject,
+            source_events,
+            evidence_ids,
+            claim_ids,
+            action_ids,
+            outcome_ids,
+            observation_run_ids,
+            child_cell_ids: deduped_child_ids,
+            trust_score,
+            summary: Some(final_summary),
+            created_by: actor,
+            created_at: chrono::Utc::now(),
+            caused_by,
+        };
+        self.create_causal_cell(cell)
+    }
+
     // === MicroModel Patch 8 — outcome learning loop ============
     //
     // Close the model feedback loop: walk backward from a recorded
@@ -15513,5 +15714,615 @@ mod sprint1_tests {
         assert_eq!(restored.kind, hydra_core::CausalCellKind::Reflex);
         assert_eq!(restored.subject, "hydra.replication/replica_lagging");
         assert!(restored.trust_score.is_some());
+    }
+
+    // === Patch 22 — CausalCell composition ===
+
+    /// Construct + ingest a minimal Reflex cell with the supplied
+    /// id fixtures. Used by the composition tests to set up
+    /// children with deterministic content (vs driving full reflex
+    /// chains, which is slower and harder to control for dedupe /
+    /// trust pins).
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_synthetic_cell(
+        hydra: &mut Hydra,
+        tenant_id: Option<hydra_core::TenantId>,
+        subject: &str,
+        evidence_ids: Vec<hydra_core::EvidenceId>,
+        claim_ids: Vec<hydra_core::ClaimId>,
+        action_ids: Vec<hydra_core::ActionId>,
+        outcome_ids: Vec<hydra_core::OutcomeId>,
+        observation_run_ids: Vec<hydra_core::MicroModelRunId>,
+        source_events: Vec<hydra_core::EventId>,
+        trust_score: Option<f64>,
+        caused_by: Option<hydra_core::EventId>,
+    ) -> hydra_core::CausalCell {
+        let cell = hydra_core::CausalCell {
+            id: hydra_core::CausalCellId::new(),
+            tenant_id,
+            kind: hydra_core::CausalCellKind::Reflex,
+            subject: subject.to_string(),
+            source_events,
+            evidence_ids,
+            claim_ids,
+            action_ids,
+            outcome_ids,
+            observation_run_ids,
+            child_cell_ids: Vec::new(),
+            trust_score,
+            summary: None,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: chrono::Utc::now(),
+            caused_by,
+        };
+        hydra.create_causal_cell(cell).unwrap()
+    }
+
+    #[test]
+    fn compose_causal_cells_creates_parent_with_children() {
+        // Happy path: two reflex children → one Health parent.
+        let mut hydra = Hydra::new();
+        let a = ingest_synthetic_cell(
+            &mut hydra,
+            None,
+            "hydra.commit_rate/under_abnormal_load",
+            vec![hydra_core::EvidenceId::from_str("evd_a")],
+            vec![hydra_core::ClaimId::from_str("claim_a")],
+            vec![],
+            vec![],
+            vec![],
+            vec![hydra_core::EventId::from_str("evt_a")],
+            Some(0.80),
+            Some(hydra_core::EventId::from_str("evt_a")),
+        );
+        let b = ingest_synthetic_cell(
+            &mut hydra,
+            None,
+            "hydra.replication/replica_lagging",
+            vec![hydra_core::EvidenceId::from_str("evd_b")],
+            vec![hydra_core::ClaimId::from_str("claim_b")],
+            vec![],
+            vec![],
+            vec![],
+            vec![hydra_core::EventId::from_str("evt_b")],
+            Some(0.60),
+            Some(hydra_core::EventId::from_str("evt_b")),
+        );
+
+        let parent = hydra
+            .compose_causal_cells(
+                vec![a.id.clone(), b.id.clone()],
+                hydra_core::CausalCellKind::Health,
+                "hydra.health".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(parent.kind, hydra_core::CausalCellKind::Health);
+        assert_eq!(parent.subject, "hydra.health");
+        assert_eq!(parent.child_cell_ids, vec![a.id.clone(), b.id.clone()]);
+        // Parent is also stored + retrievable.
+        assert_eq!(hydra.causal_cell(&parent.id), Some(&parent));
+    }
+
+    #[test]
+    fn compose_causal_cells_rejects_empty_children() {
+        let mut hydra = Hydra::new();
+        let result = hydra.compose_causal_cells(
+            Vec::new(),
+            hydra_core::CausalCellKind::Health,
+            "anything".to_string(),
+            hydra_core::ActorId::from_str("actor_ops"),
+            None,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("at least one child cell"),
+                    "msg: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compose_causal_cells_rejects_unknown_child() {
+        let mut hydra = Hydra::new();
+        let result = hydra.compose_causal_cells(
+            vec![hydra_core::CausalCellId::from_str("cell_ghost")],
+            hydra_core::CausalCellKind::Health,
+            "hydra.health".to_string(),
+            hydra_core::ActorId::from_str("actor_ops"),
+            None,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("unknown causal cell"),
+                    "msg: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compose_causal_cells_rejects_mixed_tenants() {
+        // None + Some(x) must error.
+        let mut hydra = Hydra::new();
+        let unscoped = ingest_synthetic_cell(
+            &mut hydra,
+            None,
+            "global",
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        let scoped = ingest_synthetic_cell(
+            &mut hydra,
+            Some(hydra_core::TenantId::from_str("ten_a")),
+            "tenant_a",
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+
+        let result = hydra.compose_causal_cells(
+            vec![unscoped.id.clone(), scoped.id.clone()],
+            hydra_core::CausalCellKind::Health,
+            "mixed".to_string(),
+            hydra_core::ActorId::from_str("actor_ops"),
+            None,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("tenant"),
+                    "msg should mention tenant: {msg}"
+                );
+            }
+            other => panic!("expected tenant QueryError, got {other:?}"),
+        }
+
+        // Some(a) + Some(b) must also error.
+        let scoped_b = ingest_synthetic_cell(
+            &mut hydra,
+            Some(hydra_core::TenantId::from_str("ten_b")),
+            "tenant_b",
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        let result = hydra.compose_causal_cells(
+            vec![scoped.id.clone(), scoped_b.id.clone()],
+            hydra_core::CausalCellKind::Health,
+            "mixed".to_string(),
+            hydra_core::ActorId::from_str("actor_ops"),
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(hydra_core::error::HydraError::QueryError(_))
+        ));
+    }
+
+    #[test]
+    fn compose_causal_cells_aggregates_ids_from_children() {
+        // Two children with distinct ids in every slice → parent
+        // has the union, exactly.
+        let mut hydra = Hydra::new();
+        let a = ingest_synthetic_cell(
+            &mut hydra,
+            None,
+            "a",
+            vec![hydra_core::EvidenceId::from_str("evd_a")],
+            vec![hydra_core::ClaimId::from_str("claim_a")],
+            vec![hydra_core::ActionId::from_str("act_a")],
+            vec![hydra_core::OutcomeId::from_str("out_a")],
+            vec![hydra_core::MicroModelRunId::from_str("run_a")],
+            vec![hydra_core::EventId::from_str("evt_a")],
+            None,
+            None,
+        );
+        let b = ingest_synthetic_cell(
+            &mut hydra,
+            None,
+            "b",
+            vec![hydra_core::EvidenceId::from_str("evd_b")],
+            vec![hydra_core::ClaimId::from_str("claim_b")],
+            vec![hydra_core::ActionId::from_str("act_b")],
+            vec![hydra_core::OutcomeId::from_str("out_b")],
+            vec![hydra_core::MicroModelRunId::from_str("run_b")],
+            vec![hydra_core::EventId::from_str("evt_b")],
+            None,
+            None,
+        );
+
+        let parent = hydra
+            .compose_causal_cells(
+                vec![a.id, b.id],
+                hydra_core::CausalCellKind::Health,
+                "agg".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(parent.evidence_ids.len(), 2);
+        assert_eq!(parent.claim_ids.len(), 2);
+        assert_eq!(parent.action_ids.len(), 2);
+        assert_eq!(parent.outcome_ids.len(), 2);
+        assert_eq!(parent.observation_run_ids.len(), 2);
+        assert_eq!(parent.source_events.len(), 2);
+    }
+
+    #[test]
+    fn compose_causal_cells_dedupes_ids_preserving_order() {
+        // Children share an evidence id and an event id → parent
+        // has each ONCE, in first-seen position (= child[0]'s
+        // ordering). Also pins child_cell_ids dedupe.
+        let mut hydra = Hydra::new();
+        let shared_evidence = hydra_core::EvidenceId::from_str("evd_shared");
+        let shared_event = hydra_core::EventId::from_str("evt_shared");
+
+        let a = ingest_synthetic_cell(
+            &mut hydra,
+            None,
+            "a",
+            vec![
+                shared_evidence.clone(),
+                hydra_core::EvidenceId::from_str("evd_only_a"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![
+                shared_event.clone(),
+                hydra_core::EventId::from_str("evt_only_a"),
+            ],
+            None,
+            None,
+        );
+        let b = ingest_synthetic_cell(
+            &mut hydra,
+            None,
+            "b",
+            vec![
+                shared_evidence.clone(),
+                hydra_core::EvidenceId::from_str("evd_only_b"),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![
+                shared_event.clone(),
+                hydra_core::EventId::from_str("evt_only_b"),
+            ],
+            None,
+            None,
+        );
+
+        // Pass child A twice to also pin child_cell_ids dedupe.
+        let parent = hydra
+            .compose_causal_cells(
+                vec![a.id.clone(), b.id.clone(), a.id.clone()],
+                hydra_core::CausalCellKind::Health,
+                "dedupe".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+
+        // child_cell_ids deduped, A appears only once.
+        assert_eq!(parent.child_cell_ids, vec![a.id, b.id]);
+
+        // Aggregated evidence ids: shared appears once at the
+        // FIRST-seen position (= position 0, from child A).
+        assert_eq!(parent.evidence_ids.len(), 3);
+        assert_eq!(parent.evidence_ids[0], shared_evidence);
+        // The two child-unique ids follow in child-encounter order.
+        assert_eq!(
+            parent.evidence_ids[1],
+            hydra_core::EvidenceId::from_str("evd_only_a")
+        );
+        assert_eq!(
+            parent.evidence_ids[2],
+            hydra_core::EvidenceId::from_str("evd_only_b")
+        );
+
+        // Same shape for source_events.
+        assert_eq!(parent.source_events.len(), 3);
+        assert_eq!(parent.source_events[0], shared_event);
+    }
+
+    #[test]
+    fn compose_causal_cells_averages_child_trust_scores() {
+        let mut hydra = Hydra::new();
+
+        // Two children with scores → arithmetic mean.
+        let high = ingest_synthetic_cell(
+            &mut hydra, None, "high",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            Some(0.80), None,
+        );
+        let low = ingest_synthetic_cell(
+            &mut hydra, None, "low",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            Some(0.60), None,
+        );
+        let parent = hydra
+            .compose_causal_cells(
+                vec![high.id.clone(), low.id.clone()],
+                hydra_core::CausalCellKind::Health,
+                "two_known".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+        let score = parent.trust_score.unwrap();
+        assert!(
+            (score - 0.70).abs() < 1e-9,
+            "expected 0.70, got {score}"
+        );
+
+        // Mix with a None-scored child: None children skipped from
+        // the average, NOT counted as 0.
+        let unknown = ingest_synthetic_cell(
+            &mut hydra, None, "unknown",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            None, None,
+        );
+        let parent_mixed = hydra
+            .compose_causal_cells(
+                vec![high.id, low.id, unknown.id.clone()],
+                hydra_core::CausalCellKind::Health,
+                "mixed_known".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+        let mixed_score = parent_mixed.trust_score.unwrap();
+        assert!(
+            (mixed_score - 0.70).abs() < 1e-9,
+            "None-scored child must be skipped; expected 0.70, got {mixed_score}"
+        );
+
+        // All-None children → parent None.
+        let another_unknown = ingest_synthetic_cell(
+            &mut hydra, None, "another_unknown",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            None, None,
+        );
+        let parent_none = hydra
+            .compose_causal_cells(
+                vec![unknown.id, another_unknown.id],
+                hydra_core::CausalCellKind::Health,
+                "all_unknown".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+        assert!(
+            parent_none.trust_score.is_none(),
+            "all-None children must yield parent.trust_score=None"
+        );
+    }
+
+    #[test]
+    fn compose_causal_cells_uses_default_summary() {
+        let mut hydra = Hydra::new();
+        let child = ingest_synthetic_cell(
+            &mut hydra, None, "x",
+            vec![],
+            vec![hydra_core::ClaimId::from_str("claim_x")],
+            vec![hydra_core::ActionId::from_str("act_x")],
+            vec![], vec![], vec![],
+            Some(0.85), None,
+        );
+
+        let parent = hydra
+            .compose_causal_cells(
+                vec![child.id],
+                hydra_core::CausalCellKind::Health,
+                "hydra.health".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+
+        let summary = parent.summary.as_ref().unwrap();
+        // Kind label uses discriminant() (snake_case): "health",
+        // not "Health".
+        assert!(summary.starts_with("composed health cell for hydra.health"));
+        assert!(summary.contains("1 child cells"));
+        assert!(summary.contains("1 claims"));
+        assert!(summary.contains("1 actions"));
+        assert!(summary.contains("trust=0.85"));
+    }
+
+    #[test]
+    fn compose_causal_cells_uses_caller_summary_when_provided() {
+        // Caller-supplied summary must override the default.
+        let mut hydra = Hydra::new();
+        let child = ingest_synthetic_cell(
+            &mut hydra, None, "x",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            Some(0.50), None,
+        );
+        let parent = hydra
+            .compose_causal_cells(
+                vec![child.id],
+                hydra_core::CausalCellKind::Incident,
+                "any".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                Some("operator-supplied label".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            parent.summary.as_deref(),
+            Some("operator-supplied label")
+        );
+    }
+
+    #[test]
+    fn compose_causal_cells_caused_by_walks_to_first_some() {
+        // The LOAD-BEARING adaptation pin: child[0].caused_by =
+        // None, child[1].caused_by = Some(evt). Parent inherits
+        // child[1]'s caused_by — not the first child blindly.
+        let mut hydra = Hydra::new();
+        let anchor_event = hydra_core::EventId::from_str("evt_anchor");
+
+        let no_anchor = ingest_synthetic_cell(
+            &mut hydra, None, "no_anchor",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            None,
+            None, // <- caused_by None
+        );
+        let with_anchor = ingest_synthetic_cell(
+            &mut hydra, None, "with_anchor",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            None,
+            Some(anchor_event.clone()),
+        );
+
+        let parent = hydra
+            .compose_causal_cells(
+                vec![no_anchor.id, with_anchor.id],
+                hydra_core::CausalCellKind::Health,
+                "anchor_walk".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            parent.caused_by,
+            Some(anchor_event),
+            "parent.caused_by must walk to first Some, not stop at child[0]"
+        );
+
+        // Inverse case: all children have caused_by=None → parent
+        // caused_by=None.
+        let another_no_anchor = ingest_synthetic_cell(
+            &mut hydra, None, "also_no_anchor",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            None, None,
+        );
+        let third_no_anchor = ingest_synthetic_cell(
+            &mut hydra, None, "third_no_anchor",
+            vec![], vec![], vec![], vec![], vec![], vec![],
+            None, None,
+        );
+        let parent_unanchored = hydra
+            .compose_causal_cells(
+                vec![another_no_anchor.id, third_no_anchor.id],
+                hydra_core::CausalCellKind::Health,
+                "unanchored".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+        assert!(parent_unanchored.caused_by.is_none());
+    }
+
+    #[test]
+    fn compose_causal_cells_snapshot_restore_preserves_parent_and_links() {
+        // The integration pin: compose two real Reflex cells from
+        // replication-lag chains, snapshot, restore on a fresh
+        // engine, verify the parent + both children are intact and
+        // child_cell_ids resolves.
+        let mut hydra = Hydra::new();
+
+        // First reflex chain → cell A.
+        let (claim_a, _, _, _, _) =
+            drive_full_replication_lag_chain(&mut hydra);
+        let cell_a = hydra
+            .create_reflex_causal_cell_from_claim(
+                claim_a,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+
+        // Second reflex chain (different peer) → cell B. We can't
+        // call drive_full_replication_lag_chain twice (uses fixed
+        // peer id), so do a second registration manually.
+        let peer_b = hydra_core::ReplicaId::from_str("replica_p22_b");
+        register_peer_with_lag(
+            &mut hydra,
+            &peer_b,
+            Some((300, chrono::Utc::now())),
+        );
+        let assessment_b = hydra
+            .evaluate_replication_lag_anomaly_and_propose_action(
+                peer_b,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let claim_b = assessment_b.claim_id.clone().unwrap();
+        let cell_b = hydra
+            .create_reflex_causal_cell_from_claim(
+                claim_b,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+
+        // Compose.
+        let parent = hydra
+            .compose_causal_cells(
+                vec![cell_a.id.clone(), cell_b.id.clone()],
+                hydra_core::CausalCellKind::Health,
+                "hydra.health".to_string(),
+                hydra_core::ActorId::from_str("actor_ops"),
+                None,
+            )
+            .unwrap();
+        let parent_id = parent.id.clone();
+
+        // Snapshot.
+        let manifest = hydra
+            .snapshot(hydra_core::ActorId::from_str("actor_ops"))
+            .unwrap();
+        // Three cells in the manifest count: 2 reflex + 1 health.
+        assert_eq!(manifest.total_causal_cells, 3);
+        let body = hydra
+            .snapshot_store()
+            .body(&manifest.id)
+            .expect("snapshot body present")
+            .clone();
+
+        // Replay into a fresh engine.
+        let mut fresh = Hydra::new();
+        fresh.recover_from_events(body.events.clone()).unwrap();
+        let restored_parent = fresh
+            .causal_cell(&parent_id)
+            .expect("parent cell restored");
+        assert_eq!(restored_parent.kind, hydra_core::CausalCellKind::Health);
+        assert_eq!(restored_parent.subject, "hydra.health");
+        assert_eq!(
+            restored_parent.child_cell_ids,
+            vec![cell_a.id.clone(), cell_b.id.clone()]
+        );
+        // Both children resolvable too.
+        assert!(fresh.causal_cell(&cell_a.id).is_some());
+        assert!(fresh.causal_cell(&cell_b.id).is_some());
     }
 }
