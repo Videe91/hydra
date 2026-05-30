@@ -3398,77 +3398,29 @@ impl Hydra {
         let (prediction, prediction_event_id, output) =
             self.record_commit_rate_prediction(actor.clone())?;
 
-        let (evidence_id, evidence_event_id, claim_id, claim_event_id) =
-            if output.level.is_actionable() {
-                // Build + record Evidence first so the Claim can
-                // reference its id in `evidence_for`. Capture the
-                // EvidenceAdded event id off the cascade result so
-                // downstream (Patch 4 action bridge) can chain
-                // `caused_by` cleanly.
-                let evidence = build_evidence_from_prediction(
-                    &prediction,
-                    &output,
-                    prediction_event_id.clone(),
-                );
-                let new_evidence_id = evidence.id.clone();
-                let evidence_cascade = self
-                    .ingest(hydra_core::EventKind::EvidenceAdded { evidence })?;
-                let new_evidence_event_id = evidence_cascade
-                    .events
-                    .first()
-                    .map(|event| event.id.clone())
-                    .expect(
-                        "ingest produces at least the trigger event for \
-                         EvidenceAdded",
-                    );
-
-                // Now the Claim. `created_by` is the caller-
-                // supplied actor — "I, this agent, believe Hydra
-                // is under abnormal load because the model fired."
-                // Capture the ClaimProposed event id (events[0]
-                // — the trigger). The verification cascade may
-                // append a ClaimVerified event later in the same
-                // cascade; that one lives at events[1+] and is NOT
-                // what we want for the action bridge's caused_by.
-                let claim = build_claim_from_prediction(
-                    &prediction,
-                    &new_evidence_id,
-                    actor,
-                    prediction_event_id.clone(),
-                );
-                let new_claim_id = claim.id.clone();
-                let claim_cascade =
-                    self.ingest(hydra_core::EventKind::ClaimProposed { claim })?;
-                let new_claim_event_id = claim_cascade
-                    .events
-                    .first()
-                    .map(|event| event.id.clone())
-                    .expect(
-                        "ingest produces at least the trigger event for \
-                         ClaimProposed",
-                    );
-
-                (
-                    Some(new_evidence_id),
-                    Some(new_evidence_event_id),
-                    Some(new_claim_id),
-                    Some(new_claim_event_id),
-                )
-            } else {
-                // WarmingUp / Normal: no belief formed against a
-                // baseline the model hasn't trusted (warmup) or a
-                // steady-state observation (normal).
-                (None, None, None, None)
-            };
+        // Patch 17: convert the model's typed output into the
+        // shared `MicroModelReflexParts` shape and delegate the
+        // evidence + claim emission to the spine helper. The
+        // bridge `Option` collapses the actionable/non-actionable
+        // branch — `Ok(None)` on WarmingUp/Normal, the four ids on
+        // Warning/Critical.
+        let parts = commit_rate_reflex_parts(&prediction, &output);
+        let bridge = crate::micromodels::reflex::propose_claim_from_reflex(
+            self,
+            &prediction,
+            prediction_event_id.clone(),
+            &parts,
+            actor,
+        )?;
 
         Ok(crate::micromodels::CommitRateAnomalyAssessment {
             level: output.level,
             prediction,
             prediction_event_id,
-            evidence_id,
-            evidence_event_id,
-            claim_id,
-            claim_event_id,
+            evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
+            evidence_event_id: bridge.as_ref().map(|b| b.evidence_event_id.clone()),
+            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
         })
     }
 
@@ -3534,58 +3486,45 @@ impl Hydra {
     ) -> hydra_core::error::Result<
         crate::micromodels::CommitRateAnomalyActionAssessment,
     > {
-        // Step 1 — drive Patch 3. Captures prediction + (maybe)
-        // evidence + (maybe) claim + their event ids.
-        let claim_assessment = self
-            .evaluate_commit_rate_anomaly_and_propose_claim(actor.clone())?;
+        // Patch 17: same shape as Patch 3's bridge but extended
+        // with the action stage. The two shared helpers
+        // (`propose_claim_from_reflex`, `propose_action_from_reflex`)
+        // emit the same events in the same order as the prior
+        // hand-rolled flow.
+        let (prediction, prediction_event_id, output) =
+            self.record_commit_rate_prediction(actor.clone())?;
 
-        // Step 2 — decide whether to fire. WarmingUp / Normal
-        // assessments arrive with `claim_id = None` and we exit
-        // immediately with an empty action vec.
+        let parts = commit_rate_reflex_parts(&prediction, &output);
+        let bridge = crate::micromodels::reflex::propose_claim_from_reflex(
+            self,
+            &prediction,
+            prediction_event_id.clone(),
+            &parts,
+            actor.clone(),
+        )?;
+
         let mut action_ids: Vec<hydra_core::ActionId> = Vec::new();
-        if let (Some(claim_id), Some(evidence_id), Some(claim_event_id)) = (
-            claim_assessment.claim_id.as_ref(),
-            claim_assessment.evidence_id.as_ref(),
-            claim_assessment.claim_event_id.as_ref(),
-        ) {
-            // Step 3 — re-read the claim to get its POST-cascade
-            // state. The verification agent may have auto-promoted
-            // it to Verified within the same cascade as the
-            // ClaimProposed ingest.
-            let passes_gate = self
-                .claim(claim_id)
-                .map(|claim| {
-                    claim.predicate == "under_abnormal_load"
-                        && (claim.status
-                            == hydra_core::epistemic::ClaimStatus::Verified
-                            || claim.confidence.value() >= 0.9)
-                })
-                .unwrap_or(false);
-
-            if passes_gate {
-                // Step 4 — build + ingest one Notify action.
-                let action = build_action_from_assessment(
-                    &claim_assessment,
-                    claim_id.clone(),
-                    evidence_id.clone(),
-                    claim_event_id.clone(),
+        if let Some(b) = bridge.as_ref() {
+            if let Some(action_id) =
+                crate::micromodels::reflex::propose_action_from_reflex(
+                    self,
+                    &prediction,
+                    b,
+                    &parts,
                     actor,
-                );
-                let new_action_id = action.id.clone();
-                self.ingest(hydra_core::EventKind::ActionProposed { action })?;
-                action_ids.push(new_action_id);
+                )?
+            {
+                action_ids.push(action_id);
             }
         }
 
-        // Step 5 — build the action assessment, mirroring the
-        // Patch 3 fields and adding `action_ids`.
         Ok(crate::micromodels::CommitRateAnomalyActionAssessment {
-            level: claim_assessment.level,
-            prediction: claim_assessment.prediction,
-            prediction_event_id: claim_assessment.prediction_event_id,
-            evidence_id: claim_assessment.evidence_id,
-            claim_id: claim_assessment.claim_id,
-            claim_event_id: claim_assessment.claim_event_id,
+            level: output.level,
+            prediction,
+            prediction_event_id,
+            evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
+            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
             action_ids,
         })
     }
@@ -3612,33 +3551,17 @@ impl Hydra {
         hydra_core::EventId,
         crate::micromodels::CommitRateAnomalyOutput,
     )> {
-        // Step 1 — auto-register the built-in model definition if
-        // missing. Goes through `register_micro_model` →
-        // `self.ingest(EventKind::MicroModelRegistered)`, so this
-        // is durable, auditable, and replicable like any other
-        // control-plane event. Promote to Active immediately —
-        // built-in models are usable on register.
+        // Step 1 — auto-register via the Patch 17 shared helper.
+        // Idempotent; safe across multiple `evaluate_*` calls.
         let model_id =
             hydra_core::MicroModelId::from_str(BUILTIN_COMMIT_RATE_MODEL_ID);
-        if self.micro_model(&model_id).is_none() {
-            let now = chrono::Utc::now();
-            let definition = hydra_core::MicroModelDefinition::registered(
-                model_id.clone(),
-                hydra_core::MicroModelKind::CommitRatePredictor,
-                "builtin_commit_rate_v0",
-                1,
-                vec![],
-                vec![],
-                hydra_core::ActorId::from_str(BUILTIN_COMMIT_RATE_ACTOR_ID),
-                now,
-            );
-            self.register_micro_model(definition)?;
-            self.change_micro_model_status(
-                model_id.clone(),
-                hydra_core::MicroModelStatus::Active,
-                Some("built-in micro-model: active on register".to_string()),
-            )?;
-        }
+        crate::micromodels::reflex::ensure_builtin_model_registered(
+            self,
+            &model_id,
+            hydra_core::MicroModelKind::CommitRatePredictor,
+            "builtin_commit_rate_v0",
+            &hydra_core::ActorId::from_str(BUILTIN_COMMIT_RATE_ACTOR_ID),
+        )?;
 
         // Step 2 — count commits in the model's configured window.
         let window_secs = self
@@ -3789,65 +3712,29 @@ impl Hydra {
     ) -> hydra_core::error::Result<
         crate::micromodels::ReplicationLagAnomalyAssessment,
     > {
+        // Patch 17: same shared bridge as commit-rate. Per-peer
+        // variation (the `peer_id` field) is carried via the
+        // model's parts builder + assessment envelope.
         let (prediction, prediction_event_id, output) =
             self.record_replication_lag_prediction(peer_id.clone(), actor.clone())?;
 
-        let (evidence_id, evidence_event_id, claim_id, claim_event_id) =
-            if output.level.is_actionable() {
-                let evidence = build_evidence_from_replication_lag_prediction(
-                    &prediction,
-                    &output,
-                    &peer_id,
-                    prediction_event_id.clone(),
-                );
-                let new_evidence_id = evidence.id.clone();
-                let evidence_cascade = self
-                    .ingest(hydra_core::EventKind::EvidenceAdded { evidence })?;
-                let new_evidence_event_id = evidence_cascade
-                    .events
-                    .first()
-                    .map(|event| event.id.clone())
-                    .expect(
-                        "ingest produces at least the trigger event for \
-                         EvidenceAdded",
-                    );
-
-                let claim = build_claim_from_replication_lag_prediction(
-                    &prediction,
-                    &new_evidence_id,
-                    actor,
-                    prediction_event_id.clone(),
-                );
-                let new_claim_id = claim.id.clone();
-                let claim_cascade =
-                    self.ingest(hydra_core::EventKind::ClaimProposed { claim })?;
-                let new_claim_event_id = claim_cascade
-                    .events
-                    .first()
-                    .map(|event| event.id.clone())
-                    .expect(
-                        "ingest produces at least the trigger event for \
-                         ClaimProposed",
-                    );
-
-                (
-                    Some(new_evidence_id),
-                    Some(new_evidence_event_id),
-                    Some(new_claim_id),
-                    Some(new_claim_event_id),
-                )
-            } else {
-                (None, None, None, None)
-            };
+        let parts = replication_lag_reflex_parts(&prediction, &output, &peer_id);
+        let bridge = crate::micromodels::reflex::propose_claim_from_reflex(
+            self,
+            &prediction,
+            prediction_event_id.clone(),
+            &parts,
+            actor,
+        )?;
 
         Ok(crate::micromodels::ReplicationLagAnomalyAssessment {
             level: output.level,
             prediction,
             prediction_event_id,
-            evidence_id,
-            evidence_event_id,
-            claim_id,
-            claim_event_id,
+            evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
+            evidence_event_id: bridge.as_ref().map(|b| b.evidence_event_id.clone()),
+            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
             peer_id,
         })
     }
@@ -3884,51 +3771,46 @@ impl Hydra {
     ) -> hydra_core::error::Result<
         crate::micromodels::ReplicationLagAnomalyActionAssessment,
     > {
-        let claim_assessment = self
-            .evaluate_replication_lag_anomaly_and_propose_claim(
-                peer_id.clone(),
-                actor.clone(),
-            )?;
+        // Patch 17: same shape as Patch 3's bridge for commit-rate
+        // — inline the record + parts + claim + action pipeline so
+        // the shared helpers do the work.
+        let (prediction, prediction_event_id, output) = self
+            .record_replication_lag_prediction(peer_id.clone(), actor.clone())?;
+
+        let parts =
+            replication_lag_reflex_parts(&prediction, &output, &peer_id);
+        let bridge = crate::micromodels::reflex::propose_claim_from_reflex(
+            self,
+            &prediction,
+            prediction_event_id.clone(),
+            &parts,
+            actor.clone(),
+        )?;
 
         let mut action_ids: Vec<hydra_core::ActionId> = Vec::new();
-        if let (Some(claim_id), Some(evidence_id), Some(claim_event_id)) = (
-            claim_assessment.claim_id.as_ref(),
-            claim_assessment.evidence_id.as_ref(),
-            claim_assessment.claim_event_id.as_ref(),
-        ) {
-            let passes_gate = self
-                .claim(claim_id)
-                .map(|claim| {
-                    claim.predicate == "replica_lagging"
-                        && (claim.status
-                            == hydra_core::epistemic::ClaimStatus::Verified
-                            || claim.confidence.value() >= 0.9)
-                })
-                .unwrap_or(false);
-
-            if passes_gate {
-                let action = build_action_from_replication_lag_assessment(
-                    &claim_assessment,
-                    claim_id.clone(),
-                    evidence_id.clone(),
-                    claim_event_id.clone(),
+        if let Some(b) = bridge.as_ref() {
+            if let Some(action_id) =
+                crate::micromodels::reflex::propose_action_from_reflex(
+                    self,
+                    &prediction,
+                    b,
+                    &parts,
                     actor,
-                );
-                let new_action_id = action.id.clone();
-                self.ingest(hydra_core::EventKind::ActionProposed { action })?;
-                action_ids.push(new_action_id);
+                )?
+            {
+                action_ids.push(action_id);
             }
         }
 
         Ok(crate::micromodels::ReplicationLagAnomalyActionAssessment {
-            level: claim_assessment.level,
-            prediction: claim_assessment.prediction,
-            prediction_event_id: claim_assessment.prediction_event_id,
-            evidence_id: claim_assessment.evidence_id,
-            claim_id: claim_assessment.claim_id,
-            claim_event_id: claim_assessment.claim_event_id,
+            level: output.level,
+            prediction,
+            prediction_event_id,
+            evidence_id: bridge.as_ref().map(|b| b.evidence_id.clone()),
+            claim_id: bridge.as_ref().map(|b| b.claim_id.clone()),
+            claim_event_id: bridge.as_ref().map(|b| b.claim_event_id.clone()),
             action_ids,
-            peer_id: claim_assessment.peer_id,
+            peer_id,
         })
     }
 
@@ -3947,32 +3829,17 @@ impl Hydra {
         hydra_core::EventId,
         crate::micromodels::ReplicationLagAnomalyOutput,
     )> {
-        // Step 1 — auto-register the built-in model definition if
-        // missing. Mirrors Patch 2 exactly.
+        // Step 1 — auto-register via the Patch 17 shared helper.
         let model_id = hydra_core::MicroModelId::from_str(
             BUILTIN_REPLICATION_LAG_MODEL_ID,
         );
-        if self.micro_model(&model_id).is_none() {
-            let now = chrono::Utc::now();
-            let definition = hydra_core::MicroModelDefinition::registered(
-                model_id.clone(),
-                hydra_core::MicroModelKind::ReplicationLagAnomaly,
-                "builtin_replication_lag_v0",
-                1,
-                vec![],
-                vec![],
-                hydra_core::ActorId::from_str(BUILTIN_REPLICATION_LAG_ACTOR_ID),
-                now,
-            );
-            self.register_micro_model(definition)?;
-            self.change_micro_model_status(
-                model_id.clone(),
-                hydra_core::MicroModelStatus::Active,
-                Some(
-                    "built-in micro-model: active on register".to_string(),
-                ),
-            )?;
-        }
+        crate::micromodels::reflex::ensure_builtin_model_registered(
+            self,
+            &model_id,
+            hydra_core::MicroModelKind::ReplicationLagAnomaly,
+            "builtin_replication_lag_v0",
+            &hydra_core::ActorId::from_str(BUILTIN_REPLICATION_LAG_ACTOR_ID),
+        )?;
 
         // Step 2 — peer lookup. 404 if unknown.
         let peer = self.replication_peer(&peer_id).cloned().ok_or_else(|| {
@@ -4889,366 +4756,191 @@ fn format_outcome_kind_for_observation(kind: &hydra_core::OutcomeKind) -> String
     }
 }
 
-/// Build the `Evidence` record paired with a Warning/Critical
-/// commit-rate prediction. Pure function — no engine access; the
-/// caller passes everything in. Used by the bridge in
-/// `Hydra::evaluate_commit_rate_anomaly_and_propose_claim` and
-/// kept module-private since the shape is part of Patch 3's
-/// internal contract.
-fn build_evidence_from_prediction(
+// === Patch 17 — per-model `MicroModelReflexParts` constructors ===
+//
+// Each built-in model converts its typed `Output` into the
+// shared `MicroModelReflexParts` shape. The Patch 17 spine
+// (`crate::micromodels::reflex::propose_claim_from_reflex` and
+// `propose_action_from_reflex`) reads these parts and emits the
+// Evidence + Claim + Action events. Per-model variation lives
+// entirely in these constructors:
+//
+//   - claim subject / predicate / object
+//   - action target
+//   - evidence + action payload field sets
+//
+// What was previously six private builder functions
+// (`build_evidence_from_prediction`, `build_claim_from_prediction`,
+// `build_action_from_assessment`, and their replication-lag
+// counterparts) collapses into these two.
+
+/// Convert a commit-rate `(prediction, output)` pair into the
+/// shared reflex parts. The resulting parts carry the exact
+/// shape Patches 3+4 produced before the refactor — same evidence
+/// payload keys, same claim subject/predicate, same action target,
+/// same action payload.
+fn commit_rate_reflex_parts(
     prediction: &hydra_core::MicroModelPrediction,
     output: &crate::micromodels::CommitRateAnomalyOutput,
-    prediction_event_id: hydra_core::EventId,
-) -> hydra_core::Evidence {
-    use hydra_core::epistemic::{Confidence, EvidencePayload, EvidenceSource};
-
-    let mut data: std::collections::HashMap<String, hydra_core::Value> =
+) -> crate::micromodels::reflex::MicroModelReflexParts {
+    let mut evidence_data: std::collections::HashMap<String, hydra_core::Value> =
         std::collections::HashMap::new();
-    data.insert(
+    evidence_data.insert(
         "model_id".to_string(),
         hydra_core::Value::String(prediction.model_id.as_str().to_string()),
     );
-    data.insert(
+    evidence_data.insert(
         "run_id".to_string(),
         hydra_core::Value::String(prediction.run_id.as_str().to_string()),
     );
-    data.insert(
+    evidence_data.insert(
         "level".to_string(),
         hydra_core::Value::String(output.level.wire_name().to_string()),
     );
-    data.insert(
+    evidence_data.insert(
         "direction".to_string(),
         hydra_core::Value::String(output.direction.wire_name().to_string()),
     );
-    data.insert(
+    evidence_data.insert(
         "observed_rate".to_string(),
         hydra_core::Value::Float(output.observed_rate),
     );
-    data.insert(
+    evidence_data.insert(
         "expected_rate".to_string(),
         hydra_core::Value::Float(output.expected_rate),
     );
-    data.insert(
+    evidence_data.insert(
         "z_score".to_string(),
         hydra_core::Value::Float(output.z_score),
     );
-    data.insert(
+    evidence_data.insert(
         "reason".to_string(),
         hydra_core::Value::String(output.reason.clone()),
     );
 
-    hydra_core::Evidence {
-        id: hydra_core::EvidenceId::new(),
-        // Tenant scoping mirrors Patch 2's prediction event — None
-        // in v0; future patches can thread tenant through the
-        // bridge if needed.
-        tenant_id: None,
-        // Use the model id (not a friendly name) as the source
-        // identifier so evidence joins cleanly back to the registry
-        // entry for `mm_builtin_commit_rate_v0`.
-        source: EvidenceSource::System {
-            name: prediction.model_id.as_str().to_string(),
-        },
-        payload: EvidencePayload {
-            kind: "micro_model_prediction".to_string(),
-            data,
-        },
-        reliability: Confidence::new(prediction.confidence),
-        observed_at: prediction.created_at,
-        recorded_at: prediction.created_at,
-        caused_by: Some(prediction_event_id),
-    }
-}
-
-/// Build the `Claim` paired with the Evidence above. Same purity
-/// contract — no engine access. The Patch 3 spec pins this shape:
-///
-///   subject       = ClaimSubject::System("hydra")
-///   predicate     = "under_abnormal_load"
-///   object        = ClaimObject::Value(Value::Bool(true))
-///   kind          = AnomalyFinding
-///   evidence_for  = [evidence_id]
-///   caused_by     = prediction_event_id
-fn build_claim_from_prediction(
-    prediction: &hydra_core::MicroModelPrediction,
-    evidence_id: &hydra_core::EvidenceId,
-    actor: hydra_core::ActorId,
-    prediction_event_id: hydra_core::EventId,
-) -> hydra_core::Claim {
-    use hydra_core::epistemic::{
-        ClaimKind, ClaimObject, ClaimStatus, ClaimSubject, Confidence,
-    };
-
-    hydra_core::Claim {
-        id: hydra_core::ClaimId::new(),
-        tenant_id: None,
-        kind: ClaimKind::AnomalyFinding,
-        subject: ClaimSubject::System("hydra".to_string()),
-        predicate: "under_abnormal_load".to_string(),
-        object: ClaimObject::Value(hydra_core::Value::Bool(true)),
-        confidence: Confidence::new(prediction.confidence),
-        status: ClaimStatus::Proposed,
-        evidence_for: vec![evidence_id.clone()],
-        evidence_against: vec![],
-        valid_from: prediction.created_at,
-        valid_until: None,
-        created_by: actor,
-        created_at: prediction.created_at,
-        updated_at: prediction.created_at,
-        caused_by: Some(prediction_event_id),
-    }
-}
-
-/// Build the `Action` paired with a Warning/Critical claim.
-/// Returns an `ActionKind::Notify` targeting `System("hydra")`,
-/// with the claim + evidence referenced and the model context in
-/// the payload. Pure constructor — no engine access; callers pass
-/// every input.
-///
-/// The Patch 4 spec pins this shape (see
-/// `evaluate_commit_rate_anomaly_and_propose_action` docstring).
-fn build_action_from_assessment(
-    assessment: &crate::micromodels::CommitRateAnomalyAssessment,
-    claim_id: hydra_core::ClaimId,
-    evidence_id: hydra_core::EvidenceId,
-    claim_event_id: hydra_core::EventId,
-    actor: hydra_core::ActorId,
-) -> hydra_core::Action {
-    use hydra_core::action::{ActionKind, ActionStatus, ActionTarget};
-
-    let prediction = &assessment.prediction;
-    let mut payload: std::collections::HashMap<String, hydra_core::Value> =
+    let mut action_payload: std::collections::HashMap<String, hydra_core::Value> =
         std::collections::HashMap::new();
-    // Severity = the level's wire name. WarmingUp / Normal don't
-    // reach this builder (gated upstream), so the only values that
-    // ever land here are "warning" or "critical".
-    payload.insert(
+    // Severity = the level's wire name. WarmingUp / Normal never
+    // reach the shared bridge (parts.actionable == false), so only
+    // "warning" or "critical" land here.
+    action_payload.insert(
         "severity".to_string(),
-        hydra_core::Value::String(assessment.level.wire_name().to_string()),
-    );
-    // Reason mirrors the prediction's `explanation` (set by the
-    // model's `render_reason`). One pithy line operators can drop
-    // straight into a ticket title.
-    payload.insert(
-        "reason".to_string(),
-        hydra_core::Value::String(
-            prediction
-                .explanation
-                .clone()
-                .unwrap_or_default(),
-        ),
-    );
-    payload.insert(
-        "model_id".to_string(),
-        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
-    );
-    payload.insert(
-        "run_id".to_string(),
-        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
-    );
-
-    hydra_core::Action {
-        id: hydra_core::ActionId::new(),
-        // Matches Patches 2 + 3 — multi-tenant action surface is a
-        // future patch.
-        tenant_id: None,
-        // Use the existing ActionKind::Notify vocabulary so any
-        // agent that already pattern-matches on `Notify` sees this
-        // without a code change. The "operator notification" intent
-        // is encoded in the payload's `severity` + `reason`.
-        kind: ActionKind::Notify,
-        // Patch 4 ships proposals only. Execution is a future
-        // patch (Patch 5+).
-        status: ActionStatus::Proposed,
-        targets: vec![ActionTarget::System("hydra".to_string())],
-        related_claims: vec![claim_id],
-        supporting_evidence: vec![evidence_id],
-        proposed_by: actor,
-        approved_by: None,
-        rejected_by: None,
-        // No policy DSL in v0. The gate that fires this action is
-        // inline in `evaluate_commit_rate_anomaly_and_propose_action`,
-        // not a registered Policy record.
-        policy_id: None,
-        payload,
-        created_at: prediction.created_at,
-        updated_at: prediction.created_at,
-        approved_at: None,
-        rejected_at: None,
-        executed_at: None,
-        // The load-bearing causal link of Patch 4: action points
-        // back at the claim event, which already points back at
-        // the prediction event. Lineage walks the chain.
-        caused_by: Some(claim_event_id),
-    }
-}
-
-// === MicroModel Patch 16 — Replication-lag builders ===
-//
-// Mirror the commit-rate builders. Patch 17 may extract a shared
-// trait once the parallel structure has proven itself across two
-// real models; until then the parallel structure IS the proof.
-
-/// Build the `Evidence` record paired with a Warning/Critical
-/// replication-lag prediction. Pure function — no engine access.
-/// `peer_id` is stashed in the payload so downstream queries can
-/// filter evidence by peer without re-deriving from the related
-/// claim.
-fn build_evidence_from_replication_lag_prediction(
-    prediction: &hydra_core::MicroModelPrediction,
-    output: &crate::micromodels::ReplicationLagAnomalyOutput,
-    peer_id: &hydra_core::ReplicaId,
-    prediction_event_id: hydra_core::EventId,
-) -> hydra_core::Evidence {
-    use hydra_core::epistemic::{Confidence, EvidencePayload, EvidenceSource};
-
-    let mut data: std::collections::HashMap<String, hydra_core::Value> =
-        std::collections::HashMap::new();
-    data.insert(
-        "model_id".to_string(),
-        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
-    );
-    data.insert(
-        "run_id".to_string(),
-        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
-    );
-    data.insert(
-        "peer_id".to_string(),
-        hydra_core::Value::String(peer_id.as_str().to_string()),
-    );
-    data.insert(
-        "level".to_string(),
         hydra_core::Value::String(output.level.wire_name().to_string()),
     );
-    data.insert(
-        "lag_commits".to_string(),
-        hydra_core::Value::Int(output.lag_commits as i64),
-    );
-    data.insert(
-        "stale_heartbeat".to_string(),
-        hydra_core::Value::Bool(output.stale_heartbeat),
-    );
-    data.insert(
-        "reason".to_string(),
-        hydra_core::Value::String(output.reason.clone()),
-    );
-
-    hydra_core::Evidence {
-        id: hydra_core::EvidenceId::new(),
-        tenant_id: None,
-        source: EvidenceSource::System {
-            name: prediction.model_id.as_str().to_string(),
-        },
-        payload: EvidencePayload {
-            kind: "micro_model_prediction".to_string(),
-            data,
-        },
-        reliability: Confidence::new(prediction.confidence),
-        observed_at: prediction.created_at,
-        recorded_at: prediction.created_at,
-        caused_by: Some(prediction_event_id),
-    }
-}
-
-/// Build the `Claim` paired with the Evidence above. Patch 16
-/// claim shape (subject + predicate differ from commit-rate's):
-///
-///   subject       = ClaimSubject::System("hydra.replication")
-///   predicate     = "replica_lagging"
-///   object        = ClaimObject::Value(Value::Bool(true))
-///   kind          = AnomalyFinding
-fn build_claim_from_replication_lag_prediction(
-    prediction: &hydra_core::MicroModelPrediction,
-    evidence_id: &hydra_core::EvidenceId,
-    actor: hydra_core::ActorId,
-    prediction_event_id: hydra_core::EventId,
-) -> hydra_core::Claim {
-    use hydra_core::epistemic::{
-        ClaimKind, ClaimObject, ClaimStatus, ClaimSubject, Confidence,
-    };
-
-    hydra_core::Claim {
-        id: hydra_core::ClaimId::new(),
-        tenant_id: None,
-        kind: ClaimKind::AnomalyFinding,
-        subject: ClaimSubject::System("hydra.replication".to_string()),
-        predicate: "replica_lagging".to_string(),
-        object: ClaimObject::Value(hydra_core::Value::Bool(true)),
-        confidence: Confidence::new(prediction.confidence),
-        status: ClaimStatus::Proposed,
-        evidence_for: vec![evidence_id.clone()],
-        evidence_against: vec![],
-        valid_from: prediction.created_at,
-        valid_until: None,
-        created_by: actor,
-        created_at: prediction.created_at,
-        updated_at: prediction.created_at,
-        caused_by: Some(prediction_event_id),
-    }
-}
-
-/// Build the Notify `Action` paired with a Warning/Critical
-/// replication-lag claim. Includes `peer_id` in the payload so the
-/// receiving operator (or downstream Notify delivery adapter, P14)
-/// can route the alert per-peer.
-fn build_action_from_replication_lag_assessment(
-    assessment: &crate::micromodels::ReplicationLagAnomalyAssessment,
-    claim_id: hydra_core::ClaimId,
-    evidence_id: hydra_core::EvidenceId,
-    claim_event_id: hydra_core::EventId,
-    actor: hydra_core::ActorId,
-) -> hydra_core::Action {
-    use hydra_core::action::{ActionKind, ActionStatus, ActionTarget};
-
-    let prediction = &assessment.prediction;
-    let mut payload: std::collections::HashMap<String, hydra_core::Value> =
-        std::collections::HashMap::new();
-    payload.insert(
-        "severity".to_string(),
-        hydra_core::Value::String(assessment.level.wire_name().to_string()),
-    );
-    payload.insert(
+    action_payload.insert(
         "reason".to_string(),
         hydra_core::Value::String(
             prediction.explanation.clone().unwrap_or_default(),
         ),
     );
-    payload.insert(
+    action_payload.insert(
         "model_id".to_string(),
         hydra_core::Value::String(prediction.model_id.as_str().to_string()),
     );
-    payload.insert(
+    action_payload.insert(
         "run_id".to_string(),
         hydra_core::Value::String(prediction.run_id.as_str().to_string()),
     );
-    // Patch 16 addition vs commit-rate: peer_id in the action
-    // payload. Lets the delivery adapter route alerts per-peer.
-    payload.insert(
+
+    crate::micromodels::reflex::MicroModelReflexParts {
+        actionable: output.level.is_actionable(),
+        confidence: prediction.confidence,
+        claim_subject: hydra_core::epistemic::ClaimSubject::System(
+            "hydra".to_string(),
+        ),
+        claim_predicate: "under_abnormal_load".to_string(),
+        claim_object: hydra_core::epistemic::ClaimObject::Value(
+            hydra_core::Value::Bool(true),
+        ),
+        evidence_payload_data: evidence_data,
+        action_target: hydra_core::action::ActionTarget::System(
+            "hydra".to_string(),
+        ),
+        action_payload,
+    }
+}
+
+/// Convert a replication-lag `(prediction, output, peer_id)` triple
+/// into the shared reflex parts. `peer_id` is the Patch 16 extra
+/// vs commit-rate — it lands in BOTH the evidence payload (so
+/// downstream queries can filter by peer) and the action payload
+/// (so the Patch 14 delivery adapter can route per-peer).
+fn replication_lag_reflex_parts(
+    prediction: &hydra_core::MicroModelPrediction,
+    output: &crate::micromodels::ReplicationLagAnomalyOutput,
+    peer_id: &hydra_core::ReplicaId,
+) -> crate::micromodels::reflex::MicroModelReflexParts {
+    let mut evidence_data: std::collections::HashMap<String, hydra_core::Value> =
+        std::collections::HashMap::new();
+    evidence_data.insert(
+        "model_id".to_string(),
+        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
+    );
+    evidence_data.insert(
+        "run_id".to_string(),
+        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
+    );
+    evidence_data.insert(
         "peer_id".to_string(),
-        hydra_core::Value::String(assessment.peer_id.as_str().to_string()),
+        hydra_core::Value::String(peer_id.as_str().to_string()),
+    );
+    evidence_data.insert(
+        "level".to_string(),
+        hydra_core::Value::String(output.level.wire_name().to_string()),
+    );
+    evidence_data.insert(
+        "lag_commits".to_string(),
+        hydra_core::Value::Int(output.lag_commits as i64),
+    );
+    evidence_data.insert(
+        "stale_heartbeat".to_string(),
+        hydra_core::Value::Bool(output.stale_heartbeat),
+    );
+    evidence_data.insert(
+        "reason".to_string(),
+        hydra_core::Value::String(output.reason.clone()),
     );
 
-    hydra_core::Action {
-        id: hydra_core::ActionId::new(),
-        tenant_id: None,
-        kind: ActionKind::Notify,
-        status: ActionStatus::Proposed,
-        // Per Patch 16 spec: target the replication subsystem, not
-        // the engine-as-a-whole.
-        targets: vec![ActionTarget::System("hydra.replication".to_string())],
-        related_claims: vec![claim_id],
-        supporting_evidence: vec![evidence_id],
-        proposed_by: actor,
-        approved_by: None,
-        rejected_by: None,
-        policy_id: None,
-        payload,
-        created_at: prediction.created_at,
-        updated_at: prediction.created_at,
-        approved_at: None,
-        rejected_at: None,
-        executed_at: None,
-        caused_by: Some(claim_event_id),
+    let mut action_payload: std::collections::HashMap<String, hydra_core::Value> =
+        std::collections::HashMap::new();
+    action_payload.insert(
+        "severity".to_string(),
+        hydra_core::Value::String(output.level.wire_name().to_string()),
+    );
+    action_payload.insert(
+        "reason".to_string(),
+        hydra_core::Value::String(
+            prediction.explanation.clone().unwrap_or_default(),
+        ),
+    );
+    action_payload.insert(
+        "model_id".to_string(),
+        hydra_core::Value::String(prediction.model_id.as_str().to_string()),
+    );
+    action_payload.insert(
+        "run_id".to_string(),
+        hydra_core::Value::String(prediction.run_id.as_str().to_string()),
+    );
+    action_payload.insert(
+        "peer_id".to_string(),
+        hydra_core::Value::String(peer_id.as_str().to_string()),
+    );
+
+    crate::micromodels::reflex::MicroModelReflexParts {
+        actionable: output.level.is_actionable(),
+        confidence: prediction.confidence,
+        claim_subject: hydra_core::epistemic::ClaimSubject::System(
+            "hydra.replication".to_string(),
+        ),
+        claim_predicate: "replica_lagging".to_string(),
+        claim_object: hydra_core::epistemic::ClaimObject::Value(
+            hydra_core::Value::Bool(true),
+        ),
+        evidence_payload_data: evidence_data,
+        action_target: hydra_core::action::ActionTarget::System(
+            "hydra.replication".to_string(),
+        ),
+        action_payload,
     }
 }
 
@@ -9723,6 +9415,236 @@ mod tests {
         let rejected_at = action.rejected_at.expect("rejected_at populated");
         assert!(rejected_at >= before && rejected_at <= after);
     }
+
+    // === Patch 17 — refactor pin tests ===
+    //
+    // Three small pins that catch the most likely regression
+    // shapes from the spine extraction. Existing tests (575 in
+    // hydra-engine + the HTTP/SDK suites) already cover behavior
+    // — these only add defense-in-depth against the specific
+    // failure modes the refactor introduces.
+
+    /// Drives the commit-rate bridge end-to-end and reads back
+    /// the recorded Evidence. The refactor MUST preserve the full
+    /// eight-key payload `data` shape from Patches 3-4: model_id,
+    /// run_id, level, direction, observed_rate, expected_rate,
+    /// z_score, reason. Catches an accidental field drop in
+    /// `commit_rate_reflex_parts`.
+    #[test]
+    fn patch17_commit_rate_reflex_preserves_evidence_payload_shape() {
+        let mut hydra = Hydra::new();
+        hydra.evaluate_commit_rate_anomaly(requester()).unwrap();
+        hydra.set_commit_rate_anomaly_model(primed_model_with_baseline(
+            10.0, 1.0,
+        ));
+        let need = 100u64.saturating_sub(ledger_count(&hydra));
+        ingest_signals(&mut hydra, need);
+        let assessment = hydra
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+        let evidence_id = assessment
+            .evidence_id
+            .as_ref()
+            .expect("Critical chain must emit Evidence");
+        let evidence = hydra.evidence(evidence_id).unwrap();
+        assert_eq!(evidence.payload.kind, "micro_model_prediction");
+        for key in [
+            "model_id",
+            "run_id",
+            "level",
+            "direction",
+            "observed_rate",
+            "expected_rate",
+            "z_score",
+            "reason",
+        ] {
+            assert!(
+                evidence.payload.data.contains_key(key),
+                "Patch 17 refactor dropped commit-rate evidence key `{key}`"
+            );
+        }
+        match &evidence.source {
+            hydra_core::epistemic::EvidenceSource::System { name } => {
+                assert_eq!(name, BUILTIN_COMMIT_RATE_MODEL_ID);
+            }
+            other => panic!("expected EvidenceSource::System, got {other:?}"),
+        }
+    }
+
+    /// Tiny local peer-registration helper for the replication-lag
+    /// pin tests. Duplicates the body of `sprint1_tests`'s
+    /// equivalent so this test stays in the main module alongside
+    /// the commit-rate helpers.
+    fn patch17_register_peer_with_lag(
+        hydra: &mut Hydra,
+        peer_id: &hydra_core::ReplicaId,
+        last_lag: Option<(u64, chrono::DateTime<chrono::Utc>)>,
+    ) {
+        let peer = hydra_core::ReplicationPeer::registered(
+            peer_id.clone(),
+            hydra_core::ReplicationRole::Follower,
+            hydra_core::ReplicationMode::CommitLogStreaming,
+            hydra_core::ActorId::from_str("actor_ops"),
+        );
+        hydra
+            .ingest(hydra_core::EventKind::ReplicaRegistered { peer })
+            .unwrap();
+        if let Some((lag_commits, observed_at)) = last_lag {
+            let leader_seq = 1_000u64;
+            let follower_seq = leader_seq.saturating_sub(lag_commits);
+            let offset =
+                hydra_core::ReplicationOffset::from_sequence(follower_seq);
+            let lag = hydra_core::ReplicationLag::observe(
+                leader_seq,
+                follower_seq,
+                observed_at,
+            );
+            hydra
+                .ingest(hydra_core::EventKind::ReplicaHeartbeatRecorded {
+                    peer_id: peer_id.clone(),
+                    offset,
+                    lag: Some(lag),
+                })
+                .unwrap();
+        }
+    }
+
+    /// Drives the replication-lag bridge end-to-end and reads
+    /// back the recorded Action. The refactor MUST preserve the
+    /// Patch 16 addition: `peer_id` lives in BOTH the evidence
+    /// payload AND the action payload. Catches an accidental
+    /// field drop in `replication_lag_reflex_parts`.
+    #[test]
+    fn patch17_replication_lag_reflex_preserves_peer_id_in_action_payload() {
+        let mut hydra = Hydra::new();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_p17_pin");
+        patch17_register_peer_with_lag(
+            &mut hydra,
+            &peer_id,
+            Some((500, chrono::Utc::now())),
+        );
+        let assessment = hydra
+            .evaluate_replication_lag_anomaly_and_propose_action(
+                peer_id.clone(),
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        // Critical → evidence + claim + action all fired.
+        let evidence_id = assessment.evidence_id.as_ref().unwrap();
+        let evidence = hydra.evidence(evidence_id).unwrap();
+        match evidence.payload.data.get("peer_id") {
+            Some(hydra_core::Value::String(s)) => {
+                assert_eq!(s, peer_id.as_str());
+            }
+            other => panic!("expected evidence.peer_id, got {other:?}"),
+        }
+
+        let action_id = assessment.action_ids.into_iter().next().unwrap();
+        let action = hydra.action(&action_id).unwrap();
+        match action.payload.get("peer_id") {
+            Some(hydra_core::Value::String(s)) => {
+                assert_eq!(s, peer_id.as_str());
+            }
+            other => panic!("expected action.peer_id, got {other:?}"),
+        }
+        assert_eq!(
+            action.targets,
+            vec![hydra_core::action::ActionTarget::System(
+                "hydra.replication".to_string()
+            )]
+        );
+    }
+
+    /// Both bridges drive their claim through the same shared
+    /// spine (`propose_claim_from_reflex`), so both produce
+    /// identically-shaped Evidence + Claim records EXCEPT for the
+    /// fields the model varies (claim subject, predicate, payload
+    /// data). This pin asserts the spine's invariants survive the
+    /// refactor for BOTH models simultaneously.
+    #[test]
+    fn patch17_commit_rate_and_replication_lag_share_reflex_spine() {
+        // Commit-rate side.
+        let mut hydra_cr = Hydra::new();
+        hydra_cr.evaluate_commit_rate_anomaly(requester()).unwrap();
+        hydra_cr.set_commit_rate_anomaly_model(primed_model_with_baseline(
+            10.0, 1.0,
+        ));
+        let need = 100u64.saturating_sub(ledger_count(&hydra_cr));
+        ingest_signals(&mut hydra_cr, need);
+        let cr_assessment = hydra_cr
+            .evaluate_commit_rate_anomaly_and_propose_claim(requester())
+            .unwrap();
+        let cr_evidence = hydra_cr
+            .evidence(cr_assessment.evidence_id.as_ref().unwrap())
+            .unwrap();
+        let cr_claim = hydra_cr
+            .claim(cr_assessment.claim_id.as_ref().unwrap())
+            .unwrap();
+
+        // Replication-lag side.
+        let mut hydra_rl = Hydra::new();
+        let peer_id = hydra_core::ReplicaId::from_str("replica_spine_pin");
+        patch17_register_peer_with_lag(
+            &mut hydra_rl,
+            &peer_id,
+            Some((500, chrono::Utc::now())),
+        );
+        let rl_assessment = hydra_rl
+            .evaluate_replication_lag_anomaly_and_propose_claim(
+                peer_id,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let rl_evidence = hydra_rl
+            .evidence(rl_assessment.evidence_id.as_ref().unwrap())
+            .unwrap();
+        let rl_claim = hydra_rl
+            .claim(rl_assessment.claim_id.as_ref().unwrap())
+            .unwrap();
+
+        // Spine invariant 1: evidence payload kind is identical.
+        assert_eq!(cr_evidence.payload.kind, "micro_model_prediction");
+        assert_eq!(rl_evidence.payload.kind, "micro_model_prediction");
+
+        // Spine invariant 2: evidence source shape is identical.
+        let cr_source_name = match &cr_evidence.source {
+            hydra_core::epistemic::EvidenceSource::System { name } => name,
+            _ => panic!("commit-rate evidence source must be System"),
+        };
+        let rl_source_name = match &rl_evidence.source {
+            hydra_core::epistemic::EvidenceSource::System { name } => name,
+            _ => panic!("replication-lag evidence source must be System"),
+        };
+        assert_eq!(cr_source_name, BUILTIN_COMMIT_RATE_MODEL_ID);
+        assert_eq!(rl_source_name, BUILTIN_REPLICATION_LAG_MODEL_ID);
+
+        // Spine invariant 3: claim kind is AnomalyFinding for both.
+        assert_eq!(cr_claim.kind, hydra_core::ClaimKind::AnomalyFinding);
+        assert_eq!(rl_claim.kind, hydra_core::ClaimKind::AnomalyFinding);
+
+        // Spine invariant 4: claim.evidence_for points back at the
+        // just-recorded evidence for both.
+        assert_eq!(
+            cr_claim.evidence_for,
+            vec![cr_assessment.evidence_id.unwrap()]
+        );
+        assert_eq!(
+            rl_claim.evidence_for,
+            vec![rl_assessment.evidence_id.unwrap()]
+        );
+
+        // Spine invariant 5: claim.caused_by points at the
+        // PREDICTION event, NOT the evidence event. This is the
+        // load-bearing audit-chain shape — Patch 3 invariant.
+        assert_eq!(
+            cr_claim.caused_by.as_ref(),
+            Some(&cr_assessment.prediction_event_id)
+        );
+        assert_eq!(
+            rl_claim.caused_by.as_ref(),
+            Some(&rl_assessment.prediction_event_id)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -13459,4 +13381,5 @@ mod sprint1_tests {
             BUILTIN_REPLICATION_LAG_MODEL_ID
         );
     }
+
 }

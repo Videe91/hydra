@@ -33,6 +33,12 @@
 pub mod commit_rate;
 pub mod replication_lag;
 
+// Patch 17 — shared bridge spine for all reflex micro-models.
+// Internal-only: no re-export here, no public surface, no
+// behavior change. Engine wiring calls into it via
+// `crate::micromodels::reflex::*` directly.
+pub(crate) mod reflex;
+
 pub use commit_rate::{
     AnomalyLevel, CommitRateAnomalyActionAssessment, CommitRateAnomalyAssessment,
     CommitRateAnomalyConfig, CommitRateAnomalyModel, CommitRateAnomalyOutput,
