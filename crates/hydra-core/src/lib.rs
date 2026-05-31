@@ -26,7 +26,10 @@ pub use id::{
     SensorId, SensorRunId, SnapshotId, SubscriptionId, TenantId, TypeId,
 };
 pub use causal_cell::{CausalCell, CausalCellKind};
-pub use identity::{IdentityAlias, IdentityEntity, IdentityEntityKind};
+pub use identity::{
+    IdentityAlias, IdentityEntity, IdentityEntityKind, MatchLevel,
+    SemanticIdentityMatchAssessment, SemanticIdentityMatchCandidate,
+};
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
     Claim,

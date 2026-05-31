@@ -2449,6 +2449,122 @@ impl Hydra {
         self.identity_store.all_entities()
     }
 
+    /// Patch 30 — Semantic Identity Resolution v1.
+    ///
+    /// Scores existing `IdentityEntity`s against a query alias
+    /// using deterministic, explainable factor weights. Returns
+    /// the top `limit` candidates sorted by score descending.
+    ///
+    /// ## Suggestion-only contract
+    ///
+    /// **The deterministic weights are calibrated for
+    /// EXPLAINABILITY, NOT guaranteed correctness.** False
+    /// positives are expected — token-overlap will score
+    /// `revenue_daily` and `revenue_daily_archived` as
+    /// `token_overlap_high`. Two unrelated `ANALYTICS.foo` tables
+    /// from the same Snowflake share `same_source` AND
+    /// `same_namespace` and will score ~0.30 even with no real
+    /// semantic relationship.
+    ///
+    /// Patch 30 ships read-only BECAUSE operators must judge
+    /// each match. Any future patch that auto-links or
+    /// auto-merges based on these scores **MUST** add a
+    /// separate trust gate (mirror Patch 11's `read:trust +
+    /// write:execute` pattern), gate on `MatchLevel::Strong`,
+    /// and require a configured minimum score floor.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Validate the query alias (sentinel collision rejected).
+    /// 2. Build the candidate set: entities whose `tenant_id`
+    ///    matches `tenant_id` exactly (strict — `None`-tenant
+    ///    query never returns `Some(t)` entities and vice versa).
+    ///    If `kind` is `Some(k)`, additionally filter by kind.
+    /// 3. Score each candidate against 9 deterministic factors
+    ///    (see `SCORING_FACTORS` below). Each factor is recorded
+    ///    in the candidate's `factors` list as a `TrustFactor`,
+    ///    applied or not — full explainability.
+    /// 4. Sum applied weights, clamp to `[0.0, 1.0]`. Drop
+    ///    candidates whose final score is 0.0 (no useful signal).
+    /// 5. Sort by score descending, then by `entity_id`
+    ///    ascending for stable order on ties.
+    /// 6. Take the top `limit`.
+    ///
+    /// ## Tenant isolation
+    ///
+    /// Strict — mirrors P25/P29. `None`-tenanted entities are
+    /// invisible to tenanted queries and vice versa.
+    ///
+    /// ## Mutation
+    ///
+    /// `&self`. No events, no store changes. Pinned by
+    /// `suggest_identity_matches_does_not_mutate_store`.
+    pub fn suggest_identity_matches(
+        &self,
+        tenant_id: Option<&hydra_core::TenantId>,
+        alias: &hydra_core::IdentityAlias,
+        kind: Option<hydra_core::IdentityEntityKind>,
+        limit: usize,
+    ) -> hydra_core::error::Result<
+        hydra_core::SemanticIdentityMatchAssessment,
+    > {
+        use hydra_core::error::HydraError;
+
+        // 1. Validate the query alias up front. Sentinel inputs
+        //    would otherwise produce nonsense factor outputs.
+        alias.validate().map_err(HydraError::QueryError)?;
+
+        // 2. Build the candidate set with strict tenant scoping.
+        //    Filter inline rather than adding a combined accessor
+        //    — store has ≤ thousands of entities for v0.
+        let candidates_pool: Vec<&hydra_core::IdentityEntity> = self
+            .identity_store
+            .all_entities()
+            .filter(|e| {
+                // Strict tenant equality: Some(t) only matches
+                // Some(t); None only matches None. Mirrors the
+                // alias index_key sentinel design.
+                e.tenant_id.as_ref() == tenant_id
+            })
+            .filter(|e| match &kind {
+                Some(k) => &e.kind == k,
+                None => true,
+            })
+            .collect();
+
+        // 3. Score each candidate.
+        let query_tokens = identity_resolver::tokens_of(&alias.normalized);
+        let mut scored: Vec<hydra_core::SemanticIdentityMatchCandidate> =
+            candidates_pool
+                .iter()
+                .map(|entity| {
+                    identity_resolver::score_candidate(
+                        alias,
+                        &query_tokens,
+                        entity,
+                    )
+                })
+                .filter(|c| c.score > 0.0)
+                .collect();
+
+        // 4. Sort by score desc, then entity_id asc.
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.entity_id.as_str().cmp(b.entity_id.as_str()))
+        });
+
+        // 5. Take the top `limit`.
+        scored.truncate(limit);
+
+        Ok(hydra_core::SemanticIdentityMatchAssessment {
+            query_alias: alias.clone(),
+            candidates: scored,
+            assessed_at: chrono::Utc::now(),
+        })
+    }
+
     /// Patch 21 — turn a model-derived reflex chain into a
     /// `CausalCellKind::Reflex` causal cell.
     ///
@@ -7006,6 +7122,306 @@ fn action_kind_wire_name(kind: &hydra_core::action::ActionKind) -> String {
 ///     → "hydra.replication/replica_lagging"
 /// ```
 ///
+/// Patch 30 — Semantic Identity Resolution v1 helpers.
+///
+/// Module-private scoring logic for
+/// `Hydra::suggest_identity_matches`. Pure functions, no I/O,
+/// deterministic across calls. The factor weights are
+/// **calibrated for explainability**, not guaranteed
+/// correctness — see the engine method docstring for the
+/// suggestion-only contract.
+mod identity_resolver {
+    use hydra_core::{
+        IdentityAlias, IdentityEntity, MatchLevel,
+        SemanticIdentityMatchCandidate, TrustFactor,
+    };
+    use std::collections::HashSet;
+
+    // Factor weights (signed). Sum of all positive factors
+    // bounded near 1.0 — exact-match dominates, partial signals
+    // build up.
+    const W_EXACT_ALIAS_MATCH: f64 = 0.85;
+    const W_NORMALIZED_LABEL_MATCH: f64 = 0.30;
+    const W_CANONICAL_KEY_OVERLAP_HIGH: f64 = 0.20;
+    const W_CANONICAL_KEY_OVERLAP_PARTIAL: f64 = 0.08;
+    const W_TOKEN_OVERLAP_HIGH: f64 = 0.15;
+    const W_TOKEN_OVERLAP_PARTIAL: f64 = 0.05;
+    const W_SAME_SOURCE: f64 = 0.05;
+    const W_SAME_NAMESPACE: f64 = 0.10;
+    const W_SAME_KIND: f64 = 0.10;
+
+    /// Jaccard threshold for the *_high factor variants.
+    const JACCARD_HIGH: f64 = 0.50;
+    /// Jaccard threshold for the *_partial factor variants.
+    /// Mutually exclusive with `_high` — a Jaccard value either
+    /// fires high OR partial OR neither, never both.
+    const JACCARD_PARTIAL: f64 = 0.20;
+
+    /// Tokenize a string for overlap computation.
+    ///
+    /// Split on `.`, `_`, `-`, `/`, and whitespace, drop empty
+    /// tokens, lowercase. This is the SAME tokenizer used for
+    /// both query alias normalized AND entity canonical_key /
+    /// entity alias normalized — so the comparison is fair.
+    pub(super) fn tokens_of(s: &str) -> HashSet<String> {
+        s.split(|c: char| {
+            matches!(c, '.' | '_' | '-' | '/' | ' ' | '\t' | '\n')
+        })
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect()
+    }
+
+    /// Jaccard similarity = |A ∩ B| / |A ∪ B|. Returns 0.0
+    /// when both sets are empty (no meaningful overlap to
+    /// score).
+    fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+        if a.is_empty() && b.is_empty() {
+            return 0.0;
+        }
+        let intersection = a.intersection(b).count() as f64;
+        let union = a.union(b).count() as f64;
+        if union == 0.0 {
+            0.0
+        } else {
+            intersection / union
+        }
+    }
+
+    /// Score one candidate against the query alias. Returns a
+    /// fully-populated `SemanticIdentityMatchCandidate` whose
+    /// `factors` list contains ALL 9 factors (applied or not).
+    pub(super) fn score_candidate(
+        query: &IdentityAlias,
+        query_tokens: &HashSet<String>,
+        entity: &IdentityEntity,
+    ) -> SemanticIdentityMatchCandidate {
+        let mut factors: Vec<TrustFactor> = Vec::with_capacity(9);
+        let mut score = 0.0_f64;
+
+        // Build the union of all candidate token sources once.
+        // `entity.canonical_key` + every `entity.aliases[i].normalized`
+        // contribute. This is the "any-alias" semantics — a new
+        // alias should be able to match against ANY of the
+        // entity's existing names, not just canonical_key.
+        let mut entity_tokens = tokens_of(&entity.canonical_key);
+        for a in &entity.aliases {
+            for t in tokens_of(&a.normalized) {
+                entity_tokens.insert(t);
+            }
+        }
+        let canonical_tokens = tokens_of(&entity.canonical_key);
+
+        // === Factor 1: exact_alias_match ===
+        // Strongest signal: (source, namespace, normalized)
+        // tuple matches one of the entity's existing aliases
+        // exactly. We do NOT check external_id here — that's a
+        // round-trip handle, not the identity key.
+        let exact = entity.aliases.iter().any(|a| {
+            a.source == query.source
+                && a.namespace == query.namespace
+                && a.normalized == query.normalized
+        });
+        push_factor(
+            &mut factors,
+            &mut score,
+            "exact_alias_match",
+            W_EXACT_ALIAS_MATCH,
+            exact,
+            if exact {
+                format!(
+                    "alias ({}, {:?}, {}) matches existing entity alias",
+                    query.source, query.namespace, query.normalized
+                )
+            } else {
+                "no exact (source, namespace, normalized) match".to_string()
+            },
+        );
+
+        // === Factor 2: normalized_label_match ===
+        // Same normalized string as ANY of the entity's aliases,
+        // even if source/namespace differ. Catches the case where
+        // the same dataset is referenced by the same string from
+        // different tools.
+        let label_match = entity
+            .aliases
+            .iter()
+            .any(|a| a.normalized == query.normalized);
+        push_factor(
+            &mut factors,
+            &mut score,
+            "normalized_label_match",
+            W_NORMALIZED_LABEL_MATCH,
+            label_match,
+            if label_match {
+                format!(
+                    "normalized label '{}' matches existing alias",
+                    query.normalized
+                )
+            } else {
+                "no alias shares this normalized label".to_string()
+            },
+        );
+
+        // === Factors 3 + 4: canonical_key_overlap_{high,partial} ===
+        // Token Jaccard against ONLY the canonical_key. High and
+        // partial are mutually exclusive — a Jaccard value fires
+        // at most one of the two factor records.
+        let canon_jaccard = jaccard(query_tokens, &canonical_tokens);
+        let canon_high = canon_jaccard >= JACCARD_HIGH;
+        let canon_partial =
+            !canon_high && canon_jaccard >= JACCARD_PARTIAL;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "canonical_key_overlap_high",
+            W_CANONICAL_KEY_OVERLAP_HIGH,
+            canon_high,
+            format!(
+                "Jaccard(query, canonical_key) = {:.2} (threshold {})",
+                canon_jaccard, JACCARD_HIGH
+            ),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "canonical_key_overlap_partial",
+            W_CANONICAL_KEY_OVERLAP_PARTIAL,
+            canon_partial,
+            format!(
+                "Jaccard(query, canonical_key) = {:.2} (threshold {})",
+                canon_jaccard, JACCARD_PARTIAL
+            ),
+        );
+
+        // === Factors 5 + 6: token_overlap_{high,partial} ===
+        // Token Jaccard against the FULL entity token bag
+        // (canonical_key ∪ every alias.normalized). Catches
+        // similarities that the canonical_key alone misses.
+        // Same mutual exclusion as canonical_key_overlap.
+        let tok_jaccard = jaccard(query_tokens, &entity_tokens);
+        let tok_high = tok_jaccard >= JACCARD_HIGH;
+        let tok_partial = !tok_high && tok_jaccard >= JACCARD_PARTIAL;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "token_overlap_high",
+            W_TOKEN_OVERLAP_HIGH,
+            tok_high,
+            format!(
+                "Jaccard(query, entity tokens) = {:.2} (threshold {})",
+                tok_jaccard, JACCARD_HIGH
+            ),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "token_overlap_partial",
+            W_TOKEN_OVERLAP_PARTIAL,
+            tok_partial,
+            format!(
+                "Jaccard(query, entity tokens) = {:.2} (threshold {})",
+                tok_jaccard, JACCARD_PARTIAL
+            ),
+        );
+
+        // === Factor 7: same_source ===
+        // "Any-alias" semantics: fires if ANY of the entity's
+        // aliases has the same source. A dataset registered with
+        // aliases from snowflake + dbt + github should match
+        // same_source against a new snowflake query.
+        let same_src = entity.aliases.iter().any(|a| a.source == query.source);
+        push_factor(
+            &mut factors,
+            &mut score,
+            "same_source",
+            W_SAME_SOURCE,
+            same_src,
+            if same_src {
+                format!("entity has alias from source '{}'", query.source)
+            } else {
+                format!("no entity alias from source '{}'", query.source)
+            },
+        );
+
+        // === Factor 8: same_namespace ===
+        // Any-alias semantics. `None == None` counts as a match
+        // (mirrors the index_key sentinel design — `None` is a
+        // real value, not a wildcard).
+        let same_ns = entity
+            .aliases
+            .iter()
+            .any(|a| a.namespace == query.namespace);
+        push_factor(
+            &mut factors,
+            &mut score,
+            "same_namespace",
+            W_SAME_NAMESPACE,
+            same_ns,
+            if same_ns {
+                format!(
+                    "entity has alias in namespace {:?}",
+                    query.namespace
+                )
+            } else {
+                format!("no entity alias in namespace {:?}", query.namespace)
+            },
+        );
+
+        // === Factor 9: same_kind ===
+        // Suggestion-only — the caller may have passed no kind
+        // filter, in which case this factor is informational
+        // but inapplicable (we record it as `applied=false` with
+        // a "no kind context" detail).
+        //
+        // Patch 30 v0 has no caller-provided "expected kind" on
+        // the query alias itself, so this factor never fires.
+        // It's wired in anyway so the wire shape is forward-
+        // compatible with a future signed-query-kind extension.
+        push_factor(
+            &mut factors,
+            &mut score,
+            "same_kind",
+            W_SAME_KIND,
+            false,
+            "no kind context on query alias (v0 — informational \
+             factor)"
+                .to_string(),
+        );
+
+        let clamped = score.clamp(0.0, 1.0);
+        let level = MatchLevel::level_for_score(clamped);
+        SemanticIdentityMatchCandidate {
+            entity_id: entity.id.clone(),
+            score: clamped,
+            level,
+            factors,
+        }
+    }
+
+    /// Append a factor record and, when `applied`, add its
+    /// weight to the running score. Centralized so every factor
+    /// follows the same applied → score pattern.
+    fn push_factor(
+        factors: &mut Vec<TrustFactor>,
+        score: &mut f64,
+        kind: &str,
+        weight: f64,
+        applied: bool,
+        detail: String,
+    ) {
+        if applied {
+            *score += weight;
+        }
+        factors.push(TrustFactor {
+            kind: kind.to_string(),
+            weight,
+            applied,
+            detail,
+        });
+    }
+}
+
 /// Non-`System` variants get a prefixed label so the format
 /// stays parseable.
 fn format_claim_subject(claim: &hydra_core::Claim) -> String {
@@ -18056,6 +18472,513 @@ mod sprint1_tests {
             )
             .unwrap();
         assert_eq!(resolved.id, id);
+    }
+
+    // === Patch 30 — Semantic Identity Resolution v1 ===
+    //
+    // Suggestion-only matcher. All tests use the engine's
+    // `suggest_identity_matches` method and assert against the
+    // returned `SemanticIdentityMatchAssessment`. No mutation
+    // is expected — the `does_not_mutate_store` pin is the
+    // load-bearing one.
+
+    /// Build a query alias for tests with a sane default shape.
+    fn p30_query_alias(
+        source: &str,
+        namespace: Option<&str>,
+        normalized: &str,
+    ) -> hydra_core::IdentityAlias {
+        hydra_core::IdentityAlias {
+            source: source.to_string(),
+            namespace: namespace.map(|s| s.to_string()),
+            external_id: None,
+            label: normalized.to_string(),
+            normalized: normalized.to_string(),
+        }
+    }
+
+    /// Find the factor with the given kind. Panics when
+    /// missing — every factor should appear regardless of
+    /// applied state (the explainability contract).
+    fn p30_find_factor<'a>(
+        candidate: &'a hydra_core::SemanticIdentityMatchCandidate,
+        kind: &str,
+    ) -> &'a hydra_core::TrustFactor {
+        candidate
+            .factors
+            .iter()
+            .find(|f| f.kind == kind)
+            .unwrap_or_else(|| {
+                panic!("factor {kind} missing from candidate")
+            })
+    }
+
+    #[test]
+    fn suggest_identity_matches_exact_alias_dominates_score() {
+        // Exact alias match must produce the top candidate. We
+        // do NOT short-circuit to 1.0 — the factor walk runs and
+        // the dominant `exact_alias_match` (+0.85) combined with
+        // same_source / same_namespace pushes the score past
+        // Strong threshold. Pinned at ≥ 0.80.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p30");
+        let entity = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![snowflake_alias("analytics", "revenue_daily")],
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+
+        let query = p30_query_alias(
+            "snowflake",
+            Some("analytics"),
+            "analytics.revenue_daily",
+        );
+        let assessment = hydra
+            .suggest_identity_matches(Some(&tenant), &query, None, 10)
+            .unwrap();
+        assert!(!assessment.candidates.is_empty());
+        let top = &assessment.candidates[0];
+        assert_eq!(top.entity_id, id);
+        assert!(
+            top.score >= 0.80,
+            "exact match must reach Strong threshold; got {}",
+            top.score
+        );
+        assert_eq!(top.level, hydra_core::MatchLevel::Strong);
+        // Dominant factor fired.
+        assert!(p30_find_factor(top, "exact_alias_match").applied);
+    }
+
+    #[test]
+    fn suggest_identity_matches_token_overlap_scores_candidate() {
+        // Partial-token match (no exact alias) still produces a
+        // candidate. Pinned: an entity sharing the "revenue" and
+        // "daily" tokens with the query scores above 0 and below
+        // the exact-match-Strong threshold.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p30");
+        let entity = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![snowflake_alias("analytics", "revenue_daily")],
+        );
+        hydra.create_identity_entity(entity).unwrap();
+
+        // Different source + different namespace → no exact
+        // match, but tokens "revenue" + "daily" overlap heavily
+        // with canonical_key + existing alias.
+        let query = p30_query_alias(
+            "dbt",
+            Some("models"),
+            "revenue.daily",
+        );
+        let assessment = hydra
+            .suggest_identity_matches(Some(&tenant), &query, None, 10)
+            .unwrap();
+        assert_eq!(assessment.candidates.len(), 1);
+        let cand = &assessment.candidates[0];
+        assert!(cand.score > 0.0, "expected nonzero score");
+        assert!(
+            cand.score < 0.80,
+            "non-exact token match must NOT reach Strong; got {}",
+            cand.score
+        );
+        // Either token_overlap_high or token_overlap_partial
+        // must have fired.
+        let high = p30_find_factor(cand, "token_overlap_high").applied;
+        let partial =
+            p30_find_factor(cand, "token_overlap_partial").applied;
+        assert!(
+            high || partial,
+            "token overlap must fire for shared tokens revenue/daily"
+        );
+        // High and partial are mutually exclusive.
+        assert!(!(high && partial), "_high and _partial must be exclusive");
+    }
+
+    #[test]
+    fn suggest_identity_matches_same_namespace_boosts_score() {
+        // Two entities differ only by namespace; the query
+        // shares namespace with one. That one must score higher
+        // than the other on the `same_namespace` factor alone.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p30");
+        let matched_ns = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/foo",
+            vec![hydra_core::IdentityAlias {
+                source: "snowflake".to_string(),
+                namespace: Some("analytics".to_string()),
+                external_id: None,
+                label: "ANALYTICS.FOO".to_string(),
+                normalized: "analytics.foo".to_string(),
+            }],
+        );
+        let mismatched_ns = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/bar",
+            vec![hydra_core::IdentityAlias {
+                source: "snowflake".to_string(),
+                namespace: Some("staging".to_string()),
+                external_id: None,
+                label: "STAGING.BAR".to_string(),
+                normalized: "staging.foo".to_string(),
+            }],
+        );
+        let id_matched = matched_ns.id.clone();
+        hydra.create_identity_entity(matched_ns).unwrap();
+        hydra.create_identity_entity(mismatched_ns).unwrap();
+
+        // Query in "analytics" namespace with no shared tokens
+        // beyond "foo" so namespace is the differentiator.
+        let query = p30_query_alias(
+            "snowflake",
+            Some("analytics"),
+            "analytics.foo",
+        );
+        let assessment = hydra
+            .suggest_identity_matches(Some(&tenant), &query, None, 10)
+            .unwrap();
+        assert!(!assessment.candidates.is_empty());
+        let top = &assessment.candidates[0];
+        assert_eq!(top.entity_id, id_matched);
+        assert!(p30_find_factor(top, "same_namespace").applied);
+    }
+
+    #[test]
+    fn suggest_identity_matches_wrong_tenant_invisible() {
+        // Entity in tenant_a, query as tenant_b → must NOT
+        // appear in candidates. Strict tenant isolation pin.
+        let mut hydra = Hydra::new();
+        let tenant_a = hydra_core::TenantId::from_str("tenant_a");
+        let tenant_b = hydra_core::TenantId::from_str("tenant_b");
+        let theirs = make_identity_entity(
+            Some(tenant_a),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/secret",
+            vec![snowflake_alias("analytics", "revenue_daily")],
+        );
+        hydra.create_identity_entity(theirs).unwrap();
+        let query = p30_query_alias(
+            "snowflake",
+            Some("analytics"),
+            "analytics.revenue_daily",
+        );
+        let assessment = hydra
+            .suggest_identity_matches(Some(&tenant_b), &query, None, 10)
+            .unwrap();
+        assert!(
+            assessment.candidates.is_empty(),
+            "wrong-tenant entity must be invisible"
+        );
+    }
+
+    #[test]
+    fn suggest_identity_matches_none_tenant_strict() {
+        // LOAD-BEARING isolation pin: `None`-tenanted (system)
+        // entity NEVER returned to tenanted query AND vice
+        // versa. Mirrors the P29 store pin from both directions.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p30");
+        let system_entity = make_identity_entity(
+            None,
+            hydra_core::IdentityEntityKind::Source,
+            "source/snowflake_prod",
+            vec![hydra_core::IdentityAlias {
+                source: "snowflake".to_string(),
+                namespace: None,
+                external_id: None,
+                label: "snowflake-prod".to_string(),
+                normalized: "snowflake-prod".to_string(),
+            }],
+        );
+        let id_system = system_entity.id.clone();
+        hydra.create_identity_entity(system_entity).unwrap();
+
+        let tenant_entity = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Source,
+            "source/snowflake_prod_tenanted",
+            vec![hydra_core::IdentityAlias {
+                source: "snowflake".to_string(),
+                namespace: None,
+                external_id: None,
+                label: "snowflake-prod".to_string(),
+                normalized: "snowflake-prod".to_string(),
+            }],
+        );
+        hydra.create_identity_entity(tenant_entity).unwrap();
+
+        let query = p30_query_alias("snowflake", None, "snowflake-prod");
+
+        // Tenanted query → tenant entity only, system invisible.
+        let tenanted = hydra
+            .suggest_identity_matches(Some(&tenant), &query, None, 10)
+            .unwrap();
+        for c in &tenanted.candidates {
+            assert_ne!(c.entity_id, id_system, "system entity leaked");
+        }
+
+        // None query → system entity only, tenant entity invisible.
+        let system = hydra
+            .suggest_identity_matches(None, &query, None, 10)
+            .unwrap();
+        let saw_system =
+            system.candidates.iter().any(|c| c.entity_id == id_system);
+        assert!(saw_system, "system query must see system entity");
+        for c in &system.candidates {
+            assert_eq!(c.entity_id, id_system);
+        }
+    }
+
+    #[test]
+    fn suggest_identity_matches_kind_filter_limits_candidates() {
+        // Kind filter excludes non-matching candidates from the
+        // scan entirely. Two entities share token "foo" but
+        // live under different alias namespaces (P29 alias
+        // uniqueness forbids duplicate (source, ns, normalized)
+        // tuples within a tenant).
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p30");
+        let dataset = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/foo",
+            vec![snowflake_alias("analytics", "foo")],
+        );
+        let service = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Service,
+            "service/foo_api",
+            vec![snowflake_alias("services", "foo")],
+        );
+        let id_dataset = dataset.id.clone();
+        let id_service = service.id.clone();
+        hydra.create_identity_entity(dataset).unwrap();
+        hydra.create_identity_entity(service).unwrap();
+
+        let query = p30_query_alias("snowflake", Some("analytics"), "analytics.foo");
+        // With Dataset filter → only dataset shows up.
+        let dataset_only = hydra
+            .suggest_identity_matches(
+                Some(&tenant),
+                &query,
+                Some(hydra_core::IdentityEntityKind::Dataset),
+                10,
+            )
+            .unwrap();
+        assert_eq!(dataset_only.candidates.len(), 1);
+        assert_eq!(dataset_only.candidates[0].entity_id, id_dataset);
+
+        // Without filter → both show up.
+        let all_kinds = hydra
+            .suggest_identity_matches(Some(&tenant), &query, None, 10)
+            .unwrap();
+        assert_eq!(all_kinds.candidates.len(), 2);
+        let ids: Vec<_> = all_kinds
+            .candidates
+            .iter()
+            .map(|c| c.entity_id.clone())
+            .collect();
+        assert!(ids.contains(&id_dataset));
+        assert!(ids.contains(&id_service));
+    }
+
+    #[test]
+    fn suggest_identity_matches_returns_sorted_candidates() {
+        // Multiple candidates must come back sorted by score
+        // descending. Deterministic ordering matters for
+        // dashboards and downstream tooling.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p30");
+        // Strong match: exact alias.
+        let strong = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![snowflake_alias("analytics", "revenue_daily")],
+        );
+        // Weaker match: only some shared tokens, different
+        // source.
+        let weak = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_weekly",
+            vec![hydra_core::IdentityAlias {
+                source: "dbt".to_string(),
+                namespace: Some("models".to_string()),
+                external_id: None,
+                label: "models.revenue_weekly".to_string(),
+                normalized: "models.revenue_weekly".to_string(),
+            }],
+        );
+        let id_strong = strong.id.clone();
+        let id_weak = weak.id.clone();
+        hydra.create_identity_entity(strong).unwrap();
+        hydra.create_identity_entity(weak).unwrap();
+
+        let query = p30_query_alias(
+            "snowflake",
+            Some("analytics"),
+            "analytics.revenue_daily",
+        );
+        let assessment = hydra
+            .suggest_identity_matches(Some(&tenant), &query, None, 10)
+            .unwrap();
+        assert_eq!(assessment.candidates.len(), 2);
+        assert_eq!(assessment.candidates[0].entity_id, id_strong);
+        assert_eq!(assessment.candidates[1].entity_id, id_weak);
+        assert!(
+            assessment.candidates[0].score > assessment.candidates[1].score
+        );
+    }
+
+    #[test]
+    fn suggest_identity_matches_unknown_alias_returns_empty() {
+        // Query with no token overlap or source/namespace match
+        // → no candidates above 0.0 → empty list (we drop
+        // zero-score candidates by design).
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p30");
+        let entity = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![snowflake_alias("analytics", "revenue_daily")],
+        );
+        hydra.create_identity_entity(entity).unwrap();
+
+        // Query with completely unrelated tokens and different
+        // source/namespace.
+        let query = hydra_core::IdentityAlias {
+            source: "kafka".to_string(),
+            namespace: Some("topics".to_string()),
+            external_id: None,
+            label: "orders".to_string(),
+            normalized: "orders".to_string(),
+        };
+        let assessment = hydra
+            .suggest_identity_matches(Some(&tenant), &query, None, 10)
+            .unwrap();
+        assert!(assessment.candidates.is_empty(),
+            "expected empty candidate list for unrelated query; got {:?}",
+            assessment.candidates);
+    }
+
+    #[test]
+    fn suggest_identity_matches_includes_unapplied_factors() {
+        // Explainability contract: every candidate carries ALL
+        // 9 factors, applied AND unapplied. Pinned so a future
+        // refactor doesn't filter the list.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p30");
+        let entity = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![snowflake_alias("analytics", "revenue_daily")],
+        );
+        hydra.create_identity_entity(entity).unwrap();
+
+        let query = p30_query_alias(
+            "snowflake",
+            Some("analytics"),
+            "analytics.revenue_daily",
+        );
+        let assessment = hydra
+            .suggest_identity_matches(Some(&tenant), &query, None, 10)
+            .unwrap();
+        let top = &assessment.candidates[0];
+        let expected_kinds = [
+            "exact_alias_match",
+            "normalized_label_match",
+            "canonical_key_overlap_high",
+            "canonical_key_overlap_partial",
+            "token_overlap_high",
+            "token_overlap_partial",
+            "same_source",
+            "same_namespace",
+            "same_kind",
+        ];
+        assert_eq!(top.factors.len(), expected_kinds.len());
+        for k in &expected_kinds {
+            // Each factor present, applied or not.
+            let _ = p30_find_factor(top, k);
+        }
+        // At least one applied=false survives — `same_kind`
+        // always at v0 because we don't accept a kind-context
+        // on the query alias yet.
+        assert!(!p30_find_factor(top, "same_kind").applied);
+    }
+
+    #[test]
+    fn suggest_identity_matches_does_not_mutate_store() {
+        // LOAD-BEARING: suggestion path is read-only. Entity
+        // count unchanged, event count unchanged. If a future
+        // refactor accidentally ingests an event during scoring,
+        // this test fires.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p30");
+        let entity = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![snowflake_alias("analytics", "revenue_daily")],
+        );
+        hydra.create_identity_entity(entity).unwrap();
+
+        let pre_entities = hydra.identity_entities().count();
+        let pre_events = hydra.events().len();
+        let query = p30_query_alias(
+            "snowflake",
+            Some("analytics"),
+            "analytics.revenue_daily",
+        );
+        let _ = hydra
+            .suggest_identity_matches(Some(&tenant), &query, None, 10)
+            .unwrap();
+        assert_eq!(hydra.identity_entities().count(), pre_entities);
+        assert_eq!(hydra.events().len(), pre_events);
+    }
+
+    #[test]
+    fn suggest_identity_matches_none_namespace_matches_none_namespace() {
+        // Wrinkle D pin: a query with namespace=None must score
+        // `same_namespace` applied against an entity alias with
+        // namespace=None. Mirrors the `__root__` sentinel design
+        // — None is a real value, not a wildcard.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p30");
+        let entity = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Source,
+            "source/some_source",
+            vec![hydra_core::IdentityAlias {
+                source: "slack".to_string(),
+                namespace: None,
+                external_id: None,
+                label: "#revenue".to_string(),
+                normalized: "#revenue".to_string(),
+            }],
+        );
+        hydra.create_identity_entity(entity).unwrap();
+
+        let query = p30_query_alias("slack", None, "#revenue");
+        let assessment = hydra
+            .suggest_identity_matches(Some(&tenant), &query, None, 10)
+            .unwrap();
+        assert_eq!(assessment.candidates.len(), 1);
+        let cand = &assessment.candidates[0];
+        assert!(
+            p30_find_factor(cand, "same_namespace").applied,
+            "None-namespace must match None-namespace"
+        );
     }
 
     // === Patch 23 — CausalCell trust folding ===

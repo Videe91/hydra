@@ -60,6 +60,7 @@
 use crate::event::Value;
 use crate::id::{ActorId, EventId, IdentityEntityId, TenantId};
 use crate::epistemic::Confidence;
+use crate::trust::TrustFactor;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -286,6 +287,95 @@ pub struct IdentityEntity {
     pub caused_by: Option<EventId>,
 }
 
+// === Patch 30 — Semantic Identity Resolution v1 ===================
+//
+// Suggestion-only matcher types. Patch 30 ships an engine method
+// `Hydra::suggest_identity_matches` that scores existing
+// `IdentityEntity`s against a query alias using deterministic
+// factor-based weights — same explainability shape as
+// `TrustAssessment` (P9) and `CausalCellTrustAssessment` (P23).
+//
+// **Suggestion-only by design.** The weights are calibrated for
+// EXPLAINABILITY, not guaranteed correctness — false positives
+// are expected (e.g., `revenue_daily` matching
+// `revenue_daily_archived` via token overlap). Any future patch
+// that auto-links / auto-merges based on these scores MUST add a
+// separate trust gate (mirror Patch 11's `read:trust +
+// write:execute` pattern), gate on `MatchLevel::Strong`, and
+// require a configured minimum score floor.
+
+/// Match strength for a candidate identity.
+///
+/// Distinct vocabulary from `TrustLevel` because "trust" and
+/// "match" are different concepts (you can have a high-trust
+/// mismatch). Shares the numeric threshold table for
+/// consistency with claim trust + cell trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MatchLevel {
+    /// Score ≥ 0.80. Very likely the same canonical thing.
+    Strong,
+    /// Score ≥ 0.50. Operator should compare.
+    Possible,
+    /// Score ≥ 0.20. Weak signal — usually a false positive
+    /// driven by shared tokens or same source. Worth surfacing
+    /// only when no Strong/Possible candidate exists.
+    Weak,
+    /// Score < 0.20. Effectively no match.
+    None,
+}
+
+impl MatchLevel {
+    /// Bucket a clamped `[0.0, 1.0]` score into a `MatchLevel`.
+    /// Uses the same numeric thresholds as
+    /// `TrustAssessment::level_for_score` so operators see a
+    /// consistent scale across trust + match dashboards.
+    pub fn level_for_score(score: f64) -> MatchLevel {
+        if score >= 0.80 {
+            MatchLevel::Strong
+        } else if score >= 0.50 {
+            MatchLevel::Possible
+        } else if score >= 0.20 {
+            MatchLevel::Weak
+        } else {
+            MatchLevel::None
+        }
+    }
+}
+
+/// One scored candidate entity within a
+/// `SemanticIdentityMatchAssessment`.
+///
+/// `score` is the sum of `applied=true` factor weights clamped
+/// to `[0.0, 1.0]`. `level` is computed from `score` via
+/// `MatchLevel::level_for_score`. `factors` includes ALL
+/// evaluated factors — applied AND unapplied — same contract as
+/// P9/P23 trust assessments so the explanation is honest about
+/// what was checked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticIdentityMatchCandidate {
+    pub entity_id: IdentityEntityId,
+    pub score: f64,
+    pub level: MatchLevel,
+    pub factors: Vec<TrustFactor>,
+}
+
+/// Read-only result of `Hydra::suggest_identity_matches`.
+///
+/// `query_alias` is the input alias being resolved. `candidates`
+/// are the top N entities sorted by score descending, then by
+/// `entity_id` ascending for stable ordering. Candidates with
+/// score 0.0 are excluded so the list is always actionable.
+///
+/// **Suggestion-only.** No mutation, no persistence, no events.
+/// See the module-level warning before building anything that
+/// auto-acts on this.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticIdentityMatchAssessment {
+    pub query_alias: IdentityAlias,
+    pub candidates: Vec<SemanticIdentityMatchCandidate>,
+    pub assessed_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +525,82 @@ mod tests {
             normalized: "analytics.x".to_string(),
         };
         assert!(good.validate().is_ok());
+    }
+
+    // === Patch 30 — Semantic Identity Resolution v1 tests ===
+
+    #[test]
+    fn match_level_for_score_thresholds_pinned() {
+        // Patch 30 — MatchLevel uses the SAME numeric thresholds
+        // as TrustLevel (0.80/0.50/0.20) but distinct vocabulary
+        // (Strong/Possible/Weak/None). Pin both edges to catch
+        // any future drift in the bucketing math.
+        assert_eq!(MatchLevel::level_for_score(1.0), MatchLevel::Strong);
+        assert_eq!(MatchLevel::level_for_score(0.80), MatchLevel::Strong);
+        assert_eq!(
+            MatchLevel::level_for_score(0.799),
+            MatchLevel::Possible
+        );
+        assert_eq!(MatchLevel::level_for_score(0.50), MatchLevel::Possible);
+        assert_eq!(MatchLevel::level_for_score(0.499), MatchLevel::Weak);
+        assert_eq!(MatchLevel::level_for_score(0.20), MatchLevel::Weak);
+        assert_eq!(MatchLevel::level_for_score(0.199), MatchLevel::None);
+        assert_eq!(MatchLevel::level_for_score(0.0), MatchLevel::None);
+    }
+
+    #[test]
+    fn match_level_serializes_pascal_case() {
+        // Wire form contract for the future P31 SDK/HTTP surface.
+        assert_eq!(
+            serde_json::to_string(&MatchLevel::Strong).unwrap(),
+            "\"Strong\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MatchLevel::Possible).unwrap(),
+            "\"Possible\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MatchLevel::Weak).unwrap(),
+            "\"Weak\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MatchLevel::None).unwrap(),
+            "\"None\""
+        );
+    }
+
+    #[test]
+    fn semantic_identity_match_assessment_serde_roundtrip() {
+        // Full envelope round-trips through serde — pinned so the
+        // P31 wire surface lands without rewriting fixtures.
+        let assessment = SemanticIdentityMatchAssessment {
+            query_alias: IdentityAlias {
+                source: "snowflake".to_string(),
+                namespace: Some("analytics".to_string()),
+                external_id: Some("REVENUE_DAILY".to_string()),
+                label: "Revenue Daily".to_string(),
+                normalized: "analytics.revenue_daily".to_string(),
+            },
+            candidates: vec![SemanticIdentityMatchCandidate {
+                entity_id: IdentityEntityId::from_str("ide_test"),
+                score: 0.92,
+                level: MatchLevel::Strong,
+                factors: vec![TrustFactor {
+                    kind: "exact_alias_match".to_string(),
+                    weight: 0.85,
+                    applied: true,
+                    detail: "alias matches existing entity".to_string(),
+                }],
+            }],
+            assessed_at: chrono::DateTime::parse_from_rfc3339(
+                "2026-05-31T12:00:00Z",
+            )
+            .unwrap()
+            .with_timezone(&Utc),
+        };
+        let json = serde_json::to_string(&assessment).unwrap();
+        let restored: SemanticIdentityMatchAssessment =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, assessment);
     }
 }
