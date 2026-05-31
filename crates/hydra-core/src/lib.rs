@@ -17,14 +17,16 @@ pub mod micromodel;
 pub mod replication;
 pub mod trust;
 pub mod causal_cell;
+pub mod identity;
 
 pub use id::{
     ActionId, ActorId, ApprovalId, CascadeId, CausalCellId, ClaimId, CommitId, EdgeId, EventId,
-    EvidenceId, MicroModelId, MicroModelRunId, NodeId, OutcomeId, PolicyDecisionId, PolicyId,
-    ReplicaId, ReplicationRunId, SchemaId, SensorCheckpointId, SensorId, SensorRunId, SnapshotId,
-    SubscriptionId, TenantId, TypeId,
+    EvidenceId, IdentityEntityId, MicroModelId, MicroModelRunId, NodeId, OutcomeId,
+    PolicyDecisionId, PolicyId, ReplicaId, ReplicationRunId, SchemaId, SensorCheckpointId,
+    SensorId, SensorRunId, SnapshotId, SubscriptionId, TenantId, TypeId,
 };
 pub use causal_cell::{CausalCell, CausalCellKind};
+pub use identity::{IdentityAlias, IdentityEntity, IdentityEntityKind};
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
     Claim,

@@ -10,6 +10,7 @@ use crate::schema_validator::SchemaValidator;
 use crate::sensor_checkpoint_store::SensorCheckpointStore;
 use crate::replication_store::ReplicationStore;
 use crate::causal_cell_store::CausalCellStore;
+use crate::identity_store::IdentityStore;
 use crate::action_store::ActionStore;
 use crate::epistemic_store::EpistemicStore;
 use crate::event_log::EventLog;
@@ -159,6 +160,13 @@ pub struct Hydra {
     /// automatically yet — Patch 21+ will add reflex→cell
     /// converters.
     causal_cell_store: CausalCellStore,
+    /// Patch 29 — Identity Graph vocabulary store. Holds canonical
+    /// `IdentityEntity`s with embedded source-specific aliases.
+    /// Same passive-store pattern as `causal_cell_store`: built
+    /// from the event log, restored from snapshot bodies, never
+    /// auto-populated. Future patches (P30+) layer matching,
+    /// links, and correlation on top of this primitive.
+    identity_store: IdentityStore,
     /// MicroModel Patch 2 — built-in `CommitRateAnomalyModel`.
     /// Transient by design (cold restart re-enters WarmingUp).
     /// `None` until the first call to `evaluate_commit_rate_anomaly`,
@@ -300,6 +308,7 @@ impl Hydra {
             schema_registry_store: SchemaRegistryStore::new(),
             micromodel_store: MicroModelStore::new(),
             causal_cell_store: CausalCellStore::new(),
+            identity_store: IdentityStore::new(),
             commit_rate_anomaly_model: None,
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
@@ -351,6 +360,7 @@ impl Hydra {
             schema_registry_store: SchemaRegistryStore::new(),
             micromodel_store: MicroModelStore::new(),
             causal_cell_store: CausalCellStore::new(),
+            identity_store: IdentityStore::new(),
             commit_rate_anomaly_model: None,
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
@@ -736,6 +746,7 @@ impl Hydra {
         self.schema_registry_store.apply_event(event)?;
         self.micromodel_store.apply_event(event)?;
         self.causal_cell_store.apply_event(event)?;
+        self.identity_store.apply_event(event)?;
         Ok(())
     }
 
@@ -923,6 +934,7 @@ impl Hydra {
         self.schema_registry_store = SchemaRegistryStore::new();
         self.micromodel_store = MicroModelStore::new();
         self.causal_cell_store = CausalCellStore::new();
+        self.identity_store = IdentityStore::new();
         // MicroModel Patch 2 — transient by design; cold restart
         // re-enters WarmingUp on the next evaluation.
         self.commit_rate_anomaly_model = None;
@@ -2348,6 +2360,93 @@ impl Hydra {
         kind: &hydra_core::CausalCellKind,
     ) -> Vec<&hydra_core::CausalCell> {
         self.causal_cell_store.cells_with_kind(kind)
+    }
+
+    // === Identity Graph (Patch 29) ===
+
+    /// Patch 29 — create a canonical `IdentityEntity`.
+    ///
+    /// Enforces both uniqueness contracts at the engine boundary:
+    ///
+    /// - **Alias uniqueness**: every alias on the entity is
+    ///   indexed by `IdentityAlias::index_key(tenant)`. A
+    ///   collision with an already-stored entity returns
+    ///   `QueryError("duplicate alias key ...")`.
+    /// - **Canonical-key uniqueness**: `(tenant, kind,
+    ///   canonical_key)` must be unique. Collision returns
+    ///   `QueryError("duplicate canonical_key ...")`.
+    /// - **Sentinel validation**: aliases whose `source` or
+    ///   `namespace` matches reserved sentinels (`__system__`,
+    ///   `__root__`) are rejected so a caller can't force a
+    ///   key collision with the `None`-tenant slot.
+    ///
+    /// On success, ingests `EventKind::IdentityEntityCreated`
+    /// and returns the stored entity. Identities are immutable
+    /// in v0 — no `update_identity_entity` method, no merge
+    /// events. Future patches (P30+) add those.
+    pub fn create_identity_entity(
+        &mut self,
+        entity: hydra_core::IdentityEntity,
+    ) -> hydra_core::error::Result<hydra_core::IdentityEntity> {
+        // Run the local store's create_entity FIRST so uniqueness
+        // checks fire before we hit the event log. On Err, the
+        // store is unchanged (its checks all run before
+        // insert_entity).
+        let stored = self.identity_store.create_entity(entity.clone())?;
+        // Now persist via the audit log. `apply_replayed_event`
+        // will re-insert into the store during replay, but
+        // re-insertion is idempotent — same id triggers a
+        // remove-then-add cycle in `insert_entity`.
+        self.ingest(hydra_core::EventKind::IdentityEntityCreated {
+            entity,
+        })?;
+        Ok(stored)
+    }
+
+    /// Look up one identity entity by id.
+    pub fn identity_entity(
+        &self,
+        id: &hydra_core::IdentityEntityId,
+    ) -> Option<&hydra_core::IdentityEntity> {
+        self.identity_store.entity(id)
+    }
+
+    /// Resolve a source-specific alias to its canonical entity.
+    ///
+    /// Strict tenant scoping (same rule as P25/P26/P28): a
+    /// tenanted query NEVER returns a `None`-tenanted entity,
+    /// and vice versa. The store's index keys carry distinct
+    /// sentinels for the `None` slot, so the two are physically
+    /// separate.
+    pub fn identity_entity_by_alias(
+        &self,
+        tenant_id: Option<&hydra_core::TenantId>,
+        source: &str,
+        namespace: Option<&str>,
+        normalized: &str,
+    ) -> Option<&hydra_core::IdentityEntity> {
+        self.identity_store
+            .entity_by_alias(tenant_id, source, namespace, normalized)
+    }
+
+    /// All identity entities matching the given kind (via
+    /// `IdentityEntityKind::discriminant()`). Returns an iterator
+    /// to match the `causal_cells` shape.
+    pub fn identity_entities_by_kind(
+        &self,
+        kind: hydra_core::IdentityEntityKind,
+    ) -> impl Iterator<Item = &hydra_core::IdentityEntity> {
+        self.identity_store
+            .entities_with_kind(&kind)
+            .into_iter()
+    }
+
+    /// All identity entities (unordered). Used by snapshot
+    /// assembly and tests.
+    pub fn identity_entities(
+        &self,
+    ) -> impl Iterator<Item = &hydra_core::IdentityEntity> {
+        self.identity_store.all_entities()
     }
 
     /// Patch 21 — turn a model-derived reflex chain into a
@@ -6207,6 +6306,16 @@ impl Hydra {
             micro_model_observations.len(),
         )
         .with_causal_cell_count(causal_cells.len());
+
+        // Patch 29 — Identity Graph vocabulary into the snapshot.
+        let identity_entities = self
+            .identity_store
+            .all_entities()
+            .cloned()
+            .collect::<Vec<_>>();
+        let manifest = manifest
+            .with_identity_entity_count(identity_entities.len());
+
         let body = hydra_core::SnapshotBody {
             manifest: manifest.clone(),
             nodes,
@@ -6229,6 +6338,7 @@ impl Hydra {
             micro_model_predictions,
             micro_model_observations,
             causal_cells,
+            identity_entities,
             metadata: std::collections::HashMap::new(),
         };
         // Persist to the backend FIRST so a backend failure aborts the
@@ -17732,6 +17842,220 @@ mod sprint1_tests {
         let cell_b =
             hydra.causal_cell(&b.causal_cell_id.clone().unwrap()).unwrap();
         assert_eq!(cell_b.kind, hydra_core::CausalCellKind::Reflex);
+    }
+
+    // === Patch 29 — Identity Graph vocabulary integration ===
+    //
+    // The unit-level uniqueness + replay tests live next to
+    // `IdentityStore` in `identity_store.rs`. These integration
+    // tests pin the engine-boundary contracts:
+    //
+    //   - `Hydra::create_identity_entity` ingests an event AND
+    //     populates the store (uniqueness checks fire BEFORE the
+    //     event lands so a rejected entity leaves the audit log
+    //     untouched).
+    //   - `recover_from_events` rebuilds the store from the
+    //     audit log.
+    //   - Snapshot + restore round-trip preserves identity
+    //     entities via the audit-event replay path.
+
+    fn make_identity_entity(
+        tenant: Option<hydra_core::TenantId>,
+        kind: hydra_core::IdentityEntityKind,
+        canonical_key: &str,
+        aliases: Vec<hydra_core::IdentityAlias>,
+    ) -> hydra_core::IdentityEntity {
+        let now = chrono::Utc::now();
+        hydra_core::IdentityEntity {
+            id: hydra_core::IdentityEntityId::new(),
+            tenant_id: tenant,
+            kind,
+            canonical_key: canonical_key.to_string(),
+            display_name: canonical_key.to_string(),
+            aliases,
+            confidence: hydra_core::Confidence::new(1.0),
+            metadata: std::collections::HashMap::new(),
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        }
+    }
+
+    fn snowflake_alias(ns: &str, table: &str) -> hydra_core::IdentityAlias {
+        hydra_core::IdentityAlias {
+            source: "snowflake".to_string(),
+            namespace: Some(ns.to_string()),
+            external_id: Some(format!("{ns}.{table}").to_uppercase()),
+            label: format!("{ns}.{table}").to_uppercase(),
+            normalized: format!(
+                "{}.{}",
+                ns.to_lowercase(),
+                table.to_lowercase()
+            ),
+        }
+    }
+
+    #[test]
+    fn create_identity_entity_ingests_event_and_indexes() {
+        // Happy path through the engine boundary: entity lands
+        // in the store AND an IdentityEntityCreated event lands
+        // in the audit log.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p29");
+        let entity = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![snowflake_alias("analytics", "revenue_daily")],
+        );
+        let id = entity.id.clone();
+        let stored = hydra.create_identity_entity(entity).unwrap();
+        assert_eq!(stored.id, id);
+        assert_eq!(hydra.identity_entity(&id), Some(&stored));
+        // Alias resolves.
+        let resolved = hydra
+            .identity_entity_by_alias(
+                Some(&tenant),
+                "snowflake",
+                Some("analytics"),
+                "analytics.revenue_daily",
+            )
+            .unwrap();
+        assert_eq!(resolved.id, id);
+        // IdentityEntityCreated event landed in the audit log.
+        let found = hydra.events().iter().any(|e| {
+            matches!(
+                &e.kind,
+                hydra_core::EventKind::IdentityEntityCreated { .. }
+            )
+        });
+        assert!(found, "audit log missing IdentityEntityCreated event");
+    }
+
+    #[test]
+    fn create_identity_entity_duplicate_canonical_key_via_hydra() {
+        // The canonical-key check fires AT the Hydra boundary
+        // (not just at the store), AND on rejection no event is
+        // ingested — the audit log stays clean.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p29");
+        let a = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![],
+        );
+        let b = make_identity_entity(
+            Some(tenant),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![snowflake_alias("ops", "other_thing")],
+        );
+        hydra.create_identity_entity(a).unwrap();
+        let pre_count = hydra.events().len();
+        let result = hydra.create_identity_entity(b);
+        assert!(result.is_err(), "expected duplicate-canonical-key error");
+        // Audit log unchanged — store rejection happens BEFORE
+        // event ingestion in `create_identity_entity`.
+        assert_eq!(
+            hydra.events().len(),
+            pre_count,
+            "rejected entity must NOT add an audit event"
+        );
+    }
+
+    #[test]
+    fn recover_from_events_rebuilds_identity_store() {
+        // Replay round-trip: ingest several entities, dump the
+        // event log, reset, replay. Store must be byte-identical.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p29");
+        let a = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![snowflake_alias("analytics", "revenue_daily")],
+        );
+        let b = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Service,
+            "service/payments_api",
+            vec![],
+        );
+        let id_a = a.id.clone();
+        let id_b = b.id.clone();
+        hydra.create_identity_entity(a).unwrap();
+        hydra.create_identity_entity(b).unwrap();
+        assert_eq!(hydra.identity_entities().count(), 2);
+
+        // Replay from event log.
+        let events: Vec<_> =
+            hydra.events().into_iter().cloned().collect();
+        hydra.reset_runtime_state_preserving_config();
+        assert_eq!(hydra.identity_entities().count(), 0);
+        hydra.recover_from_events(events).unwrap();
+        assert_eq!(hydra.identity_entities().count(), 2);
+        assert!(hydra.identity_entity(&id_a).is_some());
+        assert!(hydra.identity_entity(&id_b).is_some());
+        // Alias index also rebuilt.
+        let alias_resolved = hydra
+            .identity_entity_by_alias(
+                Some(&tenant),
+                "snowflake",
+                Some("analytics"),
+                "analytics.revenue_daily",
+            )
+            .unwrap();
+        assert_eq!(alias_resolved.id, id_a);
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_identity_entities() {
+        // Snapshot manifest counts + body's identity_entities
+        // vec round-trip, and post-restore the store sees the
+        // entities (via event replay).
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p29");
+        let entity = make_identity_entity(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![snowflake_alias("analytics", "revenue_daily")],
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+
+        let manifest = hydra
+            .snapshot(hydra_core::ActorId::from_str("actor_ops"))
+            .unwrap();
+        assert_eq!(manifest.total_identity_entities, 1);
+        let body = hydra
+            .snapshot_store()
+            .body(&manifest.id)
+            .expect("snapshot body present")
+            .clone();
+        assert_eq!(body.identity_entities.len(), 1);
+        assert_eq!(body.identity_entities[0].id, id);
+
+        // Restore into a fresh engine via event replay.
+        let mut fresh = Hydra::new();
+        fresh.recover_from_events(body.events.clone()).unwrap();
+        let restored = fresh
+            .identity_entity(&id)
+            .expect("entity restored");
+        assert_eq!(restored.kind, hydra_core::IdentityEntityKind::Dataset);
+        assert_eq!(restored.canonical_key, "dataset/revenue_daily");
+        // Alias resolves post-restore too.
+        let resolved = fresh
+            .identity_entity_by_alias(
+                Some(&tenant),
+                "snowflake",
+                Some("analytics"),
+                "analytics.revenue_daily",
+            )
+            .unwrap();
+        assert_eq!(resolved.id, id);
     }
 
     // === Patch 23 — CausalCell trust folding ===

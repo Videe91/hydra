@@ -206,6 +206,14 @@ define_id!(MicroModelRunId, "mmrun");
 // (`ten`, `pol`, `act`).
 define_id!(CausalCellId, "cell");
 
+// Patch 29 — Identity Graph vocabulary. An IdentityEntity is a
+// canonical real-world or system object (a dataset, service,
+// agent, user) onto which many source-specific aliases map.
+// Prefix `ide` is short for "identity entity" and matches the
+// existing 3-letter prefix convention (`ten`, `pol`, `act`,
+// `cell`, `mm`).
+define_id!(IdentityEntityId, "ide");
+
 #[cfg(test)]
 mod tests {
     use super::*;

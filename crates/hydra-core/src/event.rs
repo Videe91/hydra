@@ -330,6 +330,14 @@ pub enum EventKind {
     CausalCellCreated {
         cell: crate::causal_cell::CausalCell,
     },
+
+    // Identity Graph lifecycle (Patch 29 — vocabulary only).
+    // One event variant: identity entities are immutable once
+    // created in v0. No alias merges / canonical merges / links
+    // / deletes yet — those land in later patches (P30+).
+    IdentityEntityCreated {
+        entity: crate::identity::IdentityEntity,
+    },
 }
 
 impl EventKind {
@@ -393,7 +401,8 @@ impl EventKind {
             | EventKind::MicroModelStatusChanged { .. }
             | EventKind::MicroModelPredictionRecorded { .. }
             | EventKind::MicroModelObservationRecorded { .. }
-            | EventKind::CausalCellCreated { .. } => None,
+            | EventKind::CausalCellCreated { .. }
+            | EventKind::IdentityEntityCreated { .. } => None,
         }
     }
 
@@ -454,6 +463,7 @@ impl EventKind {
             EventKind::MicroModelPredictionRecorded { .. } => "micro_model_prediction_recorded",
             EventKind::MicroModelObservationRecorded { .. } => "micro_model_observation_recorded",
             EventKind::CausalCellCreated { .. } => "causal_cell_created",
+            EventKind::IdentityEntityCreated { .. } => "identity_entity_created",
         }
     }
 }
@@ -692,6 +702,36 @@ mod tests {
             properties: HashMap::new(),
         };
         assert_eq!(kind.kind_name(), "node_created");
+    }
+
+    #[test]
+    fn identity_entity_created_event_kind_name_is_snake_case() {
+        // Patch 29 — the new variant must produce a snake_case
+        // name like every other EventKind. Pinned so a future
+        // refactor doesn't accidentally drift naming.
+        use crate::identity::{IdentityEntity, IdentityEntityKind};
+        use crate::epistemic::Confidence;
+        use chrono::Utc;
+        let now = Utc::now();
+        let kind = EventKind::IdentityEntityCreated {
+            entity: IdentityEntity {
+                id: crate::id::IdentityEntityId::new(),
+                tenant_id: None,
+                kind: IdentityEntityKind::Dataset,
+                canonical_key: "dataset/x".to_string(),
+                display_name: "x".to_string(),
+                aliases: vec![],
+                confidence: Confidence::new(1.0),
+                metadata: HashMap::new(),
+                created_by: crate::id::ActorId::from_str("actor_ops"),
+                created_at: now,
+                updated_at: now,
+                caused_by: None,
+            },
+        };
+        assert_eq!(kind.kind_name(), "identity_entity_created");
+        // Identity events have no target node (mirrors CausalCellCreated).
+        assert!(kind.target_node().is_none());
     }
 
     #[test]

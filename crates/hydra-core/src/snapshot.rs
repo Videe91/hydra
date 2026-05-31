@@ -75,6 +75,11 @@ pub struct SnapshotManifest {
     /// so manifests written before Patch 20 deserialize as zero.
     #[serde(default)]
     pub total_causal_cells: usize,
+    /// Patch 29 — Identity Graph vocabulary count.
+    /// `#[serde(default)]` so manifests written before Patch 29
+    /// deserialize as zero.
+    #[serde(default)]
+    pub total_identity_entities: usize,
     pub metadata: HashMap<String, Value>,
 }
 
@@ -126,6 +131,11 @@ pub struct SnapshotBody {
     /// empty vector.
     #[serde(default)]
     pub causal_cells: Vec<crate::causal_cell::CausalCell>,
+    /// Patch 29 — Identity Graph vocabulary state.
+    /// `#[serde(default)]` so bodies written before Patch 29
+    /// deserialize with an empty vector.
+    #[serde(default)]
+    pub identity_entities: Vec<crate::identity::IdentityEntity>,
     pub metadata: HashMap<String, Value>,
 }
 
@@ -188,6 +198,9 @@ impl SnapshotManifest {
             // Patch 20: same pattern — defaults to zero, engine
             // attaches via `with_causal_cell_count(...)`.
             total_causal_cells: 0,
+            // Patch 29: same pattern — defaults to zero, engine
+            // attaches via `with_identity_entity_count(...)`.
+            total_identity_entities: 0,
             metadata: HashMap::new(),
         }
     }
@@ -235,6 +248,22 @@ impl SnapshotManifest {
     /// ```
     pub fn with_causal_cell_count(mut self, cells: usize) -> Self {
         self.total_causal_cells = cells;
+        self
+    }
+
+    /// Attach the Patch 29 identity-entity count. Chainable;
+    /// mirrors `with_causal_cell_count`. Engine's snapshot path
+    /// stacks all four setters:
+    ///
+    /// ```ignore
+    /// SnapshotManifest::committed(...)
+    ///     .with_replication_counts(peers, runs)
+    ///     .with_micro_model_counts(models, predictions, observations)
+    ///     .with_causal_cell_count(cells)
+    ///     .with_identity_entity_count(entities)
+    /// ```
+    pub fn with_identity_entity_count(mut self, entities: usize) -> Self {
+        self.total_identity_entities = entities;
         self
     }
 
@@ -411,6 +440,7 @@ mod tests {
             micro_model_predictions: vec![],
             micro_model_observations: vec![],
             causal_cells: vec![],
+            identity_entities: vec![],
             metadata: HashMap::new(),
         };
         let json = serde_json::to_string(&body).unwrap();
@@ -498,5 +528,87 @@ mod tests {
             serde_json::from_value(pre_patch20_json).unwrap();
         assert!(body.causal_cells.is_empty());
         assert_eq!(body.manifest.total_causal_cells, 0);
+    }
+
+    #[test]
+    fn snapshot_manifest_with_identity_entity_count_chainable() {
+        // Patch 29 — the new chainable setter composes with all
+        // three prior ones without touching them. Pinned so a
+        // future patch that adds a fifth setter follows the same
+        // shape.
+        let manifest = SnapshotManifest::committed(
+            SnapshotId::from_str("snap_p29"),
+            None,
+            42,
+            None,
+            None,
+            ActorId::from_str("actor_ops"),
+            chrono::Utc::now(),
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        )
+        .with_replication_counts(2, 3)
+        .with_micro_model_counts(4, 5, 6)
+        .with_causal_cell_count(7)
+        .with_identity_entity_count(9);
+        assert_eq!(manifest.total_replication_peers, 2);
+        assert_eq!(manifest.total_replication_runs, 3);
+        assert_eq!(manifest.total_micro_models, 4);
+        assert_eq!(manifest.total_micro_model_predictions, 5);
+        assert_eq!(manifest.total_micro_model_observations, 6);
+        assert_eq!(manifest.total_causal_cells, 7);
+        assert_eq!(manifest.total_identity_entities, 9);
+    }
+
+    #[test]
+    fn snapshot_body_backcompat_defaults_identity_entities_to_empty() {
+        // Manifests + bodies written before Patch 29 don't carry
+        // an `identity_entities` field. `#[serde(default)]`
+        // makes them deserialize cleanly with an empty vec.
+        // Same shape as the Patch 20 backcompat pin.
+        let pre_patch29_json = serde_json::json!({
+            "manifest": {
+                "id": "snap_old",
+                "tenant_id": null,
+                "sequence": 0,
+                "head_commit_id": null,
+                "head_commit_hash": null,
+                "status": "Committed",
+                "created_by": "actor_ops",
+                "created_at": "2026-05-29T00:00:00Z",
+                "total_events": 0,
+                "total_commits": 0,
+                "total_nodes": 0,
+                "total_edges": 0,
+                "total_claims": 0,
+                "total_evidence": 0,
+                "total_actions": 0,
+                "total_outcomes": 0,
+                "total_policies": 0,
+                "total_policy_decisions": 0,
+                "total_approval_requests": 0,
+                "total_sensor_checkpoints": 0,
+                "total_schemas": 0,
+                "metadata": {}
+            },
+            "nodes": [],
+            "edges": [],
+            "events": [],
+            "commit_records": [],
+            "claims": [],
+            "evidence": [],
+            "actions": [],
+            "outcomes": [],
+            "policies": [],
+            "policy_decisions": [],
+            "approval_requests": [],
+            "sensor_runs": [],
+            "sensor_checkpoints": [],
+            "schemas": [],
+            "metadata": {}
+        });
+        let body: SnapshotBody =
+            serde_json::from_value(pre_patch29_json).unwrap();
+        assert!(body.identity_entities.is_empty());
+        assert_eq!(body.manifest.total_identity_entities, 0);
     }
 }
