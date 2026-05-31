@@ -528,3 +528,39 @@ def replication_role_path() -> str:
 
 def replication_promotion_status_path() -> str:
     return "/replication/promotion-status"
+
+
+# === /identity/* (Patch 31 — Identity Graph HTTP/SDK) ===
+#
+# Four routes:
+#
+#   POST /identity/entities               — create canonical entity
+#   GET  /identity/entities/{entity_id}   — single lookup
+#   GET  /identity/entities                — paginated list (or ?kind=)
+#   GET  /identity/matches                 — semantic match suggestions
+#
+# All gated under `read:identity` (GETs) and `write:identity`
+# (POST). Tenant header required on every public route.
+
+
+def identity_entity_path(entity_id: str) -> str:
+    """`GET /identity/entities/{entity_id}` — single-entity
+    lookup. Tenant-scoped: missing `X-Hydra-Tenant` → 400; wrong
+    tenant or `None`-tenanted (system) entity → 404."""
+    return f"/identity/entities/{_seg(entity_id)}"
+
+
+def identity_entities_path() -> str:
+    """`GET /identity/entities` (list, with optional `?kind=` /
+    `?after=` / `?limit=`) AND `POST /identity/entities` (create).
+    Body for POST: `{entity: IdentityEntity}`. Server overwrites
+    `entity.tenant_id` with the header value — caller cannot
+    smuggle a different tenant or `None` via the body."""
+    return "/identity/entities"
+
+
+def identity_matches_path() -> str:
+    """`GET /identity/matches?source=&normalized=&namespace=&kind=&limit=`
+    — Patch 31 semantic match endpoint. Read-only, tenant-scoped.
+    Returns `{assessment: SemanticIdentityMatchAssessment}`."""
+    return "/identity/matches"

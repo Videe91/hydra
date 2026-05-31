@@ -39,6 +39,11 @@ from ._types import (
     CausalCellId,
     CausalCellKind,
     CausalCellTrustAssessment,
+    IdentityAlias,
+    IdentityEntity,
+    IdentityEntityId,
+    IdentityEntityKind,
+    SemanticIdentityMatchAssessment,
     Claim,
     ClaimId,
     ClaimKind,
@@ -791,6 +796,180 @@ class Hydra:
             tenant=tenant,
         )
         return CausalCell.model_validate(raw["cell"])
+
+    # ========================================================================
+    # Identity Graph (Patch 31)
+    # ========================================================================
+
+    async def create_identity_entity(
+        self,
+        entity: IdentityEntity,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityEntity:
+        """Create a canonical `IdentityEntity` (Patch 29 vocab,
+        Patch 31 wire) via `POST /identity/entities`.
+
+        The caller fully populates the entity — `id`, timestamps,
+        aliases, etc. The server overwrites `entity.tenant_id`
+        with the `X-Hydra-Tenant` header value (anti-smuggling
+        rule) so the persisted entity always belongs to the
+        calling tenant regardless of what the body says.
+
+        Errors:
+          - 400 → `HydraValidationError`: duplicate alias,
+            duplicate canonical_key, reserved sentinel in alias
+            source/namespace, empty alias source/normalized,
+            missing tenant header.
+        """
+        body = {"entity": entity.model_dump(mode="json")}
+        raw = await self._http.post(
+            _paths.identity_entities_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return IdentityEntity.model_validate(raw["entity"])
+
+    async def identity_entity(
+        self,
+        entity_id: IdentityEntityId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityEntity:
+        """Look up one `IdentityEntity` by id (`GET /identity/entities/{id}`).
+
+        Strict tenant scoping (mirrors the Patch 29 store
+        contract): wrong-tenant AND `None`-tenanted (system)
+        entities surface identically as `HydraNotFoundError`.
+        No cross-tenant probing.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header
+          - 404 → `HydraNotFoundError`: unknown id, wrong tenant,
+            or `None`-tenanted entity under a tenanted query
+        """
+        raw = await self._http.get(
+            _paths.identity_entity_path(entity_id),
+            tenant=tenant,
+        )
+        return IdentityEntity.model_validate(raw["entity"])
+
+    async def identity_entities(
+        self,
+        *,
+        kind: IdentityEntityKind | None = None,
+        limit: int | None = None,
+        after: str | None = None,
+        tenant: TenantId | None = None,
+    ) -> list[IdentityEntity]:
+        """List `IdentityEntity`s for the caller's tenant
+        (`GET /identity/entities`).
+
+        Two modes:
+
+          - **Paginated unfiltered** (`kind=None`): cursor-based
+            over all tenant entities sorted by id. `limit`
+            defaults to 100 server-side, capped at 500. v0
+            returns the page items only; `next_cursor` lives on
+            the wire but isn't surfaced through this convenience
+            method.
+
+          - **Filtered by kind** (`kind="dataset"` etc.): returns
+            the full filtered set, unpaginated. Built-in kind
+            labels are snake_case
+            (`"dataset"`, `"table"`, `"dashboard"`, `"metric"`,
+            `"service"`, `"agent"`, `"workflow"`, `"source"`,
+            `"user"`, `"system"`, `"incident"`); any other
+            non-empty string maps to `Custom(label)`
+            server-side. Unknown labels return an empty list,
+            NOT 400.
+
+        `None`-tenanted entities are NEVER included.
+        """
+        kind_param: str | None
+        if kind is None:
+            kind_param = None
+        elif isinstance(kind, dict):
+            kind_param = kind.get("Custom") or next(iter(kind.values()), None)
+        else:
+            kind_param = kind
+        params: dict[str, str | int] = {}
+        if kind_param is not None:
+            params["kind"] = kind_param
+        if limit is not None:
+            params["limit"] = limit
+        if after is not None:
+            params["after"] = after
+        raw = await self._http.get(
+            _paths.identity_entities_path(),
+            params=params if params else None,
+            tenant=tenant,
+        )
+        return [
+            IdentityEntity.model_validate(e) for e in raw["entities"]
+        ]
+
+    async def suggest_identity_matches(
+        self,
+        *,
+        source: str,
+        normalized: str,
+        namespace: str | None = None,
+        kind: IdentityEntityKind | None = None,
+        limit: int = 10,
+        tenant: TenantId | None = None,
+    ) -> SemanticIdentityMatchAssessment:
+        """Suggest canonical `IdentityEntity`s that the
+        `(source, namespace, normalized)` triple probably refers
+        to (`GET /identity/matches` — Patch 30 engine, Patch 31
+        wire).
+
+        Read-only and deterministic. Returns
+        `SemanticIdentityMatchAssessment` with candidates sorted
+        by score desc, entity_id asc. Zero-score candidates are
+        excluded server-side. `MatchLevel` on each candidate is
+        `"Strong"` / `"Possible"` / `"Weak"` / `"None"` —
+        the `"None"` value is a STRING (no match), distinct
+        from Python `None`.
+
+        ## Suggestion-only contract
+
+        The deterministic weights are calibrated for
+        **explainability, NOT guaranteed correctness**. False
+        positives are expected (e.g., `revenue_daily` matching
+        `revenue_daily_archived` via token_overlap_high). Any
+        auto-action based on these scores must add a separate
+        trust gate, gate on `level == "Strong"`, and require a
+        minimum score floor.
+
+        Strict tenant scoping: `None`-tenanted entities are
+        invisible. Missing tenant header → 400.
+        """
+        params: dict[str, str | int] = {
+            "source": source,
+            "normalized": normalized,
+        }
+        if namespace is not None:
+            params["namespace"] = namespace
+        if kind is not None:
+            kind_param: str
+            if isinstance(kind, dict):
+                kind_param = (
+                    kind.get("Custom") or next(iter(kind.values()), "") or ""
+                )
+            else:
+                kind_param = kind
+            if kind_param:
+                params["kind"] = kind_param
+        params["limit"] = limit
+        raw = await self._http.get(
+            _paths.identity_matches_path(),
+            params=params,
+            tenant=tenant,
+        )
+        return SemanticIdentityMatchAssessment.model_validate(
+            raw["assessment"]
+        )
 
     async def _ingest(
         self,

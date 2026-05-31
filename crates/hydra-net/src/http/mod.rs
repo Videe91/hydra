@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod causal_cells;
+pub mod identity;
 pub mod commit_stream;
 pub mod commits;
 pub mod diagnostics;
@@ -26,6 +27,11 @@ pub use actions::{
 pub use causal_cells::{
     causal_cells_router, CausalCellResponse, CausalCellsFilteredResponse, CausalCellsHttpState,
     CausalCellsListResponse, ListCausalCellsQuery,
+};
+pub use identity::{
+    identity_router, CreateIdentityEntityRequest, IdentityEntitiesFilteredResponse,
+    IdentityEntitiesListResponse, IdentityEntityResponse, IdentityHttpState,
+    IdentityMatchesResponse, ListIdentityEntitiesQuery, SuggestMatchesQuery,
 };
 pub use commit_stream::{
     commit_stream_router, CommitBroadcaster, CommitStreamErrorPayload,

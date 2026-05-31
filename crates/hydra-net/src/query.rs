@@ -5,8 +5,9 @@ use hydra_core::id::{CascadeId, EdgeId, EventId, NodeId};
 use hydra_core::node::Node;
 use hydra_core::{
     Action, ActionId, ActionStatus, CausalCell, CausalCellId, CausalCellKind, Claim, ClaimId,
-    ClaimKind, ClaimStatus, ClaimSubject, Evidence, EvidenceId, Outcome, OutcomeId,
-    SensorCheckpoint, SensorId, SensorRun, TenantId,
+    ClaimKind, ClaimStatus, ClaimSubject, Evidence, EvidenceId, IdentityEntity,
+    IdentityEntityId, IdentityEntityKind, Outcome, OutcomeId, SensorCheckpoint, SensorId,
+    SensorRun, TenantId,
 };
 use hydra_engine::hydra::Hydra;
 use std::sync::Arc;
@@ -636,6 +637,63 @@ impl QueryService {
             .collect();
         cells.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         cells
+    }
+
+    // === Patch 31 — Identity Graph read accessors ===================
+    //
+    // Tenant-scoped accessors mirroring `cell_for_tenant` /
+    // `cells_for_tenant` / `cells_with_kind_for_tenant`. `None`-
+    // tenanted (system) entities are NEVER returned by these
+    // methods — strict isolation. Order is sorted by id so
+    // cursor pagination at the HTTP layer is stable across
+    // calls.
+
+    /// Look up one identity entity by id, scoped to the given
+    /// tenant. Returns `None` when the entity doesn't exist OR
+    /// belongs to a different tenant OR is `None`-tenanted.
+    pub async fn identity_entity_for_tenant(
+        &self,
+        id: &IdentityEntityId,
+        tenant: &TenantId,
+    ) -> Option<IdentityEntity> {
+        let hydra = self.hydra.read().await;
+        hydra
+            .identity_entity(id)
+            .filter(|e| e.tenant_id.as_ref() == Some(tenant))
+            .cloned()
+    }
+
+    /// All identity entities belonging to `tenant`, sorted by id
+    /// for stable cursor pagination.
+    pub async fn identity_entities_for_tenant(
+        &self,
+        tenant: &TenantId,
+    ) -> Vec<IdentityEntity> {
+        let hydra = self.hydra.read().await;
+        let mut entities: Vec<IdentityEntity> = hydra
+            .identity_entities()
+            .filter(|e| e.tenant_id.as_ref() == Some(tenant))
+            .cloned()
+            .collect();
+        entities.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        entities
+    }
+
+    /// All identity entities with the given `kind` belonging to
+    /// `tenant`, sorted by id.
+    pub async fn identity_entities_with_kind_for_tenant(
+        &self,
+        kind: IdentityEntityKind,
+        tenant: &TenantId,
+    ) -> Vec<IdentityEntity> {
+        let hydra = self.hydra.read().await;
+        let mut entities: Vec<IdentityEntity> = hydra
+            .identity_entities_by_kind(kind)
+            .filter(|e| e.tenant_id.as_ref() == Some(tenant))
+            .cloned()
+            .collect();
+        entities.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        entities
     }
 
     pub async fn runs_for_sensor_for_tenant(

@@ -71,6 +71,9 @@ SnapshotId = str
 # Patch 20+ CausalCell — fractal-layer primitive (P20), reflex
 # converter (P21), composition (P22), trust folding (P23+).
 CausalCellId = str
+# Patch 29+ IdentityEntity — meaning-layer primitive ("same real
+# thing, many names").
+IdentityEntityId = str
 
 
 # === Confidence — [0.0, 1.0] clamp ===
@@ -1765,6 +1768,158 @@ class CausalCell(BaseModel):
     created_by: ActorId
     created_at: str
     caused_by: EventId | None = None
+
+
+# === Patch 29+ Identity Graph wire types ===
+#
+# Patch 29 introduced the Identity Graph vocabulary in the engine;
+# Patch 31 exposes it over HTTP/SDK. `IdentityEntityKind` mirrors
+# `CausalCellKind` exactly — union of bare PascalCase strings for
+# built-in variants and `{"Custom": "label"}` for the open-ended
+# fallback.
+
+IdentityEntityKind = str | dict[str, str]
+
+
+class IdentityAlias(BaseModel):
+    """A source-specific name for an `IdentityEntity`. Mirrors
+    `hydra_core::IdentityAlias`.
+
+    Five fields:
+
+      - `source` (required, non-empty) — system that owns this
+        name (`"snowflake"`, `"github"`, `"dbt"`, …).
+      - `namespace` (optional) — source-specific scope; `None`
+        for sources without a namespace concept (Slack channels,
+        etc.).
+      - `external_id` (optional) — source's own stable id for
+        round-trip lookups.
+      - `label` (required) — human-readable display string.
+      - `normalized` (required, non-empty) — lowercased,
+        canonicalized form used for matching. `"ANALYTICS.REVENUE_DAILY"`
+        and `"analytics.revenue_daily"` should produce the same
+        `normalized` so they resolve to the same canonical entity.
+
+    Server-side validation rejects aliases whose `source` or
+    `namespace` matches the reserved sentinels `__system__` /
+    `__root__` — those keep `None`-tenant and `None`-namespace
+    slots physically distinct in the alias index. Patch 29+
+    detail.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    namespace: str | None = None
+    external_id: str | None = None
+    label: str
+    normalized: str
+
+
+class IdentityEntity(BaseModel):
+    """Mirrors `hydra_core::IdentityEntity` — the canonical
+    identity primitive (Patch 29+ engine, Patch 31 wire).
+
+    An `IdentityEntity` represents a real-world or system object
+    (dataset, service, agent, user, …) onto which many
+    source-specific aliases map. The Hydra Identity Graph is
+    the meaning layer: distinct from graph data (claims,
+    evidence) and from trust judgments.
+
+    Identities are immutable in v0 — `POST /identity/entities`
+    creates them; there is no update / delete / merge route
+    yet. Each entity carries:
+
+      - `id` — stable `ide_`-prefixed handle.
+      - `tenant_id` — REQUIRED on the wire (the HTTP layer
+        overwrites this with the `X-Hydra-Tenant` header to
+        prevent tenant smuggling). `None`-tenanted entities
+        exist server-side but are NOT exposed via the public
+        `/identity/*` routes.
+      - `kind` + `canonical_key` + `display_name` — the
+        canonical handle (kind="Dataset",
+        canonical_key="dataset/revenue_daily", display_name=
+        "Revenue (daily)").
+      - `aliases` — embedded list of `IdentityAlias`. The store
+        indexes each one for resolution.
+      - `confidence` — Hydra's belief that this alias bundle
+        refers to one canonical thing. `1.0` for operator-
+        declared entities; lower for future auto-resolved.
+      - `metadata` — free-form bag for future fields.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: IdentityEntityId
+    tenant_id: TenantId | None = None
+    kind: IdentityEntityKind
+    canonical_key: str
+    display_name: str
+    aliases: list[IdentityAlias] = Field(default_factory=list)
+    confidence: Confidence
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_by: ActorId
+    created_at: str
+    updated_at: str
+    caused_by: EventId | None = None
+
+
+# === Patch 30 — Semantic Identity Resolution wire types ===
+#
+# `MatchLevel` is a Literal union mirroring the Rust enum.
+# Wire form is bare PascalCase strings — including `"None"`
+# which is a STRING VALUE, not Python's None. Operators
+# reading dashboards should be aware of this — `level: "None"`
+# means "no match", `level: null` would mean missing field
+# (which never happens — the field is always populated).
+
+MatchLevel = Literal["Strong", "Possible", "Weak", "None"]
+"""Match strength for a candidate identity. NOTE: `"None"` is
+a string value (no match), distinct from Python's `None`."""
+
+
+class SemanticIdentityMatchCandidate(BaseModel):
+    """One scored candidate within a
+    `SemanticIdentityMatchAssessment`. Mirrors
+    `hydra_core::SemanticIdentityMatchCandidate`.
+
+    `factors` includes ALL 9 evaluated factors (applied AND
+    unapplied) — same explainability contract as claim trust
+    (P9) and cell trust (P23). Don't filter applied=false
+    client-side; the unapplied factors carry the "what was
+    checked" information.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_id: IdentityEntityId
+    score: float
+    level: MatchLevel
+    factors: list[TrustFactor]
+
+
+class SemanticIdentityMatchAssessment(BaseModel):
+    """Response shape of `hy.suggest_identity_matches(...)`
+    (Patch 30 engine, Patch 31 wire).
+
+    `candidates` come back sorted by score descending, then
+    by `entity_id` ascending for stable ordering. Zero-score
+    candidates are excluded server-side so the list is always
+    actionable.
+
+    **Suggestion-only by design.** The deterministic weights
+    are calibrated for explainability, NOT guaranteed
+    correctness — false positives are expected. Any auto-action
+    based on these scores must add a separate trust gate.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query_alias: IdentityAlias
+    candidates: list[SemanticIdentityMatchCandidate] = Field(
+        default_factory=list
+    )
+    assessed_at: str
 
 
 # === Patch 24 — CausalCell trust folding wire types ===

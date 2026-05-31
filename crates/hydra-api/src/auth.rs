@@ -379,6 +379,16 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
         if path == "/causal-cells" || path.starts_with("/causal-cells/") {
             return vec!["write:causal-cells"];
         }
+        // Patch 31 — POSTs under `/identity/*` mutate the Identity
+        // Graph store (today: `create_identity_entity`; future:
+        // identity link routes, alias-add events, etc.).
+        // Prefix-based so future POST routes inherit
+        // automatically. Reading identities stays at
+        // `read:identity` below — identities are their own
+        // concern (a meaning layer), not graph data or trust.
+        if path == "/identity" || path.starts_with("/identity/") {
+            return vec!["write:identity"];
+        }
         return Vec::new();
     }
     // Reads.
@@ -431,6 +441,15 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
     // and `read:trust` — separation preserved.
     if path == "/causal-cells" || path.starts_with("/causal-cells/") {
         return vec!["read:query"];
+    }
+    // Patch 31 — Identity Graph read surface. Distinct from
+    // `read:query` (graph data) and `read:trust` (governance) —
+    // identities are the meaning layer, semantic resolution of
+    // "same real thing, many names". Future GET routes under
+    // `/identity/*` (identity links, alias diff, etc.) inherit
+    // automatically via this prefix.
+    if path == "/identity" || path.starts_with("/identity/") {
+        return vec!["read:identity"];
     }
     Vec::new()
 }
@@ -1112,6 +1131,28 @@ mod tests {
                 "/causal-cells/hydra-health/compose"
             ),
             vec!["write:causal-cells"]
+        );
+        // Patch 31 — Identity Graph HTTP surface. Distinct
+        // scopes from `read:query` / `write:causal-cells` since
+        // identities are the meaning layer (canonical entities +
+        // semantic resolution), not graph data.
+        // GET routes:
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/identity/entities"),
+            vec!["read:identity"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/identity/entities/ide_x"),
+            vec!["read:identity"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/identity/matches"),
+            vec!["read:identity"]
+        );
+        // POST routes:
+        assert_eq!(
+            required_scopes_for(&Method::POST, "/identity/entities"),
+            vec!["write:identity"]
         );
         // OPTIONS always has no scope requirement (CORS preflight).
         assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());

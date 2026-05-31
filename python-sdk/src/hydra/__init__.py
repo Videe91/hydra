@@ -87,6 +87,13 @@ from ._types import (
     CausalCellId,
     CausalCellKind,
     CausalCellTrustAssessment,
+    IdentityAlias,
+    IdentityEntity,
+    IdentityEntityId,
+    IdentityEntityKind,
+    MatchLevel,
+    SemanticIdentityMatchAssessment,
+    SemanticIdentityMatchCandidate,
     ClaimStatus,
     ClaimSubject,
     CommitBatchLite,
@@ -261,6 +268,19 @@ __all__ = [
     # tagged `{"Custom": "label"}` form.
     "CausalCell",
     "CausalCellKind",
+    # Identity Graph (Patch 29 vocab, Patch 30 matcher, Patch 31
+    # HTTP/SDK). `IdentityEntity` is the canonical primitive;
+    # `IdentityAlias` is one source-specific name; `MatchLevel`
+    # ("Strong"/"Possible"/"Weak"/"None") buckets the matcher
+    # score. Note: `MatchLevel.None` is a STRING value, not
+    # Python None.
+    "IdentityAlias",
+    "IdentityEntity",
+    "IdentityEntityId",
+    "IdentityEntityKind",
+    "MatchLevel",
+    "SemanticIdentityMatchAssessment",
+    "SemanticIdentityMatchCandidate",
     # Automation layer (Patch 11 + Patch 15)
     "AutoExecutionDecision",
     "AutoApprovalDecision",

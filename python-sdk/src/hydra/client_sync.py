@@ -55,6 +55,11 @@ from ._types import (
     CausalCellId,
     CausalCellKind,
     CausalCellTrustAssessment,
+    IdentityAlias,
+    IdentityEntity,
+    IdentityEntityId,
+    IdentityEntityKind,
+    SemanticIdentityMatchAssessment,
     Node,
     NodeId,
     Outcome,
@@ -512,6 +517,117 @@ class HydraSync:
             tenant=tenant,
         )
         return CausalCell.model_validate(raw["cell"])
+
+    # ========================================================================
+    # Identity Graph (Patch 31) — sync mirrors
+    # ========================================================================
+
+    def create_identity_entity(
+        self,
+        entity: IdentityEntity,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityEntity:
+        """Sync mirror of `Hydra.create_identity_entity` (Patch
+        31). Server overwrites `entity.tenant_id` with the
+        header — anti-smuggling rule. See the async docstring
+        for the full contract."""
+        body = {"entity": entity.model_dump(mode="json")}
+        raw = self._http.post(
+            _paths.identity_entities_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return IdentityEntity.model_validate(raw["entity"])
+
+    def identity_entity(
+        self,
+        entity_id: IdentityEntityId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityEntity:
+        """Sync mirror of `Hydra.identity_entity`. Strict tenant
+        scoping — `None`-tenanted entities invisible to public
+        routes."""
+        raw = self._http.get(
+            _paths.identity_entity_path(entity_id),
+            tenant=tenant,
+        )
+        return IdentityEntity.model_validate(raw["entity"])
+
+    def identity_entities(
+        self,
+        *,
+        kind: IdentityEntityKind | None = None,
+        limit: int | None = None,
+        after: str | None = None,
+        tenant: TenantId | None = None,
+    ) -> list[IdentityEntity]:
+        """Sync mirror of `Hydra.identity_entities`. Same two-mode
+        contract: paginated unfiltered vs filtered-by-kind
+        unpaginated."""
+        kind_param: str | None
+        if kind is None:
+            kind_param = None
+        elif isinstance(kind, dict):
+            kind_param = kind.get("Custom") or next(iter(kind.values()), None)
+        else:
+            kind_param = kind
+        params: dict[str, str | int] = {}
+        if kind_param is not None:
+            params["kind"] = kind_param
+        if limit is not None:
+            params["limit"] = limit
+        if after is not None:
+            params["after"] = after
+        raw = self._http.get(
+            _paths.identity_entities_path(),
+            params=params if params else None,
+            tenant=tenant,
+        )
+        return [
+            IdentityEntity.model_validate(e) for e in raw["entities"]
+        ]
+
+    def suggest_identity_matches(
+        self,
+        *,
+        source: str,
+        normalized: str,
+        namespace: str | None = None,
+        kind: IdentityEntityKind | None = None,
+        limit: int = 10,
+        tenant: TenantId | None = None,
+    ) -> SemanticIdentityMatchAssessment:
+        """Sync mirror of `Hydra.suggest_identity_matches`
+        (Patch 30 engine, Patch 31 wire). Read-only,
+        deterministic, suggestion-only contract — false
+        positives expected, see the async docstring."""
+        params: dict[str, str | int] = {
+            "source": source,
+            "normalized": normalized,
+        }
+        if namespace is not None:
+            params["namespace"] = namespace
+        if kind is not None:
+            kind_param: str
+            if isinstance(kind, dict):
+                kind_param = (
+                    kind.get("Custom") or next(iter(kind.values()), "") or ""
+                )
+            else:
+                kind_param = kind
+            if kind_param:
+                params["kind"] = kind_param
+        params["limit"] = limit
+        raw = self._http.get(
+            _paths.identity_matches_path(),
+            params=params,
+            tenant=tenant,
+        )
+        return SemanticIdentityMatchAssessment.model_validate(
+            raw["assessment"]
+        )
 
     def _ingest(
         self,
