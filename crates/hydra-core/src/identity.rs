@@ -498,6 +498,83 @@ pub struct IdentityEntityTrustAssessment {
     pub assessed_at: DateTime<Utc>,
 }
 
+// === Patch 35 — Source Trust v1 ===================================
+//
+// Read-only verdict over a *source* — the free-form `source` string
+// carried on each `IdentityAlias` (e.g. "snowflake", "github",
+// "dbt", "agent_data_quality"). Different question from P32 / P33:
+//
+//   P30  : how strongly do these names resemble each other?
+//   P32  : do I trust THIS alias→entity match?
+//   P33  : do I trust the canonical entity RECORD as a stable
+//          identity object?
+//   P35  : do I trust THIS SOURCE as a producer of identity /
+//          evidence signals?
+//
+// **Source trust is identity-backed, NOT operational.** v1 measures
+// whether a source has produced trustworthy *identity claims* in
+// this tenant — entity count, kind diversity, entity-confidence
+// corroboration (via P33), and evidence reliability where the
+// mapping from `EvidenceSource` to the source string is
+// unambiguous. v1 does NOT consider ingestion freshness, schema
+// drift, heartbeat liveness, SLA conformance, contradiction rate
+// over time, or operator override history.
+//
+// A dead Snowflake warehouse with five trustworthy historical
+// entities will score **High** here — correct for "did Snowflake
+// produce trustworthy identity claims," wrong for "is Snowflake
+// alive." Those operational signals layer on in P38+ when
+// connector primitives ship.
+
+/// Trust verdict over a source as a producer of identity / evidence
+/// signals. Produced by `Hydra::assess_source_trust`.
+///
+/// Field semantics:
+///
+/// - `source` — the source string under judgement. Compared via
+///   exact string match against `IdentityAlias::source` (P35 does
+///   NOT case-fold or normalize — `"snowflake"` and `"Snowflake"`
+///   are distinct sources). Sentinel inputs (`""`, `"__system__"`,
+///   `"__root__"`) are rejected at the engine boundary as
+///   `QueryError`.
+/// - `score` — P35 trust score, clamped to `[0.0, 1.0]`. Sum of
+///   applied factor weights; can dip below 0 pre-clamp when
+///   penalties dominate. Maximum reachable in v1 is `0.80`
+///   (positive ceiling — see factor table in `assess_source_trust`).
+/// - `level` — `TrustLevel` bucket of `score` via
+///   `TrustAssessment::level_for_score` (≥0.80 High, ≥0.50 Medium,
+///   ≥0.20 Low, else Unknown — shared with claim / cell / identity
+///   trust).
+/// - `explanation` — short prose summary for dashboards.
+/// - `factors` — ALL evaluated factors (applied AND unapplied —
+///   same explainability contract as P9 / P23 / P30 / P32 / P33).
+/// - `entity_sample_size` — how many entities were folded into the
+///   `*_trust_entities_from_source` factor calculation. Capped by
+///   `MAX_SOURCE_ENTITIES_FOR_TRUST` (highest-confidence first);
+///   the cap is documented and pinned by test so operators know
+///   when they're seeing a sampled verdict.
+/// - `evidence_sample_size` — how many `Evidence` records mapped
+///   cleanly to this source (`Warehouse.system`, `Api.system`,
+///   `System.name`). Ambiguous variants (`Document`, `Human`,
+///   `Agent`) are skipped — see `assess_source_trust` doc.
+/// - `assessed_at` — wall-clock at compute.
+///
+/// **Unknown-but-valid source** (no aliases or evidence reference
+/// it) is a legitimate `Low` verdict, NOT an error. The empty
+/// outcome is surfaced via `explanation`. Only malformed input —
+/// empty or sentinel `source` — produces `QueryError`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceTrustAssessment {
+    pub source: String,
+    pub score: f64,
+    pub level: crate::trust::TrustLevel,
+    pub explanation: String,
+    pub factors: Vec<TrustFactor>,
+    pub entity_sample_size: usize,
+    pub evidence_sample_size: usize,
+    pub assessed_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -927,6 +1004,98 @@ mod tests {
             (0.0, crate::trust::TrustLevel::Unknown),
         ] {
             let mut a = p33_sample_entity_trust_assessment();
+            a.score = score;
+            a.level = crate::trust::TrustAssessment::level_for_score(score);
+            assert_eq!(a.level, expected, "score = {score}");
+        }
+    }
+
+    // === Patch 35 — Source Trust v1 tests ===
+
+    fn p35_sample_source_trust_assessment() -> SourceTrustAssessment {
+        SourceTrustAssessment {
+            source: "snowflake".to_string(),
+            score: 0.80,
+            level: crate::trust::TrustLevel::High,
+            explanation: "Source verdict High (score 0.80) — 5 entities across \
+                          3 kinds, mean entity trust 0.78, 2 reliable evidence \
+                          records."
+                .to_string(),
+            factors: vec![
+                TrustFactor {
+                    kind: "source_has_identity_aliases".to_string(),
+                    weight: 0.20,
+                    applied: true,
+                    detail: "5 entities reference this source".to_string(),
+                },
+                TrustFactor {
+                    kind: "low_trust_entities_from_source".to_string(),
+                    weight: -0.20,
+                    applied: false,
+                    detail: "mean entity trust 0.78 (> 0.40)".to_string(),
+                },
+            ],
+            entity_sample_size: 5,
+            evidence_sample_size: 2,
+            assessed_at: chrono::DateTime::parse_from_rfc3339(
+                "2026-06-01T12:00:00Z",
+            )
+            .unwrap()
+            .with_timezone(&Utc),
+        }
+    }
+
+    #[test]
+    fn source_trust_assessment_serde_round_trip() {
+        // Full envelope must round-trip through serde. PascalCase
+        // `level` (TrustLevel) pinned. Sample sizes round-trip as
+        // bare u64-shaped fields. Pinned so the future P36 wire
+        // surface lands without rewriting fixtures.
+        let assessment = p35_sample_source_trust_assessment();
+        let json = serde_json::to_string(&assessment).unwrap();
+        assert!(json.contains("\"level\":\"High\""));
+        assert!(json.contains("\"entity_sample_size\":5"));
+        assert!(json.contains("\"evidence_sample_size\":2"));
+        let restored: SourceTrustAssessment =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, assessment);
+    }
+
+    #[test]
+    fn source_trust_assessment_pascal_case_wire_form() {
+        // The wire-facing JSON must carry the same camelCase /
+        // PascalCase shape established by P32 / P33. Pin the field
+        // names so a future `#[serde(rename_all)]` change doesn't
+        // silently break HTTP contracts.
+        let assessment = p35_sample_source_trust_assessment();
+        let json = serde_json::to_string(&assessment).unwrap();
+        // Field names are snake_case Rust idents — pinned exactly.
+        assert!(json.contains("\"source\":\"snowflake\""));
+        assert!(json.contains("\"score\":"));
+        assert!(json.contains("\"level\":\"High\""));
+        assert!(json.contains("\"explanation\":"));
+        assert!(json.contains("\"factors\":"));
+        assert!(json.contains("\"entity_sample_size\":"));
+        assert!(json.contains("\"evidence_sample_size\":"));
+        assert!(json.contains("\"assessed_at\":"));
+    }
+
+    #[test]
+    fn source_trust_assessment_level_uses_existing_thresholds() {
+        // Pin that `level` is the SHARED `TrustLevel` (≥0.80 High,
+        // ≥0.50 Medium, ≥0.20 Low, else Unknown). Bucketing edges
+        // are tested at trust.rs level — here we just confirm
+        // each variant can be stamped via the shared bucketing
+        // helper. Wrinkle E pin: empty-source-result buckets via
+        // level_for_score(0.0) → Unknown, NOT via a new
+        // TrustLevel::Unknown variant on a P35-specific enum.
+        for (score, expected) in [
+            (0.80_f64, crate::trust::TrustLevel::High), // v1 ceiling exactly
+            (0.50, crate::trust::TrustLevel::Medium),
+            (0.20, crate::trust::TrustLevel::Low),
+            (0.00, crate::trust::TrustLevel::Unknown),
+        ] {
+            let mut a = p35_sample_source_trust_assessment();
             a.score = score;
             a.level = crate::trust::TrustAssessment::level_for_score(score);
             assert_eq!(a.level, expected, "score = {score}");

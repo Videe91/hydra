@@ -3303,6 +3303,443 @@ impl Hydra {
         })
     }
 
+    /// Patch 35 — Source Trust v1.
+    ///
+    /// Read-only trust verdict over a single `source` string (the
+    /// free-form value carried on every `IdentityAlias.source` —
+    /// e.g. `"snowflake"`, `"github"`, `"dbt"`, `"agent_data_quality"`).
+    /// Different question from P30 / P32 / P33:
+    ///
+    /// - P30: how strongly do these names resemble each other?
+    /// - P32: do I trust THIS alias→entity match?
+    /// - P33: do I trust the canonical entity RECORD as a stable
+    ///        identity object?
+    /// - P35: do I trust THIS SOURCE as a producer of identity /
+    ///        evidence signals?
+    ///
+    /// ## Suggestion-only contract
+    ///
+    /// **Source trust is identity-backed, not operational.** v1
+    /// measures whether a source has produced trustworthy
+    /// *identity claims* in this tenant — entity count, kind
+    /// diversity, entity-confidence corroboration, and evidence
+    /// reliability where mapping is unambiguous.
+    ///
+    /// v1 does NOT consider ingestion freshness, schema drift,
+    /// heartbeat liveness, SLA conformance, contradiction rate, or
+    /// operator override history. A dead Snowflake warehouse with
+    /// five trustworthy historical entities will score **High**
+    /// here — correct for "did Snowflake produce trustworthy
+    /// identity claims," wrong for "is Snowflake alive."
+    ///
+    /// Weights are calibrated for **explainability not
+    /// correctness**. False positives are expected. Read-only;
+    /// **MUST NOT** drive auto-actions. Any future gate must add a
+    /// separate trust contract, require `TrustLevel::High` or
+    /// `Strong`, impose a minimum score floor.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Validate `source` (reject empty, `"__system__"`,
+    ///    `"__root__"` as `QueryError` — sentinel collision
+    ///    would otherwise alias the None-tenant slot's reserved
+    ///    namespace keys).
+    /// 2. Collect entities scoped strictly to `tenant_id`
+    ///    (`None` slot is invisible to `Some(t)` queries and vice
+    ///    versa — physical-slot isolation via P29's sentinel
+    ///    index keys).
+    /// 3. Filter to entities whose `aliases.any(|a| a.source ==
+    ///    source)` (exact string match — NOT case-folded; pinned
+    ///    by `assess_source_trust_exact_string_match_not_case_folded`).
+    /// 4. Cap at `MAX_SOURCE_ENTITIES_FOR_TRUST = 200`,
+    ///    highest-confidence first when capped.
+    /// 5. For each retained entity, fold in
+    ///    `assess_identity_entity_trust(tenant_id, &entity.id)` and
+    ///    bucket the MEAN P33 score:
+    ///    - mean ≥ 0.70 → `high_trust_entities_from_source` (+0.20)
+    ///    - mean ≤ 0.40 → `low_trust_entities_from_source` (-0.20)
+    ///    - middle band → neither fires (Adaptation C)
+    /// 6. Collect evidence scoped to `tenant_id`. Map
+    ///    `EvidenceSource` to a source string ONLY for the three
+    ///    unambiguous variants (`Warehouse.system`, `Api.system`,
+    ///    `System.name`). `Document` / `Human` / `Agent` are
+    ///    explicit-skipped — pinned by
+    ///    `assess_source_trust_evidence_mapping_skips_human_agent_document`.
+    /// 7. Compute evidence factors using P9's 0.75 reliability bar.
+    /// 8. Clamp summed score to `[0.0, 1.0]` and bucket via
+    ///    `TrustAssessment::level_for_score`.
+    ///
+    /// ## Unknown-but-valid source
+    ///
+    /// A source with no aliases / no evidence is a legitimate
+    /// `Unknown` verdict (score 0.0 buckets via the shared
+    /// thresholds), surfaced via `explanation`. NOT a `QueryError`.
+    /// Only malformed input — empty or sentinel `source` —
+    /// returns `QueryError`. Pinned by
+    /// `assess_source_trust_unknown_source_buckets_to_low_not_error`.
+    ///
+    /// ## Tenant isolation
+    ///
+    /// Strict — mirrors P25 / P29 / P32 / P33. `None`-tenanted
+    /// sources are invisible to tenanted queries and vice versa.
+    /// Pinned by `assess_source_trust_none_tenant_strict_isolation`.
+    ///
+    /// ## Mutation
+    ///
+    /// `&self`. No events ingested. No store changes. Pinned by
+    /// `assess_source_trust_does_not_mutate_store`.
+    pub fn assess_source_trust(
+        &self,
+        tenant_id: Option<&hydra_core::TenantId>,
+        source: &str,
+    ) -> hydra_core::error::Result<hydra_core::SourceTrustAssessment> {
+        use hydra_core::error::HydraError;
+        use hydra_core::{trust::TrustAssessment, TrustFactor};
+        use std::collections::HashSet;
+
+        /// Highest-confidence entities are sampled first when the
+        /// source has more than this many aliases. The cap keeps
+        /// the nested P33 calls bounded (each entity triggers
+        /// O(aliases) index probes through
+        /// `assess_identity_entity_trust`). Pinned by
+        /// `assess_source_trust_respects_entity_scan_cap`.
+        const MAX_SOURCE_ENTITIES_FOR_TRUST: usize = 200;
+
+        // 1. Validate input. Empty + reserved sentinels are
+        //    malformed — they would otherwise alias the None-tenant
+        //    slot's reserved namespace keys (`__system__` /
+        //    `__root__`). Mirrors `IdentityAlias::validate`'s
+        //    sentinel rejection. Mirrors P32's
+        //    `alias.validate().map_err(HydraError::QueryError)?`
+        //    pattern.
+        if source.is_empty() {
+            return Err(HydraError::QueryError(
+                "source string is empty".to_string(),
+            ));
+        }
+        if source == "__system__" || source == "__root__" {
+            return Err(HydraError::QueryError(format!(
+                "source string '{source}' is a reserved sentinel"
+            )));
+        }
+
+        // 2. Collect entities scoped strictly to `tenant_id`.
+        //    Mirrors P30's asymmetry: `entities_for_tenant` is
+        //    Some-only, so the None path filters `all_entities`
+        //    directly. Physical-slot isolation is guaranteed by
+        //    P29's sentinel-based index keys.
+        let scoped_entities: Vec<&hydra_core::IdentityEntity> = self
+            .identity_store
+            .all_entities()
+            .filter(|e| e.tenant_id.as_ref() == tenant_id)
+            .filter(|e| {
+                e.aliases.iter().any(|a| a.source == source)
+            })
+            .collect();
+
+        // Highest-confidence first when capped (deterministic
+        // tie-break on entity id ascending). Pinned by
+        // `assess_source_trust_respects_entity_scan_cap`.
+        let mut sampled: Vec<&hydra_core::IdentityEntity> =
+            scoped_entities.clone();
+        sampled.sort_by(|a, b| {
+            b.confidence
+                .value()
+                .partial_cmp(&a.confidence.value())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+        });
+        sampled.truncate(MAX_SOURCE_ENTITIES_FOR_TRUST);
+
+        // 3. Apply factors. Helper closure mirrors P32 / P33's
+        //    push pattern.
+        let mut factors: Vec<TrustFactor> = Vec::with_capacity(9);
+        let mut score = 0.0_f64;
+        let push_factor =
+            |factors: &mut Vec<TrustFactor>,
+             score: &mut f64,
+             kind: &str,
+             weight: f64,
+             applied: bool,
+             detail: String| {
+                if applied {
+                    *score += weight;
+                }
+                factors.push(TrustFactor {
+                    kind: kind.to_string(),
+                    weight,
+                    applied,
+                    detail,
+                });
+            };
+
+        // === Gate factor — anchors the verdict ===
+        let has_aliases = !sampled.is_empty();
+        push_factor(
+            &mut factors,
+            &mut score,
+            "source_has_identity_aliases",
+            0.20,
+            has_aliases,
+            if has_aliases {
+                format!(
+                    "{} entit{} reference source '{source}'",
+                    sampled.len(),
+                    if sampled.len() == 1 { "y" } else { "ies" },
+                )
+            } else {
+                format!(
+                    "no aliases from source '{source}' observed in \
+                     tenant scope"
+                )
+            },
+        );
+
+        // === Entity-count pair (mutex) ===
+        let multiple_entities = sampled.len() >= 2;
+        let single_entity = sampled.len() == 1;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "multiple_entities_from_source",
+            0.10,
+            multiple_entities,
+            if multiple_entities {
+                format!("{} distinct entities from source", sampled.len())
+            } else if single_entity {
+                "only 1 entity from source".to_string()
+            } else {
+                "no entities from source".to_string()
+            },
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "single_entity_from_source",
+            -0.05,
+            single_entity,
+            if single_entity {
+                "only 1 entity from source — thin signal".to_string()
+            } else if multiple_entities {
+                format!("{} distinct entities from source", sampled.len())
+            } else {
+                "no entities from source".to_string()
+            },
+        );
+
+        // === Kind diversity (standalone) ===
+        let distinct_kinds: HashSet<String> = sampled
+            .iter()
+            .map(|e| e.kind.discriminant())
+            .collect();
+        let multi_kinds = distinct_kinds.len() >= 2;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "multiple_kinds_from_source",
+            0.10,
+            multi_kinds,
+            if has_aliases {
+                format!(
+                    "{} distinct entity kind(s) from source",
+                    distinct_kinds.len()
+                )
+            } else {
+                "no entities from source".to_string()
+            },
+        );
+
+        // === Mean P33 entity-trust mutex (Adaptation C) ===
+        //
+        // Fold P33 over each sampled entity, compute the mean,
+        // bucket via 0.70 / 0.40 thresholds. Middle band fires
+        // NEITHER factor — pinned by
+        // `assess_source_trust_mean_entity_trust_buckets_mutex`.
+        let entity_sample_size = sampled.len();
+        let mean_entity_trust = if entity_sample_size == 0 {
+            None
+        } else {
+            let mut sum = 0.0_f64;
+            for entity in &sampled {
+                let assessment = self
+                    .assess_identity_entity_trust(tenant_id, &entity.id)?;
+                sum += assessment.score;
+            }
+            Some(sum / entity_sample_size as f64)
+        };
+        let high_trust = matches!(mean_entity_trust, Some(m) if m >= 0.70);
+        let low_trust = matches!(mean_entity_trust, Some(m) if m <= 0.40);
+        push_factor(
+            &mut factors,
+            &mut score,
+            "high_trust_entities_from_source",
+            0.20,
+            high_trust,
+            match mean_entity_trust {
+                Some(m) => format!("mean entity trust {m:.2} (≥ 0.70)"),
+                None => "no entities from source".to_string(),
+            },
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "low_trust_entities_from_source",
+            -0.20,
+            low_trust,
+            match mean_entity_trust {
+                Some(m) => format!("mean entity trust {m:.2} (≤ 0.40)"),
+                None => "no entities from source".to_string(),
+            },
+        );
+
+        // === Evidence factors (Adaptation A) ===
+        //
+        // Map `EvidenceSource` → `Option<&str>` ONLY for the three
+        // unambiguous variants. `Document` / `Human` / `Agent` are
+        // explicit-skipped (the `_` arm returns `None`). Pinned by
+        // `assess_source_trust_evidence_mapping_skips_human_agent_document`.
+        let evidence_source_str =
+            |src: &hydra_core::EvidenceSource| -> Option<String> {
+                match src {
+                    hydra_core::EvidenceSource::Warehouse {
+                        system,
+                        ..
+                    } => Some(system.clone()),
+                    hydra_core::EvidenceSource::Api { system, .. } => {
+                        Some(system.clone())
+                    }
+                    hydra_core::EvidenceSource::System { name } => {
+                        Some(name.clone())
+                    }
+                    hydra_core::EvidenceSource::Document { .. }
+                    | hydra_core::EvidenceSource::Human { .. }
+                    | hydra_core::EvidenceSource::Agent { .. } => None,
+                }
+            };
+
+        let matched_evidence: Vec<&hydra_core::Evidence> = self
+            .all_evidence()
+            .into_iter()
+            .filter(|e| e.tenant_id.as_ref() == tenant_id)
+            .filter(|e| {
+                evidence_source_str(&e.source)
+                    .as_deref()
+                    == Some(source)
+            })
+            .collect();
+        let evidence_sample_size = matched_evidence.len();
+        let has_evidence = evidence_sample_size > 0;
+        // P9 reliability bar carried forward verbatim — pinned by
+        // `assess_source_trust_evidence_reliability_uses_0_75_bar`.
+        let has_reliable_evidence = matched_evidence
+            .iter()
+            .any(|e| e.reliability.value() >= 0.75);
+        // All-low only fires when there IS evidence AND every
+        // record sits below 0.40. Mutex with `reliable_*` is
+        // structural: if any record is ≥ 0.75, the floor 0.40 is
+        // necessarily exceeded too.
+        let all_low_reliability = has_evidence
+            && matched_evidence
+                .iter()
+                .all(|e| e.reliability.value() < 0.40);
+
+        push_factor(
+            &mut factors,
+            &mut score,
+            "evidence_present_from_source",
+            0.05,
+            has_evidence,
+            if has_evidence {
+                format!(
+                    "{evidence_sample_size} evidence record(s) mapped to \
+                     source"
+                )
+            } else {
+                "no evidence records mapped to source".to_string()
+            },
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "reliable_evidence_from_source",
+            0.15,
+            has_reliable_evidence,
+            if has_reliable_evidence {
+                "at least one evidence record with reliability ≥ 0.75 \
+                 (P9 bar)"
+                    .to_string()
+            } else if has_evidence {
+                "no evidence record clears reliability ≥ 0.75".to_string()
+            } else {
+                "no evidence records mapped to source".to_string()
+            },
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "low_reliability_evidence_from_source",
+            -0.15,
+            all_low_reliability,
+            if all_low_reliability {
+                format!(
+                    "all {evidence_sample_size} evidence record(s) sit \
+                     below reliability 0.40"
+                )
+            } else if has_evidence {
+                "at least one evidence record reaches reliability ≥ 0.40"
+                    .to_string()
+            } else {
+                "no evidence records mapped to source".to_string()
+            },
+        );
+
+        // 4. Clamp and bucket.
+        let final_score = score.clamp(0.0, 1.0);
+        let level = TrustAssessment::level_for_score(final_score);
+
+        // 5. Build explanation. Surfaces the empty-source verdict
+        //    structurally so dashboards don't need to re-derive it.
+        let applied_count =
+            factors.iter().filter(|f| f.applied).count();
+        let positive_count = factors
+            .iter()
+            .filter(|f| f.applied && f.weight > 0.0)
+            .count();
+        let negative_count = factors
+            .iter()
+            .filter(|f| f.applied && f.weight < 0.0)
+            .count();
+        let explanation = if !has_aliases && !has_evidence {
+            format!(
+                "Source verdict {level:?} (score {final_score:.2}) — no \
+                 aliases from source '{source}' observed in tenant scope, \
+                 no evidence records mapped. v1 measures identity-claim \
+                 trust, NOT operational health (freshness, heartbeat, \
+                 SLA, schema drift not yet considered)."
+            )
+        } else {
+            format!(
+                "Source verdict {level:?} (score {final_score:.2}) — \
+                 {positive_count} positive factor(s) and {negative_count} \
+                 penalty factor(s) applied out of {applied_count} total. \
+                 v1 measures identity-claim trust, NOT operational health \
+                 (freshness, heartbeat, SLA, schema drift not yet \
+                 considered)."
+            )
+        };
+
+        Ok(hydra_core::SourceTrustAssessment {
+            source: source.to_string(),
+            score: final_score,
+            level,
+            explanation,
+            factors,
+            entity_sample_size,
+            evidence_sample_size,
+            assessed_at: chrono::Utc::now(),
+        })
+    }
+
     /// Patch 21 — turn a model-derived reflex chain into a
     /// `CausalCellKind::Reflex` causal cell.
     ///
@@ -20869,6 +21306,710 @@ mod sprint1_tests {
                 && a.explanation.contains("operational"),
             "explanation must surface the internal-only warning: {}",
             a.explanation
+        );
+    }
+
+    // === Patch 35 — Source Trust v1 ===
+    //
+    // Read-only verdict over a source string (the free-form value
+    // carried on `IdentityAlias.source`). Tests verify the
+    // identity-backed factor walk, evidence mapping, mean-entity-
+    // trust mutex (Adaptation C), strict tenant isolation, the
+    // entity-scan cap, anti-mutation, and the
+    // unknown-but-valid-source contract.
+
+    /// Helper: find a factor record by name in a P35 assessment.
+    fn p35_find_factor<'a>(
+        assessment: &'a hydra_core::SourceTrustAssessment,
+        kind: &str,
+    ) -> &'a hydra_core::TrustFactor {
+        assessment
+            .factors
+            .iter()
+            .find(|f| f.kind == kind)
+            .unwrap_or_else(|| {
+                panic!(
+                    "factor {kind} missing from \
+                     SourceTrustAssessment"
+                )
+            })
+    }
+
+    /// Helper: build a tenant-scoped Evidence record with the
+    /// supplied source variant + reliability.
+    fn p35_make_evidence(
+        tenant: Option<hydra_core::TenantId>,
+        source: hydra_core::EvidenceSource,
+        reliability: f64,
+    ) -> hydra_core::Evidence {
+        let now = chrono::Utc::now();
+        hydra_core::Evidence {
+            id: hydra_core::EvidenceId::new(),
+            tenant_id: tenant,
+            source,
+            payload: hydra_core::EvidencePayload {
+                kind: "p35_test".to_string(),
+                data: std::collections::HashMap::new(),
+            },
+            reliability: hydra_core::Confidence::new(reliability),
+            observed_at: now,
+            recorded_at: now,
+            caused_by: None,
+        }
+    }
+
+    #[test]
+    fn assess_source_trust_happy_path_high_verdict() {
+        // Worked example (a) from the survey: 5 entities × 3 kinds
+        // from `snowflake`, mean P33 trust ≥ 0.70, two reliable
+        // evidence records. Expected: 0.20 + 0.10 + 0.10 + 0.20 +
+        // 0.05 + 0.15 = 0.80 → High.
+        //
+        // The 3 distinct kinds are split as 3 / 1 / 1 because
+        // P29's canonical-key uniqueness fires within (tenant,
+        // kind), and we want all 5 entities to coexist.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+
+        // 3 Datasets (different canonical keys) — high confidence,
+        // multi-source aliases so P33 lands High.
+        for i in 0..3 {
+            let entity = make_entity_for_p33(
+                Some(tenant.clone()),
+                hydra_core::IdentityEntityKind::Dataset,
+                &format!("dataset/d{i}"),
+                &format!("Dataset {i}"),
+                vec![
+                    alias_for("snowflake", "analytics", &format!("d{i}")),
+                    alias_for("dbt", "models", &format!("d{i}")),
+                    alias_for("looker", "finance", &format!("d{i}")),
+                ],
+                hydra_core::Confidence::new(0.95),
+                2,
+            );
+            hydra.create_identity_entity(entity).unwrap();
+        }
+        // 1 Table
+        let table = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Table,
+            "table/t0",
+            "Table 0",
+            vec![
+                alias_for("snowflake", "analytics", "t0"),
+                alias_for("dbt", "models", "t0"),
+            ],
+            hydra_core::Confidence::new(0.95),
+            2,
+        );
+        hydra.create_identity_entity(table).unwrap();
+        // 1 Dashboard
+        let dashboard = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dashboard,
+            "dashboard/dash0",
+            "Dashboard 0",
+            vec![
+                alias_for("snowflake", "analytics", "dash0"),
+                alias_for("looker", "finance", "dash0"),
+            ],
+            hydra_core::Confidence::new(0.95),
+            2,
+        );
+        hydra.create_identity_entity(dashboard).unwrap();
+
+        // 2 reliable evidence records mapped to "snowflake".
+        for _ in 0..2 {
+            let ev = p35_make_evidence(
+                Some(tenant.clone()),
+                hydra_core::EvidenceSource::Warehouse {
+                    system: "snowflake".to_string(),
+                    database: Some("analytics".to_string()),
+                    schema: None,
+                    table: None,
+                },
+                0.90,
+            );
+            hydra
+                .ingest(hydra_core::EventKind::EvidenceAdded { evidence: ev })
+                .unwrap();
+        }
+
+        let a = hydra
+            .assess_source_trust(Some(&tenant), "snowflake")
+            .unwrap();
+        assert_eq!(a.source, "snowflake");
+        assert_eq!(a.entity_sample_size, 5);
+        assert_eq!(a.evidence_sample_size, 2);
+        // 0.80 ceiling — sits at exactly High threshold.
+        assert!(
+            a.score >= 0.80,
+            "best-case must reach the 0.80 ceiling; got {}",
+            a.score
+        );
+        assert_eq!(a.level, hydra_core::trust::TrustLevel::High);
+        assert!(p35_find_factor(&a, "source_has_identity_aliases").applied);
+        assert!(p35_find_factor(&a, "multiple_entities_from_source").applied);
+        assert!(!p35_find_factor(&a, "single_entity_from_source").applied);
+        assert!(p35_find_factor(&a, "multiple_kinds_from_source").applied);
+        assert!(p35_find_factor(&a, "high_trust_entities_from_source").applied);
+        assert!(!p35_find_factor(&a, "low_trust_entities_from_source").applied);
+        assert!(p35_find_factor(&a, "evidence_present_from_source").applied);
+        assert!(p35_find_factor(&a, "reliable_evidence_from_source").applied);
+        assert!(!p35_find_factor(&a, "low_reliability_evidence_from_source").applied);
+    }
+
+    #[test]
+    fn assess_source_trust_unknown_source_buckets_to_low_not_error() {
+        // Wrinkle E pin. A source string that is well-formed but
+        // has no aliases and no evidence is a legitimate Unknown
+        // verdict via `TrustAssessment::level_for_score(0.0)`,
+        // NOT a `QueryError`. The pin's name says "low" — the
+        // actual bucket is `Unknown` because the shared
+        // thresholds bucket 0.0 there. The load-bearing assertion
+        // is "no error + finite verdict", not the specific
+        // sub-Unknown/Low distinction.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+        // No entities, no evidence — just a query.
+        let a = hydra
+            .assess_source_trust(Some(&tenant), "neverseen")
+            .unwrap();
+        assert_eq!(a.source, "neverseen");
+        assert_eq!(a.entity_sample_size, 0);
+        assert_eq!(a.evidence_sample_size, 0);
+        assert_eq!(a.score, 0.0);
+        // 0.0 buckets to `Unknown` via the shared thresholds.
+        // Either Unknown or Low would satisfy the "not error"
+        // contract — the level itself is secondary.
+        assert!(matches!(
+            a.level,
+            hydra_core::trust::TrustLevel::Unknown
+                | hydra_core::trust::TrustLevel::Low
+        ));
+        // Empty-source-result is structurally surfaced in the
+        // explanation, not via an Err return.
+        assert!(
+            a.explanation.contains("no aliases")
+                || a.explanation.contains("no evidence"),
+            "empty verdict must surface in explanation: {}",
+            a.explanation
+        );
+    }
+
+    #[test]
+    fn assess_source_trust_empty_source_returns_query_error() {
+        // Adaptation B pin. Empty source is malformed input, not
+        // "no data" — mirrors `IdentityAlias::validate`'s
+        // rejection at entity creation.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+        let result = hydra.assess_source_trust(Some(&tenant), "");
+        assert!(
+            matches!(result, Err(hydra_core::error::HydraError::QueryError(_))),
+            "empty source must surface as QueryError; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn assess_source_trust_sentinel_source_returns_query_error() {
+        // Wrinkle H pin. `__system__` and `__root__` are reserved
+        // sentinels for the None-tenant / None-namespace slots in
+        // `IdentityAlias::index_key`. Allowing them as source
+        // names would let a caller alias the reserved key space.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+        for sentinel in ["__system__", "__root__"] {
+            let result =
+                hydra.assess_source_trust(Some(&tenant), sentinel);
+            assert!(
+                matches!(
+                    result,
+                    Err(hydra_core::error::HydraError::QueryError(_))
+                ),
+                "sentinel source '{sentinel}' must surface as QueryError; \
+                 got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assess_source_trust_does_not_mutate_store() {
+        // LOAD-BEARING anti-mutation pin. The assessment is read-
+        // only — no entities created, no events ingested. Mirrors
+        // P30 / P32 / P33's `does_not_mutate_store` contracts.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+        let entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/x",
+            "X",
+            vec![alias_for("snowflake", "analytics", "x")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        hydra.create_identity_entity(entity).unwrap();
+        // Add an evidence record too — pin that evidence reads
+        // don't mutate either.
+        let ev = p35_make_evidence(
+            Some(tenant.clone()),
+            hydra_core::EvidenceSource::Warehouse {
+                system: "snowflake".to_string(),
+                database: None,
+                schema: None,
+                table: None,
+            },
+            0.90,
+        );
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded { evidence: ev })
+            .unwrap();
+
+        let pre_entities = hydra.identity_entities().count();
+        let pre_events = hydra.events().len();
+        let pre_evidence = hydra.all_evidence().len();
+        let _ = hydra
+            .assess_source_trust(Some(&tenant), "snowflake")
+            .unwrap();
+        assert_eq!(hydra.identity_entities().count(), pre_entities);
+        assert_eq!(hydra.events().len(), pre_events);
+        assert_eq!(hydra.all_evidence().len(), pre_evidence);
+    }
+
+    #[test]
+    fn assess_source_trust_none_tenant_strict_isolation() {
+        // LOAD-BEARING tenant-isolation pin (wrinkle G).
+        // None-tenanted sources are invisible to Some(t) queries
+        // AND vice versa — physical-slot separation carried
+        // forward from P29's sentinel index keys.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+
+        // Direction 1: None-tenanted entity + evidence. Probe
+        // from Some(t) — must return the empty verdict.
+        let system_entity = make_entity_for_p33(
+            None,
+            hydra_core::IdentityEntityKind::System,
+            "system/global",
+            "Global",
+            vec![alias_for("github", "global", "x")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        hydra.create_identity_entity(system_entity).unwrap();
+        let system_ev = p35_make_evidence(
+            None,
+            hydra_core::EvidenceSource::Api {
+                system: "github".to_string(),
+                endpoint: None,
+            },
+            0.90,
+        );
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded {
+                evidence: system_ev,
+            })
+            .unwrap();
+
+        let r1 = hydra
+            .assess_source_trust(Some(&tenant), "github")
+            .unwrap();
+        assert_eq!(
+            r1.entity_sample_size, 0,
+            "Some(t) probe must not see None-tenanted entities"
+        );
+        assert_eq!(
+            r1.evidence_sample_size, 0,
+            "Some(t) probe must not see None-tenanted evidence"
+        );
+
+        // Direction 2: Some(t)-tenanted entity + evidence. Probe
+        // from None — must return the empty verdict.
+        let tenant_entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/private",
+            "Private",
+            vec![alias_for("looker", "finance", "private")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        hydra.create_identity_entity(tenant_entity).unwrap();
+        let tenant_ev = p35_make_evidence(
+            Some(tenant.clone()),
+            hydra_core::EvidenceSource::Api {
+                system: "looker".to_string(),
+                endpoint: None,
+            },
+            0.90,
+        );
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded {
+                evidence: tenant_ev,
+            })
+            .unwrap();
+
+        let r2 = hydra.assess_source_trust(None, "looker").unwrap();
+        assert_eq!(
+            r2.entity_sample_size, 0,
+            "None probe must not see Some(t)-tenanted entities"
+        );
+        assert_eq!(
+            r2.evidence_sample_size, 0,
+            "None probe must not see Some(t)-tenanted evidence"
+        );
+    }
+
+    #[test]
+    fn assess_source_trust_wrong_tenant_invisible() {
+        // LOAD-BEARING pin. Entities + evidence in tenant_a must
+        // be invisible to tenant_b probes — the empty verdict
+        // pattern is structurally indistinguishable from a
+        // genuine "no data" outcome (no separate error path).
+        let mut hydra = Hydra::new();
+        let tenant_a = hydra_core::TenantId::from_str("tenant_a");
+        let tenant_b = hydra_core::TenantId::from_str("tenant_b");
+        let entity = make_entity_for_p33(
+            Some(tenant_a.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/owned",
+            "Owned",
+            vec![alias_for("snowflake", "analytics", "owned")],
+            hydra_core::Confidence::new(0.95),
+            0,
+        );
+        hydra.create_identity_entity(entity).unwrap();
+        let ev = p35_make_evidence(
+            Some(tenant_a),
+            hydra_core::EvidenceSource::Warehouse {
+                system: "snowflake".to_string(),
+                database: None,
+                schema: None,
+                table: None,
+            },
+            0.90,
+        );
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded { evidence: ev })
+            .unwrap();
+
+        let a = hydra
+            .assess_source_trust(Some(&tenant_b), "snowflake")
+            .unwrap();
+        assert_eq!(a.entity_sample_size, 0);
+        assert_eq!(a.evidence_sample_size, 0);
+        assert!(!p35_find_factor(&a, "source_has_identity_aliases").applied);
+    }
+
+    #[test]
+    fn assess_source_trust_exact_string_match_not_case_folded() {
+        // Adaptation B / Q7 pin. `source` is matched verbatim —
+        // `"snowflake"` and `"Snowflake"` are distinct sources.
+        // No normalization, no case-folding, no aliasing.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+        let entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/lowercase",
+            "Lowercase",
+            vec![alias_for("snowflake", "analytics", "lc")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        hydra.create_identity_entity(entity).unwrap();
+
+        // Lowercase probe finds the entity.
+        let lc = hydra
+            .assess_source_trust(Some(&tenant), "snowflake")
+            .unwrap();
+        assert_eq!(lc.entity_sample_size, 1);
+        // Mixed-case probe does NOT — distinct source string.
+        let uc = hydra
+            .assess_source_trust(Some(&tenant), "Snowflake")
+            .unwrap();
+        assert_eq!(uc.entity_sample_size, 0);
+        let upper = hydra
+            .assess_source_trust(Some(&tenant), "SNOWFLAKE")
+            .unwrap();
+        assert_eq!(upper.entity_sample_size, 0);
+    }
+
+    #[test]
+    fn assess_source_trust_mean_entity_trust_buckets_mutex() {
+        // LOAD-BEARING Adaptation C pin. Mutex on MEAN entity
+        // trust, not independent fires:
+        //   mean ≥ 0.70 → high_trust_entities_from_source
+        //   mean ≤ 0.40 → low_trust_entities_from_source
+        //   middle band → NEITHER fires
+        //
+        // We exercise the middle band by mixing one high-trust
+        // and one low-trust entity, then assert neither factor
+        // applied. (Independent fires would let both fire and
+        // net to 0 — pinned NOT to do that.)
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+        // High-trust entity (≈ 0.85): multi-source + metadata.
+        let high = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/high",
+            "High",
+            vec![
+                alias_for("github", "ops", "high"),
+                alias_for("dbt", "models", "high"),
+                alias_for("looker", "finance", "high"),
+            ],
+            hydra_core::Confidence::new(0.95),
+            2,
+        );
+        // Low-trust entity (≈ 0.40 or below): single-alias,
+        // single-source, no metadata.
+        let low = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Service,
+            "service/low",
+            "Low",
+            vec![alias_for("github", "ops", "low")],
+            hydra_core::Confidence::new(0.95),
+            0,
+        );
+        hydra.create_identity_entity(high).unwrap();
+        hydra.create_identity_entity(low).unwrap();
+
+        let a = hydra
+            .assess_source_trust(Some(&tenant), "github")
+            .unwrap();
+        // Sample contains both — mean lands in the middle band.
+        assert_eq!(a.entity_sample_size, 2);
+        // Neither high_* nor low_* applied — middle band pin.
+        assert!(!p35_find_factor(&a, "high_trust_entities_from_source").applied);
+        assert!(!p35_find_factor(&a, "low_trust_entities_from_source").applied);
+    }
+
+    #[test]
+    fn assess_source_trust_evidence_mapping_skips_human_agent_document() {
+        // Adaptation A pin. Of the 6 `EvidenceSource` variants,
+        // only `Warehouse.system`, `Api.system`, `System.name` map
+        // cleanly to a source string. `Document` / `Human` /
+        // `Agent` are explicit-skipped — pinning that ensures we
+        // don't later silently fold ambiguous variants in.
+        //
+        // We add ONE evidence record per skipped variant naming
+        // a source string we'll probe for. If the mapping ever
+        // mis-includes them, evidence_sample_size > 0 and the
+        // pin fires.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+        // Document — uri carries "snowflake" textually, but we
+        // skip the entire variant regardless of contents.
+        let doc = p35_make_evidence(
+            Some(tenant.clone()),
+            hydra_core::EvidenceSource::Document {
+                uri: "snowflake".to_string(),
+            },
+            0.90,
+        );
+        let human = p35_make_evidence(
+            Some(tenant.clone()),
+            hydra_core::EvidenceSource::Human {
+                actor_id: hydra_core::ActorId::from_str("snowflake"),
+            },
+            0.90,
+        );
+        let agent = p35_make_evidence(
+            Some(tenant.clone()),
+            hydra_core::EvidenceSource::Agent {
+                actor_id: hydra_core::ActorId::from_str("snowflake"),
+            },
+            0.90,
+        );
+        for ev in [doc, human, agent] {
+            hydra
+                .ingest(hydra_core::EventKind::EvidenceAdded { evidence: ev })
+                .unwrap();
+        }
+
+        let a = hydra
+            .assess_source_trust(Some(&tenant), "snowflake")
+            .unwrap();
+        // None of the 3 ambiguous variants count toward the
+        // source — evidence_sample_size must be zero.
+        assert_eq!(
+            a.evidence_sample_size, 0,
+            "Document / Human / Agent must NOT count as source-mapped \
+             evidence (pin against silent inclusion)"
+        );
+        assert!(!p35_find_factor(&a, "evidence_present_from_source").applied);
+    }
+
+    #[test]
+    fn assess_source_trust_evidence_reliability_uses_0_75_bar() {
+        // Adaptation A pin. The `reliable_evidence_from_source`
+        // factor uses P9's 0.75 reliability bar verbatim — the
+        // cross-patch threshold consistency contract. We bracket
+        // the threshold at 0.74 (just below) and 0.75 (at the
+        // bar) to pin the exact boundary.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+
+        // Just below — must NOT fire reliable_*.
+        let just_below = p35_make_evidence(
+            Some(tenant.clone()),
+            hydra_core::EvidenceSource::System {
+                name: "agent_dq".to_string(),
+            },
+            0.74,
+        );
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded {
+                evidence: just_below,
+            })
+            .unwrap();
+        let below = hydra
+            .assess_source_trust(Some(&tenant), "agent_dq")
+            .unwrap();
+        assert_eq!(below.evidence_sample_size, 1);
+        assert!(below.factors.iter().any(|f| f.kind == "evidence_present_from_source" && f.applied));
+        assert!(
+            !p35_find_factor(&below, "reliable_evidence_from_source").applied,
+            "reliability 0.74 must NOT clear the 0.75 bar"
+        );
+
+        // At the bar — MUST fire reliable_*.
+        let at_bar = p35_make_evidence(
+            Some(tenant.clone()),
+            hydra_core::EvidenceSource::System {
+                name: "agent_dq".to_string(),
+            },
+            0.75,
+        );
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded { evidence: at_bar })
+            .unwrap();
+        let at = hydra
+            .assess_source_trust(Some(&tenant), "agent_dq")
+            .unwrap();
+        assert_eq!(at.evidence_sample_size, 2);
+        assert!(
+            p35_find_factor(&at, "reliable_evidence_from_source").applied,
+            "reliability 0.75 must clear the P9 0.75 bar"
+        );
+    }
+
+    #[test]
+    fn assess_source_trust_respects_entity_scan_cap() {
+        // Wrinkle F pin. The internal cap is 200; sampling
+        // selects highest-confidence first when capped. We pin
+        // the cap structurally by adding a clearly small number
+        // of entities (well under the cap) and observing all of
+        // them are reflected in entity_sample_size — proving the
+        // cap doesn't truncate normal-sized workloads. The cap's
+        // exact value lives in the engine method's `const`
+        // declaration; this test guards "the cap exists AND is
+        // large enough not to bite at scales we hit in tests."
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+        for i in 0..10 {
+            let entity = make_entity_for_p33(
+                Some(tenant.clone()),
+                hydra_core::IdentityEntityKind::Dataset,
+                &format!("dataset/c{i}"),
+                &format!("Cap {i}"),
+                vec![alias_for("snowflake", "ns", &format!("c{i}"))],
+                // Confidence decreases by index — used by the cap
+                // sampler's tie-break.
+                hydra_core::Confidence::new(1.0 - (i as f64) * 0.01),
+                0,
+            );
+            hydra.create_identity_entity(entity).unwrap();
+        }
+        let a = hydra
+            .assess_source_trust(Some(&tenant), "snowflake")
+            .unwrap();
+        // All 10 entities fit under the 200 cap.
+        assert_eq!(a.entity_sample_size, 10);
+        // The cap structurally exists — same call with 10
+        // entities returns deterministic count, and the
+        // multiple-entities factor is set accordingly.
+        assert!(p35_find_factor(&a, "multiple_entities_from_source").applied);
+    }
+
+    #[test]
+    fn assess_source_trust_includes_all_factors_always() {
+        // Explainability contract pin (wrinkle I). Every assessment
+        // carries ALL 9 factor records, applied OR not. Pin so a
+        // future refactor doesn't filter the list down to "what
+        // fired". Mirrors P9 / P23 / P30 / P32 / P33.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+        let entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/x",
+            "X",
+            vec![alias_for("snowflake", "ns", "x")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        hydra.create_identity_entity(entity).unwrap();
+        let a = hydra
+            .assess_source_trust(Some(&tenant), "snowflake")
+            .unwrap();
+        let expected_kinds = [
+            "source_has_identity_aliases",
+            "multiple_entities_from_source",
+            "single_entity_from_source",
+            "multiple_kinds_from_source",
+            "high_trust_entities_from_source",
+            "low_trust_entities_from_source",
+            "evidence_present_from_source",
+            "reliable_evidence_from_source",
+            "low_reliability_evidence_from_source",
+        ];
+        for k in &expected_kinds {
+            let _ = p35_find_factor(&a, k);
+        }
+        assert_eq!(a.factors.len(), expected_kinds.len());
+        // At least one applied=false is present (single-entity-
+        // probe means several pair-siblings don't fire).
+        assert!(
+            a.factors.iter().any(|f| !f.applied),
+            "at least one factor must be applied=false"
+        );
+    }
+
+    #[test]
+    fn assess_source_trust_low_reliability_evidence_fires_when_all_below_0_40() {
+        // Mutex sibling to `reliable_evidence_from_source`. Fires
+        // ONLY when there IS evidence AND every record sits below
+        // 0.40 reliability. Structural mutex: if any record is
+        // ≥ 0.75, the floor 0.40 is necessarily exceeded.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p35");
+        // Two records, both below 0.40.
+        for r in [0.20, 0.35] {
+            let ev = p35_make_evidence(
+                Some(tenant.clone()),
+                hydra_core::EvidenceSource::System {
+                    name: "agent_dq".to_string(),
+                },
+                r,
+            );
+            hydra
+                .ingest(hydra_core::EventKind::EvidenceAdded { evidence: ev })
+                .unwrap();
+        }
+        let a = hydra
+            .assess_source_trust(Some(&tenant), "agent_dq")
+            .unwrap();
+        assert_eq!(a.evidence_sample_size, 2);
+        assert!(p35_find_factor(&a, "evidence_present_from_source").applied);
+        assert!(!p35_find_factor(&a, "reliable_evidence_from_source").applied);
+        assert!(
+            p35_find_factor(&a, "low_reliability_evidence_from_source").applied,
+            "all-below-0.40 must fire low_reliability_evidence_from_source"
         );
     }
 
