@@ -1105,6 +1105,28 @@ mod tests {
             required_scopes_for(&Method::GET, "/trust/cells/cell_abc"),
             vec!["read:trust"]
         );
+        // Patch 34 — Identity trust routes. **Load-bearing
+        // precedence pin**: `/trust/identity/*` resolves to
+        // `read:trust` via the `/trust/*` prefix clause that runs
+        // BEFORE the `/identity/*` clause (which would otherwise
+        // map to `read:identity`). Trust namespace wins over
+        // identity namespace because trust judgments are
+        // governance state, not graph data. If a future refactor
+        // reorders these clauses, both pins below fire.
+        assert_eq!(
+            required_scopes_for(
+                &Method::GET,
+                "/trust/identity/entities/ide_abc"
+            ),
+            vec!["read:trust"]
+        );
+        assert_eq!(
+            required_scopes_for(
+                &Method::GET,
+                "/trust/identity/matches"
+            ),
+            vec!["read:trust"]
+        );
         // Patch 25 — CausalCell read/query routes. Cells are graph
         // data (composition primitive), gated under `read:query`.
         // Cell TRUST stays under `/trust/cells/*` → `read:trust`;

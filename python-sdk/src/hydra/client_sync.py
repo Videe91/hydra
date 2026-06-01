@@ -59,6 +59,8 @@ from ._types import (
     IdentityEntity,
     IdentityEntityId,
     IdentityEntityKind,
+    IdentityEntityTrustAssessment,
+    IdentityMatchTrustAssessment,
     SemanticIdentityMatchAssessment,
     Node,
     NodeId,
@@ -628,6 +630,69 @@ class HydraSync:
         return SemanticIdentityMatchAssessment.model_validate(
             raw["assessment"]
         )
+
+    # ========================================================================
+    # Identity trust (Patch 34) — sync mirrors
+    # ========================================================================
+
+    def assess_identity_entity_trust(
+        self,
+        entity_id: IdentityEntityId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityEntityTrustAssessment:
+        """Sync mirror of `Hydra.assess_identity_entity_trust`
+        (Patch 33 engine, Patch 34 wire). Strict tenant scoping;
+        unknown / wrong-tenant / `None`-tenanted entity all
+        surface as `HydraNotFoundError`. See the async
+        docstring for the full suggestion-only contract."""
+        raw = self._http.get(
+            _paths.trust_identity_entity_path(entity_id),
+            tenant=tenant,
+        )
+        return IdentityEntityTrustAssessment.model_validate(raw)
+
+    def assess_identity_match_trust(
+        self,
+        *,
+        source: str,
+        normalized: str,
+        candidate_entity_id: IdentityEntityId,
+        namespace: str | None = None,
+        kind: IdentityEntityKind | None = None,
+        tenant: TenantId | None = None,
+    ) -> IdentityMatchTrustAssessment:
+        """Sync mirror of `Hydra.assess_identity_match_trust`
+        (Patch 32 engine, Patch 34 wire). Required kwargs:
+        `source`, `normalized`, `candidate_entity_id`. The
+        returned envelope carries BOTH axes — `match_level`
+        (P30 similarity, including the `"None"` STRING) AND
+        `level` (P32 trust verdict). Don't conflate them. See
+        the async docstring for the full suggestion-only
+        contract."""
+        params: dict[str, str] = {
+            "source": source,
+            "normalized": normalized,
+            "candidate_entity_id": str(candidate_entity_id),
+        }
+        if namespace is not None:
+            params["namespace"] = namespace
+        if kind is not None:
+            kind_param: str
+            if isinstance(kind, dict):
+                kind_param = (
+                    kind.get("Custom") or next(iter(kind.values()), "") or ""
+                )
+            else:
+                kind_param = kind
+            if kind_param:
+                params["kind"] = kind_param
+        raw = self._http.get(
+            _paths.trust_identity_matches_path(),
+            params=params,
+            tenant=tenant,
+        )
+        return IdentityMatchTrustAssessment.model_validate(raw)
 
     def _ingest(
         self,

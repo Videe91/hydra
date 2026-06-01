@@ -1922,6 +1922,95 @@ class SemanticIdentityMatchAssessment(BaseModel):
     assessed_at: str
 
 
+# === Patch 32 + Patch 33 — Identity trust wire types ===
+#
+# Two trust axes over the Identity Graph:
+#
+#   P32 / IdentityMatchTrustAssessment :
+#     "do I trust this alias→entity match?"
+#
+#   P33 / IdentityEntityTrustAssessment :
+#     "do I trust this canonical entity record itself?"
+#
+# Both surface via Patch 34's HTTP routes under
+# `/trust/identity/*` and the corresponding SDK methods. Both
+# are read-only suggestion verdicts — calibrated for
+# explainability NOT correctness; false positives expected;
+# any auto-action requires separate trust gates AND a durable
+# audit event (P36+ `IdentityLink`).
+
+
+class IdentityEntityTrustAssessment(BaseModel):
+    """Response shape of `hy.assess_identity_entity_trust(...)`
+    (Patch 33 engine, Patch 34 wire).
+
+    Trust verdict over the canonical entity RECORD itself.
+    v1 uses only entity-internal signals (confidence, aliases,
+    canonical key, display name, metadata) — it does NOT
+    consult related claims, cells, observations, or source
+    reliability. Those layer on in P35+ after `IdentityLink`.
+
+    **A High verdict means "this identity record is well-formed
+    and consistent with P29 invariants" — NOT "every operational
+    fact about this entity is trustworthy."** Auto-actions
+    based on entity trust must gate on `TrustLevel::High` +
+    minimum score floor + emit a separate audit event.
+
+    `factors` always includes all 12 P33 records (applied AND
+    unapplied — explainability contract). Don't filter
+    `applied=false` client-side.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_id: IdentityEntityId
+    score: float
+    level: TrustLevel
+    explanation: str
+    factors: list[TrustFactor]
+    assessed_at: str
+
+
+class IdentityMatchTrustAssessment(BaseModel):
+    """Response shape of `hy.assess_identity_match_trust(...)`
+    (Patch 32 engine, Patch 34 wire).
+
+    Trust verdict over a single (query alias → candidate
+    entity) pair. The wire carries BOTH axes:
+
+      - `match_score` / `match_level` — P30 similarity
+        (`MatchLevel` is `"Strong"` / `"Possible"` / `"Weak"`
+        / `"None"`; **the `"None"` value is a STRING, not
+        Python `None`** — distinct semantics)
+      - `score` / `level` — P32 trust verdict (`TrustLevel`
+        High/Medium/Low/Unknown)
+
+    These axes are independent. A Strong match can be Low
+    trust (e.g., alias conflict drags the verdict down). Don't
+    conflate them — Patch 32's design pin treats them as
+    separately reported on every assessment.
+
+    **Suggestion-only**: trust factors inherit P30's
+    positive-only weight calibration — `semantic_match_strong`
+    can fire for `revenue_daily ↔ revenue_daily_archived` as
+    readily as a true match. Future auto-link MUST add a
+    separate gate, require `TrustLevel::High`, require a
+    score floor, AND emit a durable `IdentityLink` event.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query_alias: IdentityAlias
+    candidate_entity_id: IdentityEntityId
+    match_score: float
+    match_level: MatchLevel
+    score: float
+    level: TrustLevel
+    explanation: str
+    factors: list[TrustFactor]
+    assessed_at: str
+
+
 # === Patch 24 — CausalCell trust folding wire types ===
 #
 # Reuses the existing `TrustLevel` Literal and `TrustFactor`

@@ -43,6 +43,8 @@ from ._types import (
     IdentityEntity,
     IdentityEntityId,
     IdentityEntityKind,
+    IdentityEntityTrustAssessment,
+    IdentityMatchTrustAssessment,
     SemanticIdentityMatchAssessment,
     Claim,
     ClaimId,
@@ -970,6 +972,131 @@ class Hydra:
         return SemanticIdentityMatchAssessment.model_validate(
             raw["assessment"]
         )
+
+    # ========================================================================
+    # Identity trust (Patch 34 — wire surface over P32 + P33)
+    # ========================================================================
+
+    async def assess_identity_entity_trust(
+        self,
+        entity_id: IdentityEntityId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityEntityTrustAssessment:
+        """Read the Patch 33 trust verdict over a canonical
+        `IdentityEntity` (`GET /trust/identity/entities/{id}` —
+        Patch 34 wire).
+
+        Returns the typed envelope with `score`, `level`
+        (`TrustLevel`), `explanation`, and all 12 P33 factor
+        records. Strict tenant scoping: requires
+        `X-Hydra-Tenant` (propagated automatically); unknown
+        id, wrong tenant, OR `None`-tenanted entity under a
+        tenanted query all surface as `HydraNotFoundError` —
+        indistinguishable by design (no cross-tenant existence
+        leak).
+
+        ## Suggestion-only contract
+
+        Trust verdict judges the IDENTITY RECORD ITSELF, not
+        operational truth. A High verdict means "well-formed
+        and consistent with P29 invariants"; it does NOT mean
+        "every operational fact about this entity is
+        trustworthy." Auto-actions based on entity trust must
+        gate on `level == "High"` + minimum score floor + emit
+        a separate audit event.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header
+          - 404 → `HydraNotFoundError`: unknown id, wrong
+            tenant, or `None`-tenanted entity under a tenanted
+            query
+        """
+        raw = await self._http.get(
+            _paths.trust_identity_entity_path(entity_id),
+            tenant=tenant,
+        )
+        return IdentityEntityTrustAssessment.model_validate(raw)
+
+    async def assess_identity_match_trust(
+        self,
+        *,
+        source: str,
+        normalized: str,
+        candidate_entity_id: IdentityEntityId,
+        namespace: str | None = None,
+        kind: IdentityEntityKind | None = None,
+        tenant: TenantId | None = None,
+    ) -> IdentityMatchTrustAssessment:
+        """Read the Patch 32 trust verdict over a single (query
+        alias → candidate entity) pair
+        (`GET /trust/identity/matches` — Patch 34 wire).
+
+        Required kwargs:
+          - `source` — alias source (e.g. `"snowflake"`)
+          - `normalized` — alias normalized form
+          - `candidate_entity_id` — the entity being judged
+            against
+
+        Optional kwargs:
+          - `namespace` — alias namespace (`None` matches the
+            `None`-namespace slot per P29 sentinel design)
+          - `kind` — optional kind hint (snake_case discriminant
+            or `{"Custom": "label"}`); empty → 400
+          - `tenant` — per-call override for `X-Hydra-Tenant`
+
+        Returns the typed envelope carrying BOTH axes:
+          - `match_score` / `match_level` — P30 similarity.
+            `MatchLevel` is one of `"Strong"` / `"Possible"` /
+            `"Weak"` / `"None"`. **NOTE**: `"None"` is a STRING
+            literal (no match), NOT Python's `None`. The field
+            is always populated.
+          - `score` / `level` — P32 trust verdict over the
+            match. `level` is `TrustLevel`
+            (High/Medium/Low/Unknown).
+
+        These axes are independent. A Strong match can be Low
+        trust (e.g., alias conflict drags the verdict down).
+        Don't conflate them.
+
+        ## Suggestion-only contract
+
+        Identity match trust is calibrated for explainability,
+        NOT correctness. False positives expected. Any
+        auto-link MUST add a separate gate, require
+        `level == "High"`, require a minimum score floor, AND
+        emit a durable `IdentityLink` event for audit. P34
+        does NONE of those — it only exposes the verdict.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header,
+            missing required query param, empty `kind`
+          - 404 → `HydraNotFoundError`: unknown candidate /
+            wrong tenant / `None`-tenanted candidate
+        """
+        params: dict[str, str] = {
+            "source": source,
+            "normalized": normalized,
+            "candidate_entity_id": str(candidate_entity_id),
+        }
+        if namespace is not None:
+            params["namespace"] = namespace
+        if kind is not None:
+            kind_param: str
+            if isinstance(kind, dict):
+                kind_param = (
+                    kind.get("Custom") or next(iter(kind.values()), "") or ""
+                )
+            else:
+                kind_param = kind
+            if kind_param:
+                params["kind"] = kind_param
+        raw = await self._http.get(
+            _paths.trust_identity_matches_path(),
+            params=params,
+            tenant=tenant,
+        )
+        return IdentityMatchTrustAssessment.model_validate(raw)
 
     async def _ingest(
         self,

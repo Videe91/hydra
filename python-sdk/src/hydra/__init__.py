@@ -91,6 +91,8 @@ from ._types import (
     IdentityEntity,
     IdentityEntityId,
     IdentityEntityKind,
+    IdentityEntityTrustAssessment,
+    IdentityMatchTrustAssessment,
     MatchLevel,
     SemanticIdentityMatchAssessment,
     SemanticIdentityMatchCandidate,
@@ -278,6 +280,12 @@ __all__ = [
     "IdentityEntity",
     "IdentityEntityId",
     "IdentityEntityKind",
+    # Identity trust HTTP/SDK (Patch 34 — exposes P32/P33
+    # verdicts over `/trust/identity/*` + the SDK methods
+    # `assess_identity_entity_trust` and
+    # `assess_identity_match_trust`).
+    "IdentityEntityTrustAssessment",
+    "IdentityMatchTrustAssessment",
     "MatchLevel",
     "SemanticIdentityMatchAssessment",
     "SemanticIdentityMatchCandidate",

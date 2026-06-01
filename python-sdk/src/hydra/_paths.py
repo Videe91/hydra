@@ -371,6 +371,28 @@ def causal_cells_list_path() -> str:
     return "/causal-cells"
 
 
+def trust_identity_entity_path(entity_id: str) -> str:
+    """`GET /trust/identity/entities/{entity_id}` — Patch 34
+    identity entity trust. Reads the Patch 33 verdict over a
+    canonical identity record. Strict tenant-scoped: missing
+    `X-Hydra-Tenant` → 400; wrong tenant / unknown id /
+    `None`-tenanted entity under tenanted query → 404
+    (indistinguishable — no cross-tenant existence leak)."""
+    return f"/trust/identity/entities/{_seg(entity_id)}"
+
+
+def trust_identity_matches_path() -> str:
+    """`GET /trust/identity/matches?source=&normalized=&candidate_entity_id=&namespace=&kind=`
+    — Patch 34 identity match trust. Reads the Patch 32
+    verdict over a (query alias → candidate entity) pair.
+    Required query params: `source`, `normalized`,
+    `candidate_entity_id`. Optional: `namespace`, `kind`.
+    Returns a bare `IdentityMatchTrustAssessment` carrying BOTH
+    axes: `match_score`/`match_level` (P30 similarity) AND
+    `score`/`level` (P32 trust verdict)."""
+    return "/trust/identity/matches"
+
+
 def trust_cell_path(cell_id: str) -> str:
     """`GET /trust/cells/{cell_id}` — read-only trust assessment
     of one CausalCell (Patch 24). Folds the Patch 23 12-factor

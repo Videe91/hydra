@@ -40,13 +40,15 @@
 use crate::http::tenant::{extract_tenant, tenant_error_response};
 use crate::runtime::RuntimeHandle;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
-use hydra_core::{CausalCellId, ClaimId};
+use hydra_core::{
+    CausalCellId, ClaimId, IdentityAlias, IdentityEntityId, IdentityEntityKind,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -60,18 +62,75 @@ impl TrustHttpState {
     }
 }
 
-/// Build the trust router. Two routes today:
+/// Build the trust router. Routes:
 ///
-/// - `/trust/claims/:claim_id` — Patch 10 claim trust
-/// - `/trust/cells/:cell_id`   — Patch 24 causal-cell trust
+/// - `/trust/claims/:claim_id`                — Patch 10 claim trust
+/// - `/trust/cells/:cell_id`                  — Patch 24 cell trust
+/// - `/trust/identity/entities/:entity_id`    — Patch 34 identity entity trust
+/// - `/trust/identity/matches`                — Patch 34 identity match trust
+///
+/// **Auth scope precedence pin**: `/trust/identity/*` resolves to
+/// `read:trust` via the `/trust/*` prefix clause in
+/// `hydra-api::auth`, NOT to `read:identity` via the `/identity/*`
+/// clause. The trust namespace wins because the trust-prefix
+/// clause runs first. This is intentional — judgments over
+/// identity are governance state, not graph data. Pinned by
+/// auth tests.
 ///
 /// Future patches mount alongside under the same `/trust/*`
-/// prefix.
+/// prefix (Source Trust → `/trust/identity/sources/:id`, Link
+/// Trust → `/trust/identity/links/:id`, etc.).
 pub fn trust_router(runtime: RuntimeHandle) -> Router {
     Router::new()
         .route("/trust/claims/:claim_id", get(get_claim_trust))
         .route("/trust/cells/:cell_id", get(get_cell_trust))
+        .route(
+            "/trust/identity/entities/:entity_id",
+            get(get_identity_entity_trust),
+        )
+        .route(
+            "/trust/identity/matches",
+            get(get_identity_match_trust),
+        )
         .with_state(TrustHttpState::new(runtime))
+}
+
+/// Query params for `GET /trust/identity/matches`. `source`,
+/// `normalized`, and `candidate_entity_id` are REQUIRED; the
+/// rest are optional. axum's `Query<T>` extractor returns 400
+/// when required fields are absent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdentityMatchTrustQuery {
+    pub source: String,
+    pub normalized: String,
+    pub candidate_entity_id: String,
+    pub namespace: Option<String>,
+    pub kind: Option<String>,
+}
+
+/// Parse a URL `?kind=<discriminant>` value into an
+/// `IdentityEntityKind`. Duplicated from
+/// `hydra-net/src/http/identity.rs::parse_identity_kind` for v0
+/// — two callers with identical input shape but no coupling yet.
+/// If a third caller appears, pull it up to a shared module.
+fn parse_identity_kind(value: &str) -> Option<IdentityEntityKind> {
+    if value.is_empty() {
+        return None;
+    }
+    Some(match value {
+        "dataset" => IdentityEntityKind::Dataset,
+        "table" => IdentityEntityKind::Table,
+        "dashboard" => IdentityEntityKind::Dashboard,
+        "metric" => IdentityEntityKind::Metric,
+        "service" => IdentityEntityKind::Service,
+        "agent" => IdentityEntityKind::Agent,
+        "workflow" => IdentityEntityKind::Workflow,
+        "source" => IdentityEntityKind::Source,
+        "user" => IdentityEntityKind::User,
+        "system" => IdentityEntityKind::System,
+        "incident" => IdentityEntityKind::Incident,
+        other => IdentityEntityKind::Custom(other.to_string()),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +253,169 @@ async fn get_cell_trust(
         Err(other) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("cell trust assessment failed: {other}"),
+        ),
+    }
+}
+
+/// `GET /trust/identity/entities/:entity_id` — Patch 34
+/// identity entity trust surface. Exposes the Patch 33
+/// `Hydra::assess_identity_entity_trust` verdict over HTTP.
+///
+/// Strict tenant scoping carries forward from P33:
+/// - missing `X-Hydra-Tenant` → 400
+/// - unknown entity / wrong tenant / `None`-tenanted entity
+///   under tenanted query → 404 with engine message
+/// - happy path → 200 with bare `IdentityEntityTrustAssessment`
+///   body (no envelope — matches `/trust/claims/:id` and
+///   `/trust/cells/:id` conventions from P10/P24)
+///
+/// **Suggestion-only contract carries forward**: the verdict
+/// judges the IDENTITY RECORD ITSELF, not operational truth.
+/// See the engine method docstring for the full warning.
+async fn get_identity_entity_trust(
+    State(state): State<TrustHttpState>,
+    headers: HeaderMap,
+    Path(entity_id): Path<String>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(err) => return tenant_error_response(err),
+    };
+    let id = IdentityEntityId::from_str(&entity_id);
+
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
+
+    match hydra.assess_identity_entity_trust(Some(&tenant), &id) {
+        Ok(assessment) => (StatusCode::OK, Json(assessment)).into_response(),
+        Err(hydra_core::error::HydraError::QueryError(msg))
+            if msg.contains("unknown identity entity") =>
+        {
+            // Engine returns the same QueryError for genuine
+            // miss + wrong tenant + None/Some slot mismatch.
+            // Map to 404 with the engine message so operators
+            // see the entity id but no cross-tenant existence
+            // leak.
+            error_response(StatusCode::NOT_FOUND, msg)
+        }
+        Err(other) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("identity entity trust assessment failed: {other}"),
+        ),
+    }
+}
+
+/// `GET /trust/identity/matches` — Patch 34 identity match
+/// trust surface. Exposes the Patch 32
+/// `Hydra::assess_identity_match_trust` verdict over HTTP.
+///
+/// Required query params (axum returns 400 if any are absent):
+///
+/// - `source`
+/// - `normalized`
+/// - `candidate_entity_id`
+///
+/// Optional:
+///
+/// - `namespace`
+/// - `kind` — snake_case discriminant or `Custom(s)` fallback;
+///   empty string → 400
+///
+/// Synthesizes the query alias server-side
+/// (`external_id: None`, `label: normalized.clone()`) and
+/// delegates to the engine. Strict tenant scoping carries
+/// forward from P32.
+///
+/// Response: bare `IdentityMatchTrustAssessment` body (same
+/// no-envelope convention as the other `/trust/*` routes).
+/// Carries BOTH axes: `match_score`/`match_level` (P30
+/// similarity) AND `score`/`level` (P32 trust verdict).
+///
+/// **Suggestion-only contract**: identity match trust is
+/// calibrated for explainability, NOT correctness. False
+/// positives expected. Auto-actions or auto-linking require
+/// separate gates AND a durable `IdentityLink` audit event
+/// (P36+).
+async fn get_identity_match_trust(
+    State(state): State<TrustHttpState>,
+    headers: HeaderMap,
+    Query(query): Query<IdentityMatchTrustQuery>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(err) => return tenant_error_response(err),
+    };
+
+    if query.source.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "source query parameter cannot be empty",
+        );
+    }
+    if query.normalized.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "normalized query parameter cannot be empty",
+        );
+    }
+    if query.candidate_entity_id.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "candidate_entity_id query parameter cannot be empty",
+        );
+    }
+
+    let kind = match query.kind.as_deref() {
+        Some(s) => match parse_identity_kind(s) {
+            Some(k) => Some(k),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "kind query parameter cannot be empty",
+                );
+            }
+        },
+        None => None,
+    };
+
+    // Synthesize the query alias from params — mirrors P31's
+    // matcher handler. `external_id` is unused by the scorer;
+    // `label` defaults to `normalized` so the alias passes
+    // `validate()`.
+    let alias = IdentityAlias {
+        source: query.source.clone(),
+        namespace: query.namespace.clone(),
+        external_id: None,
+        label: query.normalized.clone(),
+        normalized: query.normalized.clone(),
+    };
+    let candidate_id =
+        IdentityEntityId::from_str(&query.candidate_entity_id);
+
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
+
+    match hydra.assess_identity_match_trust(
+        Some(&tenant),
+        &alias,
+        &candidate_id,
+        kind,
+    ) {
+        Ok(assessment) => (StatusCode::OK, Json(assessment)).into_response(),
+        Err(hydra_core::error::HydraError::QueryError(msg))
+            if msg.contains("unknown identity entity") =>
+        {
+            error_response(StatusCode::NOT_FOUND, msg)
+        }
+        Err(hydra_core::error::HydraError::QueryError(msg)) => {
+            // Other engine validation failures — empty source
+            // (caught above), sentinel collisions in the alias,
+            // etc. — map to 400 with the engine message.
+            error_response(StatusCode::BAD_REQUEST, msg)
+        }
+        Err(other) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("identity match trust assessment failed: {other}"),
         ),
     }
 }
@@ -704,6 +926,474 @@ mod tests {
             .await
             .unwrap();
         // 200 means trust_router resolved the route.
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // === Patch 34 — Identity trust HTTP tests ===
+
+    /// Build a minimal `IdentityEntity` for tenant-scoped tests.
+    fn make_test_entity(
+        tenant: Option<TenantId>,
+        kind: hydra_core::IdentityEntityKind,
+        canonical_key: &str,
+        aliases: Vec<hydra_core::IdentityAlias>,
+        confidence: hydra_core::Confidence,
+    ) -> hydra_core::IdentityEntity {
+        let now = chrono::Utc::now();
+        hydra_core::IdentityEntity {
+            id: hydra_core::IdentityEntityId::new(),
+            tenant_id: tenant,
+            kind,
+            canonical_key: canonical_key.to_string(),
+            display_name: canonical_key.to_string(),
+            aliases,
+            confidence,
+            metadata: HashMap::new(),
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        }
+    }
+
+    fn snowflake_test_alias(ns: &str, name: &str) -> hydra_core::IdentityAlias {
+        hydra_core::IdentityAlias {
+            source: "snowflake".to_string(),
+            namespace: Some(ns.to_string()),
+            external_id: Some(format!("{ns}.{name}").to_uppercase()),
+            label: format!("{ns}.{name}").to_uppercase(),
+            normalized: format!("{}.{}", ns.to_lowercase(), name.to_lowercase()),
+        }
+    }
+
+    async fn ingest_entity(
+        runtime: &crate::runtime::RuntimeHandle,
+        entity: hydra_core::IdentityEntity,
+    ) -> hydra_core::IdentityEntity {
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        hydra.create_identity_entity(entity).unwrap()
+    }
+
+    // === GET /trust/identity/entities/:entity_id ===
+
+    #[tokio::test]
+    async fn get_identity_entity_trust_returns_assessment() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let entity = ingest_entity(
+            &runtime,
+            make_test_entity(
+                Some(tenant.clone()),
+                hydra_core::IdentityEntityKind::Dataset,
+                "dataset/revenue_daily",
+                vec![
+                    snowflake_test_alias("analytics", "revenue_daily"),
+                    hydra_core::IdentityAlias {
+                        source: "dbt".to_string(),
+                        namespace: Some("models".to_string()),
+                        external_id: None,
+                        label: "models.revenue_daily".to_string(),
+                        normalized: "models.revenue_daily".to_string(),
+                    },
+                ],
+                hydra_core::Confidence::new(0.95),
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/trust/identity/entities/{}",
+                entity.id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        // Bare wire body — assessment fields at the top level, no
+        // `{assessment: ...}` envelope (mirrors /trust/claims and
+        // /trust/cells).
+        assert_eq!(
+            body.get("entity_id").and_then(|v| v.as_str()),
+            Some(entity.id.as_str())
+        );
+        assert!(body.get("score").is_some());
+        assert!(body.get("level").is_some());
+        assert!(body.get("explanation").is_some());
+        assert!(body.get("factors").is_some());
+    }
+
+    #[tokio::test]
+    async fn get_identity_entity_trust_requires_tenant_header() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get_without_tenant(
+                "/trust/identity/entities/anything",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_identity_entity_trust_unknown_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/trust/identity/entities/ide_ghost"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(body.error.contains("unknown identity entity"));
+    }
+
+    #[tokio::test]
+    async fn get_identity_entity_trust_wrong_tenant_returns_404() {
+        // Strict isolation pin: same 404 body whether the entity
+        // is missing OR exists in another tenant. No
+        // cross-tenant existence leak.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let entity = ingest_entity(
+            &runtime,
+            make_test_entity(
+                Some(TenantId::from_str("tenant_owner")),
+                hydra_core::IdentityEntityKind::Dataset,
+                "dataset/secret",
+                vec![snowflake_test_alias("analytics", "secret")],
+                hydra_core::Confidence::new(0.90),
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get_for_tenant(
+                &format!("/trust/identity/entities/{}", entity.id),
+                "tenant_other",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_identity_entity_trust_none_tenanted_invisible_to_tenanted_query()
+    {
+        // LOAD-BEARING strict isolation pin: a `None`-tenanted
+        // (system-wide) entity is invisible to a tenanted query
+        // through the trust surface. Mirrors P33's engine pin.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let entity = ingest_entity(
+            &runtime,
+            make_test_entity(
+                None,
+                hydra_core::IdentityEntityKind::Source,
+                "source/system",
+                vec![hydra_core::IdentityAlias {
+                    source: "snowflake".to_string(),
+                    namespace: None,
+                    external_id: None,
+                    label: "snowflake-prod".to_string(),
+                    normalized: "snowflake-prod".to_string(),
+                }],
+                hydra_core::Confidence::new(0.90),
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/trust/identity/entities/{}",
+                entity.id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_identity_entity_trust_includes_all_factors() {
+        // Explainability contract: every assessment carries all
+        // 12 P33 factor records — applied + unapplied. Pin so a
+        // future refactor doesn't filter the list to "what fired".
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let entity = ingest_entity(
+            &runtime,
+            make_test_entity(
+                Some(tenant),
+                hydra_core::IdentityEntityKind::Dataset,
+                "dataset/x",
+                vec![snowflake_test_alias("analytics", "x")],
+                hydra_core::Confidence::new(0.90),
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/trust/identity/entities/{}",
+                entity.id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        let factors = body.get("factors").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            factors.len(),
+            12,
+            "all 12 P33 factor records must appear on the wire"
+        );
+        // At least one applied=false must survive (single-alias
+        // entity has metadata=false, no multi-source).
+        assert!(factors.iter().any(|f| f.get("applied")
+            .and_then(|v| v.as_bool())
+            == Some(false)));
+    }
+
+    // === GET /trust/identity/matches ===
+
+    #[tokio::test]
+    async fn get_identity_match_trust_returns_assessment() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let alias = snowflake_test_alias("analytics", "revenue_daily");
+        let entity = ingest_entity(
+            &runtime,
+            make_test_entity(
+                Some(tenant),
+                hydra_core::IdentityEntityKind::Dataset,
+                "dataset/revenue_daily",
+                vec![alias.clone()],
+                hydra_core::Confidence::new(0.95),
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let uri = format!(
+            "/trust/identity/matches\
+             ?source=snowflake\
+             &namespace=analytics\
+             &normalized=analytics.revenue_daily\
+             &candidate_entity_id={}",
+            entity.id
+        );
+        let response = app
+            .oneshot(empty_get(&uri))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        // Bare wire body — both axes present.
+        assert!(body.get("query_alias").is_some());
+        assert!(body.get("candidate_entity_id").is_some());
+        assert!(body.get("match_score").is_some());
+        assert!(body.get("match_level").is_some());
+        assert!(body.get("score").is_some());
+        assert!(body.get("level").is_some());
+        assert!(body.get("factors").is_some());
+    }
+
+    #[tokio::test]
+    async fn get_identity_match_trust_requires_tenant_header() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get_without_tenant(
+                "/trust/identity/matches\
+                 ?source=x&normalized=y&candidate_entity_id=ide_x",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_identity_match_trust_missing_candidate_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(
+                "/trust/identity/matches?source=snowflake&normalized=x",
+            ))
+            .await
+            .unwrap();
+        // axum Query<T> rejects when a required field is absent.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_identity_match_trust_missing_required_params_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        // Missing source.
+        let r1 = app
+            .clone()
+            .oneshot(empty_get(
+                "/trust/identity/matches\
+                 ?normalized=x&candidate_entity_id=ide_x",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::BAD_REQUEST);
+        // Missing normalized.
+        let r2 = app
+            .oneshot(empty_get(
+                "/trust/identity/matches\
+                 ?source=snowflake&candidate_entity_id=ide_x",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_identity_match_trust_unknown_candidate_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(
+                "/trust/identity/matches\
+                 ?source=snowflake\
+                 &normalized=x\
+                 &candidate_entity_id=ide_ghost",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(body.error.contains("unknown identity entity"));
+    }
+
+    #[tokio::test]
+    async fn get_identity_match_trust_wrong_tenant_invisible() {
+        // LOAD-BEARING strict isolation: candidate exists in
+        // tenant_owner but the query comes as tenant_other → 404
+        // indistinguishable from a genuine miss.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let entity = ingest_entity(
+            &runtime,
+            make_test_entity(
+                Some(TenantId::from_str("tenant_owner")),
+                hydra_core::IdentityEntityKind::Dataset,
+                "dataset/secret",
+                vec![snowflake_test_alias("analytics", "secret")],
+                hydra_core::Confidence::new(0.90),
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let uri = format!(
+            "/trust/identity/matches\
+             ?source=snowflake\
+             &namespace=analytics\
+             &normalized=analytics.secret\
+             &candidate_entity_id={}",
+            entity.id
+        );
+        let response = app
+            .oneshot(empty_get_for_tenant(&uri, "tenant_other"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_identity_match_trust_preserves_match_level_distinct_from_trust_level(
+    ) {
+        // LOAD-BEARING: the wire carries BOTH `match_level` (P30
+        // similarity) AND `level` (P32 trust verdict) as separate
+        // fields. They are different axes — never conflate them.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let alias = snowflake_test_alias("analytics", "revenue_daily");
+        let entity = ingest_entity(
+            &runtime,
+            make_test_entity(
+                Some(tenant),
+                hydra_core::IdentityEntityKind::Dataset,
+                "dataset/revenue_daily",
+                vec![alias.clone()],
+                hydra_core::Confidence::new(0.95),
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let uri = format!(
+            "/trust/identity/matches\
+             ?source=snowflake\
+             &namespace=analytics\
+             &normalized=analytics.revenue_daily\
+             &candidate_entity_id={}",
+            entity.id
+        );
+        let response = app
+            .oneshot(empty_get(&uri))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        // Both axes live at top-level. `match_level` uses
+        // `MatchLevel` PascalCase ("Strong"/"Possible"/"Weak"/"None")
+        // and `level` uses `TrustLevel` PascalCase
+        // ("High"/"Medium"/"Low"/"Unknown") — distinct vocabularies.
+        let match_level = body
+            .get("match_level")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        let trust_level = body.get("level").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            ["Strong", "Possible", "Weak", "None"].contains(&match_level),
+            "match_level must be a MatchLevel; got {match_level}"
+        );
+        assert!(
+            ["High", "Medium", "Low", "Unknown"].contains(&trust_level),
+            "level must be a TrustLevel; got {trust_level}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_identity_match_trust_route_lives_in_trust_router() {
+        // Sanity: the match-trust route is mounted by
+        // `trust_router` itself (not by a separate identity
+        // router). If a future refactor moves it, this fires.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let alias = snowflake_test_alias("analytics", "x");
+        let entity = ingest_entity(
+            &runtime,
+            make_test_entity(
+                Some(tenant),
+                hydra_core::IdentityEntityKind::Dataset,
+                "dataset/x",
+                vec![alias.clone()],
+                hydra_core::Confidence::new(0.90),
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let uri = format!(
+            "/trust/identity/matches\
+             ?source=snowflake\
+             &namespace=analytics\
+             &normalized=analytics.x\
+             &candidate_entity_id={}",
+            entity.id
+        );
+        let response = app
+            .oneshot(empty_get(&uri))
+            .await
+            .unwrap();
+        // 200 = trust_router resolved the route.
         assert_eq!(response.status(), StatusCode::OK);
     }
 }
