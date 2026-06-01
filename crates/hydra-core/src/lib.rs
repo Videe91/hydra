@@ -27,8 +27,8 @@ pub use id::{
 };
 pub use causal_cell::{CausalCell, CausalCellKind};
 pub use identity::{
-    IdentityAlias, IdentityEntity, IdentityEntityKind, MatchLevel,
-    SemanticIdentityMatchAssessment, SemanticIdentityMatchCandidate,
+    IdentityAlias, IdentityEntity, IdentityEntityKind, IdentityMatchTrustAssessment,
+    MatchLevel, SemanticIdentityMatchAssessment, SemanticIdentityMatchCandidate,
 };
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
@@ -109,11 +109,15 @@ pub use automation::{AutoApprovalDecision, AutoExecutionDecision, DeliveryOutcom
 pub mod prelude {
     pub use crate::id::{
         ActionId, ActorId, ApprovalId, CascadeId, CausalCellId, ClaimId, CommitId, EdgeId,
-        EventId, EvidenceId, MicroModelId, MicroModelRunId, NodeId, OutcomeId, PolicyDecisionId,
-        PolicyId, ReplicaId, ReplicationRunId, SchemaId, SensorCheckpointId, SensorId,
-        SensorRunId, SnapshotId, SubscriptionId, TenantId, TypeId,
+        EventId, EvidenceId, IdentityEntityId, MicroModelId, MicroModelRunId, NodeId, OutcomeId,
+        PolicyDecisionId, PolicyId, ReplicaId, ReplicationRunId, SchemaId, SensorCheckpointId,
+        SensorId, SensorRunId, SnapshotId, SubscriptionId, TenantId, TypeId,
     };
     pub use crate::causal_cell::{CausalCell, CausalCellKind};
+    pub use crate::identity::{
+        IdentityAlias, IdentityEntity, IdentityEntityKind, IdentityMatchTrustAssessment,
+        MatchLevel, SemanticIdentityMatchAssessment, SemanticIdentityMatchCandidate,
+    };
     pub use crate::error::{HydraError, Result};
     pub use crate::event::{Event, EventKind, Value};
     pub use crate::epistemic::{

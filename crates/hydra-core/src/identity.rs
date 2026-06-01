@@ -376,6 +376,67 @@ pub struct SemanticIdentityMatchAssessment {
     pub assessed_at: DateTime<Utc>,
 }
 
+// === Patch 32 — Identity Match Trust ============================
+//
+// Read-only trust verdict over a single P30 semantic-match
+// candidate. Distinct vocabulary axis from `MatchLevel`:
+//
+//   MatchLevel : "how strongly do these names resemble each other?"
+//   TrustLevel : "do I trust the resemblance enough to act on it?"
+//
+// `match_score` + `match_level` are passed through from P30
+// verbatim so the caller sees both signals. `score` + `level`
+// are the P32 verdict (clamped sum of factors). `factors`
+// includes ALL evaluated factors (applied + unapplied) — same
+// explainability contract as P9 / P23 / P30.
+//
+// **Suggestion-only contract carries forward.** See the
+// `assess_identity_match_trust` docstring on the engine method
+// for the full warning. Trust factors inherit P30's positive-
+// only weight calibration; a `semantic_match_strong` factor
+// can fire for `revenue_daily ↔ revenue_daily_archived` as
+// readily as a true match. Operators must judge each verdict;
+// any future auto-link MUST add a separate trust gate, require
+// `TrustLevel::High`, require a minimum score floor, AND emit
+// a durable `IdentityLink` event for audit.
+
+/// One trust verdict over a (query alias, candidate entity)
+/// pair, produced by `Hydra::assess_identity_match_trust`.
+///
+/// Field semantics:
+///
+/// - `query_alias` — the alias being assessed (echoed back).
+/// - `candidate_entity_id` — the entity being judged against.
+/// - `match_score` / `match_level` — pass-through from P30's
+///   semantic scoring on this candidate alone (recomputed
+///   live; never accepted from the caller). `match_level` uses
+///   `MatchLevel` PascalCase wire (including the literal
+///   string `"None"` for no semantic match).
+/// - `score` — P32 trust score, clamped to `[0.0, 1.0]`. Sum
+///   of applied factor weights; can dip below 0 pre-clamp
+///   when penalties dominate.
+/// - `level` — `TrustLevel` bucket of `score` via
+///   `TrustAssessment::level_for_score` (≥0.80 High, ≥0.50
+///   Medium, ≥0.20 Low, else Unknown — shared with claim/cell
+///   trust).
+/// - `explanation` — short prose for dashboards.
+/// - `factors` — ALL evaluated factors. Don't filter
+///   `applied=false` client-side; the explanation is what was
+///   checked, not just what fired.
+/// - `assessed_at` — wall-clock at compute.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdentityMatchTrustAssessment {
+    pub query_alias: IdentityAlias,
+    pub candidate_entity_id: IdentityEntityId,
+    pub match_score: f64,
+    pub match_level: MatchLevel,
+    pub score: f64,
+    pub level: crate::trust::TrustLevel,
+    pub explanation: String,
+    pub factors: Vec<TrustFactor>,
+    pub assessed_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,5 +663,115 @@ mod tests {
         let restored: SemanticIdentityMatchAssessment =
             serde_json::from_str(&json).unwrap();
         assert_eq!(restored, assessment);
+    }
+
+    // === Patch 32 — Identity Match Trust tests ===
+
+    fn p32_sample_trust_assessment() -> IdentityMatchTrustAssessment {
+        IdentityMatchTrustAssessment {
+            query_alias: IdentityAlias {
+                source: "snowflake".to_string(),
+                namespace: Some("analytics".to_string()),
+                external_id: Some("REVENUE_DAILY".to_string()),
+                label: "Revenue Daily".to_string(),
+                normalized: "analytics.revenue_daily".to_string(),
+            },
+            candidate_entity_id: IdentityEntityId::from_str(
+                "ide_revenue_daily",
+            ),
+            match_score: 0.95,
+            match_level: MatchLevel::Strong,
+            score: 0.90,
+            level: crate::trust::TrustLevel::High,
+            explanation: "Strong semantic match with high entity \
+                          confidence and no alias conflict."
+                .to_string(),
+            factors: vec![
+                TrustFactor {
+                    kind: "exact_alias_match".to_string(),
+                    weight: 0.40,
+                    applied: true,
+                    detail: "alias appears verbatim on candidate"
+                        .to_string(),
+                },
+                TrustFactor {
+                    kind: "semantic_match_strong".to_string(),
+                    weight: 0.25,
+                    applied: true,
+                    detail: "P30 score 0.95 (≥ 0.80)".to_string(),
+                },
+            ],
+            assessed_at: chrono::DateTime::parse_from_rfc3339(
+                "2026-05-31T12:00:00Z",
+            )
+            .unwrap()
+            .with_timezone(&Utc),
+        }
+    }
+
+    #[test]
+    fn identity_match_trust_assessment_serde_round_trip() {
+        // Full envelope must round-trip through serde. Pinned
+        // so the future P33 SDK lands without rewriting
+        // fixtures. PascalCase wire form for both `match_level`
+        // (MatchLevel) and `level` (TrustLevel) preserved.
+        let assessment = p32_sample_trust_assessment();
+        let json = serde_json::to_string(&assessment).unwrap();
+        // Both PascalCase strings on the wire.
+        assert!(json.contains("\"match_level\":\"Strong\""));
+        assert!(json.contains("\"level\":\"High\""));
+        let restored: IdentityMatchTrustAssessment =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, assessment);
+    }
+
+    #[test]
+    fn identity_match_trust_assessment_carries_match_level_passthrough() {
+        // `match_level` is the P30 axis ("how strongly do these
+        // names resemble each other?") while `level` is the
+        // P32 axis ("do I trust this match?"). They live
+        // side-by-side on the envelope and are independently
+        // typed. Pinned because conflating them is the most
+        // likely silent regression downstream.
+        let mut assessment = p32_sample_trust_assessment();
+        // Strong match (P30) but Low trust (P32). e.g., alias
+        // conflict dragged the trust score down.
+        assessment.match_level = MatchLevel::Strong;
+        assessment.match_score = 0.90;
+        assessment.level = crate::trust::TrustLevel::Low;
+        assessment.score = 0.25;
+        let json = serde_json::to_string(&assessment).unwrap();
+        let restored: IdentityMatchTrustAssessment =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.match_level, MatchLevel::Strong);
+        assert_eq!(restored.level, crate::trust::TrustLevel::Low);
+        // Distinct fields — not the same value via type
+        // confusion.
+        assert!(
+            (restored.match_score - 0.90).abs() < 1e-9
+                && (restored.score - 0.25).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn identity_match_trust_assessment_level_matches_trust_thresholds() {
+        // P32's `level` is computed via
+        // `TrustAssessment::level_for_score`. Pin that the
+        // type is the `TrustLevel` shared with claim/cell
+        // trust, not a P32-specific reinvention. Bucketing
+        // edges are tested at the trust.rs level — here we
+        // just confirm we can stamp each variant.
+        for (score, expected) in [
+            (1.0_f64, crate::trust::TrustLevel::High),
+            (0.80, crate::trust::TrustLevel::High),
+            (0.50, crate::trust::TrustLevel::Medium),
+            (0.20, crate::trust::TrustLevel::Low),
+            (0.0, crate::trust::TrustLevel::Unknown),
+        ] {
+            let mut a = p32_sample_trust_assessment();
+            a.score = score;
+            a.level = crate::trust::TrustAssessment::level_for_score(score);
+            assert_eq!(a.level, expected, "score = {score}");
+        }
     }
 }

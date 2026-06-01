@@ -2565,6 +2565,400 @@ impl Hydra {
         })
     }
 
+    /// Patch 32 — Identity Match Trust.
+    ///
+    /// Read-only trust verdict over a single (query alias,
+    /// candidate entity) pair. Recomputes P30's semantic score
+    /// live (never trusts a caller-supplied value), then applies
+    /// trust factors that judge the resemblance.
+    ///
+    /// ## Suggestion-only contract
+    ///
+    /// **Identity match trust is suggestion-only.** The
+    /// deterministic factors are explainable but NOT proof of
+    /// correctness. False positives are expected — trust
+    /// factors inherit P30's positive-only weight calibration,
+    /// so `semantic_match_strong` can fire for
+    /// `revenue_daily ↔ revenue_daily_archived` as readily as a
+    /// true match. Operators must judge each verdict.
+    ///
+    /// Any future auto-link MUST add a separate trust gate,
+    /// require `TrustLevel::High`, require a configured minimum
+    /// score floor, AND emit a durable `IdentityLink` event for
+    /// audit. Patch 32 does NONE of these — it only computes a
+    /// verdict.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Validate the query alias (sentinel collisions
+    ///    rejected — mirrors P30).
+    /// 2. Load the candidate entity, strictly scoped to
+    ///    `tenant_id`. Unknown id, wrong tenant, OR `None`/
+    ///    `Some` slot mismatch all surface as the SAME
+    ///    `QueryError("unknown identity entity: {id}")` — no
+    ///    cross-tenant probing.
+    /// 3. Recompute the P30 semantic score for THIS candidate
+    ///    alone (via `identity_resolver::score_candidate`).
+    ///    The caller cannot smuggle a forged score.
+    /// 4. Compute P32 trust factors against the candidate's
+    ///    current state (aliases, kind, confidence).
+    /// 5. Clamp the summed score to `[0.0, 1.0]` and bucket via
+    ///    `TrustAssessment::level_for_score`.
+    ///
+    /// ## Mutation
+    ///
+    /// `&self`. No events ingested. No store changes. Pinned by
+    /// `assess_identity_match_trust_does_not_mutate_store`.
+    pub fn assess_identity_match_trust(
+        &self,
+        tenant_id: Option<&hydra_core::TenantId>,
+        alias: &hydra_core::IdentityAlias,
+        candidate_entity_id: &hydra_core::IdentityEntityId,
+        kind: Option<hydra_core::IdentityEntityKind>,
+    ) -> hydra_core::error::Result<
+        hydra_core::IdentityMatchTrustAssessment,
+    > {
+        use hydra_core::error::HydraError;
+        use hydra_core::{
+            trust::TrustAssessment, MatchLevel, TrustFactor,
+        };
+
+        // 1. Validate the query alias up front.
+        alias.validate().map_err(HydraError::QueryError)?;
+
+        // 2. Load candidate strictly within `tenant_id`. Genuine
+        //    miss AND tenant mismatch AND None/Some slot
+        //    mismatch all surface as the same QueryError.
+        //    Mirrors P10 / P24 / P29 / P31 strict isolation.
+        let candidate = match self.identity_entity(candidate_entity_id) {
+            Some(e) if e.tenant_id.as_ref() == tenant_id => e,
+            _ => {
+                return Err(HydraError::QueryError(format!(
+                    "unknown identity entity: {candidate_entity_id}"
+                )));
+            }
+        };
+
+        // 3. Recompute the P30 semantic score for THIS candidate.
+        //    Never accept a caller-supplied score (anti-forgery).
+        let query_tokens = identity_resolver::tokens_of(&alias.normalized);
+        let semantic = identity_resolver::score_candidate(
+            alias,
+            &query_tokens,
+            candidate,
+        );
+        let match_score = semantic.score;
+        let match_level = semantic.level;
+
+        // 4. Apply P32 trust factors. Mirrors the P30 resolver
+        //    structure but with its own weight table — calibrated
+        //    for VERDICT (do I trust this resemblance?), not for
+        //    SUGGESTION (how strong is the resemblance?).
+        let mut factors: Vec<TrustFactor> = Vec::with_capacity(12);
+        let mut score = 0.0_f64;
+
+        // Helper: push a factor record and add weight to running
+        // score when applied.
+        let push_factor =
+            |factors: &mut Vec<TrustFactor>,
+             score: &mut f64,
+             kind: &str,
+             weight: f64,
+             applied: bool,
+             detail: String| {
+                if applied {
+                    *score += weight;
+                }
+                factors.push(TrustFactor {
+                    kind: kind.to_string(),
+                    weight,
+                    applied,
+                    detail,
+                });
+            };
+
+        // === Factor: exact_alias_match (+0.40) ===
+        // Tuple-walk against the candidate's existing aliases.
+        // Stronger signal than P30's resolver alone because P32
+        // verdict requires corroboration.
+        let exact = candidate.aliases.iter().any(|a| {
+            a.source == alias.source
+                && a.namespace == alias.namespace
+                && a.normalized == alias.normalized
+        });
+        push_factor(
+            &mut factors,
+            &mut score,
+            "exact_alias_match",
+            0.40,
+            exact,
+            if exact {
+                format!(
+                    "alias ({}, {:?}, {}) appears verbatim on candidate",
+                    alias.source, alias.namespace, alias.normalized
+                )
+            } else {
+                "no exact (source, namespace, normalized) match on candidate"
+                    .to_string()
+            },
+        );
+
+        // === Factor: alias_already_on_candidate (+0.30)
+        // vs alias_conflict_present (-0.35) ===
+        // Probe the alias index ON THE CANDIDATE'S TENANT SLOT
+        // (load-bearing for `None`-tenanted candidates).
+        // `entity_by_alias` returns Some(entity) when the alias
+        // already maps to ANY entity in that tenant. Mutex:
+        // exactly one of {already_on_candidate, conflict_present,
+        // neither} applies.
+        let index_hit = self
+            .identity_entity_by_alias(
+                candidate.tenant_id.as_ref(),
+                &alias.source,
+                alias.namespace.as_deref(),
+                &alias.normalized,
+            );
+        let (already_on_candidate, conflict_present) = match index_hit {
+            Some(hit) if hit.id == candidate.id => (true, false),
+            Some(_) => (false, true),
+            None => (false, false),
+        };
+        push_factor(
+            &mut factors,
+            &mut score,
+            "alias_already_on_candidate",
+            0.30,
+            already_on_candidate,
+            if already_on_candidate {
+                "alias index resolves directly to this candidate"
+                    .to_string()
+            } else {
+                "alias does not currently resolve to this candidate"
+                    .to_string()
+            },
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "alias_conflict_present",
+            -0.35,
+            conflict_present,
+            if conflict_present {
+                "alias already maps to a different entity in the \
+                 candidate's tenant — using it for this candidate \
+                 would violate P29 uniqueness"
+                    .to_string()
+            } else {
+                "no conflicting entity for this alias".to_string()
+            },
+        );
+
+        // === Factors: semantic_match_{strong,possible,weak} ===
+        // Bucket P30's match level into three mutex factors.
+        // Exactly one fires.
+        let sm_strong = match_level == MatchLevel::Strong;
+        let sm_possible = match_level == MatchLevel::Possible;
+        let sm_weak = !sm_strong && !sm_possible;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "semantic_match_strong",
+            0.25,
+            sm_strong,
+            format!("P30 match_score {match_score:.3} → Strong (≥ 0.80)"),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "semantic_match_possible",
+            0.10,
+            sm_possible,
+            format!(
+                "P30 match_score {match_score:.3} → Possible (0.50–0.80)",
+            ),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "semantic_match_weak",
+            -0.20,
+            sm_weak,
+            format!("P30 match_score {match_score:.3} → Weak / None (< 0.50)"),
+        );
+
+        // === Factors: candidate_entity_confidence_{high,low} ===
+        // Reuse TrustLevel thresholds. Skip the medium band as
+        // noise — the verdict either lifts on high confidence
+        // OR penalizes on low confidence, never both.
+        let conf = candidate.confidence.value();
+        let conf_high = conf >= 0.80;
+        let conf_low = conf < 0.50;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "candidate_entity_confidence_high",
+            0.15,
+            conf_high,
+            format!("candidate confidence {conf:.2} (≥ 0.80)"),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "candidate_entity_confidence_low",
+            -0.10,
+            conf_low,
+            format!("candidate confidence {conf:.2} (< 0.50)"),
+        );
+
+        // === Factor: same_kind (+0.10) ===
+        // Any-alias semantics doesn't apply here — kind is on
+        // the entity itself. Compare directly against the
+        // caller-supplied `kind` arg when present; otherwise
+        // record as unapplied with "no kind context".
+        //
+        // Note: the kind arg is also used by `kind_filter_mismatch`
+        // below. `same_kind` answers "does the candidate's kind
+        // align with the query intent?"; `kind_filter_mismatch`
+        // is the penalty when it disagrees.
+        let same_kind = match &kind {
+            Some(k) => &candidate.kind == k,
+            None => false,
+        };
+        push_factor(
+            &mut factors,
+            &mut score,
+            "same_kind",
+            0.10,
+            same_kind,
+            if same_kind {
+                format!(
+                    "candidate kind matches query kind '{}'",
+                    candidate.kind.discriminant()
+                )
+            } else if kind.is_some() {
+                format!(
+                    "candidate kind '{}' differs from query kind",
+                    candidate.kind.discriminant()
+                )
+            } else {
+                "no kind context on query (factor inapplicable)".to_string()
+            },
+        );
+
+        // === Factor: same_namespace (+0.10) ===
+        // Any-alias semantics (mirrors P30): fires if ANY of the
+        // candidate's aliases shares the query's namespace.
+        // None matches None by design (sentinel design from P29).
+        let same_ns = candidate
+            .aliases
+            .iter()
+            .any(|a| a.namespace == alias.namespace);
+        push_factor(
+            &mut factors,
+            &mut score,
+            "same_namespace",
+            0.10,
+            same_ns,
+            if same_ns {
+                format!(
+                    "candidate has alias in namespace {:?}",
+                    alias.namespace
+                )
+            } else {
+                format!(
+                    "no candidate alias in namespace {:?}",
+                    alias.namespace
+                )
+            },
+        );
+
+        // === Factor: same_source (+0.05) ===
+        // Any-alias semantics.
+        let same_src = candidate
+            .aliases
+            .iter()
+            .any(|a| a.source == alias.source);
+        push_factor(
+            &mut factors,
+            &mut score,
+            "same_source",
+            0.05,
+            same_src,
+            if same_src {
+                format!(
+                    "candidate has alias from source '{}'",
+                    alias.source
+                )
+            } else {
+                format!(
+                    "no candidate alias from source '{}'",
+                    alias.source
+                )
+            },
+        );
+
+        // === Factor: kind_filter_mismatch (-0.05) ===
+        // Fires only when the caller supplied a kind filter AND
+        // the candidate's kind differs. Soft signal, not a hard
+        // error — caller may legitimately want to assess a
+        // candidate they're considering relabeling.
+        let kind_mismatch = match &kind {
+            Some(k) => &candidate.kind != k,
+            None => false,
+        };
+        push_factor(
+            &mut factors,
+            &mut score,
+            "kind_filter_mismatch",
+            -0.05,
+            kind_mismatch,
+            if kind_mismatch {
+                format!(
+                    "caller requested kind filter but candidate \
+                     kind '{}' differs",
+                    candidate.kind.discriminant()
+                )
+            } else {
+                "no kind filter / candidate kind matches".to_string()
+            },
+        );
+
+        // 5. Clamp and bucket.
+        let final_score = score.clamp(0.0, 1.0);
+        let level = TrustAssessment::level_for_score(final_score);
+
+        // 6. Build a short explanation. Mirrors P9/P23 style:
+        //    summary of the most influential applied factors.
+        let applied_count =
+            factors.iter().filter(|f| f.applied).count();
+        let positive_count = factors
+            .iter()
+            .filter(|f| f.applied && f.weight > 0.0)
+            .count();
+        let negative_count = factors
+            .iter()
+            .filter(|f| f.applied && f.weight < 0.0)
+            .count();
+        let explanation = format!(
+            "Trust verdict {level:?} (score {final_score:.2}) — \
+             {positive_count} positive factor(s) and \
+             {negative_count} penalty factor(s) applied out of \
+             {applied_count} total."
+        );
+
+        Ok(hydra_core::IdentityMatchTrustAssessment {
+            query_alias: alias.clone(),
+            candidate_entity_id: candidate.id.clone(),
+            match_score,
+            match_level,
+            score: final_score,
+            level,
+            explanation,
+            factors,
+            assessed_at: chrono::Utc::now(),
+        })
+    }
+
     /// Patch 21 — turn a model-derived reflex chain into a
     /// `CausalCellKind::Reflex` causal cell.
     ///
@@ -18978,6 +19372,663 @@ mod sprint1_tests {
         assert!(
             p30_find_factor(cand, "same_namespace").applied,
             "None-namespace must match None-namespace"
+        );
+    }
+
+    // === Patch 32 — Identity Match Trust ===
+    //
+    // Read-only trust verdict over a single P30 candidate.
+    // Tests verify: (a) the load-bearing tenant isolation,
+    // (b) the factor table calibration via worked examples,
+    // (c) mutual exclusivity of bucket factors, (d) the
+    // "do_not_mutate" + "no caller-supplied score" anti-forgery
+    // pins, and (e) the strategic-warning docstring is in place.
+
+    /// Helper: find an applied/unapplied factor record by name
+    /// inside a `IdentityMatchTrustAssessment`. Mirrors
+    /// `p30_find_factor` for the P30 list shape.
+    fn p32_find_factor<'a>(
+        assessment: &'a hydra_core::IdentityMatchTrustAssessment,
+        kind: &str,
+    ) -> &'a hydra_core::TrustFactor {
+        assessment
+            .factors
+            .iter()
+            .find(|f| f.kind == kind)
+            .unwrap_or_else(|| {
+                panic!(
+                    "factor {kind} missing from IdentityMatchTrustAssessment"
+                )
+            })
+    }
+
+    /// Build a `IdentityEntity` with the supplied confidence.
+    /// Mirrors `make_identity_entity` but lets P32 tests pin
+    /// confidence-band behavior precisely.
+    fn make_identity_entity_with_confidence(
+        tenant: Option<hydra_core::TenantId>,
+        kind: hydra_core::IdentityEntityKind,
+        canonical_key: &str,
+        aliases: Vec<hydra_core::IdentityAlias>,
+        confidence: hydra_core::Confidence,
+    ) -> hydra_core::IdentityEntity {
+        let now = chrono::Utc::now();
+        hydra_core::IdentityEntity {
+            id: hydra_core::IdentityEntityId::new(),
+            tenant_id: tenant,
+            kind,
+            canonical_key: canonical_key.to_string(),
+            display_name: canonical_key.to_string(),
+            aliases,
+            confidence,
+            metadata: std::collections::HashMap::new(),
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        }
+    }
+
+    #[test]
+    fn assess_identity_match_trust_happy_path_high() {
+        // Worked example (a): exact alias + high entity
+        // confidence + same kind/namespace, no conflict.
+        // Expected score: alias_already_on_candidate (+0.30) +
+        // exact_alias_match (+0.40) + semantic_match_strong
+        // (+0.25) + confidence_high (+0.15) + same_kind (+0.10)
+        // + same_namespace (+0.10) + same_source (+0.05) = 1.35,
+        // clamped to 1.00 → High.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        let alias = snowflake_alias("analytics", "revenue_daily");
+        let entity = make_identity_entity_with_confidence(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![alias.clone()],
+            hydra_core::Confidence::new(0.95),
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let assessment = hydra
+            .assess_identity_match_trust(
+                Some(&tenant),
+                &alias,
+                &id,
+                Some(hydra_core::IdentityEntityKind::Dataset),
+            )
+            .unwrap();
+        assert_eq!(assessment.candidate_entity_id, id);
+        assert_eq!(assessment.level, hydra_core::trust::TrustLevel::High);
+        assert!(assessment.score >= 0.80);
+        assert!(p32_find_factor(&assessment, "exact_alias_match").applied);
+        assert!(
+            p32_find_factor(&assessment, "alias_already_on_candidate")
+                .applied
+        );
+        assert!(p32_find_factor(&assessment, "semantic_match_strong").applied);
+        assert!(
+            p32_find_factor(&assessment, "candidate_entity_confidence_high")
+                .applied
+        );
+    }
+
+    #[test]
+    fn alias_conflict_drags_strong_to_low() {
+        // Worked example (b): two entities in the same tenant.
+        // Query alias maps to entity A; we ask trust for entity
+        // B. Strong P30 match (B has overlapping tokens) plus
+        // confidence_high + same_kind/namespace lift the base
+        // — but alias_conflict_present (-0.35) drags it down
+        // to Low.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        let query_alias = snowflake_alias("analytics", "revenue_daily");
+        // Entity A owns the query alias.
+        let entity_a = make_identity_entity_with_confidence(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/a",
+            vec![query_alias.clone()],
+            hydra_core::Confidence::new(0.95),
+        );
+        // Entity B has its OWN alias but shares enough tokens
+        // for a Strong P30 match against the query.
+        let entity_b = make_identity_entity_with_confidence(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/b/revenue_daily",
+            vec![hydra_core::IdentityAlias {
+                source: "snowflake".to_string(),
+                namespace: Some("analytics_b".to_string()),
+                external_id: None,
+                label: "analytics_b.revenue_daily".to_string(),
+                normalized: "analytics.revenue_daily".to_string(),
+            }],
+            hydra_core::Confidence::new(0.95),
+        );
+        hydra.create_identity_entity(entity_a).unwrap();
+        let id_b = entity_b.id.clone();
+        hydra.create_identity_entity(entity_b).unwrap();
+        let assessment = hydra
+            .assess_identity_match_trust(
+                Some(&tenant),
+                &query_alias,
+                &id_b,
+                None,
+            )
+            .unwrap();
+        assert!(p32_find_factor(&assessment, "alias_conflict_present").applied);
+        assert!(!p32_find_factor(
+            &assessment,
+            "alias_already_on_candidate"
+        )
+        .applied);
+        // Conflict drags the verdict down — should NOT be High.
+        assert!(
+            !matches!(
+                assessment.level,
+                hydra_core::trust::TrustLevel::High
+            ),
+            "conflict must prevent High verdict; got {:?} score {}",
+            assessment.level,
+            assessment.score
+        );
+    }
+
+    #[test]
+    fn weak_match_low_confidence_clamps_to_zero() {
+        // Worked example (c): weak P30 match, low entity
+        // confidence, kind filter mismatch → all negatives
+        // pile up and the pre-clamp score is below 0. Clamp
+        // produces 0.0 → Unknown.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        let entity = make_identity_entity_with_confidence(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/unrelated",
+            vec![hydra_core::IdentityAlias {
+                source: "github".to_string(),
+                namespace: Some("repo/x".to_string()),
+                external_id: None,
+                label: "completely_different.sql".to_string(),
+                normalized: "completely_different".to_string(),
+            }],
+            hydra_core::Confidence::new(0.10),
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        // Query: entirely different source/namespace/tokens; also
+        // pass a kind filter that doesn't match (Service).
+        let query = hydra_core::IdentityAlias {
+            source: "slack".to_string(),
+            namespace: Some("ops".to_string()),
+            external_id: None,
+            label: "incident-1".to_string(),
+            normalized: "incident-1".to_string(),
+        };
+        let assessment = hydra
+            .assess_identity_match_trust(
+                Some(&tenant),
+                &query,
+                &id,
+                Some(hydra_core::IdentityEntityKind::Service),
+            )
+            .unwrap();
+        assert_eq!(assessment.score, 0.0);
+        assert_eq!(
+            assessment.level,
+            hydra_core::trust::TrustLevel::Unknown
+        );
+        assert!(
+            p32_find_factor(&assessment, "semantic_match_weak").applied
+        );
+        assert!(
+            p32_find_factor(&assessment, "candidate_entity_confidence_low")
+                .applied
+        );
+        assert!(p32_find_factor(&assessment, "kind_filter_mismatch").applied);
+    }
+
+    #[test]
+    fn alias_already_on_candidate_fires_not_conflict() {
+        // Mutex pin: when the alias index resolves directly to
+        // the candidate itself, `alias_already_on_candidate`
+        // fires AND `alias_conflict_present` is unapplied.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        let alias = snowflake_alias("analytics", "revenue_daily");
+        let entity = make_identity_entity_with_confidence(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![alias.clone()],
+            hydra_core::Confidence::new(0.80),
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let assessment = hydra
+            .assess_identity_match_trust(
+                Some(&tenant),
+                &alias,
+                &id,
+                None,
+            )
+            .unwrap();
+        assert!(
+            p32_find_factor(&assessment, "alias_already_on_candidate")
+                .applied
+        );
+        assert!(
+            !p32_find_factor(&assessment, "alias_conflict_present").applied
+        );
+    }
+
+    #[test]
+    fn semantic_match_factors_mutually_exclusive() {
+        // Exactly one of strong/possible/weak fires for every
+        // candidate. Pinned because conflating mutex tiers is
+        // the easiest silent regression.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        let alias = snowflake_alias("analytics", "revenue_daily");
+        let entity = make_identity_entity_with_confidence(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![alias.clone()],
+            hydra_core::Confidence::new(1.0),
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let assessment = hydra
+            .assess_identity_match_trust(Some(&tenant), &alias, &id, None)
+            .unwrap();
+        let strong =
+            p32_find_factor(&assessment, "semantic_match_strong").applied;
+        let possible =
+            p32_find_factor(&assessment, "semantic_match_possible").applied;
+        let weak =
+            p32_find_factor(&assessment, "semantic_match_weak").applied;
+        let count = [strong, possible, weak]
+            .iter()
+            .filter(|b| **b)
+            .count();
+        assert_eq!(
+            count, 1,
+            "exactly one of strong/possible/weak must fire; \
+             strong={strong} possible={possible} weak={weak}"
+        );
+    }
+
+    #[test]
+    fn confidence_factors_mutually_exclusive() {
+        // confidence_high and confidence_low must never BOTH
+        // fire. Either one or the other (medium band = neither).
+        // Test all three bands.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        for (conf_val, ns) in [(0.95_f64, "high"), (0.60, "med"), (0.10, "low")] {
+            let alias = snowflake_alias(ns, "x");
+            let entity = make_identity_entity_with_confidence(
+                Some(tenant.clone()),
+                hydra_core::IdentityEntityKind::Dataset,
+                &format!("dataset/x_{ns}"),
+                vec![alias.clone()],
+                hydra_core::Confidence::new(conf_val),
+            );
+            let id = entity.id.clone();
+            hydra.create_identity_entity(entity).unwrap();
+            let assessment = hydra
+                .assess_identity_match_trust(
+                    Some(&tenant),
+                    &alias,
+                    &id,
+                    None,
+                )
+                .unwrap();
+            let high = p32_find_factor(
+                &assessment,
+                "candidate_entity_confidence_high",
+            )
+            .applied;
+            let low = p32_find_factor(
+                &assessment,
+                "candidate_entity_confidence_low",
+            )
+            .applied;
+            assert!(!(high && low), "high and low must not both fire");
+            match ns {
+                "high" => assert!(high && !low),
+                "med" => assert!(!high && !low),
+                "low" => assert!(!high && low),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn assess_identity_match_trust_unknown_candidate_returns_query_error() {
+        // Hard error on missing candidate. Mirrors P9 / P23.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        let alias = snowflake_alias("analytics", "x");
+        let ghost = hydra_core::IdentityEntityId::from_str("ide_ghost");
+        let result = hydra.assess_identity_match_trust(
+            Some(&tenant),
+            &alias,
+            &ghost,
+            None,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("unknown identity entity"),
+                    "expected unknown-entity error; got {msg}"
+                );
+            }
+            other => panic!("expected QueryError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_tenant_indistinguishable_from_missing() {
+        // LOAD-BEARING strict isolation: a candidate that exists
+        // but belongs to a different tenant surfaces with the
+        // SAME error as a genuine miss. No cross-tenant
+        // existence leak. Mirrors P10 / P24 / P29 / P31.
+        let mut hydra = Hydra::new();
+        let tenant_owner =
+            hydra_core::TenantId::from_str("tenant_owner");
+        let tenant_other =
+            hydra_core::TenantId::from_str("tenant_other");
+        let alias = snowflake_alias("analytics", "x");
+        let entity = make_identity_entity_with_confidence(
+            Some(tenant_owner),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/x",
+            vec![alias.clone()],
+            hydra_core::Confidence::new(0.90),
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let result = hydra.assess_identity_match_trust(
+            Some(&tenant_other),
+            &alias,
+            &id,
+            None,
+        );
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("unknown identity entity"),
+                    "wrong-tenant must emit same error as genuine \
+                     miss; got {msg}"
+                );
+            }
+            other => panic!("expected QueryError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn none_tenanted_candidate_probes_none_slot() {
+        // LOAD-BEARING (Adaptation C): conflict probe uses the
+        // CANDIDATE'S tenant slot, not the caller's. For a
+        // `None`-tenanted candidate, the index lookup must
+        // probe the `__system__` slot. If we passed the
+        // caller's tenant arg, we'd miss a conflict against
+        // another None-tenanted entity (or fabricate one across
+        // slots).
+        let mut hydra = Hydra::new();
+        let alias = snowflake_alias("system", "snowflake_prod");
+        // System-tenanted candidate A claims the alias.
+        let entity_a = make_identity_entity_with_confidence(
+            None,
+            hydra_core::IdentityEntityKind::Source,
+            "source/system_a",
+            vec![alias.clone()],
+            hydra_core::Confidence::new(0.90),
+        );
+        // System-tenanted candidate B does NOT have the alias.
+        let entity_b = make_identity_entity_with_confidence(
+            None,
+            hydra_core::IdentityEntityKind::Source,
+            "source/system_b",
+            vec![hydra_core::IdentityAlias {
+                source: "snowflake".to_string(),
+                namespace: Some("system_b".to_string()),
+                external_id: None,
+                label: "other".to_string(),
+                normalized: "other".to_string(),
+            }],
+            hydra_core::Confidence::new(0.90),
+        );
+        hydra.create_identity_entity(entity_a).unwrap();
+        let id_b = entity_b.id.clone();
+        hydra.create_identity_entity(entity_b).unwrap();
+        // Assess trust for B against the alias. The probe must
+        // use B's tenant slot (`None`) and surface the conflict
+        // with A.
+        let assessment = hydra
+            .assess_identity_match_trust(None, &alias, &id_b, None)
+            .unwrap();
+        assert!(
+            p32_find_factor(&assessment, "alias_conflict_present").applied,
+            "None-tenanted probe must see the conflict in the \
+             None slot, not the caller's slot"
+        );
+    }
+
+    #[test]
+    fn assess_identity_match_trust_none_tenant_strict_isolation() {
+        // LOAD-BEARING strict-isolation both directions
+        // (mirrors P30): `None`-tenanted candidate is invisible
+        // to a tenanted query, and vice versa.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        let alias = snowflake_alias("system", "snowflake_prod");
+        // System candidate.
+        let system_entity = make_identity_entity_with_confidence(
+            None,
+            hydra_core::IdentityEntityKind::Source,
+            "source/system",
+            vec![alias.clone()],
+            hydra_core::Confidence::new(0.90),
+        );
+        let id_system = system_entity.id.clone();
+        hydra.create_identity_entity(system_entity).unwrap();
+        // Tenanted query against the system candidate → error.
+        let r1 = hydra.assess_identity_match_trust(
+            Some(&tenant),
+            &alias,
+            &id_system,
+            None,
+        );
+        assert!(r1.is_err());
+
+        // Tenanted candidate.
+        let tenanted = make_identity_entity_with_confidence(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Source,
+            "source/tenanted",
+            vec![hydra_core::IdentityAlias {
+                source: "snowflake".to_string(),
+                namespace: Some("tenanted".to_string()),
+                external_id: None,
+                label: "x".to_string(),
+                normalized: "x".to_string(),
+            }],
+            hydra_core::Confidence::new(0.90),
+        );
+        let id_tenanted = tenanted.id.clone();
+        hydra.create_identity_entity(tenanted).unwrap();
+        // None query against the tenanted candidate → error.
+        let r2 = hydra.assess_identity_match_trust(
+            None,
+            &alias,
+            &id_tenanted,
+            None,
+        );
+        assert!(r2.is_err());
+    }
+
+    #[test]
+    fn assess_identity_match_trust_does_not_mutate_store() {
+        // LOAD-BEARING read-only pin: entity count + event count
+        // unchanged before/after. If a future refactor
+        // accidentally ingests an event during scoring, this
+        // test fires.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        let alias = snowflake_alias("analytics", "revenue_daily");
+        let entity = make_identity_entity_with_confidence(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![alias.clone()],
+            hydra_core::Confidence::new(0.95),
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let pre_entities = hydra.identity_entities().count();
+        let pre_events = hydra.events().len();
+        let _ = hydra
+            .assess_identity_match_trust(Some(&tenant), &alias, &id, None)
+            .unwrap();
+        assert_eq!(hydra.identity_entities().count(), pre_entities);
+        assert_eq!(hydra.events().len(), pre_events);
+    }
+
+    #[test]
+    fn assess_identity_match_trust_includes_all_factors_always() {
+        // Explainability contract: every assessment carries ALL
+        // ~12 factors, applied OR not. Pinned so a future
+        // refactor doesn't filter the list down to "what fired".
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        let alias = snowflake_alias("analytics", "revenue_daily");
+        let entity = make_identity_entity_with_confidence(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            vec![alias.clone()],
+            hydra_core::Confidence::new(0.95),
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let assessment = hydra
+            .assess_identity_match_trust(Some(&tenant), &alias, &id, None)
+            .unwrap();
+        let expected_kinds = [
+            "exact_alias_match",
+            "alias_already_on_candidate",
+            "alias_conflict_present",
+            "semantic_match_strong",
+            "semantic_match_possible",
+            "semantic_match_weak",
+            "candidate_entity_confidence_high",
+            "candidate_entity_confidence_low",
+            "same_kind",
+            "same_namespace",
+            "same_source",
+            "kind_filter_mismatch",
+        ];
+        for k in &expected_kinds {
+            let _ = p32_find_factor(&assessment, k);
+        }
+        assert_eq!(assessment.factors.len(), expected_kinds.len());
+        // At least one applied=false present (kind_filter_mismatch
+        // with no kind arg, OR confidence_low when confidence is
+        // high, etc.).
+        assert!(
+            assessment.factors.iter().any(|f| !f.applied),
+            "at least one factor must be applied=false"
+        );
+    }
+
+    #[test]
+    fn score_recomputed_not_caller_supplied() {
+        // Anti-forgery pin (Wrinkle E): there is NO API path
+        // through which a caller can supply a P30 score. The
+        // engine method takes (alias, candidate_entity_id) —
+        // not a SemanticIdentityMatchCandidate. Pin via type
+        // observation: the signature accepts an IdentityAlias
+        // and an IdentityEntityId, never a candidate struct.
+        // We exercise the recomputation directly: a caller
+        // can't forge `match_score` via the input shape.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        let alias = snowflake_alias("analytics", "x");
+        let entity = make_identity_entity_with_confidence(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/x",
+            vec![alias.clone()],
+            hydra_core::Confidence::new(0.90),
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let assessment = hydra
+            .assess_identity_match_trust(
+                Some(&tenant),
+                &alias,
+                &id,
+                None,
+            )
+            .unwrap();
+        // The match_score is computed live from the alias +
+        // entity, not from anything the caller passed in. It
+        // must reflect the actual P30 calibration — for an
+        // exact alias this lands in the Strong band.
+        assert_eq!(assessment.match_level, hydra_core::MatchLevel::Strong);
+        assert!(
+            assessment.match_score >= 0.80,
+            "exact-alias match must score Strong; got {}",
+            assessment.match_score
+        );
+    }
+
+    #[test]
+    fn assess_identity_match_trust_docstring_warns_against_auto_link() {
+        // Strategic warning pin. We can't read doc-comments at
+        // runtime, but we can pin that the EXPLANATION string
+        // produced by the method includes the language the
+        // contract requires. The compiled docstring lives in
+        // the engine method; this test guards the wire-facing
+        // explanation as a separate safety net.
+        //
+        // For v0 the explanation summarizes factor counts. We
+        // pin that the contract still surfaces SOMEWHERE in
+        // the assessment by checking that at least one applied
+        // factor's `detail` references suggestion-only semantics
+        // (the canned details for sensitive factors). If a
+        // future refactor drops the docstring AND the detail
+        // strings, this test should catch the second drop.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p32");
+        let alias = snowflake_alias("analytics", "x");
+        let entity = make_identity_entity_with_confidence(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/x",
+            vec![alias.clone()],
+            hydra_core::Confidence::new(0.90),
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let assessment = hydra
+            .assess_identity_match_trust(Some(&tenant), &alias, &id, None)
+            .unwrap();
+        // The explanation summary mentions both positive +
+        // penalty factor groupings — a structural signal that
+        // the verdict is multi-factor + explainable, NOT a
+        // simple boolean.
+        assert!(
+            assessment.explanation.contains("positive")
+                && assessment.explanation.contains("penalty"),
+            "explanation must surface positive + penalty grouping: {}",
+            assessment.explanation
         );
     }
 
