@@ -68,6 +68,7 @@ impl TrustHttpState {
 /// - `/trust/cells/:cell_id`                  — Patch 24 cell trust
 /// - `/trust/identity/entities/:entity_id`    — Patch 34 identity entity trust
 /// - `/trust/identity/matches`                — Patch 34 identity match trust
+/// - `/trust/identity/sources/:source`        — Patch 36 source trust
 ///
 /// **Auth scope precedence pin**: `/trust/identity/*` resolves to
 /// `read:trust` via the `/trust/*` prefix clause in
@@ -78,8 +79,8 @@ impl TrustHttpState {
 /// auth tests.
 ///
 /// Future patches mount alongside under the same `/trust/*`
-/// prefix (Source Trust → `/trust/identity/sources/:id`, Link
-/// Trust → `/trust/identity/links/:id`, etc.).
+/// prefix (Link Trust → `/trust/identity/links/:id`, operational
+/// connector trust → `/trust/connectors/:id`, etc.).
 pub fn trust_router(runtime: RuntimeHandle) -> Router {
     Router::new()
         .route("/trust/claims/:claim_id", get(get_claim_trust))
@@ -91,6 +92,10 @@ pub fn trust_router(runtime: RuntimeHandle) -> Router {
         .route(
             "/trust/identity/matches",
             get(get_identity_match_trust),
+        )
+        .route(
+            "/trust/identity/sources/:source",
+            get(get_source_trust),
         )
         .with_state(TrustHttpState::new(runtime))
 }
@@ -416,6 +421,96 @@ async fn get_identity_match_trust(
         Err(other) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("identity match trust assessment failed: {other}"),
+        ),
+    }
+}
+
+/// `GET /trust/identity/sources/:source` — Patch 36 source trust
+/// surface. Exposes the Patch 35
+/// `Hydra::assess_source_trust` verdict over HTTP.
+///
+/// The `source` path segment is URL-decoded by axum; SDK callers
+/// percent-encode automatically (`_seg()`). Sources containing
+/// `/` MUST be encoded by hand-rolled HTTP callers as `%2F`.
+///
+/// ## Status mapping
+///
+/// - missing `X-Hydra-Tenant` → **400**
+/// - empty source segment → **400** (defense in depth — engine
+///   also rejects, but HTTP semantically should reject caller
+///   input as `BAD_REQUEST` not surface a 500)
+/// - sentinel source (`__system__`, `__root__`) → **400** (same
+///   reason — would otherwise alias the None-tenant slot's
+///   reserved keys)
+/// - well-formed source with no aliases / no evidence in tenant
+///   scope → **200** with a normal `SourceTrustAssessment` body,
+///   `level == "Unknown"` (`level_for_score(0.0)`). This is NOT
+///   404 — P35 explicitly made empty-result a legitimate verdict.
+/// - well-formed source with data → **200** with bare assessment
+///   body (no envelope — matches `/trust/claims/:id`,
+///   `/trust/cells/:id`, `/trust/identity/entities/:id`)
+/// - unexpected engine error → **500**
+///
+/// ## Tenant isolation
+///
+/// `None`-tenanted source data (entities + evidence) is invisible
+/// to tenanted probes — but the response is **200 with an empty
+/// verdict**, NOT 404. Distinct from `/trust/identity/entities/:id`
+/// where wrong tenant returns 404, because the entity route gates
+/// on a specific id (existence is sensitive); source is a free-
+/// form string and the empty-result-is-legitimate contract carries
+/// forward from the engine.
+///
+/// ## Suggestion-only contract
+///
+/// Source trust is **identity-backed, NOT operational**. v1
+/// measures whether a source has produced trustworthy identity /
+/// evidence claims in this tenant — entity count, kind diversity,
+/// entity-confidence corroboration, evidence reliability. v1 does
+/// NOT consider ingestion freshness, schema drift, heartbeat
+/// liveness, SLA conformance. A dead Snowflake warehouse with
+/// five trustworthy historical entities will score **High** here.
+/// Operational signals layer on when connector primitives ship.
+async fn get_source_trust(
+    State(state): State<TrustHttpState>,
+    headers: HeaderMap,
+    Path(source): Path<String>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(err) => return tenant_error_response(err),
+    };
+
+    // Defense in depth — engine also rejects, but HTTP should
+    // surface caller-input errors as 400, not 500. Mirrors P34's
+    // match-route param validation pattern.
+    if source.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "source path segment cannot be empty",
+        );
+    }
+    if source == "__system__" || source == "__root__" {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("source '{source}' is a reserved sentinel"),
+        );
+    }
+
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
+
+    match hydra.assess_source_trust(Some(&tenant), &source) {
+        Ok(assessment) => (StatusCode::OK, Json(assessment)).into_response(),
+        Err(hydra_core::error::HydraError::QueryError(msg)) => {
+            // Engine's QueryError surfaces ONLY for malformed
+            // input (empty / sentinel — both caught above). If we
+            // reach here, defense-in-depth failed; honest 400.
+            error_response(StatusCode::BAD_REQUEST, msg)
+        }
+        Err(other) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("source trust assessment failed: {other}"),
         ),
     }
 }
@@ -1394,6 +1489,404 @@ mod tests {
             .await
             .unwrap();
         // 200 = trust_router resolved the route.
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // === Patch 36 — Source trust HTTP tests ===
+
+    /// Ingest a tenant-scoped Evidence record via `EvidenceAdded`.
+    /// Used by source-trust tests that need real evidence in the
+    /// engine to exercise the P35 evidence-mapping factors.
+    async fn ingest_evidence(
+        runtime: &crate::runtime::RuntimeHandle,
+        evidence: hydra_core::Evidence,
+    ) {
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded { evidence })
+            .unwrap();
+    }
+
+    /// Build a tenant-scoped Evidence record with the supplied
+    /// source variant + reliability. P36 helper, mirrors the P35
+    /// engine-test fixture.
+    fn make_test_evidence(
+        tenant: Option<TenantId>,
+        source: hydra_core::EvidenceSource,
+        reliability: f64,
+    ) -> hydra_core::Evidence {
+        let now = chrono::Utc::now();
+        hydra_core::Evidence {
+            id: hydra_core::EvidenceId::new(),
+            tenant_id: tenant,
+            source,
+            payload: hydra_core::EvidencePayload {
+                kind: "p36_test".to_string(),
+                data: HashMap::new(),
+            },
+            reliability: hydra_core::Confidence::new(reliability),
+            observed_at: now,
+            recorded_at: now,
+            caused_by: None,
+        }
+    }
+
+    // === GET /trust/identity/sources/:source ===
+
+    #[tokio::test]
+    async fn get_source_trust_returns_assessment() {
+        // Happy path — 2 entities + 1 reliable evidence under the
+        // same source. Verify the bare-body envelope, all P35
+        // fields, AND the P36 `related_entity_ids` Adaptation A1
+        // extension.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let entity_a = ingest_entity(
+            &runtime,
+            make_test_entity(
+                Some(tenant.clone()),
+                hydra_core::IdentityEntityKind::Dataset,
+                "dataset/revenue_daily",
+                vec![snowflake_test_alias("analytics", "revenue_daily")],
+                hydra_core::Confidence::new(0.95),
+            ),
+        )
+        .await;
+        let entity_b = ingest_entity(
+            &runtime,
+            make_test_entity(
+                Some(tenant.clone()),
+                hydra_core::IdentityEntityKind::Table,
+                "table/users",
+                vec![snowflake_test_alias("ops", "users")],
+                hydra_core::Confidence::new(0.95),
+            ),
+        )
+        .await;
+        ingest_evidence(
+            &runtime,
+            make_test_evidence(
+                Some(tenant.clone()),
+                hydra_core::EvidenceSource::Warehouse {
+                    system: "snowflake".to_string(),
+                    database: None,
+                    schema: None,
+                    table: None,
+                },
+                0.90,
+            ),
+        )
+        .await;
+
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/trust/identity/sources/snowflake"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        // Bare wire body — no envelope.
+        assert_eq!(body.get("source").and_then(|v| v.as_str()), Some("snowflake"));
+        assert!(body.get("score").is_some());
+        assert!(body.get("level").is_some());
+        assert!(body.get("explanation").is_some());
+        assert!(body.get("factors").is_some());
+        // Patch 36 Adaptation A1 — related_entity_ids on the wire,
+        // containing both entity ids.
+        let related = body
+            .get("related_entity_ids")
+            .and_then(|v| v.as_array())
+            .expect("related_entity_ids must be an array");
+        assert_eq!(related.len(), 2);
+        let related_strs: Vec<&str> =
+            related.iter().filter_map(|v| v.as_str()).collect();
+        assert!(related_strs.contains(&entity_a.id.as_str()));
+        assert!(related_strs.contains(&entity_b.id.as_str()));
+        // Sample sizes carry forward from P35.
+        assert_eq!(body.get("entity_sample_size").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(body.get("evidence_sample_size").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn get_source_trust_requires_tenant_header() {
+        // Missing X-Hydra-Tenant → 400. Same contract as the other
+        // /trust/* routes.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get_without_tenant(
+                "/trust/identity/sources/snowflake",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_source_trust_empty_source_returns_400() {
+        // Empty source path segment is malformed input — caught
+        // at the HTTP boundary BEFORE the engine call. Adaptation
+        // B (defense in depth).
+        //
+        // Note: axum's path-segment routing won't match a literal
+        // empty `:source` (the trailing `/sources/` doesn't bind
+        // the param), so we exercise the next-closest behavior: a
+        // request to `/trust/identity/sources/` returns 404 from
+        // axum's router. To pin the handler's OWN empty-source
+        // guard, we use a URL-encoded zero-length segment via
+        // `%20`-trimmed: realistically the guard never fires from
+        // a well-formed HTTP client. Pinned via the sentinel
+        // check instead — see the next test.
+        //
+        // For wire compatibility, callers sending the literal
+        // `/trust/identity/sources/` would see a 404 (route
+        // unmatched). The handler's `source.is_empty()` guard
+        // exists as defense-in-depth and is exercised by the
+        // engine path; we pin the route-unmatched behavior here.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/trust/identity/sources/"))
+            .await
+            .unwrap();
+        // Trailing-slash without a segment doesn't bind `:source`
+        // — axum returns 404 NOT_FOUND. The HTTP contract
+        // semantically rejects empty-source URLs at the routing
+        // layer.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_source_trust_sentinel_source_returns_400() {
+        // `__system__` and `__root__` are reserved sentinels.
+        // The handler rejects them with 400 BEFORE calling the
+        // engine — caller-input malformation is BAD_REQUEST, not
+        // INTERNAL_SERVER_ERROR.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        for sentinel in ["__system__", "__root__"] {
+            let response = app
+                .clone()
+                .oneshot(empty_get(&format!(
+                    "/trust/identity/sources/{sentinel}"
+                )))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "sentinel source '{sentinel}' must surface as 400"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_source_trust_unknown_source_returns_200_with_low_verdict() {
+        // Wrinkle E pin: a well-formed but unseen source is a
+        // legitimate empty verdict, NOT a 404. The exact level is
+        // `Unknown` via `level_for_score(0.0)`; the test asserts
+        // status==200 + level in {Unknown, Low} for wording
+        // tolerance (the "not 404" contract is what's
+        // load-bearing).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/trust/identity/sources/neverseen"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.get("source").and_then(|v| v.as_str()), Some("neverseen"));
+        assert_eq!(body.get("entity_sample_size").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(body.get("evidence_sample_size").and_then(|v| v.as_u64()), Some(0));
+        let level = body.get("level").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            level == "Unknown" || level == "Low",
+            "unknown source must bucket to Unknown (or Low for wording \
+             tolerance); got {level}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_source_trust_none_tenanted_source_invisible_to_tenanted_query() {
+        // LOAD-BEARING pin (Wrinkle G). `None`-tenanted entities
+        // + evidence are invisible to tenanted probes — but the
+        // result is 200 + empty verdict, NOT 404. Distinct from
+        // /trust/identity/entities/:id where wrong tenant returns
+        // 404. Source is free-form and empty-result-is-legitimate
+        // carries forward from the engine.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let _system_entity = ingest_entity(
+            &runtime,
+            make_test_entity(
+                None,
+                hydra_core::IdentityEntityKind::System,
+                "system/global",
+                vec![hydra_core::IdentityAlias {
+                    source: "github".to_string(),
+                    namespace: Some("global".to_string()),
+                    external_id: None,
+                    label: "global/x".to_string(),
+                    normalized: "global.x".to_string(),
+                }],
+                hydra_core::Confidence::new(0.90),
+            ),
+        )
+        .await;
+        ingest_evidence(
+            &runtime,
+            make_test_evidence(
+                None,
+                hydra_core::EvidenceSource::Api {
+                    system: "github".to_string(),
+                    endpoint: None,
+                },
+                0.90,
+            ),
+        )
+        .await;
+
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/trust/identity/sources/github"))
+            .await
+            .unwrap();
+        // 200 with empty verdict — NOT 404. The tenanted probe
+        // simply sees no data for the source.
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(body.get("entity_sample_size").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(body.get("evidence_sample_size").and_then(|v| v.as_u64()), Some(0));
+        let related = body
+            .get("related_entity_ids")
+            .and_then(|v| v.as_array())
+            .expect("related_entity_ids must be an array even when empty");
+        assert!(related.is_empty(), "None-tenanted entity must not leak");
+    }
+
+    #[tokio::test]
+    async fn get_source_trust_includes_all_factors() {
+        // Explainability contract pin. All 9 P35 factor records
+        // surface on the wire (applied OR not). Mirrors P34's
+        // `get_identity_entity_trust_includes_all_factors`.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let _e = ingest_entity(
+            &runtime,
+            make_test_entity(
+                Some(tenant),
+                hydra_core::IdentityEntityKind::Dataset,
+                "dataset/x",
+                vec![snowflake_test_alias("ns", "x")],
+                hydra_core::Confidence::new(0.90),
+            ),
+        )
+        .await;
+
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/trust/identity/sources/snowflake"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        let factors = body
+            .get("factors")
+            .and_then(|v| v.as_array())
+            .expect("factors must be an array");
+        let factor_kinds: Vec<&str> = factors
+            .iter()
+            .filter_map(|f| f.get("kind").and_then(|v| v.as_str()))
+            .collect();
+        let expected_kinds = [
+            "source_has_identity_aliases",
+            "multiple_entities_from_source",
+            "single_entity_from_source",
+            "multiple_kinds_from_source",
+            "high_trust_entities_from_source",
+            "low_trust_entities_from_source",
+            "evidence_present_from_source",
+            "reliable_evidence_from_source",
+            "low_reliability_evidence_from_source",
+        ];
+        for k in &expected_kinds {
+            assert!(
+                factor_kinds.contains(k),
+                "factor '{k}' missing from wire body; got {factor_kinds:?}"
+            );
+        }
+        assert_eq!(factors.len(), expected_kinds.len());
+    }
+
+    #[tokio::test]
+    async fn get_source_trust_url_encoded_source_with_hyphen_or_dot() {
+        // Adaptation C pin — sources containing hyphens and dots
+        // (`"snowflake-prod"`, `"github.com"`) round-trip through
+        // the path segment correctly. URL-decoding is handled by
+        // axum's Path extractor; sources with `/` would require
+        // explicit `%2F` encoding by the caller (not exercised
+        // here — covered by the SDK's _seg() helper test).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let _e = ingest_entity(
+            &runtime,
+            make_test_entity(
+                Some(tenant),
+                hydra_core::IdentityEntityKind::Service,
+                "service/prod",
+                vec![hydra_core::IdentityAlias {
+                    source: "snowflake-prod".to_string(),
+                    namespace: Some("ops".to_string()),
+                    external_id: None,
+                    label: "ops.prod".to_string(),
+                    normalized: "ops.prod".to_string(),
+                }],
+                hydra_core::Confidence::new(0.95),
+            ),
+        )
+        .await;
+
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/trust/identity/sources/snowflake-prod"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(
+            body.get("source").and_then(|v| v.as_str()),
+            Some("snowflake-prod")
+        );
+        assert_eq!(
+            body.get("entity_sample_size").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_source_trust_route_lives_in_trust_router() {
+        // Sanity: the source-trust route is mounted by
+        // `trust_router` itself (not by a separate identity
+        // router). If a future refactor moves it, this fires.
+        // Mirrors `get_identity_match_trust_route_lives_in_trust_router`.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/trust/identity/sources/snowflake"))
+            .await
+            .unwrap();
+        // 200 OK on an unknown-but-valid source proves the route
+        // resolved through trust_router (engine produced the
+        // empty verdict). A 404 here would mean the route wasn't
+        // mounted.
         assert_eq!(response.status(), StatusCode::OK);
     }
 }

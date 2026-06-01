@@ -393,6 +393,31 @@ def trust_identity_matches_path() -> str:
     return "/trust/identity/matches"
 
 
+def trust_identity_source_path(source: str) -> str:
+    """`GET /trust/identity/sources/{source}` — Patch 36 source
+    trust. Reads the Patch 35 verdict over a free-form source
+    string (e.g. `"snowflake"`, `"github"`, `"agent_data_quality"`).
+
+    The `source` segment is URL-encoded via `_seg()` so sources
+    containing `/`, `.`, or other URL-special characters
+    round-trip correctly (e.g. `"snowflake/east"` →
+    `snowflake%2Feast`).
+
+    Strict tenant-scoped: missing `X-Hydra-Tenant` → 400.
+    Empty / sentinel source → 400. Unknown-but-valid source
+    → 200 with `level="Unknown"` (NOT 404 — P35 explicitly
+    made empty-result a legitimate verdict). `None`-tenanted
+    source data is invisible to tenanted probes (200 with empty
+    verdict, NOT 404).
+
+    Returns a bare `SourceTrustAssessment` body — the same
+    no-envelope convention as `/trust/claims/:id`,
+    `/trust/cells/:id`, and the other `/trust/identity/*`
+    routes.
+    """
+    return f"/trust/identity/sources/{_seg(source)}"
+
+
 def trust_cell_path(cell_id: str) -> str:
     """`GET /trust/cells/{cell_id}` — read-only trust assessment
     of one CausalCell (Patch 24). Folds the Patch 23 12-factor

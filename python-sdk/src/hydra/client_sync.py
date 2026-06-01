@@ -61,6 +61,7 @@ from ._types import (
     IdentityEntityKind,
     IdentityEntityTrustAssessment,
     IdentityMatchTrustAssessment,
+    SourceTrustAssessment,
     SemanticIdentityMatchAssessment,
     Node,
     NodeId,
@@ -693,6 +694,30 @@ class HydraSync:
             tenant=tenant,
         )
         return IdentityMatchTrustAssessment.model_validate(raw)
+
+    # ========================================================================
+    # Source trust (Patch 36) — sync mirror
+    # ========================================================================
+
+    def assess_source_trust(
+        self,
+        source: str,
+        *,
+        tenant: TenantId | None = None,
+    ) -> SourceTrustAssessment:
+        """Sync mirror of `Hydra.assess_source_trust` (Patch 35
+        engine, Patch 36 wire). Trust verdict over a free-form
+        source string — identity-backed, NOT operational. v1
+        folds entity P33 trust + clean-mapped evidence
+        reliability; freshness / heartbeat / SLA are out of
+        scope. Unknown-but-valid source returns a 200 verdict
+        with `level="Unknown"`, NOT 404. See the async docstring
+        for the full suggestion-only contract."""
+        raw = self._http.get(
+            _paths.trust_identity_source_path(source),
+            tenant=tenant,
+        )
+        return SourceTrustAssessment.model_validate(raw)
 
     def _ingest(
         self,

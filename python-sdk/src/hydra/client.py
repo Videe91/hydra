@@ -46,6 +46,7 @@ from ._types import (
     IdentityEntityTrustAssessment,
     IdentityMatchTrustAssessment,
     SemanticIdentityMatchAssessment,
+    SourceTrustAssessment,
     Claim,
     ClaimId,
     ClaimKind,
@@ -1097,6 +1098,79 @@ class Hydra:
             tenant=tenant,
         )
         return IdentityMatchTrustAssessment.model_validate(raw)
+
+    # ========================================================================
+    # Source trust (Patch 36 — wire surface over P35)
+    # ========================================================================
+
+    async def assess_source_trust(
+        self,
+        source: str,
+        *,
+        tenant: TenantId | None = None,
+    ) -> SourceTrustAssessment:
+        """Read the Patch 35 trust verdict over a free-form source
+        string (`GET /trust/identity/sources/{source}` — Patch 36
+        wire).
+
+        Asks: **do I trust this source as a producer of identity /
+        evidence signals?** Identity-backed in v1; the verdict
+        folds the source's entities (P33 mean trust mutex on
+        ≥0.70 / ≤0.40) and clean-mapped evidence reliability
+        (Warehouse.system / Api.system / System.name).
+
+        **v1 does NOT measure operational health** — freshness,
+        heartbeat, schema drift, SLA conformance, contradiction
+        rate are out of scope. A dead Snowflake warehouse with
+        five trustworthy historical entities will score `"High"`
+        here; that's correct for "did Snowflake produce
+        trustworthy identity claims," wrong for "is Snowflake
+        alive." Operational signals layer on when connector
+        primitives ship in later patches.
+
+        Args:
+          - `source` — the source string under judgement. Compared
+            verbatim against `IdentityAlias.source` — no
+            normalization, no case-folding (`"snowflake"` and
+            `"Snowflake"` are distinct sources). URL-encoded
+            automatically for sources containing `/` or other
+            URL-special characters.
+          - `tenant` — per-call override for `X-Hydra-Tenant`.
+
+        Returns a typed `SourceTrustAssessment`:
+          - `score` / `level` — overall verdict (`TrustLevel`)
+          - `factors` — all 9 P35 records (applied AND unapplied)
+          - `related_entity_ids` — entity ids that contributed
+            (sorted by id ascending)
+          - `entity_sample_size` / `evidence_sample_size` — for
+            cap transparency
+
+        Error mapping:
+          - 400 → `HydraValidationError`: missing tenant header,
+            empty source, reserved sentinel source (`__system__`,
+            `__root__`)
+          - 200 with `level="Unknown"`: well-formed source with
+            no aliases / no evidence in tenant scope. **This is
+            NOT a 404.** Empty-result is a legitimate verdict per
+            P35's contract. None-tenanted source data probed by a
+            tenanted caller also returns 200 with the empty
+            verdict (strict tenant isolation surfaced as "no data
+            visible," not "not found").
+
+        ## Suggestion-only contract
+
+        Weights are calibrated for **explainability, NOT
+        correctness**. False positives are expected. This method
+        is read-only and MUST NOT drive auto-actions. Any future
+        gate must add a separate trust contract, require
+        `level == "High"`, impose a minimum score floor, and emit
+        a durable audit event.
+        """
+        raw = await self._http.get(
+            _paths.trust_identity_source_path(source),
+            tenant=tenant,
+        )
+        return SourceTrustAssessment.model_validate(raw)
 
     async def _ingest(
         self,

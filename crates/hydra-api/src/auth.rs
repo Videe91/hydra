@@ -1127,6 +1127,18 @@ mod tests {
             ),
             vec!["read:trust"]
         );
+        // Patch 36 — Source trust route. Same precedence rule: the
+        // `/trust/*` prefix clause runs BEFORE `/identity/*`, so
+        // `/trust/identity/sources/:source` resolves to
+        // `read:trust`. Pinned alongside P34's identity-trust pins
+        // so any future clause reorder fires here too.
+        assert_eq!(
+            required_scopes_for(
+                &Method::GET,
+                "/trust/identity/sources/snowflake"
+            ),
+            vec!["read:trust"]
+        );
         // Patch 25 — CausalCell read/query routes. Cells are graph
         // data (composition primitive), gated under `read:query`.
         // Cell TRUST stays under `/trust/cells/*` → `read:trust`;

@@ -548,11 +548,21 @@ pub struct IdentityEntityTrustAssessment {
 /// - `explanation` — short prose summary for dashboards.
 /// - `factors` — ALL evaluated factors (applied AND unapplied —
 ///   same explainability contract as P9 / P23 / P30 / P32 / P33).
+/// - `related_entity_ids` — the entity ids whose aliases reference
+///   this source AND were folded into the assessment. Sorted by
+///   entity id ascending for deterministic output regardless of
+///   the internal sampling order. When the source has more
+///   entities than `MAX_SOURCE_ENTITIES_FOR_TRUST`, this list
+///   contains the (highest-confidence first) sample — paired with
+///   `entity_sample_size`, operators can detect a capped verdict.
 /// - `entity_sample_size` — how many entities were folded into the
 ///   `*_trust_entities_from_source` factor calculation. Capped by
 ///   `MAX_SOURCE_ENTITIES_FOR_TRUST` (highest-confidence first);
 ///   the cap is documented and pinned by test so operators know
-///   when they're seeing a sampled verdict.
+///   when they're seeing a sampled verdict. Always equal to
+///   `related_entity_ids.len()` — kept distinct from the list for
+///   symmetry with `evidence_sample_size` (which has no `_ids`
+///   counterpart because evidence cardinality is much higher).
 /// - `evidence_sample_size` — how many `Evidence` records mapped
 ///   cleanly to this source (`Warehouse.system`, `Api.system`,
 ///   `System.name`). Ambiguous variants (`Document`, `Human`,
@@ -560,7 +570,7 @@ pub struct IdentityEntityTrustAssessment {
 /// - `assessed_at` — wall-clock at compute.
 ///
 /// **Unknown-but-valid source** (no aliases or evidence reference
-/// it) is a legitimate `Low` verdict, NOT an error. The empty
+/// it) is a legitimate `Unknown` verdict, NOT an error. The empty
 /// outcome is surfaced via `explanation`. Only malformed input —
 /// empty or sentinel `source` — produces `QueryError`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -570,6 +580,7 @@ pub struct SourceTrustAssessment {
     pub level: crate::trust::TrustLevel,
     pub explanation: String,
     pub factors: Vec<TrustFactor>,
+    pub related_entity_ids: Vec<IdentityEntityId>,
     pub entity_sample_size: usize,
     pub evidence_sample_size: usize,
     pub assessed_at: DateTime<Utc>,
@@ -1035,6 +1046,13 @@ mod tests {
                     detail: "mean entity trust 0.78 (> 0.40)".to_string(),
                 },
             ],
+            related_entity_ids: vec![
+                IdentityEntityId::from_str("ide_dash0"),
+                IdentityEntityId::from_str("ide_d0"),
+                IdentityEntityId::from_str("ide_d1"),
+                IdentityEntityId::from_str("ide_d2"),
+                IdentityEntityId::from_str("ide_t0"),
+            ],
             entity_sample_size: 5,
             evidence_sample_size: 2,
             assessed_at: chrono::DateTime::parse_from_rfc3339(
@@ -1075,6 +1093,8 @@ mod tests {
         assert!(json.contains("\"level\":\"High\""));
         assert!(json.contains("\"explanation\":"));
         assert!(json.contains("\"factors\":"));
+        // Patch 36 Adaptation A1 — related_entity_ids on the wire.
+        assert!(json.contains("\"related_entity_ids\":"));
         assert!(json.contains("\"entity_sample_size\":"));
         assert!(json.contains("\"evidence_sample_size\":"));
         assert!(json.contains("\"assessed_at\":"));

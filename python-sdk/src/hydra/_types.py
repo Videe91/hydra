@@ -2011,6 +2011,88 @@ class IdentityMatchTrustAssessment(BaseModel):
     assessed_at: str
 
 
+# === Patch 35 + Patch 36 — Source trust wire type ===
+#
+# Third axis of identity trust, after P32 (match) and P33 (entity).
+# Question: "do I trust this SOURCE as a producer of identity /
+# evidence signals?" — e.g. `"snowflake"`, `"github"`, `"dbt"`,
+# `"agent_data_quality"`.
+#
+# v1 is **identity-backed, NOT operational**. It folds:
+#   - the source's entities (P33 mean trust mutex on ≥0.70 / ≤0.40)
+#   - clean-mapped evidence reliability
+#     (`Warehouse.system` / `Api.system` / `System.name`;
+#     `Document` / `Human` / `Agent` explicit-skipped)
+#
+# v1 does NOT consider ingestion freshness, schema drift, heartbeat
+# liveness, SLA conformance, contradiction rate, or operator
+# override history. A dead Snowflake warehouse with five
+# trustworthy historical entities scores **High** here — correct
+# for "did Snowflake produce trustworthy identity claims," wrong
+# for "is Snowflake alive."
+
+
+class SourceTrustAssessment(BaseModel):
+    """Response shape of `hy.assess_source_trust(...)`
+    (Patch 35 engine, Patch 36 wire).
+
+    Trust verdict over a free-form source string. Identity-
+    backed, NOT operational:
+
+      - `score` / `level` — overall trust verdict
+        (`TrustLevel` High/Medium/Low/Unknown). Score is
+        clamped to `[0.0, 1.0]`; positive ceiling 0.80 by
+        design (sub-1.0 — leaves headroom for connector
+        primitives in P38+).
+      - `factors` — ALL 9 P35 records, applied AND unapplied
+        (explainability contract; don't filter
+        `applied=false` client-side).
+      - `related_entity_ids` — Patch 36 Adaptation A1.
+        Entity ids whose aliases reference this source AND
+        were folded into the assessment. Sorted by entity
+        id ascending for deterministic output. When the
+        source has more than `MAX_SOURCE_ENTITIES_FOR_TRUST`
+        (200) entities, the engine samples highest-confidence
+        first; this list shows which entities contributed.
+      - `entity_sample_size` — how many entities were folded.
+        Always equals `len(related_entity_ids)`. Kept
+        distinct for symmetry with `evidence_sample_size`
+        (which has no `_ids` counterpart).
+      - `evidence_sample_size` — how many evidence records
+        cleanly mapped to this source.
+
+    **Unknown-but-valid source** (no aliases, no evidence in
+    tenant scope) is a legitimate verdict with `score=0.0`
+    and `level="Unknown"` — NOT a 404. The result is surfaced
+    via `explanation`. Only malformed input — empty source or
+    reserved sentinels — produces an error (400 →
+    `HydraValidationError`).
+
+    **Strict tenant isolation**: `None`-tenanted source data
+    is invisible to tenanted probes and vice versa. The
+    response is 200 with an empty verdict, NOT 404.
+
+    **Suggestion-only contract**: weights calibrated for
+    explainability, NOT correctness. False positives expected.
+    Read-only — MUST NOT drive auto-actions. Future gates must
+    add a separate trust contract, require `level == "High"`,
+    impose a minimum score floor, and emit a durable audit
+    event.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    score: float
+    level: TrustLevel
+    explanation: str
+    factors: list[TrustFactor]
+    related_entity_ids: list[IdentityEntityId]
+    entity_sample_size: int
+    evidence_sample_size: int
+    assessed_at: str
+
+
 # === Patch 24 — CausalCell trust folding wire types ===
 #
 # Reuses the existing `TrustLevel` Literal and `TrustFactor`

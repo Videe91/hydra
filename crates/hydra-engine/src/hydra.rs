@@ -3728,12 +3728,23 @@ impl Hydra {
             )
         };
 
+        // Patch 36 Adaptation A1 — surface which entities were
+        // folded. Built from `sampled` (already
+        // confidence-desc / id-asc ordered), then re-sorted by id
+        // ascending so the wire output is deterministic regardless
+        // of internal sampling order. `len == entity_sample_size`
+        // by construction.
+        let mut related_entity_ids: Vec<hydra_core::IdentityEntityId> =
+            sampled.iter().map(|e| e.id.clone()).collect();
+        related_entity_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
         Ok(hydra_core::SourceTrustAssessment {
             source: source.to_string(),
             score: final_score,
             level,
             explanation,
             factors,
+            related_entity_ids,
             entity_sample_size,
             evidence_sample_size,
             assessed_at: chrono::Utc::now(),
@@ -21441,6 +21452,16 @@ mod sprint1_tests {
         assert_eq!(a.source, "snowflake");
         assert_eq!(a.entity_sample_size, 5);
         assert_eq!(a.evidence_sample_size, 2);
+        // Patch 36 Adaptation A1 — related_entity_ids populated,
+        // length matches entity_sample_size, sorted by entity id
+        // ascending for deterministic wire output.
+        assert_eq!(a.related_entity_ids.len(), 5);
+        let mut sorted_check = a.related_entity_ids.clone();
+        sorted_check.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+        assert_eq!(
+            a.related_entity_ids, sorted_check,
+            "related_entity_ids must be sorted by entity id ascending"
+        );
         // 0.80 ceiling — sits at exactly High threshold.
         assert!(
             a.score >= 0.80,

@@ -96,6 +96,7 @@ from ._types import (
     MatchLevel,
     SemanticIdentityMatchAssessment,
     SemanticIdentityMatchCandidate,
+    SourceTrustAssessment,
     ClaimStatus,
     ClaimSubject,
     CommitBatchLite,
@@ -289,6 +290,13 @@ __all__ = [
     "MatchLevel",
     "SemanticIdentityMatchAssessment",
     "SemanticIdentityMatchCandidate",
+    # Source trust HTTP/SDK (Patch 36 — exposes P35 over
+    # `/trust/identity/sources/:source` + the SDK method
+    # `assess_source_trust`). Third identity-trust axis after
+    # match (P32) and entity (P33). Identity-backed, NOT
+    # operational. Unknown-but-valid source returns level
+    # "Unknown" with 200, NOT 404.
+    "SourceTrustAssessment",
     # Automation layer (Patch 11 + Patch 15)
     "AutoExecutionDecision",
     "AutoApprovalDecision",
