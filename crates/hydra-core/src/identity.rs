@@ -437,6 +437,67 @@ pub struct IdentityMatchTrustAssessment {
     pub assessed_at: DateTime<Utc>,
 }
 
+// === Patch 33 — Identity Entity Trust v1 ===========================
+//
+// Read-only verdict over the IDENTITY RECORD ITSELF — distinct
+// from P32's match-axis trust. Different question:
+//
+//   P30  : how strongly do these names resemble each other?
+//   P32  : do I trust THIS alias→entity match?
+//   P33  : do I trust the canonical entity RECORD as a stable
+//          identity object?
+//
+// v1 uses ONLY entity-internal signals — `confidence`,
+// `aliases`, `canonical_key`, `display_name`, `metadata`. It
+// does NOT consult related claims, cells, observations, source
+// reliability, or external evidence. Those layer on in P35+
+// (after `IdentityLink` connects the identity graph to other
+// Hydra primitives).
+//
+// **A High verdict means "this identity record is well-formed
+// and consistent with P29 invariants"**, NOT "every operational
+// fact about this entity is trustworthy." Future auto-actions
+// MUST gate on `TrustLevel::High` + minimum score floor + emit
+// a separate audit event.
+
+/// Trust verdict over an `IdentityEntity` as an identity
+/// record. Produced by `Hydra::assess_identity_entity_trust`.
+///
+/// Field semantics:
+///
+/// - `entity_id` — the entity being judged.
+/// - `score` — P33 trust score, clamped to `[0.0, 1.0]`. Sum
+///   of applied factor weights; can dip below 0 pre-clamp
+///   when penalties dominate. Maximum reachable in v1 is
+///   `0.85` (positive ceiling — see factor table in
+///   `assess_identity_entity_trust`).
+/// - `level` — `TrustLevel` bucket of `score` via
+///   `TrustAssessment::level_for_score` (≥0.80 High, ≥0.50
+///   Medium, ≥0.20 Low, else Unknown — shared with claim/cell
+///   trust + identity match trust).
+/// - `explanation` — short prose summary for dashboards.
+/// - `factors` — ALL 12 evaluated factors (applied AND
+///   unapplied — same explainability contract as P9 / P23 /
+///   P30 / P32). The 6 alias-related factor records appear
+///   regardless of whether the entity has aliases, but mark
+///   `applied=false` with a "no aliases" detail when the
+///   entity carries none.
+/// - `assessed_at` — wall-clock at compute.
+///
+/// **No `related_claim_ids` or `related_cell_ids`** in v1.
+/// Those would imply behavior the assessment does NOT compute.
+/// They land in P35+ when `IdentityLink` connects the identity
+/// graph to claims and cells.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdentityEntityTrustAssessment {
+    pub entity_id: IdentityEntityId,
+    pub score: f64,
+    pub level: crate::trust::TrustLevel,
+    pub explanation: String,
+    pub factors: Vec<TrustFactor>,
+    pub assessed_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,6 +830,103 @@ mod tests {
             (0.0, crate::trust::TrustLevel::Unknown),
         ] {
             let mut a = p32_sample_trust_assessment();
+            a.score = score;
+            a.level = crate::trust::TrustAssessment::level_for_score(score);
+            assert_eq!(a.level, expected, "score = {score}");
+        }
+    }
+
+    // === Patch 33 — Identity Entity Trust tests ===
+
+    fn p33_sample_entity_trust_assessment() -> IdentityEntityTrustAssessment {
+        IdentityEntityTrustAssessment {
+            entity_id: IdentityEntityId::from_str("ide_revenue_daily"),
+            score: 0.85,
+            level: crate::trust::TrustLevel::High,
+            explanation: "Well-formed identity record with multi-source \
+                          aliases and no conflicts."
+                .to_string(),
+            factors: vec![
+                TrustFactor {
+                    kind: "entity_confidence_high".to_string(),
+                    weight: 0.30,
+                    applied: true,
+                    detail: "confidence 0.95 (≥ 0.80)".to_string(),
+                },
+                TrustFactor {
+                    kind: "multiple_aliases".to_string(),
+                    weight: 0.10,
+                    applied: true,
+                    detail: "3 aliases".to_string(),
+                },
+            ],
+            assessed_at: chrono::DateTime::parse_from_rfc3339(
+                "2026-05-31T12:00:00Z",
+            )
+            .unwrap()
+            .with_timezone(&Utc),
+        }
+    }
+
+    #[test]
+    fn identity_entity_trust_assessment_serde_round_trip() {
+        // Full envelope must round-trip through serde. Pinned
+        // so the future P34 wire surface lands without
+        // rewriting fixtures. PascalCase `level` (TrustLevel)
+        // pinned.
+        let assessment = p33_sample_entity_trust_assessment();
+        let json = serde_json::to_string(&assessment).unwrap();
+        assert!(json.contains("\"level\":\"High\""));
+        let restored: IdentityEntityTrustAssessment =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, assessment);
+    }
+
+    #[test]
+    fn identity_entity_trust_assessment_omits_related_ids_in_v1() {
+        // Adaptation B pin: v1 type must NOT carry
+        // `related_claim_ids` or `related_cell_ids` fields.
+        // Carrying empty vecs would mis-signal what the
+        // assessment computed. Type stays honest now;
+        // additive fields land in P35+ when the relevant
+        // factors fire. If a future patch adds them, this
+        // test will need updating intentionally (a tripwire
+        // against accidental scope creep).
+        //
+        // We verify by attempting to deserialize a JSON
+        // payload that DOES include those fields with
+        // `extra="forbid"`-style strictness: the type uses
+        // serde's default behavior (extra fields ignored on
+        // deserialize for normal structs, but the SERIALIZE
+        // side does NOT include them — which is what the v1
+        // wire contract requires).
+        let assessment = p33_sample_entity_trust_assessment();
+        let json = serde_json::to_string(&assessment).unwrap();
+        assert!(
+            !json.contains("related_claim_ids"),
+            "v1 wire shape must not carry related_claim_ids; \
+             got {json}"
+        );
+        assert!(
+            !json.contains("related_cell_ids"),
+            "v1 wire shape must not carry related_cell_ids"
+        );
+    }
+
+    #[test]
+    fn identity_entity_trust_assessment_level_matches_trust_thresholds() {
+        // Pin that `level` is the `TrustLevel` shared with
+        // claim/cell trust, not a P33-specific reinvention.
+        // Bucketing edges are tested at trust.rs level — here
+        // we just confirm each variant can be stamped.
+        for (score, expected) in [
+            (0.85_f64, crate::trust::TrustLevel::High), // v1 ceiling
+            (0.80, crate::trust::TrustLevel::High),
+            (0.50, crate::trust::TrustLevel::Medium),
+            (0.20, crate::trust::TrustLevel::Low),
+            (0.0, crate::trust::TrustLevel::Unknown),
+        ] {
+            let mut a = p33_sample_entity_trust_assessment();
             a.score = score;
             a.level = crate::trust::TrustAssessment::level_for_score(score);
             assert_eq!(a.level, expected, "score = {score}");

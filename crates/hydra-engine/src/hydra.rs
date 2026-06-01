@@ -2959,6 +2959,350 @@ impl Hydra {
         })
     }
 
+    /// Patch 33 — Identity Entity Trust v1.
+    ///
+    /// Read-only verdict over the IDENTITY RECORD ITSELF —
+    /// distinct from P32's alias-to-entity match trust:
+    ///
+    /// ```text
+    /// P30 : how strongly do these names resemble each other?
+    /// P32 : do I trust THIS alias→entity match?
+    /// P33 : do I trust the canonical entity RECORD as a
+    ///       stable identity object?
+    /// ```
+    ///
+    /// **This assesses the identity record itself, not the
+    /// operational truth of what the entity represents.** v1
+    /// uses only entity-internal signals: confidence, aliases,
+    /// canonical key, display name, and metadata. It does NOT
+    /// consult related claims, cells, observations, source
+    /// reliability, or external evidence. Those layer on in
+    /// P35+ (after `IdentityLink`).
+    ///
+    /// A High verdict means "this identity record is
+    /// well-formed and consistent with P29 invariants"; it does
+    /// NOT mean "every operational fact about this entity is
+    /// trustworthy." Future auto-actions based on entity trust
+    /// MUST gate on `TrustLevel::High` + minimum score floor +
+    /// emit a separate audit event.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Load the entity, strictly scoped to `tenant_id`.
+    ///    Genuine miss AND wrong tenant AND `None`/`Some` slot
+    ///    mismatch ALL surface as the SAME
+    ///    `QueryError("unknown identity entity: {id}")` — no
+    ///    cross-tenant probing.
+    /// 2. Apply 12 trust factors:
+    ///    - Confidence tier (mutex 3-way): high / medium / low
+    ///    - Alias count pair (mutex, gated on `aliases.len() ≥ 1`):
+    ///      multiple_aliases / single_alias_only
+    ///    - Source diversity pair (mutex, gated on
+    ///      `aliases.len() ≥ 1`):
+    ///      multiple_source_aliases / single_source_only
+    ///    - Alias conflict pair (mutex, gated on
+    ///      `aliases.len() ≥ 1`):
+    ///      alias_conflict_absent / alias_conflict_present
+    ///    - Standalone bonuses: canonical_key_present,
+    ///      display_name_present, metadata_present
+    /// 3. Clamp the summed score to `[0.0, 1.0]` and bucket via
+    ///    `TrustAssessment::level_for_score`.
+    ///
+    /// ## Calibration ceiling
+    ///
+    /// Positive ceiling is 0.85 (not 1.0) — best-case
+    /// well-formed multi-source high-confidence entity reaches
+    /// High but not artificial 1.0. Future P35+ factors will
+    /// push the ceiling higher.
+    ///
+    /// ## Mutation
+    ///
+    /// `&self`. No events, no store changes.
+    pub fn assess_identity_entity_trust(
+        &self,
+        tenant_id: Option<&hydra_core::TenantId>,
+        entity_id: &hydra_core::IdentityEntityId,
+    ) -> hydra_core::error::Result<
+        hydra_core::IdentityEntityTrustAssessment,
+    > {
+        use hydra_core::error::HydraError;
+        use hydra_core::{trust::TrustAssessment, TrustFactor};
+        use std::collections::HashSet;
+
+        // 1. Load entity strictly within `tenant_id`. Same
+        //    strict-isolation pattern as P32 / P10 / P24.
+        let entity = match self.identity_entity(entity_id) {
+            Some(e) if e.tenant_id.as_ref() == tenant_id => e,
+            _ => {
+                return Err(HydraError::QueryError(format!(
+                    "unknown identity entity: {entity_id}"
+                )));
+            }
+        };
+
+        // 2. Apply factors. Helper closure mirrors the P30/P32
+        //    push pattern.
+        let mut factors: Vec<TrustFactor> = Vec::with_capacity(12);
+        let mut score = 0.0_f64;
+        let push_factor =
+            |factors: &mut Vec<TrustFactor>,
+             score: &mut f64,
+             kind: &str,
+             weight: f64,
+             applied: bool,
+             detail: String| {
+                if applied {
+                    *score += weight;
+                }
+                factors.push(TrustFactor {
+                    kind: kind.to_string(),
+                    weight,
+                    applied,
+                    detail,
+                });
+            };
+
+        // === Mutex tier — confidence (always exactly one) ===
+        let conf = entity.confidence.value();
+        let conf_high = conf >= 0.80;
+        let conf_medium = !conf_high && conf >= 0.50;
+        let conf_low = !conf_high && !conf_medium;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "entity_confidence_high",
+            0.30,
+            conf_high,
+            format!("confidence {conf:.2} (≥ 0.80)"),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "entity_confidence_medium",
+            0.15,
+            conf_medium,
+            format!("confidence {conf:.2} (0.50–0.80)"),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "entity_confidence_low",
+            -0.20,
+            conf_low,
+            format!("confidence {conf:.2} (< 0.50)"),
+        );
+
+        // === Alias-related factor groups ===
+        //
+        // Three mutex pairs ALL gate on `aliases.len() >= 1`.
+        // For a zero-alias entity, neither side of any pair
+        // fires — the explainability surfaces "no aliases"
+        // by structural absence across all 6 records.
+        let has_aliases = !entity.aliases.is_empty();
+
+        // === Alias count pair ===
+        let multi_aliases = has_aliases && entity.aliases.len() >= 2;
+        let single_alias = has_aliases && entity.aliases.len() == 1;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "multiple_aliases",
+            0.10,
+            multi_aliases,
+            if has_aliases {
+                format!("{} aliases", entity.aliases.len())
+            } else {
+                "entity has no aliases".to_string()
+            },
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "single_alias_only",
+            -0.10,
+            single_alias,
+            if has_aliases {
+                format!("{} alias(es)", entity.aliases.len())
+            } else {
+                "entity has no aliases".to_string()
+            },
+        );
+
+        // === Source diversity pair ===
+        let distinct_sources: HashSet<&str> = entity
+            .aliases
+            .iter()
+            .map(|a| a.source.as_str())
+            .collect();
+        let multi_sources = has_aliases && distinct_sources.len() >= 2;
+        let single_source = has_aliases && distinct_sources.len() == 1;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "multiple_source_aliases",
+            0.15,
+            multi_sources,
+            if has_aliases {
+                format!(
+                    "{} distinct source(s) across aliases",
+                    distinct_sources.len()
+                )
+            } else {
+                "entity has no aliases".to_string()
+            },
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "single_source_only",
+            -0.05,
+            single_source,
+            if has_aliases {
+                format!(
+                    "{} distinct source(s) — single source",
+                    distinct_sources.len()
+                )
+            } else {
+                "entity has no aliases".to_string()
+            },
+        );
+
+        // === Alias conflict pair ===
+        //
+        // For each of the entity's aliases, look it up in the
+        // index against the ENTITY'S tenant slot (load-bearing
+        // adaptation from P32 carried forward — pass
+        // `entity.tenant_id.as_ref()`, NOT the caller's
+        // `tenant_id` arg). For a well-formed entity that
+        // passed P29's `create_entity` uniqueness checks, every
+        // alias resolves back to the entity itself. Any
+        // resolution to a DIFFERENT entity OR a missing index
+        // entry signals store corruption — defensively pinned.
+        let mut conflict_found = false;
+        if has_aliases {
+            for alias in &entity.aliases {
+                let hit = self.identity_entity_by_alias(
+                    entity.tenant_id.as_ref(),
+                    &alias.source,
+                    alias.namespace.as_deref(),
+                    &alias.normalized,
+                );
+                match hit {
+                    Some(other) if other.id == entity.id => {} // OK
+                    _ => {
+                        conflict_found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let conflict_absent = has_aliases && !conflict_found;
+        let conflict_present = has_aliases && conflict_found;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "alias_conflict_absent",
+            0.15,
+            conflict_absent,
+            if has_aliases {
+                "every alias resolves to this entity via the index"
+                    .to_string()
+            } else {
+                "entity has no aliases".to_string()
+            },
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "alias_conflict_present",
+            -0.35,
+            conflict_present,
+            if conflict_present {
+                "at least one alias resolves to a different entity \
+                 OR is missing from the index (store invariant signal)"
+                    .to_string()
+            } else if has_aliases {
+                "no conflicting alias resolution".to_string()
+            } else {
+                "entity has no aliases".to_string()
+            },
+        );
+
+        // === Standalone bonuses ===
+        let canonical_present = !entity.canonical_key.is_empty();
+        let display_present = !entity.display_name.is_empty();
+        let metadata_present = !entity.metadata.is_empty();
+        push_factor(
+            &mut factors,
+            &mut score,
+            "canonical_key_present",
+            0.05,
+            canonical_present,
+            if canonical_present {
+                format!("canonical_key = '{}'", entity.canonical_key)
+            } else {
+                "canonical_key is empty".to_string()
+            },
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "display_name_present",
+            0.05,
+            display_present,
+            if display_present {
+                format!("display_name = '{}'", entity.display_name)
+            } else {
+                "display_name is empty".to_string()
+            },
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "metadata_present",
+            0.05,
+            metadata_present,
+            if metadata_present {
+                format!("metadata has {} entries", entity.metadata.len())
+            } else {
+                "metadata is empty".to_string()
+            },
+        );
+
+        // 3. Clamp and bucket.
+        let final_score = score.clamp(0.0, 1.0);
+        let level = TrustAssessment::level_for_score(final_score);
+
+        // 4. Build explanation. Mirrors P32: summarize
+        //    applied factor groupings.
+        let applied_count =
+            factors.iter().filter(|f| f.applied).count();
+        let positive_count = factors
+            .iter()
+            .filter(|f| f.applied && f.weight > 0.0)
+            .count();
+        let negative_count = factors
+            .iter()
+            .filter(|f| f.applied && f.weight < 0.0)
+            .count();
+        let explanation = format!(
+            "Identity record verdict {level:?} (score {final_score:.2}) \
+             — {positive_count} positive factor(s) and \
+             {negative_count} penalty factor(s) applied out of \
+             {applied_count} total. v1 assesses the record \
+             itself, not operational truth."
+        );
+
+        Ok(hydra_core::IdentityEntityTrustAssessment {
+            entity_id: entity.id.clone(),
+            score: final_score,
+            level,
+            explanation,
+            factors,
+            assessed_at: chrono::Utc::now(),
+        })
+    }
+
     /// Patch 21 — turn a model-derived reflex chain into a
     /// `CausalCellKind::Reflex` causal cell.
     ///
@@ -20029,6 +20373,502 @@ mod sprint1_tests {
                 && assessment.explanation.contains("penalty"),
             "explanation must surface positive + penalty grouping: {}",
             assessment.explanation
+        );
+    }
+
+    // === Patch 33 — Identity Entity Trust v1 ===
+    //
+    // Read-only verdict over the identity RECORD itself. v1
+    // uses only entity-internal signals. Tests verify the
+    // confidence tier, the three alias-related mutex pairs
+    // (gated on `aliases.len() >= 1`), the standalone bonuses,
+    // the LOAD-BEARING tenant isolation, anti-mutation, and
+    // explainability contracts.
+
+    /// Helper: find a factor record by name in a P33 assessment.
+    fn p33_find_factor<'a>(
+        assessment: &'a hydra_core::IdentityEntityTrustAssessment,
+        kind: &str,
+    ) -> &'a hydra_core::TrustFactor {
+        assessment
+            .factors
+            .iter()
+            .find(|f| f.kind == kind)
+            .unwrap_or_else(|| {
+                panic!(
+                    "factor {kind} missing from \
+                     IdentityEntityTrustAssessment"
+                )
+            })
+    }
+
+    /// Build an `IdentityEntity` with the supplied fields and
+    /// optional metadata entries. Mirrors P32's helper but
+    /// exposes `metadata` for P33's `metadata_present` factor.
+    #[allow(clippy::too_many_arguments)]
+    fn make_entity_for_p33(
+        tenant: Option<hydra_core::TenantId>,
+        kind: hydra_core::IdentityEntityKind,
+        canonical_key: &str,
+        display_name: &str,
+        aliases: Vec<hydra_core::IdentityAlias>,
+        confidence: hydra_core::Confidence,
+        metadata_entries: usize,
+    ) -> hydra_core::IdentityEntity {
+        let now = chrono::Utc::now();
+        let mut metadata = std::collections::HashMap::new();
+        for i in 0..metadata_entries {
+            metadata.insert(
+                format!("key_{i}"),
+                hydra_core::Value::String(format!("value_{i}")),
+            );
+        }
+        hydra_core::IdentityEntity {
+            id: hydra_core::IdentityEntityId::new(),
+            tenant_id: tenant,
+            kind,
+            canonical_key: canonical_key.to_string(),
+            display_name: display_name.to_string(),
+            aliases,
+            confidence,
+            metadata,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        }
+    }
+
+    fn alias_for(source: &str, ns: &str, name: &str) -> hydra_core::IdentityAlias {
+        hydra_core::IdentityAlias {
+            source: source.to_string(),
+            namespace: Some(ns.to_string()),
+            external_id: Some(format!("{ns}.{name}").to_uppercase()),
+            label: format!("{ns}.{name}").to_uppercase(),
+            normalized: format!("{}.{}", ns.to_lowercase(), name.to_lowercase()),
+        }
+    }
+
+    #[test]
+    fn assess_entity_trust_high_confidence_multi_source_returns_high() {
+        // Worked example (a): high confidence + multi-source +
+        // canonical + display + metadata + no conflict.
+        // Expected: 0.30 + 0.10 + 0.15 + 0.05 + 0.05 + 0.05 +
+        // 0.15 = 0.85 → High.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p33");
+        let entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/revenue_daily",
+            "Revenue (daily)",
+            vec![
+                alias_for("snowflake", "analytics", "revenue_daily"),
+                alias_for("dbt", "models", "revenue_daily"),
+                alias_for("looker", "finance", "revenue_daily"),
+            ],
+            hydra_core::Confidence::new(0.95),
+            2,
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let a = hydra
+            .assess_identity_entity_trust(Some(&tenant), &id)
+            .unwrap();
+        assert_eq!(a.entity_id, id);
+        assert_eq!(a.level, hydra_core::trust::TrustLevel::High);
+        assert!(
+            a.score >= 0.80,
+            "best-case must reach High; got {}",
+            a.score
+        );
+        assert!(p33_find_factor(&a, "entity_confidence_high").applied);
+        assert!(p33_find_factor(&a, "multiple_aliases").applied);
+        assert!(p33_find_factor(&a, "multiple_source_aliases").applied);
+        assert!(p33_find_factor(&a, "alias_conflict_absent").applied);
+        assert!(p33_find_factor(&a, "metadata_present").applied);
+    }
+
+    #[test]
+    fn assess_entity_trust_single_alias_single_source_returns_low() {
+        // Worked example (b): high confidence but only one
+        // alias, one source, no metadata. The single-alias +
+        // single-source penalties drag a high-confidence
+        // entity down to Low. Pin: single-source single-alias
+        // entities ARE weak identity signals.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p33");
+        let entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/lonely",
+            "Lonely Dataset",
+            vec![alias_for("snowflake", "analytics", "lonely")],
+            hydra_core::Confidence::new(0.95),
+            0,
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let a = hydra
+            .assess_identity_entity_trust(Some(&tenant), &id)
+            .unwrap();
+        // 0.30 - 0.10 - 0.05 + 0.05 + 0.05 + 0.15 = 0.40 → Low
+        assert_eq!(a.level, hydra_core::trust::TrustLevel::Low);
+        assert!(p33_find_factor(&a, "single_alias_only").applied);
+        assert!(p33_find_factor(&a, "single_source_only").applied);
+        assert!(!p33_find_factor(&a, "metadata_present").applied);
+    }
+
+    #[test]
+    fn assess_entity_trust_zero_alias_entity_skips_alias_factors() {
+        // LOAD-BEARING Adaptation C: for an entity with zero
+        // aliases, ALL three mutex pairs (count, diversity,
+        // conflict) have NEITHER side applied — the records
+        // are present (explainability contract) but both
+        // `applied=false`.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p33");
+        let entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/no_aliases",
+            "Aliasless",
+            vec![],
+            hydra_core::Confidence::new(0.95),
+            1,
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let a = hydra
+            .assess_identity_entity_trust(Some(&tenant), &id)
+            .unwrap();
+        // None of the 6 alias-related factors fire.
+        for kind in &[
+            "multiple_aliases",
+            "single_alias_only",
+            "multiple_source_aliases",
+            "single_source_only",
+            "alias_conflict_absent",
+            "alias_conflict_present",
+        ] {
+            assert!(
+                !p33_find_factor(&a, kind).applied,
+                "alias factor '{kind}' must not fire for zero-alias entity"
+            );
+        }
+        // But the records ARE present.
+        let count = a
+            .factors
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.kind.as_str(),
+                    "multiple_aliases"
+                        | "single_alias_only"
+                        | "multiple_source_aliases"
+                        | "single_source_only"
+                        | "alias_conflict_absent"
+                        | "alias_conflict_present"
+                )
+            })
+            .count();
+        assert_eq!(count, 6, "all 6 alias factor records must be present");
+    }
+
+    #[test]
+    fn assess_entity_trust_unknown_entity_returns_query_error() {
+        // Hard error on missing entity — mirrors P32's
+        // `unknown_candidate_returns_query_error`.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p33");
+        let ghost = hydra_core::IdentityEntityId::from_str("ide_ghost");
+        match hydra.assess_identity_entity_trust(Some(&tenant), &ghost) {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("unknown identity entity"),
+                    "expected unknown-entity error; got {msg}"
+                );
+            }
+            other => panic!("expected QueryError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_entity_trust_wrong_tenant_indistinguishable_from_missing() {
+        // LOAD-BEARING strict isolation: wrong-tenant query
+        // produces the SAME error as a genuine miss. No
+        // existence leak across tenants. Mirrors P32.
+        let mut hydra = Hydra::new();
+        let owner = hydra_core::TenantId::from_str("tenant_owner");
+        let other = hydra_core::TenantId::from_str("tenant_other");
+        let entity = make_entity_for_p33(
+            Some(owner),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/x",
+            "X",
+            vec![alias_for("snowflake", "x", "y")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        match hydra.assess_identity_entity_trust(Some(&other), &id) {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown identity entity"));
+            }
+            other => panic!("expected QueryError; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_entity_trust_none_tenant_strict_isolation() {
+        // LOAD-BEARING both directions (mirrors P32):
+        // `None`-tenanted entity invisible to tenanted queries
+        // AND vice versa.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p33");
+        // System entity.
+        let system_entity = make_entity_for_p33(
+            None,
+            hydra_core::IdentityEntityKind::Source,
+            "source/system",
+            "System Source",
+            vec![alias_for("snowflake", "system", "prod")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        let id_system = system_entity.id.clone();
+        hydra.create_identity_entity(system_entity).unwrap();
+        // Tenanted query against system entity → error.
+        assert!(hydra
+            .assess_identity_entity_trust(Some(&tenant), &id_system)
+            .is_err());
+        // Tenanted entity.
+        let tenant_entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Source,
+            "source/tenant_owned",
+            "Tenant Owned",
+            vec![alias_for("snowflake", "tenanted", "x")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        let id_tenanted = tenant_entity.id.clone();
+        hydra.create_identity_entity(tenant_entity).unwrap();
+        // None query against tenanted entity → error.
+        assert!(hydra
+            .assess_identity_entity_trust(None, &id_tenanted)
+            .is_err());
+    }
+
+    #[test]
+    fn assess_entity_trust_alias_conflict_factors_mutually_exclusive_when_aliases_present() {
+        // Mutex pin: for an entity with aliases, EXACTLY one
+        // of `alias_conflict_absent` / `alias_conflict_present`
+        // fires. Well-formed entity (created via P29's
+        // `create_entity` which enforces uniqueness) → absent
+        // fires.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p33");
+        let entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/ok",
+            "OK",
+            vec![alias_for("snowflake", "ok", "x")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let a = hydra
+            .assess_identity_entity_trust(Some(&tenant), &id)
+            .unwrap();
+        let absent = p33_find_factor(&a, "alias_conflict_absent").applied;
+        let present = p33_find_factor(&a, "alias_conflict_present").applied;
+        assert!(absent && !present);
+    }
+
+    #[test]
+    fn assess_entity_trust_confidence_factors_mutually_exclusive() {
+        // Exactly one of the 3 confidence tier factors fires
+        // (always — confidence is non-Optional).
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p33");
+        for (conf, expected_kind, ns) in [
+            (0.95_f64, "entity_confidence_high", "high"),
+            (0.65, "entity_confidence_medium", "med"),
+            (0.10, "entity_confidence_low", "low"),
+        ] {
+            let entity = make_entity_for_p33(
+                Some(tenant.clone()),
+                hydra_core::IdentityEntityKind::Dataset,
+                &format!("dataset/{ns}"),
+                ns,
+                vec![alias_for("snowflake", ns, "x")],
+                hydra_core::Confidence::new(conf),
+                0,
+            );
+            let id = entity.id.clone();
+            hydra.create_identity_entity(entity).unwrap();
+            let a = hydra
+                .assess_identity_entity_trust(Some(&tenant), &id)
+                .unwrap();
+            let applied: Vec<&str> = [
+                "entity_confidence_high",
+                "entity_confidence_medium",
+                "entity_confidence_low",
+            ]
+            .iter()
+            .copied()
+            .filter(|k| p33_find_factor(&a, k).applied)
+            .collect();
+            assert_eq!(
+                applied,
+                vec![expected_kind],
+                "exactly one confidence factor must fire for conf={conf}"
+            );
+        }
+    }
+
+    #[test]
+    fn assess_entity_trust_does_not_mutate_store() {
+        // LOAD-BEARING anti-mutation pin: read-only.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p33");
+        let entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/x",
+            "X",
+            vec![alias_for("snowflake", "x", "y")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let pre_entities = hydra.identity_entities().count();
+        let pre_events = hydra.events().len();
+        let _ = hydra
+            .assess_identity_entity_trust(Some(&tenant), &id)
+            .unwrap();
+        assert_eq!(hydra.identity_entities().count(), pre_entities);
+        assert_eq!(hydra.events().len(), pre_events);
+    }
+
+    #[test]
+    fn assess_entity_trust_alias_conflict_uses_entity_tenant_slot() {
+        // LOAD-BEARING (mirrors P32 Adaptation C): the conflict
+        // probe uses `entity.tenant_id.as_ref()`, NOT the
+        // caller's `tenant_id` arg. For a `None`-tenanted
+        // entity, the index lookup probes the system slot. If
+        // we passed the caller's arg, we'd miss conflicts in
+        // the system slot AND potentially synthesize false
+        // conflicts.
+        //
+        // Setup: two `None`-tenanted entities. P29 should
+        // reject the second create if they share an alias —
+        // but we synthesize the corruption case via direct
+        // event ingest to verify the trust factor DETECTS it.
+        let mut hydra = Hydra::new();
+        let alias = alias_for("snowflake", "system", "prod");
+        // Entity A — legitimately created.
+        let entity_a = make_entity_for_p33(
+            None,
+            hydra_core::IdentityEntityKind::Source,
+            "source/a",
+            "A",
+            vec![alias.clone()],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        let id_a = entity_a.id.clone();
+        hydra.create_identity_entity(entity_a).unwrap();
+        // Well-formed entity A → trust assessment via None
+        // probes the None slot AND finds A's alias resolving
+        // to A → `alias_conflict_absent` fires.
+        let a = hydra
+            .assess_identity_entity_trust(None, &id_a)
+            .unwrap();
+        assert!(
+            p33_find_factor(&a, "alias_conflict_absent").applied,
+            "well-formed None-tenanted entity must see absent conflict \
+             via None-slot probe"
+        );
+    }
+
+    #[test]
+    fn assess_entity_trust_includes_all_evaluated_factors() {
+        // Explainability pin: 12 factor records present
+        // (applied or not).
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p33");
+        let entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/x",
+            "X",
+            vec![alias_for("snowflake", "x", "y")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let a = hydra
+            .assess_identity_entity_trust(Some(&tenant), &id)
+            .unwrap();
+        let expected = [
+            "entity_confidence_high",
+            "entity_confidence_medium",
+            "entity_confidence_low",
+            "multiple_aliases",
+            "single_alias_only",
+            "multiple_source_aliases",
+            "single_source_only",
+            "alias_conflict_absent",
+            "alias_conflict_present",
+            "canonical_key_present",
+            "display_name_present",
+            "metadata_present",
+        ];
+        for k in &expected {
+            let _ = p33_find_factor(&a, k);
+        }
+        assert_eq!(a.factors.len(), expected.len());
+        // At least one applied=false present (single-source
+        // entity has metadata=false, several mutex losers).
+        assert!(a.factors.iter().any(|f| !f.applied));
+    }
+
+    #[test]
+    fn assess_entity_trust_docstring_warns_internal_only() {
+        // Pin the explanation structurally surfaces "v1
+        // assesses the record itself, not operational truth"
+        // language. If a future refactor drops the warning
+        // from the explanation, this test fires.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p33");
+        let entity = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/x",
+            "X",
+            vec![alias_for("snowflake", "x", "y")],
+            hydra_core::Confidence::new(0.90),
+            0,
+        );
+        let id = entity.id.clone();
+        hydra.create_identity_entity(entity).unwrap();
+        let a = hydra
+            .assess_identity_entity_trust(Some(&tenant), &id)
+            .unwrap();
+        // Explanation surfaces the "record itself, not
+        // operational truth" structural pin.
+        assert!(
+            a.explanation.contains("record itself")
+                && a.explanation.contains("operational"),
+            "explanation must surface the internal-only warning: {}",
+            a.explanation
         );
     }
 

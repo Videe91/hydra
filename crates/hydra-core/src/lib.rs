@@ -27,8 +27,9 @@ pub use id::{
 };
 pub use causal_cell::{CausalCell, CausalCellKind};
 pub use identity::{
-    IdentityAlias, IdentityEntity, IdentityEntityKind, IdentityMatchTrustAssessment,
-    MatchLevel, SemanticIdentityMatchAssessment, SemanticIdentityMatchCandidate,
+    IdentityAlias, IdentityEntity, IdentityEntityKind, IdentityEntityTrustAssessment,
+    IdentityMatchTrustAssessment, MatchLevel, SemanticIdentityMatchAssessment,
+    SemanticIdentityMatchCandidate,
 };
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
@@ -115,8 +116,9 @@ pub mod prelude {
     };
     pub use crate::causal_cell::{CausalCell, CausalCellKind};
     pub use crate::identity::{
-        IdentityAlias, IdentityEntity, IdentityEntityKind, IdentityMatchTrustAssessment,
-        MatchLevel, SemanticIdentityMatchAssessment, SemanticIdentityMatchCandidate,
+        IdentityAlias, IdentityEntity, IdentityEntityKind, IdentityEntityTrustAssessment,
+        IdentityMatchTrustAssessment, MatchLevel, SemanticIdentityMatchAssessment,
+        SemanticIdentityMatchCandidate,
     };
     pub use crate::error::{HydraError, Result};
     pub use crate::event::{Event, EventKind, Value};
