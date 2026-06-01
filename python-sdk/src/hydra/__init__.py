@@ -92,6 +92,9 @@ from ._types import (
     IdentityEntityId,
     IdentityEntityKind,
     IdentityEntityTrustAssessment,
+    IdentityLink,
+    IdentityLinkId,
+    IdentityLinkKind,
     IdentityMatchTrustAssessment,
     MatchLevel,
     SemanticIdentityMatchAssessment,
@@ -281,6 +284,18 @@ __all__ = [
     "IdentityEntity",
     "IdentityEntityId",
     "IdentityEntityKind",
+    # Identity Graph relationships (Patch 37 engine vocab + store,
+    # Patch 38 HTTP/SDK). `IdentityLink` is a durable directed
+    # assertion between two entities; built-in kinds cover
+    # same_as / depends_on / downstream_of / owned_by /
+    # produced_by / consumed_by / derived_from / observed_in /
+    # part_of / related_to, plus open-ended Custom.
+    # **Informational confidence only — NOT a trust verdict.**
+    # Auto-actions must wait for IdentityLinkTrustAssessment
+    # (P39+). No update / delete in v0.
+    "IdentityLink",
+    "IdentityLinkId",
+    "IdentityLinkKind",
     # Identity trust HTTP/SDK (Patch 34 — exposes P32/P33
     # verdicts over `/trust/identity/*` + the SDK methods
     # `assess_identity_entity_trust` and

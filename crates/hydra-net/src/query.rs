@@ -6,8 +6,8 @@ use hydra_core::node::Node;
 use hydra_core::{
     Action, ActionId, ActionStatus, CausalCell, CausalCellId, CausalCellKind, Claim, ClaimId,
     ClaimKind, ClaimStatus, ClaimSubject, Evidence, EvidenceId, IdentityEntity,
-    IdentityEntityId, IdentityEntityKind, Outcome, OutcomeId, SensorCheckpoint, SensorId,
-    SensorRun, TenantId,
+    IdentityEntityId, IdentityEntityKind, IdentityLink, IdentityLinkId, IdentityLinkKind,
+    Outcome, OutcomeId, SensorCheckpoint, SensorId, SensorRun, TenantId,
 };
 use hydra_engine::hydra::Hydra;
 use std::sync::Arc;
@@ -694,6 +694,101 @@ impl QueryService {
             .collect();
         entities.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         entities
+    }
+
+    // === Patch 38 — IdentityLink read accessors ===
+    //
+    // P37 shipped 6 engine accessors that return cross-tenant
+    // results. **LOAD-BEARING**: tenant filtering MUST happen at
+    // the QueryService boundary, never at the engine. None-tenanted
+    // links are invisible to public routes (mirrors P29 / P31).
+
+    /// Look up one identity link by id, scoped to the given
+    /// tenant. Returns `None` when the link doesn't exist OR
+    /// belongs to a different tenant OR is `None`-tenanted —
+    /// indistinguishable by design (no cross-tenant existence
+    /// leak; mirrors `identity_entity_for_tenant`).
+    pub async fn identity_link_for_tenant(
+        &self,
+        id: &IdentityLinkId,
+        tenant: &TenantId,
+    ) -> Option<IdentityLink> {
+        let hydra = self.hydra.read().await;
+        hydra
+            .identity_link(id)
+            .filter(|l| l.tenant_id.as_ref() == Some(tenant))
+            .cloned()
+    }
+
+    /// All identity links belonging to `tenant`, optionally
+    /// filtered by `from_entity_id` / `to_entity_id` / `kind`,
+    /// sorted by id for stable cursor pagination.
+    ///
+    /// Pick-most-selective-axis strategy:
+    ///   - `from` provided → seed from `identity_links_from`
+    ///   - else `to` provided → seed from `identity_links_to`
+    ///   - else `kind` provided → seed from `identity_links_by_kind`
+    ///   - else → all links
+    /// Then post-filter remaining axes + tenant.
+    pub async fn identity_links_for_tenant_filtered(
+        &self,
+        tenant: &TenantId,
+        from: Option<&IdentityEntityId>,
+        to: Option<&IdentityEntityId>,
+        kind: Option<&IdentityLinkKind>,
+    ) -> Vec<IdentityLink> {
+        let hydra = self.hydra.read().await;
+        let candidates: Vec<IdentityLink> = match (from, to, kind) {
+            (Some(f), _, _) => hydra
+                .identity_links_from(f)
+                .into_iter()
+                .cloned()
+                .collect(),
+            (None, Some(t), _) => hydra
+                .identity_links_to(t)
+                .into_iter()
+                .cloned()
+                .collect(),
+            (None, None, Some(k)) => hydra
+                .identity_links_by_kind(k)
+                .into_iter()
+                .cloned()
+                .collect(),
+            (None, None, None) => hydra.identity_links().cloned().collect(),
+        };
+        let mut out: Vec<IdentityLink> = candidates
+            .into_iter()
+            .filter(|l| l.tenant_id.as_ref() == Some(tenant))
+            .filter(|l| from.map_or(true, |f| &l.from_entity_id == f))
+            .filter(|l| to.map_or(true, |t| &l.to_entity_id == t))
+            .filter(|l| kind.map_or(true, |k| &l.kind == k))
+            .collect();
+        out.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        out
+    }
+
+    /// All identity links touching `entity_id` (incoming OR
+    /// outgoing) belonging to `tenant`, optionally filtered by
+    /// `kind`, sorted by id. The caller should verify entity
+    /// existence + tenant ownership BEFORE calling this — empty
+    /// result is ambiguous between "no links" and "entity not in
+    /// tenant" otherwise.
+    pub async fn identity_links_for_entity_for_tenant(
+        &self,
+        entity_id: &IdentityEntityId,
+        tenant: &TenantId,
+        kind: Option<&IdentityLinkKind>,
+    ) -> Vec<IdentityLink> {
+        let hydra = self.hydra.read().await;
+        let mut out: Vec<IdentityLink> = hydra
+            .identity_links_for_entity(entity_id)
+            .into_iter()
+            .filter(|l| l.tenant_id.as_ref() == Some(tenant))
+            .filter(|l| kind.map_or(true, |k| &l.kind == k))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        out
     }
 
     pub async fn runs_for_sensor_for_tenant(

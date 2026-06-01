@@ -74,6 +74,9 @@ CausalCellId = str
 # Patch 29+ IdentityEntity — meaning-layer primitive ("same real
 # thing, many names").
 IdentityEntityId = str
+# Patch 37+ IdentityLink — directed semantic relationship between
+# two `IdentityEntity` rows. Prefix `idl_` groups with `ide_`.
+IdentityLinkId = str
 
 
 # === Confidence — [0.0, 1.0] clamp ===
@@ -1861,6 +1864,87 @@ class IdentityEntity(BaseModel):
     created_by: ActorId
     created_at: str
     updated_at: str
+    caused_by: EventId | None = None
+
+
+# === Patch 37 + Patch 38 — IdentityLink wire types ===
+#
+# Patch 37 shipped the engine-only IdentityLink vocabulary (durable
+# directed semantic relationships between two `IdentityEntity`
+# rows: `same_as`, `depends_on`, `downstream_of`, `owned_by`,
+# `produced_by`, `consumed_by`, `derived_from`, `observed_in`,
+# `part_of`, `related_to`, plus `Custom(label)`). Patch 38 exposes
+# that surface over HTTP + SDK under `/identity/links*`.
+#
+# **Wire-form conventions** (carry from `IdentityEntityKind`):
+#
+# - `IdentityLinkKind` is a union of bare PascalCase strings for
+#   built-in variants AND `{"Custom": "label"}` for the open-ended
+#   fallback. POST body sends either form via JSON.
+# - URL `?kind=` filter accepts the SNAKE_CASE discriminant only
+#   (`?kind=downstream_of`). `?kind=DownstreamOf` is treated as
+#   `Custom("DownstreamOf")` and will almost always return empty —
+#   parsing/intent wart, documented + pinned by HTTP test.
+
+IdentityLinkKind = str | dict[str, str]
+
+
+class IdentityLink(BaseModel):
+    """Mirrors `hydra_core::IdentityLink` (Patch 37 engine, Patch
+    38 wire). Durable directed semantic relationship between two
+    `IdentityEntity` rows.
+
+    Field semantics:
+
+      - `id` — stable `idl_`-prefixed handle. Caller-supplied for
+        idempotent-retry semantics; server accepts as-is.
+      - `tenant_id` — REQUIRED on the wire but the HTTP layer
+        OVERWRITES this with the `X-Hydra-Tenant` header at POST
+        time (anti-smuggling rule mirroring `IdentityEntity`).
+      - `kind` — relationship type. PascalCase wire form for
+        built-ins; `{"Custom": "label"}` for custom kinds.
+      - `from_entity_id` / `to_entity_id` — must reference
+        existing entities in the SAME tenant as the link. The
+        engine rejects self-links (from == to) and tenant
+        mismatches with the same `"unknown identity entity"`
+        error (no cross-tenant existence leak).
+      - `confidence` — author-asserted belief. **Informational
+        in v0; NOT a trust verdict.** Auto-actions MUST gate on
+        a future `IdentityLinkTrustAssessment` (P39+), NOT raw
+        confidence.
+      - `evidence_ids` / `claim_ids` / `cell_ids` — opaque audit
+        references; v0 does NOT validate that the referenced ids
+        exist. Free-form audit handles only.
+      - `metadata` — free-form bag; convention `_hydra_` prefix
+        reserved for future engine use (not enforced).
+      - `created_by` / `created_at` / `caused_by` — standard
+        audit trail; caller-supplied.
+
+    **v0 contract**: IdentityLink is a DURABLE assertion. There
+    is NO update or delete; wrong links are corrected by
+    creating NEW links (the wrong link stays in the audit log
+    forever). NO automated link inference, NO graph projection,
+    NO referential integrity on evidence/claim/cell ids, NO
+    cycle prevention.
+
+    `SameAs` is logically symmetric but stored DIRECTIONALLY —
+    callers MUST NOT assume the reverse edge exists.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: IdentityLinkId
+    tenant_id: TenantId | None = None
+    kind: IdentityLinkKind
+    from_entity_id: IdentityEntityId
+    to_entity_id: IdentityEntityId
+    confidence: Confidence
+    evidence_ids: list[EvidenceId] = Field(default_factory=list)
+    claim_ids: list[ClaimId] = Field(default_factory=list)
+    cell_ids: list[CausalCellId] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_by: ActorId
+    created_at: str
     caused_by: EventId | None = None
 
 

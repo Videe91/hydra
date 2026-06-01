@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 
 from . import _paths
+from .client import _link_kind_param
 from ._http import HydraHttpClientSync
 from ._types import (
     Action,
@@ -60,6 +61,9 @@ from ._types import (
     IdentityEntityId,
     IdentityEntityKind,
     IdentityEntityTrustAssessment,
+    IdentityLink,
+    IdentityLinkId,
+    IdentityLinkKind,
     IdentityMatchTrustAssessment,
     SourceTrustAssessment,
     SemanticIdentityMatchAssessment,
@@ -631,6 +635,107 @@ class HydraSync:
         return SemanticIdentityMatchAssessment.model_validate(
             raw["assessment"]
         )
+
+    # ========================================================================
+    # IdentityLink (Patch 38) — sync mirrors
+    # ========================================================================
+
+    def create_identity_link(
+        self,
+        link: IdentityLink,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityLink:
+        """Sync mirror of `Hydra.create_identity_link` (Patch 37
+        engine, Patch 38 wire). Server overwrites `link.tenant_id`
+        from the header; v0 contract carries forward —
+        informational confidence only, no trust verdict, no
+        update/delete. See async docstring."""
+        body = {"link": link.model_dump(mode="json")}
+        raw = self._http.post(
+            _paths.identity_links_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return IdentityLink.model_validate(raw["link"])
+
+    def identity_link(
+        self,
+        link_id: IdentityLinkId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityLink:
+        """Sync mirror of `Hydra.identity_link`. Strict tenant
+        scoping; unknown / wrong-tenant / `None`-tenanted link
+        all surface as `HydraNotFoundError`."""
+        raw = self._http.get(
+            _paths.identity_link_path(link_id),
+            tenant=tenant,
+        )
+        return IdentityLink.model_validate(raw["link"])
+
+    def identity_links(
+        self,
+        *,
+        from_entity_id: IdentityEntityId | None = None,
+        to_entity_id: IdentityEntityId | None = None,
+        kind: IdentityLinkKind | None = None,
+        after: str | None = None,
+        limit: int | None = None,
+        tenant: TenantId | None = None,
+    ) -> tuple[list[IdentityLink], str | None]:
+        """Sync mirror of `Hydra.identity_links`. Returns
+        `(links, next_cursor)`. `?kind=` accepts snake_case only;
+        `"DownstreamOf"` becomes `Custom("DownstreamOf")` and
+        returns empty (documented wart, see async docstring)."""
+        params: dict[str, str | int] = {}
+        if from_entity_id is not None:
+            params["from_entity_id"] = from_entity_id
+        if to_entity_id is not None:
+            params["to_entity_id"] = to_entity_id
+        kp = _link_kind_param(kind)
+        if kp is not None:
+            params["kind"] = kp
+        if after is not None:
+            params["after"] = after
+        if limit is not None:
+            params["limit"] = limit
+        raw = self._http.get(
+            _paths.identity_links_path(),
+            params=params if params else None,
+            tenant=tenant,
+        )
+        links = [IdentityLink.model_validate(l) for l in raw["links"]]
+        return links, raw.get("next_cursor")
+
+    def identity_links_for_entity(
+        self,
+        entity_id: IdentityEntityId,
+        *,
+        kind: IdentityLinkKind | None = None,
+        after: str | None = None,
+        limit: int | None = None,
+        tenant: TenantId | None = None,
+    ) -> tuple[list[IdentityLink], str | None]:
+        """Sync mirror of `Hydra.identity_links_for_entity`.
+        Returns `(links, next_cursor)` covering both incoming and
+        outgoing links for `entity_id`. Server probes entity
+        tenant first; missing → 404."""
+        params: dict[str, str | int] = {}
+        kp = _link_kind_param(kind)
+        if kp is not None:
+            params["kind"] = kp
+        if after is not None:
+            params["after"] = after
+        if limit is not None:
+            params["limit"] = limit
+        raw = self._http.get(
+            _paths.identity_entity_links_path(entity_id),
+            params=params if params else None,
+            tenant=tenant,
+        )
+        links = [IdentityLink.model_validate(l) for l in raw["links"]]
+        return links, raw.get("next_cursor")
 
     # ========================================================================
     # Identity trust (Patch 34) — sync mirrors

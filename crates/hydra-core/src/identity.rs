@@ -816,12 +816,20 @@ pub struct IdentityLink {
     pub from_entity_id: IdentityEntityId,
     pub to_entity_id: IdentityEntityId,
     pub confidence: Confidence,
+    /// Patch 38 polish — `#[serde(default)]` lets wire callers
+    /// omit empty arrays/maps. Common case: a one-shot
+    /// `(from)--depends_on-->(to)` link with no audit refs.
+    #[serde(default)]
     pub evidence_ids: Vec<EvidenceId>,
+    #[serde(default)]
     pub claim_ids: Vec<ClaimId>,
+    #[serde(default)]
     pub cell_ids: Vec<CausalCellId>,
+    #[serde(default)]
     pub metadata: HashMap<String, Value>,
     pub created_by: ActorId,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
     pub caused_by: Option<EventId>,
 }
 
@@ -1544,6 +1552,34 @@ mod tests {
             err.contains("self-link rejected"),
             "expected self-link rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn identity_link_serde_default_polish_accepts_minimal_body() {
+        // Patch 38 polish — wire callers can omit empty arrays /
+        // maps / caused_by. With `#[serde(default)]` on
+        // evidence_ids, claim_ids, cell_ids, metadata, caused_by,
+        // a minimal POST body deserializes cleanly. Pinned so a
+        // future patch can't accidentally drop the defaults.
+        let minimal = serde_json::json!({
+            "id": "idl_min",
+            "tenant_id": "tenant_x",
+            "kind": "DependsOn",
+            "from_entity_id": "ide_a",
+            "to_entity_id": "ide_b",
+            "confidence": 0.9,
+            "created_by": "actor_ops",
+            "created_at": "2026-06-01T12:00:00Z"
+            // evidence_ids / claim_ids / cell_ids / metadata /
+            // caused_by absent — must default cleanly.
+        });
+        let link: IdentityLink = serde_json::from_value(minimal).unwrap();
+        assert!(link.evidence_ids.is_empty());
+        assert!(link.claim_ids.is_empty());
+        assert!(link.cell_ids.is_empty());
+        assert!(link.metadata.is_empty());
+        assert!(link.caused_by.is_none());
+        assert_eq!(link.kind, IdentityLinkKind::DependsOn);
     }
 
     #[test]

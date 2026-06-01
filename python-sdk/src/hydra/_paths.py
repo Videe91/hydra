@@ -611,3 +611,34 @@ def identity_matches_path() -> str:
     — Patch 31 semantic match endpoint. Read-only, tenant-scoped.
     Returns `{assessment: SemanticIdentityMatchAssessment}`."""
     return "/identity/matches"
+
+
+def identity_link_path(link_id: str) -> str:
+    """`GET /identity/links/{link_id}` — Patch 38 single-link
+    lookup. Tenant-scoped: missing `X-Hydra-Tenant` → 400; wrong
+    tenant or `None`-tenanted link → 404 (indistinguishable)."""
+    return f"/identity/links/{_seg(link_id)}"
+
+
+def identity_links_path() -> str:
+    """`GET /identity/links` (list, with optional
+    `?from_entity_id=`/`?to_entity_id=`/`?kind=`/`?after=`/`?limit=`)
+    AND `POST /identity/links` (create). Body for POST:
+    `{link: IdentityLink}`. Server overwrites `link.tenant_id`
+    with the header value — caller cannot smuggle a different
+    tenant or `None` via the body. `?kind=` accepts snake_case
+    discriminants only (`?kind=downstream_of`); `?kind=DownstreamOf`
+    is treated as `Custom("DownstreamOf")` and almost always
+    returns empty."""
+    return "/identity/links"
+
+
+def identity_entity_links_path(entity_id: str) -> str:
+    """`GET /identity/entities/{entity_id}/links` — Patch 38
+    entity-scoped link neighborhood. Returns BOTH incoming AND
+    outgoing links for the entity in one envelope. Supports
+    `?kind=`/`?after=`/`?limit=`. Tenant-scoped: missing /
+    wrong-tenant / `None`-tenanted entity → 404 (probed before
+    listing links to prevent existence enumeration through link
+    counts)."""
+    return f"/identity/entities/{_seg(entity_id)}/links"

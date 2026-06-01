@@ -1188,6 +1188,29 @@ mod tests {
             required_scopes_for(&Method::POST, "/identity/entities"),
             vec!["write:identity"]
         );
+        // Patch 38 — IdentityLink HTTP routes. Same `/identity/*`
+        // prefix clause covers them; no auth code changed.
+        // Regression pins so a future clause reorder or scope
+        // rename fires here.
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/identity/links"),
+            vec!["read:identity"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/identity/links/idl_x"),
+            vec!["read:identity"]
+        );
+        assert_eq!(
+            required_scopes_for(
+                &Method::GET,
+                "/identity/entities/ide_x/links"
+            ),
+            vec!["read:identity"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::POST, "/identity/links"),
+            vec!["write:identity"]
+        );
         // OPTIONS always has no scope requirement (CORS preflight).
         assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());
         // Routes with no entry don't require any scope.

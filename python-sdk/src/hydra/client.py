@@ -44,6 +44,9 @@ from ._types import (
     IdentityEntityId,
     IdentityEntityKind,
     IdentityEntityTrustAssessment,
+    IdentityLink,
+    IdentityLinkId,
+    IdentityLinkKind,
     IdentityMatchTrustAssessment,
     SemanticIdentityMatchAssessment,
     SourceTrustAssessment,
@@ -77,6 +80,29 @@ from .replication import _Replication
 from .schemas import _Schemas
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+
+def _link_kind_param(kind: IdentityLinkKind | None) -> str | None:
+    """Extract the URL `?kind=` value from an `IdentityLinkKind`.
+
+    Patch 38 server expects snake_case discriminants OR the raw
+    `Custom` label. dict-form input (`{"Custom": "uses_metric"}`)
+    is unwrapped to the inner label. String input passes through
+    verbatim — callers passing `"DownstreamOf"` (PascalCase) will
+    be treated as a `Custom("DownstreamOf")` filter server-side
+    and almost always get an empty result; this is a documented
+    parsing/intent wart, see `parse_identity_link_kind` in
+    `hydra-net/src/http/identity.rs`.
+
+    Shared by `Hydra.identity_links` and
+    `Hydra.identity_links_for_entity`; re-imported by the sync
+    client to keep the extraction logic single-source.
+    """
+    if kind is None:
+        return None
+    if isinstance(kind, dict):
+        return kind.get("Custom") or next(iter(kind.values()), None)
+    return kind
 
 
 class Hydra:
@@ -973,6 +999,164 @@ class Hydra:
         return SemanticIdentityMatchAssessment.model_validate(
             raw["assessment"]
         )
+
+    # ========================================================================
+    # IdentityLink (Patch 38 — wire surface over P37 vocabulary)
+    # ========================================================================
+
+    async def create_identity_link(
+        self,
+        link: IdentityLink,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityLink:
+        """Create a durable directed `IdentityLink` between two
+        `IdentityEntity`s (`POST /identity/links` — Patch 38).
+
+        The server OVERWRITES `link.tenant_id` with the
+        `X-Hydra-Tenant` header value — caller cannot smuggle a
+        different tenant or `None` via the body. All other
+        fields (`id`, `created_by`, `created_at`, `caused_by`,
+        evidence/claim/cell ids, metadata) pass through as
+        supplied.
+
+        ## Strategic warning (P37 carry-forward)
+
+        IdentityLink is a DURABLE assertion. v0 has NO trust
+        verdict over the link itself; `confidence` is
+        informational only. **Auto-actions MUST gate on a future
+        `IdentityLinkTrustAssessment` (P39+), NOT raw confidence.**
+        There is NO update or delete in v0 — wrong links are
+        corrected by creating new links; the wrong link remains
+        in the audit log forever. NO referential integrity on
+        evidence/claim/cell ids; NO cycle prevention; NO graph
+        projection.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header,
+            self-link (from == to), invalid kind (empty Custom /
+            sentinel Custom / built-in-collision Custom),
+            duplicate `(tenant, from, to, kind)`, duplicate link
+            id
+          - 404 → `HydraNotFoundError`: unknown from/to entity,
+            wrong-tenant entity, OR `None`-tenanted entity
+            (unified error per P37 — no cross-tenant existence
+            leak)
+        """
+        body = {"link": link.model_dump(mode="json")}
+        raw = await self._http.post(
+            _paths.identity_links_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return IdentityLink.model_validate(raw["link"])
+
+    async def identity_link(
+        self,
+        link_id: IdentityLinkId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityLink:
+        """Read one `IdentityLink` by id
+        (`GET /identity/links/{link_id}` — Patch 38).
+
+        Strict tenant scoping: unknown id, wrong tenant, OR
+        `None`-tenanted link all surface as `HydraNotFoundError`
+        — indistinguishable by design.
+        """
+        raw = await self._http.get(
+            _paths.identity_link_path(link_id),
+            tenant=tenant,
+        )
+        return IdentityLink.model_validate(raw["link"])
+
+    async def identity_links(
+        self,
+        *,
+        from_entity_id: IdentityEntityId | None = None,
+        to_entity_id: IdentityEntityId | None = None,
+        kind: IdentityLinkKind | None = None,
+        after: str | None = None,
+        limit: int | None = None,
+        tenant: TenantId | None = None,
+    ) -> tuple[list[IdentityLink], str | None]:
+        """List identity links for the caller's tenant, optionally
+        filtered (`GET /identity/links` — Patch 38). Returns
+        `(links, next_cursor)`; `next_cursor` is the raw
+        `IdentityLinkId` of the last item when more pages exist,
+        or `None` on the final page.
+
+        All filters optional. With no filter args, returns all
+        tenant links paginated under the server-side default
+        page size.
+
+        `kind` accepts either a PascalCase string
+        (`"DownstreamOf"`) or the dict form (`{"Custom":
+        "uses_metric"}`); the SDK extracts the snake_case
+        discriminant for the URL via `_link_kind_param`. **Note
+        the wart**: `"DownstreamOf"` becomes
+        `Custom("DownstreamOf")` server-side and almost always
+        returns empty — use `"downstream_of"` (snake_case) to
+        filter for the `DownstreamOf` built-in.
+
+        Strict tenant scoping: `None`-tenanted links never
+        appear in results.
+        """
+        params: dict[str, str | int] = {}
+        if from_entity_id is not None:
+            params["from_entity_id"] = from_entity_id
+        if to_entity_id is not None:
+            params["to_entity_id"] = to_entity_id
+        kp = _link_kind_param(kind)
+        if kp is not None:
+            params["kind"] = kp
+        if after is not None:
+            params["after"] = after
+        if limit is not None:
+            params["limit"] = limit
+        raw = await self._http.get(
+            _paths.identity_links_path(),
+            params=params if params else None,
+            tenant=tenant,
+        )
+        links = [IdentityLink.model_validate(l) for l in raw["links"]]
+        return links, raw.get("next_cursor")
+
+    async def identity_links_for_entity(
+        self,
+        entity_id: IdentityEntityId,
+        *,
+        kind: IdentityLinkKind | None = None,
+        after: str | None = None,
+        limit: int | None = None,
+        tenant: TenantId | None = None,
+    ) -> tuple[list[IdentityLink], str | None]:
+        """List all links touching `entity_id` (incoming AND
+        outgoing) for the caller's tenant
+        (`GET /identity/entities/{entity_id}/links` — Patch 38).
+        Returns `(links, next_cursor)`.
+
+        Tenant probe happens server-side BEFORE link listing: if
+        the entity doesn't exist OR belongs to a different tenant
+        OR is `None`-tenanted → 404 `HydraNotFoundError`. This
+        prevents wrong-tenant entity-id enumeration through link
+        counts.
+        """
+        params: dict[str, str | int] = {}
+        kp = _link_kind_param(kind)
+        if kp is not None:
+            params["kind"] = kp
+        if after is not None:
+            params["after"] = after
+        if limit is not None:
+            params["limit"] = limit
+        raw = await self._http.get(
+            _paths.identity_entity_links_path(entity_id),
+            params=params if params else None,
+            tenant=tenant,
+        )
+        links = [IdentityLink.model_validate(l) for l in raw["links"]]
+        return links, raw.get("next_cursor")
 
     # ========================================================================
     # Identity trust (Patch 34 — wire surface over P32 + P33)

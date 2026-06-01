@@ -51,6 +51,7 @@ use axum::{
 };
 use hydra_core::{
     IdentityAlias, IdentityEntity, IdentityEntityId, IdentityEntityKind,
+    IdentityLink, IdentityLinkId, IdentityLinkKind,
     SemanticIdentityMatchAssessment,
 };
 use serde::{Deserialize, Serialize};
@@ -75,14 +76,29 @@ impl IdentityHttpState {
     }
 }
 
-/// Build the identity router. Four routes:
+/// Build the identity router. Eight routes (Patch 31 entities +
+/// matches; Patch 38 links + entity-scoped links):
 ///
-/// - `POST /identity/entities`
-/// - `GET  /identity/entities/:entity_id`
-/// - `GET  /identity/entities` (with `?kind=` / `?after=` / `?limit=`)
-/// - `GET  /identity/matches` (with required `?source=` + `?normalized=`)
+/// - `POST /identity/entities`                     — P31 create
+/// - `GET  /identity/entities/:entity_id`          — P31 single read
+/// - `GET  /identity/entities/:entity_id/links`    — P38 entity link neighborhood
+/// - `GET  /identity/entities` (with `?kind=`/`?after=`/`?limit=`) — P31 list
+/// - `GET  /identity/matches` (required `?source=`+`?normalized=`) — P31 matcher
+/// - `POST /identity/links`                        — P38 create link
+/// - `GET  /identity/links/:link_id`               — P38 single read
+/// - `GET  /identity/links` (with filter/pagination) — P38 list
+///
+/// **Route ordering note** (LOAD-BEARING): the entity-scoped link
+/// route `/identity/entities/:entity_id/links` is registered
+/// alongside the bare `:entity_id` route. Axum's trie correctly
+/// prefers the longer literal-segment match, but we pin both
+/// routes hit distinct handlers via test.
 pub fn identity_router(runtime: RuntimeHandle) -> Router {
     Router::new()
+        .route(
+            "/identity/entities/:entity_id/links",
+            get(list_links_for_entity),
+        )
         .route(
             "/identity/entities/:entity_id",
             get(get_identity_entity),
@@ -92,6 +108,11 @@ pub fn identity_router(runtime: RuntimeHandle) -> Router {
             get(list_identity_entities).post(create_identity_entity),
         )
         .route("/identity/matches", get(suggest_identity_matches))
+        .route("/identity/links/:link_id", get(get_identity_link))
+        .route(
+            "/identity/links",
+            get(list_identity_links).post(create_identity_link),
+        )
         .with_state(IdentityHttpState::new(runtime))
 }
 
@@ -409,6 +430,349 @@ async fn suggest_identity_matches(
             format!("suggest_identity_matches failed: {other}"),
         ),
     }
+}
+
+// === Patch 38 — IdentityLink HTTP surface =========================
+//
+// Expose the P37 IdentityLink vocabulary over HTTP. Read shape
+// mirrors the P31 entity surface (wrapped `{"link": ...}` singular
+// + wrapped `{"links": [...], "next_cursor": ...}` paginated).
+//
+// **LOAD-BEARING contracts** (all pinned by tests):
+//
+// 1. POST overwrites `link.tenant_id` from the X-Hydra-Tenant
+//    header. Caller cannot smuggle a different tenant via the
+//    body. Mirrors `create_identity_entity` (P31).
+// 2. Tenant filtering happens at the QueryService boundary, NOT
+//    the engine. Engine accessors are cross-tenant. None-tenanted
+//    links are invisible to public routes.
+// 3. Entity-scoped link route probes entity ownership FIRST via
+//    `identity_entity_for_tenant`; missing/wrong-tenant entity →
+//    404 unified-error to prevent existence enumeration through
+//    link counts.
+// 4. Single envelope shape for list — `{"links": [...],
+//    "next_cursor": ...}` regardless of filter combinations.
+//    Diverges from P31 entities-kind-filter two-mode response.
+// 5. `?kind=` URL param accepts snake_case discriminants ONLY;
+//    `?kind=DownstreamOf` becomes `Custom("DownstreamOf")` and
+//    almost always returns empty (parsing/intent wart pinned by
+//    test).
+// 6. Error mapping splits on `QueryError` substring: a message
+//    containing `"unknown identity entity"` → 404; everything
+//    else → 400. Brittle; pin substring as constant.
+
+const UNKNOWN_ENTITY_ERROR_PREFIX: &str = "unknown identity entity";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityLinkResponse {
+    pub link: IdentityLink,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityLinksListResponse {
+    pub links: Vec<IdentityLink>,
+    pub next_cursor: Option<String>,
+}
+
+/// Request body for `POST /identity/links`. Full `IdentityLink`
+/// lives under a `link` envelope so request + response are
+/// symmetric (mirrors `CreateIdentityEntityRequest`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateIdentityLinkRequest {
+    pub link: IdentityLink,
+}
+
+/// Combined query params for `GET /identity/links`. All optional;
+/// when all absent, returns the full tenant link list paginated
+/// under the default page size.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListIdentityLinksQuery {
+    pub from_entity_id: Option<String>,
+    pub to_entity_id: Option<String>,
+    pub kind: Option<String>,
+    pub limit: Option<usize>,
+    pub after: Option<String>,
+}
+
+/// Query params for `GET /identity/entities/:entity_id/links`.
+/// Pagination identical to the global list route; `kind` filter
+/// optional and follows the same snake_case-only convention.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListLinksForEntityQuery {
+    pub kind: Option<String>,
+    pub limit: Option<usize>,
+    pub after: Option<String>,
+}
+
+/// Parse a URL `?kind=<discriminant>` value into an
+/// `IdentityLinkKind`. Snake_case built-ins round-trip; any other
+/// non-empty string maps to `Custom(s)`. Empty string → caller
+/// maps to 400.
+///
+/// **Wart pinned by test**: `?kind=DownstreamOf` becomes
+/// `Custom("DownstreamOf")`, NOT the `DownstreamOf` built-in
+/// (its discriminant is the snake_case `"downstream_of"`). Mirrors
+/// `parse_identity_kind` (P31) — uniform across all `/identity/*`
+/// routes.
+fn parse_identity_link_kind(value: &str) -> Option<IdentityLinkKind> {
+    if value.is_empty() {
+        return None;
+    }
+    Some(match value {
+        "same_as" => IdentityLinkKind::SameAs,
+        "depends_on" => IdentityLinkKind::DependsOn,
+        "downstream_of" => IdentityLinkKind::DownstreamOf,
+        "owned_by" => IdentityLinkKind::OwnedBy,
+        "produced_by" => IdentityLinkKind::ProducedBy,
+        "consumed_by" => IdentityLinkKind::ConsumedBy,
+        "derived_from" => IdentityLinkKind::DerivedFrom,
+        "observed_in" => IdentityLinkKind::ObservedIn,
+        "part_of" => IdentityLinkKind::PartOf,
+        "related_to" => IdentityLinkKind::RelatedTo,
+        other => IdentityLinkKind::Custom(other.to_string()),
+    })
+}
+
+/// Map a `QueryError` message to (status, body). 404 for the
+/// unified "unknown identity entity" prefix; 400 for everything
+/// else (self-link, invalid kind, duplicate pair+kind, duplicate
+/// id). Mirrors the P37 engine error vocabulary.
+fn map_link_query_error(msg: String) -> Response {
+    if msg.starts_with(UNKNOWN_ENTITY_ERROR_PREFIX) {
+        error_response(StatusCode::NOT_FOUND, msg)
+    } else {
+        error_response(StatusCode::BAD_REQUEST, msg)
+    }
+}
+
+/// `POST /identity/links` — Patch 38 create handler.
+///
+/// **Server overwrites `link.tenant_id` with the header value.**
+/// Anti-smuggling rule mirrors `create_identity_entity` (P31).
+/// `id`, `created_by`, `created_at`, `caused_by` pass through —
+/// callers can supply stable ids for idempotent-retry semantics.
+///
+/// ## Strategic warning carry-forward (P37)
+///
+/// IdentityLink is a DURABLE assertion. v0 has NO trust verdict
+/// over the link itself; `confidence` is informational only.
+/// Auto-actions MUST gate on a future `IdentityLinkTrustAssessment`
+/// (P39+), NOT on raw confidence. There is NO update or delete
+/// in v0 — wrong links are corrected by creating new links.
+///
+/// ## Status mapping
+///
+/// - 200 + `{link: IdentityLink}` — created successfully
+/// - 400 — missing tenant; self-link; invalid kind (empty /
+///   sentinel / built-in collision Custom); duplicate pair+kind;
+///   duplicate id
+/// - 404 — unknown from/to entity, wrong-tenant entity, or
+///   `None`-tenanted entity (unified error per P37)
+/// - 500 — any other engine error
+async fn create_identity_link(
+    State(state): State<IdentityHttpState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateIdentityLinkRequest>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(err) => return tenant_error_response(err),
+    };
+    // LOAD-BEARING anti-smuggling: header is authoritative.
+    let mut link = req.link;
+    link.tenant_id = Some(tenant);
+
+    let hydra = state.runtime.hydra();
+    let mut hydra = hydra.write().await;
+    match hydra.create_identity_link(link) {
+        Ok(stored) => {
+            (StatusCode::OK, Json(IdentityLinkResponse { link: stored }))
+                .into_response()
+        }
+        Err(hydra_core::error::HydraError::QueryError(msg)) => {
+            map_link_query_error(msg)
+        }
+        Err(other) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create_identity_link failed: {other}"),
+        ),
+    }
+}
+
+/// `GET /identity/links/:link_id` — Patch 38 single-link read.
+///
+/// Strict tenant scoping via QueryService: unknown id, wrong
+/// tenant, OR `None`-tenanted link all surface as 404 with the
+/// same message (no cross-tenant existence leak; mirrors
+/// `get_identity_entity`).
+async fn get_identity_link(
+    State(state): State<IdentityHttpState>,
+    headers: HeaderMap,
+    Path(link_id): Path<String>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(err) => return tenant_error_response(err),
+    };
+    let id = IdentityLinkId::from_str(&link_id);
+    match state.service.identity_link_for_tenant(&id, &tenant).await {
+        Some(link) => {
+            Json(IdentityLinkResponse { link }).into_response()
+        }
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            format!("identity link not found: {link_id}"),
+        ),
+    }
+}
+
+/// `GET /identity/links` — Patch 38 paginated/filtered list.
+///
+/// All filters optional. Single envelope shape regardless of
+/// filter combination. Sort by `IdentityLinkId` for stable
+/// cursor pagination. Cursor is the raw id string (not base64).
+async fn list_identity_links(
+    State(state): State<IdentityHttpState>,
+    headers: HeaderMap,
+    Query(query): Query<ListIdentityLinksQuery>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(err) => return tenant_error_response(err),
+    };
+
+    let from = query
+        .from_entity_id
+        .as_deref()
+        .map(IdentityEntityId::from_str);
+    let to = query
+        .to_entity_id
+        .as_deref()
+        .map(IdentityEntityId::from_str);
+
+    let kind = match query.kind.as_deref() {
+        Some(s) => match parse_identity_link_kind(s) {
+            Some(k) => Some(k),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "kind query parameter cannot be empty",
+                );
+            }
+        },
+        None => None,
+    };
+
+    let links = state
+        .service
+        .identity_links_for_tenant_filtered(
+            &tenant,
+            from.as_ref(),
+            to.as_ref(),
+            kind.as_ref(),
+        )
+        .await;
+
+    paginate_links_response(links, query.limit, query.after.as_deref())
+}
+
+/// `GET /identity/entities/:entity_id/links` — Patch 38 entity-
+/// scoped link neighborhood. Returns both incoming AND outgoing
+/// links for the entity in one envelope.
+///
+/// **LOAD-BEARING ordering**: tenant probe FIRST via
+/// `identity_entity_for_tenant`. If the entity doesn't exist OR
+/// belongs to a different tenant OR is `None`-tenanted → 404
+/// unified-error. Otherwise an attacker could enumerate which
+/// entity ids exist under other tenants via link counts.
+async fn list_links_for_entity(
+    State(state): State<IdentityHttpState>,
+    headers: HeaderMap,
+    Path(entity_id): Path<String>,
+    Query(query): Query<ListLinksForEntityQuery>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(err) => return tenant_error_response(err),
+    };
+
+    let eid = IdentityEntityId::from_str(&entity_id);
+    // LOAD-BEARING tenant probe FIRST.
+    if state
+        .service
+        .identity_entity_for_tenant(&eid, &tenant)
+        .await
+        .is_none()
+    {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("identity entity not found: {entity_id}"),
+        );
+    }
+
+    let kind = match query.kind.as_deref() {
+        Some(s) => match parse_identity_link_kind(s) {
+            Some(k) => Some(k),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "kind query parameter cannot be empty",
+                );
+            }
+        },
+        None => None,
+    };
+
+    let links = state
+        .service
+        .identity_links_for_entity_for_tenant(&eid, &tenant, kind.as_ref())
+        .await;
+
+    paginate_links_response(links, query.limit, query.after.as_deref())
+}
+
+/// Apply cursor pagination to a tenant-filtered link list.
+/// Shared by both list routes — same envelope, same cursor
+/// semantics, same 400-on-unknown-cursor behavior.
+fn paginate_links_response(
+    links: Vec<IdentityLink>,
+    limit: Option<usize>,
+    after: Option<&str>,
+) -> Response {
+    let pagination = PaginationQuery {
+        limit,
+        after: after.map(|s| s.to_string()),
+    };
+    let limit = normalized_limit(pagination.limit);
+
+    let mut start_index = 0usize;
+    if let Some(cursor) = pagination.after.as_deref() {
+        match links.iter().position(|l| l.id.as_str() == cursor) {
+            Some(idx) => start_index = idx + 1,
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown identity link cursor: {cursor}"),
+                );
+            }
+        }
+    }
+    let page_items: Vec<IdentityLink> = links
+        .iter()
+        .skip(start_index)
+        .take(limit)
+        .cloned()
+        .collect();
+    let next_cursor = if start_index + page_items.len() < links.len() {
+        page_items.last().map(|l| l.id.as_str().to_string())
+    } else {
+        None
+    };
+    Json(IdentityLinksListResponse {
+        links: page_items,
+        next_cursor,
+    })
+    .into_response()
 }
 
 #[cfg(test)]
@@ -982,5 +1346,566 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r2.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // === Patch 38 — IdentityLink HTTP tests ===
+
+    /// Build a minimal `IdentityLink` between two entities for
+    /// HTTP tests. Caller supplies tenant + kind + from/to.
+    fn make_link(
+        tenant: Option<TenantId>,
+        kind: IdentityLinkKind,
+        from: &IdentityEntityId,
+        to: &IdentityEntityId,
+    ) -> IdentityLink {
+        IdentityLink {
+            id: hydra_core::IdentityLinkId::new(),
+            tenant_id: tenant,
+            kind,
+            from_entity_id: from.clone(),
+            to_entity_id: to.clone(),
+            confidence: Confidence::new(0.9),
+            evidence_ids: vec![],
+            claim_ids: vec![],
+            cell_ids: vec![],
+            metadata: HashMap::new(),
+            created_by: actor(),
+            created_at: chrono::Utc::now(),
+            caused_by: None,
+        }
+    }
+
+    async fn ingest_link(
+        runtime: &crate::runtime::RuntimeHandle,
+        link: IdentityLink,
+    ) -> IdentityLink {
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        hydra.create_identity_link(link).unwrap()
+    }
+
+    /// Seed two entities under the test tenant + return their ids.
+    async fn seed_two_entities(
+        runtime: &crate::runtime::RuntimeHandle,
+    ) -> (IdentityEntityId, IdentityEntityId) {
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let a = make_entity(
+            Some(tenant.clone()),
+            IdentityEntityKind::Dataset,
+            "dataset/p38_a",
+            vec![snowflake_alias("analytics", "p38_a")],
+        );
+        let mut b = make_entity(
+            Some(tenant),
+            IdentityEntityKind::Service,
+            "service/p38_b",
+            vec![snowflake_alias("ops", "p38_b")],
+        );
+        // Distinct alias so it doesn't collide with `a`'s (P29
+        // alias uniqueness check).
+        b.aliases[0].namespace = Some("ops".to_string());
+        b.aliases[0].normalized = "ops.p38_b".to_string();
+        b.aliases[0].label = "ops.p38_b".to_string();
+        b.aliases[0].external_id = Some("ops.p38_b".to_string());
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        ingest_entity(runtime, a).await;
+        ingest_entity(runtime, b).await;
+        (a_id, b_id)
+    }
+
+    // === POST /identity/links ===
+
+    #[tokio::test]
+    async fn create_identity_link_happy_path() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_entities(&runtime).await;
+        let link = make_link(
+            Some(TenantId::from_str(TEST_TENANT)),
+            IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+        );
+        let app = identity_router(runtime.clone());
+        let body = serde_json::json!({ "link": link });
+        let response = app
+            .oneshot(json_post("/identity/links", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed: IdentityLinkResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(parsed.link.from_entity_id, a);
+        assert_eq!(parsed.link.to_entity_id, b);
+        assert_eq!(parsed.link.kind, IdentityLinkKind::DependsOn);
+        assert_eq!(
+            parsed.link.tenant_id,
+            Some(TenantId::from_str(TEST_TENANT))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_identity_link_missing_tenant_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_entities(&runtime).await;
+        let link = make_link(None, IdentityLinkKind::DependsOn, &a, &b);
+        let app = identity_router(runtime.clone());
+        let body = serde_json::json!({ "link": link });
+        let response = app
+            .oneshot(json_post_without_tenant("/identity/links", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_identity_link_server_overwrites_body_tenant_id() {
+        // LOAD-BEARING anti-smuggling pin: body claims tenant_x,
+        // header says tenant_y, from/to entities live in tenant_x.
+        // Server overwrites link.tenant_id to tenant_y → engine
+        // sees mismatch → "unknown identity entity" → 404. Pins
+        // BOTH tenant overwrite AND strict isolation in one test.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_entities(&runtime).await;
+        let body_tenant = TenantId::from_str("tenant_smuggled");
+        let link = make_link(
+            Some(body_tenant), // caller claims this in body
+            IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+        );
+        let app = identity_router(runtime.clone());
+        let body = serde_json::json!({ "link": link });
+        // Header tenant DIFFERS from body tenant AND from entity
+        // tenant. The handler overwrites with header value
+        // ("tenant_evil"); engine then rejects because entities
+        // are in TEST_TENANT, not "tenant_evil".
+        let response = app
+            .oneshot(json_post_for_tenant(
+                "/identity/links",
+                "tenant_evil",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "header tenant must overwrite body AND mismatch isolates"
+        );
+        let parsed: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(
+            parsed.error.starts_with("unknown identity entity"),
+            "unified error must surface; got {}",
+            parsed.error
+        );
+    }
+
+    #[tokio::test]
+    async fn create_identity_link_self_link_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, _b) = seed_two_entities(&runtime).await;
+        let link = make_link(
+            Some(TenantId::from_str(TEST_TENANT)),
+            IdentityLinkKind::SameAs,
+            &a,
+            &a,
+        );
+        let app = identity_router(runtime.clone());
+        let body = serde_json::json!({ "link": link });
+        let response = app
+            .oneshot(json_post("/identity/links", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let parsed: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(parsed.error.contains("self-link"));
+    }
+
+    #[tokio::test]
+    async fn create_identity_link_duplicate_pair_kind_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_entities(&runtime).await;
+        let tenant = Some(TenantId::from_str(TEST_TENANT));
+        ingest_link(
+            &runtime,
+            make_link(tenant.clone(), IdentityLinkKind::DependsOn, &a, &b),
+        )
+        .await;
+        // Second create — same tenant, same from, same to, same kind.
+        let dup = make_link(tenant, IdentityLinkKind::DependsOn, &a, &b);
+        let app = identity_router(runtime.clone());
+        let body = serde_json::json!({ "link": dup });
+        let response = app
+            .oneshot(json_post("/identity/links", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let parsed: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(parsed.error.contains("duplicate link"));
+    }
+
+    #[tokio::test]
+    async fn create_identity_link_unknown_from_entity_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (_a, b) = seed_two_entities(&runtime).await;
+        let ghost = IdentityEntityId::new();
+        let link = make_link(
+            Some(TenantId::from_str(TEST_TENANT)),
+            IdentityLinkKind::DependsOn,
+            &ghost,
+            &b,
+        );
+        let app = identity_router(runtime.clone());
+        let body = serde_json::json!({ "link": link });
+        let response = app
+            .oneshot(json_post("/identity/links", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // === GET /identity/links/:link_id ===
+
+    #[tokio::test]
+    async fn get_identity_link_happy_path() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_entities(&runtime).await;
+        let link = ingest_link(
+            &runtime,
+            make_link(
+                Some(TenantId::from_str(TEST_TENANT)),
+                IdentityLinkKind::DependsOn,
+                &a,
+                &b,
+            ),
+        )
+        .await;
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/identity/links/{}",
+                link.id.as_str()
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed: IdentityLinkResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(parsed.link.id, link.id);
+        assert_eq!(parsed.link.kind, IdentityLinkKind::DependsOn);
+    }
+
+    #[tokio::test]
+    async fn get_identity_link_wrong_tenant_invisible() {
+        // LOAD-BEARING: link exists in TEST_TENANT but queried
+        // from a different tenant → 404 indistinguishable.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_entities(&runtime).await;
+        let link = ingest_link(
+            &runtime,
+            make_link(
+                Some(TenantId::from_str(TEST_TENANT)),
+                IdentityLinkKind::DependsOn,
+                &a,
+                &b,
+            ),
+        )
+        .await;
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get_for_tenant(
+                &format!("/identity/links/{}", link.id.as_str()),
+                "tenant_other",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // === GET /identity/links (list with filters + pagination) ===
+
+    #[tokio::test]
+    async fn list_identity_links_happy_paginated() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_entities(&runtime).await;
+        let tenant = Some(TenantId::from_str(TEST_TENANT));
+        ingest_link(
+            &runtime,
+            make_link(tenant.clone(), IdentityLinkKind::DependsOn, &a, &b),
+        )
+        .await;
+        ingest_link(
+            &runtime,
+            make_link(tenant, IdentityLinkKind::OwnedBy, &b, &a),
+        )
+        .await;
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/identity/links"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed: IdentityLinksListResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(parsed.links.len(), 2);
+        // Sort stability — by id ascending.
+        let ids: Vec<&str> = parsed.links.iter().map(|l| l.id.as_str()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
+    }
+
+    #[tokio::test]
+    async fn list_identity_links_filters_propagate() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_entities(&runtime).await;
+        let tenant = Some(TenantId::from_str(TEST_TENANT));
+        let depends = ingest_link(
+            &runtime,
+            make_link(tenant.clone(), IdentityLinkKind::DependsOn, &a, &b),
+        )
+        .await;
+        ingest_link(
+            &runtime,
+            make_link(tenant, IdentityLinkKind::OwnedBy, &b, &a),
+        )
+        .await;
+        let app = identity_router(runtime.clone());
+
+        // Filter by from.
+        let r = app
+            .clone()
+            .oneshot(empty_get(&format!(
+                "/identity/links?from_entity_id={}",
+                a.as_str()
+            )))
+            .await
+            .unwrap();
+        let parsed: IdentityLinksListResponse =
+            serde_json::from_slice(&read_body_bytes(r).await).unwrap();
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(parsed.links[0].id, depends.id);
+
+        // Filter by kind (snake_case).
+        let r = app
+            .clone()
+            .oneshot(empty_get("/identity/links?kind=depends_on"))
+            .await
+            .unwrap();
+        let parsed: IdentityLinksListResponse =
+            serde_json::from_slice(&read_body_bytes(r).await).unwrap();
+        assert_eq!(parsed.links.len(), 1);
+        assert_eq!(parsed.links[0].kind, IdentityLinkKind::DependsOn);
+    }
+
+    #[tokio::test]
+    async fn list_identity_links_kind_pascal_vs_snake_url_param_wart() {
+        // Pin the documented wart: ?kind=DependsOn is treated as
+        // Custom("DependsOn") and almost always returns empty.
+        // Snake_case is the canonical URL form.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_entities(&runtime).await;
+        let tenant = Some(TenantId::from_str(TEST_TENANT));
+        ingest_link(
+            &runtime,
+            make_link(tenant, IdentityLinkKind::DependsOn, &a, &b),
+        )
+        .await;
+        let app = identity_router(runtime.clone());
+        // PascalCase silently filters Custom("DependsOn") → empty.
+        let r = app
+            .clone()
+            .oneshot(empty_get("/identity/links?kind=DependsOn"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let parsed: IdentityLinksListResponse =
+            serde_json::from_slice(&read_body_bytes(r).await).unwrap();
+        assert!(
+            parsed.links.is_empty(),
+            "PascalCase kind must filter empty (custom-kind wart pin)"
+        );
+        // snake_case finds the link.
+        let r = app
+            .oneshot(empty_get("/identity/links?kind=depends_on"))
+            .await
+            .unwrap();
+        let parsed: IdentityLinksListResponse =
+            serde_json::from_slice(&read_body_bytes(r).await).unwrap();
+        assert_eq!(parsed.links.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_identity_links_bad_cursor_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(
+                "/identity/links?after=idl_nonexistent",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_identity_links_none_tenanted_invisible() {
+        // LOAD-BEARING: None-tenanted links are physically
+        // invisible to tenanted callers (mirrors P29/P31).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        // Seed None-tenanted entities + link directly via engine.
+        let (a, b) = {
+            let mut a = make_entity(
+                None,
+                IdentityEntityKind::System,
+                "system/none_a",
+                vec![IdentityAlias {
+                    source: "system".to_string(),
+                    namespace: Some("global".to_string()),
+                    external_id: None,
+                    label: "none_a".to_string(),
+                    normalized: "none_a".to_string(),
+                }],
+            );
+            let mut b = make_entity(
+                None,
+                IdentityEntityKind::System,
+                "system/none_b",
+                vec![IdentityAlias {
+                    source: "system".to_string(),
+                    namespace: Some("global".to_string()),
+                    external_id: None,
+                    label: "none_b".to_string(),
+                    normalized: "none_b".to_string(),
+                }],
+            );
+            // Ensure canonical key + alias are distinct.
+            a.aliases[0].normalized = "global.none_a".to_string();
+            a.aliases[0].label = "global.none_a".to_string();
+            b.aliases[0].normalized = "global.none_b".to_string();
+            b.aliases[0].label = "global.none_b".to_string();
+            let a_id = a.id.clone();
+            let b_id = b.id.clone();
+            ingest_entity(&runtime, a).await;
+            ingest_entity(&runtime, b).await;
+            (a_id, b_id)
+        };
+        ingest_link(
+            &runtime,
+            make_link(None, IdentityLinkKind::SameAs, &a, &b),
+        )
+        .await;
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/identity/links"))
+            .await
+            .unwrap();
+        let parsed: IdentityLinksListResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(
+            parsed.links.is_empty(),
+            "None-tenanted links must NOT leak to tenanted caller"
+        );
+    }
+
+    // === GET /identity/entities/:entity_id/links ===
+
+    #[tokio::test]
+    async fn list_links_for_entity_returns_incoming_and_outgoing() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_entities(&runtime).await;
+        let tenant = Some(TenantId::from_str(TEST_TENANT));
+        // a --DependsOn--> b   (outgoing from a)
+        ingest_link(
+            &runtime,
+            make_link(tenant.clone(), IdentityLinkKind::DependsOn, &a, &b),
+        )
+        .await;
+        // b --OwnedBy--> a     (incoming to a)
+        ingest_link(
+            &runtime,
+            make_link(tenant, IdentityLinkKind::OwnedBy, &b, &a),
+        )
+        .await;
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/identity/entities/{}/links",
+                a.as_str()
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed: IdentityLinksListResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(parsed.links.len(), 2);
+        let kinds: Vec<&IdentityLinkKind> =
+            parsed.links.iter().map(|l| &l.kind).collect();
+        assert!(kinds.contains(&&IdentityLinkKind::DependsOn));
+        assert!(kinds.contains(&&IdentityLinkKind::OwnedBy));
+    }
+
+    #[tokio::test]
+    async fn list_links_for_entity_tenant_probe_first_blocks_existence_leak() {
+        // LOAD-BEARING: entity-scoped route MUST probe entity
+        // ownership before listing links — otherwise wrong-tenant
+        // entity-id enumeration leaks via link counts.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, _b) = seed_two_entities(&runtime).await;
+        let app = identity_router(runtime.clone());
+        // Probe `a` from a different tenant — entity exists in
+        // TEST_TENANT but not in "tenant_other", so 404
+        // indistinguishable from "id doesn't exist".
+        let response = app
+            .oneshot(empty_get_for_tenant(
+                &format!("/identity/entities/{}/links", a.as_str()),
+                "tenant_other",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn entity_id_with_links_suffix_routes_distinct_handler() {
+        // Sanity pin for route ordering: the trie correctly
+        // selects the longer literal-segment match. Probe both
+        // /identity/entities/:id and /identity/entities/:id/links
+        // and confirm they hit different handlers (responses
+        // have different envelope shapes).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, _b) = seed_two_entities(&runtime).await;
+        let app = identity_router(runtime.clone());
+
+        // Bare :entity_id → IdentityEntityResponse (has "entity").
+        let r = app
+            .clone()
+            .oneshot(empty_get(&format!(
+                "/identity/entities/{}",
+                a.as_str()
+            )))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(r).await).unwrap();
+        assert!(body.get("entity").is_some());
+
+        // :entity_id/links → IdentityLinksListResponse (has "links").
+        let r = app
+            .oneshot(empty_get(&format!(
+                "/identity/entities/{}/links",
+                a.as_str()
+            )))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(r).await).unwrap();
+        assert!(body.get("links").is_some());
     }
 }
