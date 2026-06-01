@@ -306,7 +306,8 @@ impl Projection {
             | EventKind::MicroModelPredictionRecorded { .. }
             | EventKind::MicroModelObservationRecorded { .. }
             | EventKind::CausalCellCreated { .. }
-            | EventKind::IdentityEntityCreated { .. } => Ok(false),
+            | EventKind::IdentityEntityCreated { .. }
+            | EventKind::IdentityLinkCreated { .. } => Ok(false),
         }
     }
 

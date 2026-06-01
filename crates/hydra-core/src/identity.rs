@@ -58,7 +58,10 @@
 //! references that may or may not resolve to one yet.
 
 use crate::event::Value;
-use crate::id::{ActorId, EventId, IdentityEntityId, TenantId};
+use crate::id::{
+    ActorId, CausalCellId, ClaimId, EventId, EvidenceId, IdentityEntityId,
+    IdentityLinkId, TenantId,
+};
 use crate::epistemic::Confidence;
 use crate::trust::TrustFactor;
 use chrono::{DateTime, Utc};
@@ -584,6 +587,266 @@ pub struct SourceTrustAssessment {
     pub entity_sample_size: usize,
     pub evidence_sample_size: usize,
     pub assessed_at: DateTime<Utc>,
+}
+
+// === Patch 37 — IdentityLink vocabulary ============================
+//
+// IdentityLink turns the Identity Graph from a canonical entity
+// REGISTRY into a SEMANTIC RELATIONSHIP GRAPH. An `IdentityLink`
+// is a durable directed assertion that two `IdentityEntity` rows
+// stand in a specific relationship — a Snowflake table that a dbt
+// model `depends_on`, a Looker dashboard that is `downstream_of`
+// a dataset, a service that `owned_by` a team entity, two
+// canonical entities accidentally minted as separate that are in
+// fact `same_as` each other.
+//
+// ## Suggestion-only contract (mirrors P30 / P32 / P33 / P35)
+//
+// **IdentityLink is a DURABLE assertion: once created it becomes
+// Hydra's standing belief, projected into every snapshot and
+// replayed on recovery.**
+//
+// v0 has:
+//
+// - **NO trust verdict over the link itself.** The `confidence`
+//   field is what the link author believes; it is informational
+//   only. Auto-actions MUST gate on a future
+//   `IdentityLinkTrustAssessment` (P38+), NOT on raw confidence.
+//   Mirrors the P30 suggestion-only contract.
+// - **NO automated link inference.** Every link arrives via
+//   explicit `Hydra::create_identity_link` from a caller
+//   responsible for correctness.
+// - **NO update or delete.** Wrong links are corrected by
+//   creating a NEW link with corrected semantics; the wrong link
+//   remains in the audit log forever. This is append-only
+//   assertion, not editable records.
+// - **NO referential integrity** on `evidence_ids`, `claim_ids`,
+//   `cell_ids`. These are opaque audit references; v0 does not
+//   validate that the referenced ids exist.
+// - **NO cycle prevention.** Real-world cycles are legitimate
+//   (mutual `DependsOn` between micro-services; future
+//   Correlation Engine reasons about SCCs).
+// - **NO graph projection.** `IdentityLink` lives in
+//   `IdentityLinkStore` only; not minted as `Edge` in v0 (mirrors
+//   P20 CausalCell + P29 IdentityEntity).
+//
+// `SameAs` is logically symmetric but stored directionally;
+// callers should NOT assume the reverse edge exists. Reverse
+// traversal is a query-side concern.
+//
+// Strict tenant equality applies to `(link, from, to)` — all
+// three must agree, including `None == None`. Tenant mismatches
+// surface as `"unknown identity entity"` to prevent cross-tenant
+// existence enumeration (mirrors P32 indistinguishable-error
+// pattern).
+
+/// Kind of `IdentityLink`. PascalCase wire form via serde default
+/// — matches `IdentityEntityKind` and every other Hydra enum.
+///
+/// The 10 built-in kinds cover the common semantic relationships
+/// observed in data + operational lineage. `Custom(String)` is
+/// the open-ended escape hatch; the label MUST pass
+/// `IdentityLinkKind::validate` (no empty, no reserved sentinels,
+/// no collision with built-in discriminants).
+///
+/// Distinction from `IdentityAlias` (P29): an alias is a label
+/// stored ON an entity (intra-entity, the entity's name in some
+/// source); `SameAs` is a link BETWEEN two distinct canonical
+/// entities (inter-entity, two entities accidentally minted as
+/// separate that represent the same real thing).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IdentityLinkKind {
+    /// Two distinct canonical entities represent the same real
+    /// thing. Logically symmetric but stored directionally —
+    /// callers do NOT get an auto-mirrored reverse edge.
+    SameAs,
+    /// Source entity depends on the target (build-time / runtime
+    /// dependency). e.g., a dbt model `DependsOn` a Snowflake
+    /// table.
+    DependsOn,
+    /// Source entity is downstream of the target in a lineage
+    /// chain. e.g., a Looker dashboard `DownstreamOf` a dbt
+    /// model.
+    DownstreamOf,
+    /// Source entity is owned by the target (team, service
+    /// account, user, organizational unit). e.g., a service
+    /// `OwnedBy` a User/team entity.
+    OwnedBy,
+    /// Source entity is produced by the target (writer
+    /// relationship). e.g., a dataset `ProducedBy` a workflow.
+    ProducedBy,
+    /// Source entity is consumed by the target (reader
+    /// relationship). e.g., a dataset `ConsumedBy` a dashboard.
+    ConsumedBy,
+    /// Source entity is derived from the target (transformation
+    /// / projection / aggregation). e.g., a metric
+    /// `DerivedFrom` a base table.
+    DerivedFrom,
+    /// Source entity was observed in the context of the target
+    /// (telemetry / log / span). e.g., an error `ObservedIn` a
+    /// service.
+    ObservedIn,
+    /// Source entity is part of the target (containment, NOT
+    /// dependency). e.g., a column `PartOf` a table; a service
+    /// `PartOf` a system.
+    PartOf,
+    /// Source entity has a relationship to the target that
+    /// doesn't fit the more specific kinds. Soft fallback —
+    /// prefer a specific kind when one applies.
+    RelatedTo,
+    /// Open-ended escape hatch. Label MUST pass `validate()`:
+    /// non-empty, not a reserved sentinel (`__system__`,
+    /// `__root__`), and not a collision with a built-in
+    /// discriminant.
+    Custom(String),
+}
+
+impl IdentityLinkKind {
+    /// snake_case discriminant string used by `IdentityLinkStore`
+    /// indexes and the `by_pair_kind` dedup key. Mirrors
+    /// `IdentityEntityKind::discriminant`.
+    pub fn discriminant(&self) -> String {
+        match self {
+            Self::SameAs => "same_as".to_string(),
+            Self::DependsOn => "depends_on".to_string(),
+            Self::DownstreamOf => "downstream_of".to_string(),
+            Self::OwnedBy => "owned_by".to_string(),
+            Self::ProducedBy => "produced_by".to_string(),
+            Self::ConsumedBy => "consumed_by".to_string(),
+            Self::DerivedFrom => "derived_from".to_string(),
+            Self::ObservedIn => "observed_in".to_string(),
+            Self::PartOf => "part_of".to_string(),
+            Self::RelatedTo => "related_to".to_string(),
+            Self::Custom(label) => label.clone(),
+        }
+    }
+
+    /// Validate that this kind is well-formed. `Custom(label)`
+    /// must NOT:
+    ///
+    /// - be empty
+    /// - collide with reserved sentinels (`__system__`,
+    ///   `__root__`) — these are used as None-tenant sentinels
+    ///   in alias / canonical / pair-kind index keys
+    /// - collide with a built-in discriminant (`Custom("same_as")`
+    ///   would otherwise dedup-collide with `SameAs` in
+    ///   `by_pair_kind`)
+    ///
+    /// Built-in variants always pass.
+    ///
+    /// **LOAD-BEARING note for future maintainers**:
+    /// `IdentityEntityKind::Custom` and `CausalCellKind::Custom`
+    /// do NOT yet enforce these rules — a pre-existing gap. P37
+    /// does NOT inherit that gap.
+    pub fn validate(&self) -> Result<(), String> {
+        let Self::Custom(label) = self else {
+            return Ok(());
+        };
+        if label.is_empty() {
+            return Err(
+                "custom link kind label cannot be empty".to_string()
+            );
+        }
+        if label == "__system__" || label == "__root__" {
+            return Err(format!(
+                "custom link kind label collides with reserved \
+                 sentinel: {label}"
+            ));
+        }
+        // Reject collision with any built-in discriminant. Otherwise
+        // `Custom("same_as")` would silently dedup against
+        // `SameAs` in the `by_pair_kind` index — caller would
+        // expect their custom kind to be a distinct edge type.
+        const BUILTIN_DISCRIMINANTS: &[&str] = &[
+            "same_as",
+            "depends_on",
+            "downstream_of",
+            "owned_by",
+            "produced_by",
+            "consumed_by",
+            "derived_from",
+            "observed_in",
+            "part_of",
+            "related_to",
+        ];
+        if BUILTIN_DISCRIMINANTS.contains(&label.as_str()) {
+            return Err(format!(
+                "custom link kind label '{label}' collides with \
+                 built-in discriminant"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A durable directed assertion that two `IdentityEntity` rows
+/// have a semantic relationship of a given kind. v0 has no trust
+/// verdict over the link; `confidence` is author-asserted and
+/// informational only. See the module-level banner for the full
+/// suggestion-only contract.
+///
+/// ## Field semantics
+///
+/// - `id` — opaque `IdentityLinkId` with prefix `idl_`.
+/// - `tenant_id` — strict tenant equality with `from_entity_id`
+///   and `to_entity_id` (including `None == None`). Mismatches
+///   surface as `"unknown identity entity: {id}"` to prevent
+///   cross-tenant existence enumeration.
+/// - `kind` — relationship type. Must pass
+///   `IdentityLinkKind::validate` at create time.
+/// - `from_entity_id` / `to_entity_id` — must reference existing
+///   entities in `IdentityStore`. Self-links (`from == to`)
+///   rejected at create time, even for `SameAs`.
+/// - `confidence` — author-asserted belief in this link.
+///   **Informational in v0** — NOT a trust verdict; auto-actions
+///   MUST gate on a future `IdentityLinkTrustAssessment`.
+/// - `evidence_ids` / `claim_ids` / `cell_ids` — opaque audit
+///   references. v0 does NOT validate that the referenced ids
+///   exist; they're stored verbatim for the audit trail.
+/// - `metadata` — free-form bag. Convention: keys with prefix
+///   `_hydra_` are reserved for future engine use (NOT enforced
+///   in v0).
+/// - `created_by` / `created_at` / `caused_by` — standard audit
+///   trail mirroring P29's `IdentityEntity`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdentityLink {
+    pub id: IdentityLinkId,
+    pub tenant_id: Option<TenantId>,
+    pub kind: IdentityLinkKind,
+    pub from_entity_id: IdentityEntityId,
+    pub to_entity_id: IdentityEntityId,
+    pub confidence: Confidence,
+    pub evidence_ids: Vec<EvidenceId>,
+    pub claim_ids: Vec<ClaimId>,
+    pub cell_ids: Vec<CausalCellId>,
+    pub metadata: HashMap<String, Value>,
+    pub created_by: ActorId,
+    pub created_at: DateTime<Utc>,
+    pub caused_by: Option<EventId>,
+}
+
+impl IdentityLink {
+    /// Validate that the link is structurally well-formed.
+    /// Tenant equality + entity existence are checked at the
+    /// `IdentityLinkStore::create_link` boundary because they
+    /// require store context.
+    ///
+    /// Rejects:
+    ///
+    /// - self-links (`from_entity_id == to_entity_id`), even
+    ///   for `SameAs` — a self-`SameAs` is meaningless
+    /// - invalid `kind` (empty `Custom`, sentinel `Custom`,
+    ///   built-in-collision `Custom`)
+    pub fn validate(&self) -> Result<(), String> {
+        self.kind.validate()?;
+        if self.from_entity_id == self.to_entity_id {
+            return Err(format!(
+                "self-link rejected: from == to == {}",
+                self.from_entity_id
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1120,5 +1383,202 @@ mod tests {
             a.level = crate::trust::TrustAssessment::level_for_score(score);
             assert_eq!(a.level, expected, "score = {score}");
         }
+    }
+
+    // === Patch 37 — IdentityLink vocabulary tests ===
+
+    #[test]
+    fn identity_link_id_uses_idl_prefix() {
+        let id = IdentityLinkId::new();
+        assert!(
+            id.as_str().starts_with("idl_"),
+            "expected idl_ prefix, got {}",
+            id.as_str()
+        );
+    }
+
+    #[test]
+    fn identity_link_kind_serializes_pascal_case() {
+        // Wire form: built-in variants serialize as bare
+        // PascalCase strings; `Custom(label)` serializes as the
+        // externally-tagged dict `{"Custom": "label"}`. Mirrors
+        // IdentityEntityKind exactly. Pinned so a future
+        // `#[serde(rename_all)]` change doesn't silently break
+        // the wire contract.
+        assert_eq!(
+            serde_json::to_string(&IdentityLinkKind::SameAs).unwrap(),
+            "\"SameAs\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IdentityLinkKind::DependsOn).unwrap(),
+            "\"DependsOn\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IdentityLinkKind::PartOf).unwrap(),
+            "\"PartOf\""
+        );
+        let custom = IdentityLinkKind::Custom("uses_metric".to_string());
+        let json = serde_json::to_string(&custom).unwrap();
+        assert_eq!(json, "{\"Custom\":\"uses_metric\"}");
+        let parsed: IdentityLinkKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, custom);
+    }
+
+    #[test]
+    fn identity_link_kind_discriminant_returns_snake_case() {
+        // All 10 built-ins return snake_case; Custom returns its
+        // label verbatim (used by IdentityLinkStore's by_kind +
+        // by_pair_kind indexes).
+        assert_eq!(IdentityLinkKind::SameAs.discriminant(), "same_as");
+        assert_eq!(IdentityLinkKind::DependsOn.discriminant(), "depends_on");
+        assert_eq!(
+            IdentityLinkKind::DownstreamOf.discriminant(),
+            "downstream_of"
+        );
+        assert_eq!(IdentityLinkKind::OwnedBy.discriminant(), "owned_by");
+        assert_eq!(
+            IdentityLinkKind::ProducedBy.discriminant(),
+            "produced_by"
+        );
+        assert_eq!(
+            IdentityLinkKind::ConsumedBy.discriminant(),
+            "consumed_by"
+        );
+        assert_eq!(
+            IdentityLinkKind::DerivedFrom.discriminant(),
+            "derived_from"
+        );
+        assert_eq!(
+            IdentityLinkKind::ObservedIn.discriminant(),
+            "observed_in"
+        );
+        assert_eq!(IdentityLinkKind::PartOf.discriminant(), "part_of");
+        assert_eq!(IdentityLinkKind::RelatedTo.discriminant(), "related_to");
+        assert_eq!(
+            IdentityLinkKind::Custom("uses_metric".to_string()).discriminant(),
+            "uses_metric"
+        );
+    }
+
+    #[test]
+    fn identity_link_kind_custom_rejects_sentinel_label() {
+        // LOAD-BEARING — IdentityEntityKind::Custom and
+        // CausalCellKind::Custom do NOT validate against
+        // sentinels today; P37 must NOT inherit that gap.
+        assert!(
+            IdentityLinkKind::Custom("".to_string()).validate().is_err(),
+            "empty Custom label must be rejected"
+        );
+        assert!(
+            IdentityLinkKind::Custom("__system__".to_string())
+                .validate()
+                .is_err(),
+            "sentinel __system__ must be rejected"
+        );
+        assert!(
+            IdentityLinkKind::Custom("__root__".to_string())
+                .validate()
+                .is_err(),
+            "sentinel __root__ must be rejected"
+        );
+        // Built-ins always pass validate.
+        assert!(IdentityLinkKind::SameAs.validate().is_ok());
+        assert!(IdentityLinkKind::DependsOn.validate().is_ok());
+        // Well-formed Custom passes.
+        assert!(
+            IdentityLinkKind::Custom("uses_metric".to_string())
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn identity_link_kind_custom_rejects_builtin_collision() {
+        // LOAD-BEARING — Custom("same_as") would dedup-collide
+        // with SameAs in IdentityLinkStore's by_pair_kind index.
+        // Reject all 10 built-in discriminants explicitly.
+        for collision in [
+            "same_as",
+            "depends_on",
+            "downstream_of",
+            "owned_by",
+            "produced_by",
+            "consumed_by",
+            "derived_from",
+            "observed_in",
+            "part_of",
+            "related_to",
+        ] {
+            let result =
+                IdentityLinkKind::Custom(collision.to_string()).validate();
+            assert!(
+                result.is_err(),
+                "Custom('{collision}') must be rejected as built-in \
+                 discriminant collision; got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_link_validate_rejects_self_link() {
+        // Self-links (from == to) are meaningless even for
+        // SameAs — rejected at the type level.
+        let entity_id = IdentityEntityId::from_str("ide_alone");
+        let link = IdentityLink {
+            id: IdentityLinkId::new(),
+            tenant_id: None,
+            kind: IdentityLinkKind::SameAs,
+            from_entity_id: entity_id.clone(),
+            to_entity_id: entity_id,
+            confidence: crate::epistemic::Confidence::new(0.9),
+            evidence_ids: vec![],
+            claim_ids: vec![],
+            cell_ids: vec![],
+            metadata: HashMap::new(),
+            created_by: crate::id::ActorId::from_str("actor_ops"),
+            created_at: Utc::now(),
+            caused_by: None,
+        };
+        let err = link.validate().unwrap_err();
+        assert!(
+            err.contains("self-link rejected"),
+            "expected self-link rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_link_serde_round_trip() {
+        // Full envelope must round-trip through serde. Wire
+        // contract pin for P38 wire surface.
+        let link = IdentityLink {
+            id: IdentityLinkId::from_str("idl_xyz"),
+            tenant_id: Some(crate::id::TenantId::from_str("tenant_test")),
+            kind: IdentityLinkKind::DependsOn,
+            from_entity_id: IdentityEntityId::from_str("ide_a"),
+            to_entity_id: IdentityEntityId::from_str("ide_b"),
+            confidence: crate::epistemic::Confidence::new(0.85),
+            evidence_ids: vec![crate::id::EvidenceId::from_str("evd_1")],
+            claim_ids: vec![crate::id::ClaimId::from_str("claim_1")],
+            cell_ids: vec![crate::id::CausalCellId::from_str("cell_1")],
+            metadata: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "source".to_string(),
+                    crate::event::Value::String("dbt_manifest".to_string()),
+                );
+                m
+            },
+            created_by: crate::id::ActorId::from_str("actor_ops"),
+            created_at: chrono::DateTime::parse_from_rfc3339(
+                "2026-06-01T12:00:00Z",
+            )
+            .unwrap()
+            .with_timezone(&Utc),
+            caused_by: None,
+        };
+        let json = serde_json::to_string(&link).unwrap();
+        assert!(json.contains("\"kind\":\"DependsOn\""));
+        let restored: IdentityLink = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, link);
     }
 }

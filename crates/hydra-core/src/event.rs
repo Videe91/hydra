@@ -338,6 +338,16 @@ pub enum EventKind {
     IdentityEntityCreated {
         entity: crate::identity::IdentityEntity,
     },
+
+    // Identity Graph relationships (Patch 37 — vocabulary only).
+    // One event variant: IdentityLinks are immutable once
+    // created in v0. Wrong links are corrected by creating a NEW
+    // link; the wrong link remains in the audit log forever.
+    // No update / delete / accept-semantic-match yet — those
+    // land in P38+.
+    IdentityLinkCreated {
+        link: crate::identity::IdentityLink,
+    },
 }
 
 impl EventKind {
@@ -402,7 +412,8 @@ impl EventKind {
             | EventKind::MicroModelPredictionRecorded { .. }
             | EventKind::MicroModelObservationRecorded { .. }
             | EventKind::CausalCellCreated { .. }
-            | EventKind::IdentityEntityCreated { .. } => None,
+            | EventKind::IdentityEntityCreated { .. }
+            | EventKind::IdentityLinkCreated { .. } => None,
         }
     }
 
@@ -464,6 +475,7 @@ impl EventKind {
             EventKind::MicroModelObservationRecorded { .. } => "micro_model_observation_recorded",
             EventKind::CausalCellCreated { .. } => "causal_cell_created",
             EventKind::IdentityEntityCreated { .. } => "identity_entity_created",
+            EventKind::IdentityLinkCreated { .. } => "identity_link_created",
         }
     }
 }
@@ -731,6 +743,43 @@ mod tests {
         };
         assert_eq!(kind.kind_name(), "identity_entity_created");
         // Identity events have no target node (mirrors CausalCellCreated).
+        assert!(kind.target_node().is_none());
+    }
+
+    #[test]
+    fn identity_link_created_event_kind_name_is_snake_case() {
+        // Patch 37 — the new variant must produce a snake_case
+        // name like every other EventKind. Same shape as
+        // identity_entity_created. Pinned so a future refactor
+        // doesn't accidentally drift naming.
+        use crate::identity::{IdentityLink, IdentityLinkKind};
+        use crate::epistemic::Confidence;
+        use chrono::Utc;
+        let kind = EventKind::IdentityLinkCreated {
+            link: IdentityLink {
+                id: crate::id::IdentityLinkId::new(),
+                tenant_id: None,
+                kind: IdentityLinkKind::DependsOn,
+                from_entity_id: crate::id::IdentityEntityId::from_str(
+                    "ide_a",
+                ),
+                to_entity_id: crate::id::IdentityEntityId::from_str(
+                    "ide_b",
+                ),
+                confidence: Confidence::new(0.9),
+                evidence_ids: vec![],
+                claim_ids: vec![],
+                cell_ids: vec![],
+                metadata: HashMap::new(),
+                created_by: crate::id::ActorId::from_str("actor_ops"),
+                created_at: Utc::now(),
+                caused_by: None,
+            },
+        };
+        assert_eq!(kind.kind_name(), "identity_link_created");
+        // Link events have no target node (mirrors IdentityEntityCreated
+        // and CausalCellCreated — they live in their own stores,
+        // not the graph projection).
         assert!(kind.target_node().is_none());
     }
 

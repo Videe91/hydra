@@ -11,6 +11,7 @@ use crate::sensor_checkpoint_store::SensorCheckpointStore;
 use crate::replication_store::ReplicationStore;
 use crate::causal_cell_store::CausalCellStore;
 use crate::identity_store::IdentityStore;
+use crate::identity_link_store::IdentityLinkStore;
 use crate::action_store::ActionStore;
 use crate::epistemic_store::EpistemicStore;
 use crate::event_log::EventLog;
@@ -167,6 +168,16 @@ pub struct Hydra {
     /// auto-populated. Future patches (P30+) layer matching,
     /// links, and correlation on top of this primitive.
     identity_store: IdentityStore,
+    /// Patch 37 — Identity Graph relationship store. Holds
+    /// durable directed `IdentityLink`s between entities
+    /// (same_as, depends_on, downstream_of, owned_by, ...).
+    /// Same passive-store pattern as `identity_store`: built
+    /// from the event log, restored from snapshot bodies, no
+    /// auto-link inference (every link arrives via explicit
+    /// `Hydra::create_identity_link`). v0 is append-only — no
+    /// update or delete; wrong links are corrected by creating
+    /// new links.
+    identity_link_store: IdentityLinkStore,
     /// MicroModel Patch 2 — built-in `CommitRateAnomalyModel`.
     /// Transient by design (cold restart re-enters WarmingUp).
     /// `None` until the first call to `evaluate_commit_rate_anomaly`,
@@ -309,6 +320,7 @@ impl Hydra {
             micromodel_store: MicroModelStore::new(),
             causal_cell_store: CausalCellStore::new(),
             identity_store: IdentityStore::new(),
+            identity_link_store: IdentityLinkStore::new(),
             commit_rate_anomaly_model: None,
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
@@ -361,6 +373,7 @@ impl Hydra {
             micromodel_store: MicroModelStore::new(),
             causal_cell_store: CausalCellStore::new(),
             identity_store: IdentityStore::new(),
+            identity_link_store: IdentityLinkStore::new(),
             commit_rate_anomaly_model: None,
             schema_validator: SchemaValidator::new(),
             schema_gate: SchemaGate::disabled(),
@@ -747,6 +760,7 @@ impl Hydra {
         self.micromodel_store.apply_event(event)?;
         self.causal_cell_store.apply_event(event)?;
         self.identity_store.apply_event(event)?;
+        self.identity_link_store.apply_event(event)?;
         Ok(())
     }
 
@@ -935,6 +949,7 @@ impl Hydra {
         self.micromodel_store = MicroModelStore::new();
         self.causal_cell_store = CausalCellStore::new();
         self.identity_store = IdentityStore::new();
+        self.identity_link_store = IdentityLinkStore::new();
         // MicroModel Patch 2 — transient by design; cold restart
         // re-enters WarmingUp on the next evaluation.
         self.commit_rate_anomaly_model = None;
@@ -2447,6 +2462,103 @@ impl Hydra {
         &self,
     ) -> impl Iterator<Item = &hydra_core::IdentityEntity> {
         self.identity_store.all_entities()
+    }
+
+    /// Patch 37 — create an `IdentityLink` between two existing
+    /// `IdentityEntity`s.
+    ///
+    /// **LOAD-BEARING ordering**: validation happens at the store
+    /// FIRST, then the `IdentityLinkCreated` event is ingested
+    /// ONLY on success. On any rejection — self-link, invalid
+    /// kind, unknown entity, tenant mismatch, duplicate pair+kind
+    /// — the audit log stays UNTOUCHED. Mirrors the
+    /// `create_identity_entity` (P29) pattern exactly.
+    ///
+    /// ## Errors
+    ///
+    /// All failures return `QueryError`:
+    ///
+    /// - self-link rejected (from == to, even for `SameAs`)
+    /// - invalid `Custom` link kind (empty / sentinel / collides
+    ///   with built-in discriminant)
+    /// - unknown `from_entity_id` OR unknown `to_entity_id`
+    /// - tenant mismatch — `link.tenant_id`, `from.tenant_id`,
+    ///   `to.tenant_id` must all agree (including `None == None`).
+    ///   Surfaces as `"unknown identity entity: {id}"` (same
+    ///   error as a genuine miss) to prevent cross-tenant
+    ///   existence enumeration.
+    /// - duplicate `(tenant, from, to, kind.discriminant())`
+    ///
+    /// ## Suggestion-only contract
+    ///
+    /// `IdentityLink` is a DURABLE assertion. v0 has NO trust
+    /// verdict over the link; `confidence` is informational only.
+    /// Auto-actions MUST gate on a future
+    /// `IdentityLinkTrustAssessment` (P38+), NOT on raw
+    /// confidence. See the module-level banner in
+    /// `hydra-core/src/identity.rs` for the full contract.
+    pub fn create_identity_link(
+        &mut self,
+        link: hydra_core::IdentityLink,
+    ) -> hydra_core::error::Result<hydra_core::IdentityLink> {
+        let stored = self
+            .identity_link_store
+            .create_link(link.clone(), &self.identity_store)?;
+        self.ingest(hydra_core::EventKind::IdentityLinkCreated {
+            link: stored.clone(),
+        })?;
+        Ok(stored)
+    }
+
+    /// Look up one identity link by id.
+    pub fn identity_link(
+        &self,
+        id: &hydra_core::IdentityLinkId,
+    ) -> Option<&hydra_core::IdentityLink> {
+        self.identity_link_store.link(id)
+    }
+
+    /// All outgoing identity links from the given entity.
+    pub fn identity_links_from(
+        &self,
+        entity_id: &hydra_core::IdentityEntityId,
+    ) -> Vec<&hydra_core::IdentityLink> {
+        self.identity_link_store.links_from(entity_id)
+    }
+
+    /// All incoming identity links to the given entity.
+    pub fn identity_links_to(
+        &self,
+        entity_id: &hydra_core::IdentityEntityId,
+    ) -> Vec<&hydra_core::IdentityLink> {
+        self.identity_link_store.links_to(entity_id)
+    }
+
+    /// All identity links touching the given entity in either
+    /// direction (incoming + outgoing). Deduplicated internally.
+    pub fn identity_links_for_entity(
+        &self,
+        entity_id: &hydra_core::IdentityEntityId,
+    ) -> Vec<&hydra_core::IdentityLink> {
+        self.identity_link_store.links_for_entity(entity_id)
+    }
+
+    /// All identity links of the given kind. Returns
+    /// `Vec<&IdentityLink>` so callers don't need
+    /// `.into_iter()`.
+    pub fn identity_links_by_kind(
+        &self,
+        kind: &hydra_core::IdentityLinkKind,
+    ) -> Vec<&hydra_core::IdentityLink> {
+        self.identity_link_store.links_with_kind(kind)
+    }
+
+    /// All identity links (unordered). Used by snapshot assembly
+    /// and tests.
+    pub fn identity_links(
+        &self,
+    ) -> impl Iterator<Item = &hydra_core::IdentityLink> {
+        self.identity_link_store.all_links()
     }
 
     /// Patch 30 — Semantic Identity Resolution v1.
@@ -7615,8 +7727,15 @@ impl Hydra {
             .all_entities()
             .cloned()
             .collect::<Vec<_>>();
+        // Patch 37 — Identity Graph relationships into the snapshot.
+        let identity_links = self
+            .identity_link_store
+            .all_links()
+            .cloned()
+            .collect::<Vec<_>>();
         let manifest = manifest
-            .with_identity_entity_count(identity_entities.len());
+            .with_identity_entity_count(identity_entities.len())
+            .with_identity_link_count(identity_links.len());
 
         let body = hydra_core::SnapshotBody {
             manifest: manifest.clone(),
@@ -7641,6 +7760,7 @@ impl Hydra {
             micro_model_observations,
             causal_cells,
             identity_entities,
+            identity_links,
             metadata: std::collections::HashMap::new(),
         };
         // Persist to the backend FIRST so a backend failure aborts the
@@ -19658,6 +19778,257 @@ mod sprint1_tests {
             )
             .unwrap();
         assert_eq!(resolved.id, id);
+    }
+
+    // === Patch 37 — IdentityLink integration tests ===
+
+    /// Build two entities under the same tenant, create them in
+    /// `hydra`, and return their ids. Mirrors the P29 test
+    /// helper pattern but exposes `(a, b)` rather than only `a`.
+    fn p37_seed_entity_pair(
+        hydra: &mut Hydra,
+        tenant: Option<hydra_core::TenantId>,
+    ) -> (hydra_core::IdentityEntityId, hydra_core::IdentityEntityId) {
+        let a = make_identity_entity(
+            tenant.clone(),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/p37_a",
+            vec![snowflake_alias("analytics", "p37_a")],
+        );
+        let mut b = make_identity_entity(
+            tenant,
+            hydra_core::IdentityEntityKind::Service,
+            "service/p37_b",
+            vec![snowflake_alias("ops", "p37_b")],
+        );
+        // Make `b`'s alias triple distinct from `a`'s so P29's
+        // alias-uniqueness check is satisfied.
+        b.aliases[0].namespace = Some("ops".to_string());
+        b.aliases[0].normalized = "ops.p37_b".to_string();
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        hydra.create_identity_entity(a).unwrap();
+        hydra.create_identity_entity(b).unwrap();
+        (a_id, b_id)
+    }
+
+    fn p37_make_link(
+        tenant: Option<hydra_core::TenantId>,
+        kind: hydra_core::IdentityLinkKind,
+        from: &hydra_core::IdentityEntityId,
+        to: &hydra_core::IdentityEntityId,
+    ) -> hydra_core::IdentityLink {
+        let now = chrono::Utc::now();
+        hydra_core::IdentityLink {
+            id: hydra_core::IdentityLinkId::new(),
+            tenant_id: tenant,
+            kind,
+            from_entity_id: from.clone(),
+            to_entity_id: to.clone(),
+            confidence: hydra_core::Confidence::new(0.9),
+            evidence_ids: vec![],
+            claim_ids: vec![],
+            cell_ids: vec![],
+            metadata: std::collections::HashMap::new(),
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: now,
+            caused_by: None,
+        }
+    }
+
+    #[test]
+    fn create_identity_link_ingests_event_and_indexes() {
+        // Happy path: link lands in the store AND an
+        // IdentityLinkCreated event lands in the audit log. From-
+        // and to-side accessors both surface the link.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p37");
+        let (a, b) = p37_seed_entity_pair(&mut hydra, Some(tenant.clone()));
+        let link = p37_make_link(
+            Some(tenant),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+        );
+        let link_id = link.id.clone();
+        let stored = hydra.create_identity_link(link).unwrap();
+        assert_eq!(stored.id, link_id);
+        assert_eq!(hydra.identity_link(&link_id).map(|l| &l.id), Some(&link_id));
+        assert_eq!(hydra.identity_links_from(&a).len(), 1);
+        assert_eq!(hydra.identity_links_to(&b).len(), 1);
+        // IdentityLinkCreated event landed in the audit log.
+        let found = hydra.events().iter().any(|e| {
+            matches!(
+                &e.kind,
+                hydra_core::EventKind::IdentityLinkCreated { .. }
+            )
+        });
+        assert!(found, "audit log missing IdentityLinkCreated event");
+    }
+
+    #[test]
+    fn create_identity_link_duplicate_pair_kind_via_hydra() {
+        // LOAD-BEARING — duplicate-pair-kind check fires AT the
+        // Hydra method (not just at the store), AND on rejection
+        // no event is ingested — the audit log stays clean.
+        // Mirrors P29 `create_identity_entity_duplicate_canonical_key_via_hydra`.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p37");
+        let (a, b) = p37_seed_entity_pair(&mut hydra, Some(tenant.clone()));
+        hydra
+            .create_identity_link(p37_make_link(
+                Some(tenant.clone()),
+                hydra_core::IdentityLinkKind::DependsOn,
+                &a,
+                &b,
+            ))
+            .unwrap();
+        let pre_count = hydra
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    hydra_core::EventKind::IdentityLinkCreated { .. }
+                )
+            })
+            .count();
+        let result = hydra.create_identity_link(p37_make_link(
+            Some(tenant),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+        ));
+        assert!(result.is_err(), "expected duplicate-pair-kind error");
+        // Audit log unchanged — store rejection happens BEFORE
+        // event ingestion in `create_identity_link`.
+        assert_eq!(
+            hydra
+                .events()
+                .iter()
+                .filter(|e| matches!(
+                    &e.kind,
+                    hydra_core::EventKind::IdentityLinkCreated { .. }
+                ))
+                .count(),
+            pre_count,
+            "audit log must NOT grow on duplicate-pair-kind rejection"
+        );
+    }
+
+    #[test]
+    fn v0_allows_cycles_sameas_a_to_b_and_b_to_a() {
+        // Cycle prevention is explicitly OUT OF SCOPE in v0.
+        // SameAs is logically symmetric but stored directionally,
+        // so both edges can coexist — pinning this prevents a
+        // future patch from silently enforcing acyclicity without
+        // an explicit design decision.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p37");
+        let (a, b) = p37_seed_entity_pair(&mut hydra, Some(tenant.clone()));
+        hydra
+            .create_identity_link(p37_make_link(
+                Some(tenant.clone()),
+                hydra_core::IdentityLinkKind::SameAs,
+                &a,
+                &b,
+            ))
+            .unwrap();
+        // Reverse direction — same pair, same kind, distinct
+        // entry per the duplicate-prevention key (which is
+        // directional).
+        hydra
+            .create_identity_link(p37_make_link(
+                Some(tenant),
+                hydra_core::IdentityLinkKind::SameAs,
+                &b,
+                &a,
+            ))
+            .unwrap();
+        assert_eq!(hydra.identity_links_for_entity(&a).len(), 2);
+        assert_eq!(hydra.identity_links_for_entity(&b).len(), 2);
+    }
+
+    #[test]
+    fn recover_from_events_rebuilds_identity_link_store() {
+        // Replay round-trip rebuilds the link store including
+        // all 6 indexes. Mirrors the P29 entity-store rebuild
+        // pin.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p37");
+        let (a, b) = p37_seed_entity_pair(&mut hydra, Some(tenant.clone()));
+        let link = p37_make_link(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+        );
+        let link_id = link.id.clone();
+        hydra.create_identity_link(link).unwrap();
+
+        // Capture the full event sequence and replay into a
+        // fresh engine.
+        let events: Vec<hydra_core::Event> =
+            hydra.events().iter().map(|e| (*e).clone()).collect();
+        let mut fresh = Hydra::new();
+        fresh.recover_from_events(events).unwrap();
+        // Link surfaces via every accessor post-replay.
+        assert!(fresh.identity_link(&link_id).is_some());
+        assert_eq!(fresh.identity_links_from(&a).len(), 1);
+        assert_eq!(fresh.identity_links_to(&b).len(), 1);
+        assert_eq!(
+            fresh
+                .identity_links_by_kind(
+                    &hydra_core::IdentityLinkKind::DependsOn,
+                )
+                .len(),
+            1
+        );
+        assert_eq!(fresh.identity_links_for_entity(&a).len(), 1);
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_identity_links() {
+        // Snapshot manifest count + body's identity_links vec
+        // round-trip, and post-restore the link store sees the
+        // links (via event replay). Mirrors the P29 entity
+        // snapshot-restore pin.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p37");
+        let (a, b) = p37_seed_entity_pair(&mut hydra, Some(tenant.clone()));
+        let link = p37_make_link(
+            Some(tenant),
+            hydra_core::IdentityLinkKind::OwnedBy,
+            &a,
+            &b,
+        );
+        let link_id = link.id.clone();
+        hydra.create_identity_link(link).unwrap();
+
+        let manifest = hydra
+            .snapshot(hydra_core::ActorId::from_str("actor_ops"))
+            .unwrap();
+        assert_eq!(manifest.total_identity_links, 1);
+        let body = hydra
+            .snapshot_store()
+            .body(&manifest.id)
+            .expect("snapshot body present")
+            .clone();
+        assert_eq!(body.identity_links.len(), 1);
+        assert_eq!(body.identity_links[0].id, link_id);
+
+        // Restore into a fresh engine via event replay.
+        let mut fresh = Hydra::new();
+        fresh.recover_from_events(body.events.clone()).unwrap();
+        let restored = fresh
+            .identity_link(&link_id)
+            .expect("link restored");
+        assert_eq!(
+            restored.kind,
+            hydra_core::IdentityLinkKind::OwnedBy
+        );
+        assert_eq!(restored.from_entity_id, a);
+        assert_eq!(restored.to_entity_id, b);
     }
 
     // === Patch 30 — Semantic Identity Resolution v1 ===

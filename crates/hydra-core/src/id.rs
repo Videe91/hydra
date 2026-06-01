@@ -214,6 +214,15 @@ define_id!(CausalCellId, "cell");
 // `cell`, `mm`).
 define_id!(IdentityEntityId, "ide");
 
+// Patch 37 — IdentityLink vocabulary. An IdentityLink is a
+// durable directed assertion that two IdentityEntities have a
+// semantic relationship (same_as, depends_on, downstream_of,
+// owned_by, ...). Prefix `idl` groups with `ide` under the
+// `id*` family so operators reading logs can immediately tell
+// link records (`idl_*`) apart from entity records (`ide_*`)
+// without parsing further.
+define_id!(IdentityLinkId, "idl");
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -427,7 +427,8 @@ impl TemporalIndex {
             | EventKind::MicroModelPredictionRecorded { .. }
             | EventKind::MicroModelObservationRecorded { .. }
             | EventKind::CausalCellCreated { .. }
-            | EventKind::IdentityEntityCreated { .. } => false,
+            | EventKind::IdentityEntityCreated { .. }
+            | EventKind::IdentityLinkCreated { .. } => false,
         }
     }
 

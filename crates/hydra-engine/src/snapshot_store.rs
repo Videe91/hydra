@@ -158,6 +158,7 @@ mod tests {
             micro_model_observations: vec![],
             causal_cells: vec![],
             identity_entities: vec![],
+            identity_links: vec![],
             metadata: HashMap::new(),
         }
     }
