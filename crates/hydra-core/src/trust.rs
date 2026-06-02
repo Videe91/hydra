@@ -131,6 +131,38 @@ impl TrustAssessment {
 /// an explicit decision rather than silent loosening.
 pub const ACCEPT_MATCH_SCORE_FLOOR: f64 = 0.80;
 
+/// Patch 45 — pinned floor for auto-actions on correlation candidates.
+///
+/// Equals the current `TrustLevel::High` / `CorrelationStrength::Strong`
+/// threshold (0.80), but **defined as a separate constant** so future
+/// trust recalibration cannot silently lower the gate at which an
+/// agent is allowed to act on a `CorrelationCandidate`. The future
+/// auto-action workflow MUST compose
+/// `trust.level == TrustLevel::High AND trust.score >= ACCEPT_CORRELATION_FLOOR`
+/// rather than relying on the band threshold alone.
+///
+/// Mirrors `ACCEPT_MATCH_SCORE_FLOOR` (Patch 41) — the same belt-
+/// and-suspenders pattern. Pinned by
+/// `accept_correlation_floor_is_eighty` in `hydra-core::trust::tests`.
+pub const ACCEPT_CORRELATION_FLOOR: f64 = 0.80;
+
+/// Patch 45 — pairwise `observed_at` delta gate for the
+/// `CorrelationReasonKind::TimeProximity` reason.
+///
+/// Default: 15 minutes (900 seconds). Wide enough to span typical
+/// ETL-fail → dashboard-alert chains, tight enough to avoid spurious
+/// co-occurrence between unrelated streams. The
+/// `assess_correlation_candidate` engine method fires the
+/// `TimeProximity` factor only when SOME pair of supplied signals
+/// both carry `observed_at == Some(_)` AND their delta in seconds is
+/// `<= CORRELATION_TIME_PROXIMITY_WINDOW_SECS`.
+///
+/// Pinned by `correlation_time_proximity_window_is_nine_hundred` in
+/// `hydra-core::trust::tests`. A future patch may want to make this
+/// per-tenant configurable — that requires an explicit amendment, not
+/// a silent recalibration.
+pub const CORRELATION_TIME_PROXIMITY_WINDOW_SECS: u64 = 900;
+
 // === Patch 23 — CausalCell trust folding ===========================
 //
 // Cell trust is structurally different from claim trust: it walks
@@ -413,5 +445,39 @@ mod tests {
         assert_eq!(l, "\"Low\"");
         let u = serde_json::to_string(&TrustLevel::Unknown).unwrap();
         assert_eq!(u, "\"Unknown\"");
+    }
+
+    #[test]
+    fn accept_correlation_floor_is_eighty() {
+        // LOAD-BEARING pin: Patch 45's auto-action gate floor must
+        // equal the `TrustLevel::High` band threshold (0.80) AND must
+        // sit inside the `High` bucket — drift of either side without
+        // an explicit amendment is forbidden. Mirrors the P41
+        // `ACCEPT_MATCH_SCORE_FLOOR` discipline.
+        assert_eq!(ACCEPT_CORRELATION_FLOOR, 0.80);
+        assert_eq!(
+            TrustAssessment::level_for_score(ACCEPT_CORRELATION_FLOOR),
+            TrustLevel::High
+        );
+        // Just below the floor must NOT clear High — proves the
+        // gate-band relationship is `score >= floor`, not `score >
+        // floor`.
+        assert_eq!(
+            TrustAssessment::level_for_score(ACCEPT_CORRELATION_FLOOR - 0.0001),
+            TrustLevel::Medium
+        );
+    }
+
+    #[test]
+    fn correlation_time_proximity_window_is_nine_hundred() {
+        // LOAD-BEARING pin: Patch 45's `TimeProximity` reason fires
+        // for signal pairs within 900s (15min). A silent widening
+        // would make unrelated streams appear correlated; a silent
+        // tightening would suppress legitimate ETL → alert chains.
+        // Either drift requires a deliberate amendment.
+        assert_eq!(CORRELATION_TIME_PROXIMITY_WINDOW_SECS, 900);
+        // 15 minutes spelled in seconds — guards against a future
+        // accidental unit change (e.g., minutes vs. seconds).
+        assert_eq!(CORRELATION_TIME_PROXIMITY_WINDOW_SECS, 15 * 60);
     }
 }

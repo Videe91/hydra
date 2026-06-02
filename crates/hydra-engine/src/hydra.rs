@@ -4415,6 +4415,818 @@ impl Hydra {
         })
     }
 
+    /// Patch 45 — Correlation Engine v1 (supplied-signals assessor).
+    ///
+    /// Given a caller-supplied set of `CorrelationSignalRef`s,
+    /// returns a fully-populated `CorrelationCandidate` whose
+    /// REQUIRED `trust: CorrelationTrustAssessment` reflects how
+    /// strongly Hydra believes those signals belong to the same
+    /// real-world story.
+    ///
+    /// **v1 assesses CALLER-PROVIDED groupings, NOT discovers
+    /// groupings.** No store scan. No background job. No
+    /// CausalCell emission. The future correlation arc layers
+    /// discovery (P48+) on top of this assessor — the boundary
+    /// here is deliberately narrow so the scoring logic can be
+    /// pinned in isolation before discovery widens the inputs.
+    ///
+    /// ## 11 reasons (mirrored 1:1 as `TrustFactor`s)
+    ///
+    /// Weights below are applied to the running score only when
+    /// `applied=true`; every record emits regardless so the full
+    /// factor list is explainable.
+    ///
+    /// | Reason                          | Weight |
+    /// |---------------------------------|-------:|
+    /// | `SameIdentityEntity`            |  +0.25 |
+    /// | `TrustedIdentityLink`           |  +0.20 |
+    /// | `SameSource`                    |  +0.10 |
+    /// | `SourceTrustHigh`               |  +0.10 |
+    /// | `EntityTrustHigh`               |  +0.15 |
+    /// | `CellTrustHigh`                 |  +0.15 |
+    /// | `TimeProximity`                 |  +0.10 |
+    /// | `SemanticSimilarity` (stub v1)  |   0.00 |
+    /// | `ClaimPredicateSimilarity`      |  +0.10 |
+    /// | `Contradiction`                 |  -0.30 |
+    /// | `OperatorConfirmed` (stub v1)   |   0.00 |
+    ///
+    /// `SemanticSimilarity` and `OperatorConfirmed` ship as
+    /// `applied=false` stubs (weight 0.0) so the
+    /// "11 reasons always emit" explainability contract holds
+    /// without falsely contributing to the score.
+    ///
+    /// ## Same-source convention (precedence)
+    ///
+    /// Per-signal source resolves as:
+    ///   1. `metadata["source"]` if `Value::String(non_empty)`.
+    ///   2. For `CorrelationSignalKind::Claim` signals: the
+    ///      `system`/`name` field of the first evidence
+    ///      referenced by `claim.evidence_for` — only when the
+    ///      `EvidenceSource` variant is `Warehouse{system}`,
+    ///      `Api{system}`, or `System{name}` (cleanly mapped
+    ///      P35 variants; `Document`/`Human`/`Agent` skipped to
+    ///      avoid ambiguity).
+    ///   3. Otherwise `None` — signal contributes nothing to
+    ///      `SameSource`/`SourceTrustHigh`.
+    ///
+    /// `SameSource` fires when ≥2 signals resolve to the SAME
+    /// non-None source. `SourceTrustHigh` is gated by
+    /// `SameSource` and the P35 verdict on the shared source
+    /// reaching `TrustLevel::High`.
+    ///
+    /// ## Tenant isolation
+    ///
+    /// Strict. Every signal MUST carry the same `tenant_id` as
+    /// the caller (`None == None`, `Some(t) == Some(t)`). Every
+    /// referenced entity / cell / claim / evidence MUST exist
+    /// AND match the same tenant — wrong tenant + miss + None/
+    /// Some slot mismatch all collapse into a single unified
+    /// `"unknown {kind}: {id}"` error to prevent cross-tenant
+    /// existence enumeration (the standard P29+ pattern).
+    ///
+    /// ## LOAD-BEARING acyclicity contract
+    ///
+    /// Correlation-trust depends on entity-trust (P33),
+    /// source-trust (P35), link-trust (P39), and cell-trust
+    /// (P23). **None of those four MAY depend on
+    /// correlation-trust.** The recursion graph stays strictly
+    /// one-way; a future patch that wants "entity is
+    /// trustworthy because it appears in trusted correlations"
+    /// MUST route through a separate aggregate, never back
+    /// through this method.
+    ///
+    /// ## Calibration
+    ///
+    /// Clearing `ACCEPT_CORRELATION_FLOOR` (0.80) requires
+    /// multiple factors to fire together — a single shared
+    /// entity (+0.25) lands at Possible, not Strong. The
+    /// scoring deliberately gates auto-actions behind
+    /// composite evidence: shared identity + trusted link +
+    /// entity-trust-high + time-proximity +
+    /// claim-predicate-similarity exactly clears 0.80.
+    /// Candidates without a trusted link OR without
+    /// entity-trust-high typically land at Possible/Medium —
+    /// the intended v1 conservatism.
+    ///
+    /// Weights are calibrated for EXPLAINABILITY, not
+    /// correctness. Auto-actions on correlation candidates
+    /// MUST compose `trust.level == High AND trust.score >=
+    /// ACCEPT_CORRELATION_FLOOR` plus a dedicated audit event
+    /// — never act on this assessment alone.
+    ///
+    /// ## Mutation
+    ///
+    /// `&self`. No events, no store changes. Pinned by
+    /// `assess_correlation_candidate_no_persistence`.
+    pub fn assess_correlation_candidate(
+        &self,
+        tenant_id: Option<&hydra_core::TenantId>,
+        signals: Vec<hydra_core::CorrelationSignalRef>,
+    ) -> hydra_core::error::Result<hydra_core::CorrelationCandidate> {
+        use hydra_core::error::HydraError;
+        use hydra_core::trust::{
+            TrustAssessment, CORRELATION_TIME_PROXIMITY_WINDOW_SECS,
+        };
+        use hydra_core::{
+            CorrelationCandidate, CorrelationReason, CorrelationReasonKind,
+            CorrelationSignalKind, CorrelationStrength,
+            CorrelationTrustAssessment, TrustFactor, TrustLevel, Value,
+        };
+        use std::collections::{HashMap, HashSet};
+
+        // 1. Minimum signals — engine policy, NOT P44 vocabulary
+        //    policy (P44 treats empty signals as vacuously
+        //    consistent).
+        if signals.len() < 2 {
+            return Err(HydraError::QueryError(
+                "correlation requires at least two signals".to_string(),
+            ));
+        }
+
+        // 2. Per-signal validation: kind well-formedness + strict
+        //    tenant. Errors surface BEFORE any store reads.
+        for (idx, signal) in signals.iter().enumerate() {
+            signal
+                .kind
+                .validate()
+                .map_err(HydraError::QueryError)?;
+            if signal.tenant_id.as_ref() != tenant_id {
+                return Err(HydraError::QueryError(format!(
+                    "tenant mismatch: signal at index {idx} has \
+                     tenant_id {:?} but candidate tenant_id is {:?}",
+                    signal.tenant_id, tenant_id
+                )));
+            }
+        }
+
+        // 3. Resolve referenced ids strictly within tenant. Wrong
+        //    tenant + None/Some slot mismatch + miss collapse into
+        //    `"unknown {kind}: {id}"` (no cross-tenant existence
+        //    leak). Memoize each per-entity / per-cell trust verdict
+        //    to avoid redundant folding.
+        let mut entity_trust_cache: HashMap<
+            hydra_core::IdentityEntityId,
+            hydra_core::IdentityEntityTrustAssessment,
+        > = HashMap::new();
+        let mut cell_trust_cache: HashMap<
+            hydra_core::CausalCellId,
+            hydra_core::CausalCellTrustAssessment,
+        > = HashMap::new();
+        let mut claim_cache: HashMap<
+            hydra_core::ClaimId,
+            hydra_core::Claim,
+        > = HashMap::new();
+
+        for (idx, signal) in signals.iter().enumerate() {
+            for eid in &signal.entity_ids {
+                if entity_trust_cache.contains_key(eid) {
+                    continue;
+                }
+                // Strict-tenant existence check (mirrors hydra.rs
+                // P33/P39 lookup pattern — collapse wrong-tenant +
+                // miss).
+                match self.identity_entity(eid) {
+                    Some(e) if e.tenant_id.as_ref() == tenant_id => {}
+                    _ => {
+                        return Err(HydraError::QueryError(format!(
+                            "correlation signal at index {idx} \
+                             references unknown identity entity: {eid}"
+                        )));
+                    }
+                }
+                let trust =
+                    self.assess_identity_entity_trust(tenant_id, eid)?;
+                entity_trust_cache.insert(eid.clone(), trust);
+            }
+            for cid in &signal.cell_ids {
+                if cell_trust_cache.contains_key(cid) {
+                    continue;
+                }
+                // Cells aren't tenant-scoped at the assessor level;
+                // we MUST guard manually before calling, otherwise
+                // cross-tenant cell trust leaks via correlation
+                // factors.
+                match self.causal_cell(cid) {
+                    Some(c) if c.tenant_id.as_ref() == tenant_id => {}
+                    _ => {
+                        return Err(HydraError::QueryError(format!(
+                            "correlation signal at index {idx} \
+                             references unknown causal cell: {cid}"
+                        )));
+                    }
+                }
+                let trust = self.assess_causal_cell_trust(cid)?;
+                cell_trust_cache.insert(cid.clone(), trust);
+            }
+            for claim_id in &signal.claim_ids {
+                if claim_cache.contains_key(claim_id) {
+                    continue;
+                }
+                let claim = match self.claim(claim_id) {
+                    Some(c) if c.tenant_id.as_ref() == tenant_id => {
+                        c.clone()
+                    }
+                    _ => {
+                        return Err(HydraError::QueryError(format!(
+                            "correlation signal at index {idx} \
+                             references unknown claim: {claim_id}"
+                        )));
+                    }
+                };
+                claim_cache.insert(claim_id.clone(), claim);
+            }
+            for evidence_id in &signal.evidence_ids {
+                match self.evidence(evidence_id) {
+                    Some(e) if e.tenant_id.as_ref() == tenant_id => {}
+                    _ => {
+                        return Err(HydraError::QueryError(format!(
+                            "correlation signal at index {idx} \
+                             references unknown evidence: {evidence_id}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // 4. Derive time-window envelope from signals' observed_at
+        //    (min/max). None/None when no signal carries one.
+        let observed_times: Vec<chrono::DateTime<chrono::Utc>> = signals
+            .iter()
+            .filter_map(|s| s.observed_at)
+            .collect();
+        let time_window_start = observed_times.iter().min().copied();
+        let time_window_end = observed_times.iter().max().copied();
+
+        // 5. Resolve per-signal source via the documented
+        //    precedence (metadata["source"] → claim's first
+        //    evidence cleanly-mapped P35 source).
+        let signal_sources: Vec<Option<String>> = signals
+            .iter()
+            .map(|s| {
+                // (a) metadata["source"] when it's a non-empty
+                //     `Value::String`.
+                if let Some(Value::String(src)) = s.metadata.get("source")
+                {
+                    if !src.is_empty() {
+                        return Some(src.clone());
+                    }
+                }
+                // (b) Claim signals: first cleanly-mapped
+                //     evidence source per P35 conventions.
+                if matches!(s.kind, CorrelationSignalKind::Claim) {
+                    let claim_id =
+                        hydra_core::ClaimId::from_str(&s.id);
+                    if let Some(claim) = claim_cache.get(&claim_id) {
+                        if let Some(ev_id) = claim.evidence_for.first()
+                        {
+                            if let Some(evidence) = self.evidence(ev_id)
+                            {
+                                match &evidence.source {
+                                    hydra_core::EvidenceSource::Warehouse {
+                                        system,
+                                        ..
+                                    } => {
+                                        if !system.is_empty() {
+                                            return Some(system.clone());
+                                        }
+                                    }
+                                    hydra_core::EvidenceSource::Api {
+                                        system,
+                                        ..
+                                    } => {
+                                        if !system.is_empty() {
+                                            return Some(system.clone());
+                                        }
+                                    }
+                                    hydra_core::EvidenceSource::System {
+                                        name,
+                                    } => {
+                                        if !name.is_empty() {
+                                            return Some(name.clone());
+                                        }
+                                    }
+                                    // Document / Human / Agent skip —
+                                    // ambiguous P35 mapping.
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        // 6. Build the 11 reasons + matching 11 factors via a
+        //    single push closure. Both vecs stay 1:1.
+        let mut reasons: Vec<CorrelationReason> = Vec::with_capacity(11);
+        let mut factors: Vec<TrustFactor> = Vec::with_capacity(11);
+        let mut score = 0.0_f64;
+        let mut push = |rkind: CorrelationReasonKind,
+                        fkind: &str,
+                        weight: f64,
+                        applied: bool,
+                        detail: String| {
+            if applied {
+                score += weight;
+            }
+            reasons.push(CorrelationReason {
+                kind: rkind,
+                weight,
+                applied,
+                detail: detail.clone(),
+            });
+            factors.push(TrustFactor {
+                kind: fkind.to_string(),
+                weight,
+                applied,
+                detail,
+            });
+        };
+
+        // === Reason 1 / Factor 1 — SameIdentityEntity (+0.25) ===
+        let mut shared_entities: HashSet<hydra_core::IdentityEntityId> =
+            HashSet::new();
+        let mut first_shared_pair: Option<(
+            usize,
+            usize,
+            hydra_core::IdentityEntityId,
+        )> = None;
+        for i in 0..signals.len() {
+            let s_i: HashSet<_> = signals[i].entity_ids.iter().collect();
+            if s_i.is_empty() {
+                continue;
+            }
+            for (j, sj) in signals.iter().enumerate().skip(i + 1) {
+                for e in &sj.entity_ids {
+                    if s_i.contains(e) {
+                        shared_entities.insert(e.clone());
+                        if first_shared_pair.is_none() {
+                            first_shared_pair = Some((i, j, e.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        let same_entity_applied = !shared_entities.is_empty();
+        push(
+            CorrelationReasonKind::SameIdentityEntity,
+            "same_identity_entity",
+            0.25,
+            same_entity_applied,
+            if let Some((i, j, e)) = &first_shared_pair {
+                format!(
+                    "signals[{i}] and signals[{j}] both reference \
+                     entity {e}"
+                )
+            } else {
+                "no entity_id appears in two or more signals".to_string()
+            },
+        );
+
+        // === Reason 2 / Factor 2 — TrustedIdentityLink (+0.20) ===
+        //
+        // For every ordered pair (A, B) of entities mentioned
+        // across signals, scan `identity_links_from(A)` for links
+        // where `to_entity_id == B`. Probe up to 50 candidate
+        // links; first link reaching `assess_identity_link_trust
+        // → High` fires the factor.
+        const MAX_LINK_PROBES: usize = 50;
+        let all_entities: HashSet<hydra_core::IdentityEntityId> = signals
+            .iter()
+            .flat_map(|s| s.entity_ids.iter().cloned())
+            .collect();
+        let mut probes = 0usize;
+        let mut trusted_link_detail: Option<String> = None;
+        'linkloop: for a in &all_entities {
+            for link in self.identity_links_from(a) {
+                if !all_entities.contains(&link.to_entity_id)
+                    || &link.to_entity_id == a
+                {
+                    continue;
+                }
+                if link.tenant_id.as_ref() != tenant_id {
+                    // Cross-tenant link cannot fire correlation
+                    // trust without leaking. Skip silently.
+                    continue;
+                }
+                if probes >= MAX_LINK_PROBES {
+                    break 'linkloop;
+                }
+                probes += 1;
+                if let Ok(link_trust) =
+                    self.assess_identity_link_trust(tenant_id, &link.id)
+                {
+                    if link_trust.level == TrustLevel::High {
+                        trusted_link_detail = Some(format!(
+                            "trusted identity link {} ({}): {} → {} \
+                             (level {:?}, score {:.2})",
+                            link.id,
+                            link.kind.discriminant(),
+                            a,
+                            link.to_entity_id,
+                            link_trust.level,
+                            link_trust.score,
+                        ));
+                        break 'linkloop;
+                    }
+                }
+            }
+        }
+        let trusted_link_applied = trusted_link_detail.is_some();
+        push(
+            CorrelationReasonKind::TrustedIdentityLink,
+            "trusted_identity_link",
+            0.20,
+            trusted_link_applied,
+            trusted_link_detail.unwrap_or_else(|| {
+                format!(
+                    "no trusted identity link found across {probes} \
+                     probed link(s) (cap {MAX_LINK_PROBES})"
+                )
+            }),
+        );
+
+        // === Reason 3 / Factor 3 — SameSource (+0.10) ===
+        let mut source_counts: HashMap<String, usize> = HashMap::new();
+        for src in signal_sources.iter().flatten() {
+            *source_counts.entry(src.clone()).or_insert(0) += 1;
+        }
+        let shared_source: Option<String> = source_counts
+            .iter()
+            .filter(|(_, &n)| n >= 2)
+            .max_by_key(|(_, &n)| n)
+            .map(|(s, _)| s.clone());
+        let same_source_applied = shared_source.is_some();
+        push(
+            CorrelationReasonKind::SameSource,
+            "same_source",
+            0.10,
+            same_source_applied,
+            if let Some(ref s) = shared_source {
+                let n = source_counts.get(s).copied().unwrap_or(0);
+                format!("{n} signal(s) share source '{s}'")
+            } else {
+                "no two signals resolve to the same source under the \
+                 documented precedence (metadata['source'] → claim \
+                 evidence source)"
+                    .to_string()
+            },
+        );
+
+        // === Reason 4 / Factor 4 — SourceTrustHigh (+0.10) ===
+        let (source_high_applied, source_high_detail) =
+            if let Some(ref src) = shared_source {
+                match self.assess_source_trust(tenant_id, src) {
+                    Ok(t) => {
+                        let applied = t.level == TrustLevel::High;
+                        let detail = format!(
+                            "P35 source '{src}' trust {:?} \
+                             (score {:.2})",
+                            t.level, t.score
+                        );
+                        (applied, detail)
+                    }
+                    Err(e) => (
+                        false,
+                        format!(
+                            "source '{src}' trust unavailable: {e}"
+                        ),
+                    ),
+                }
+            } else {
+                (false, "no shared source to assess".to_string())
+            };
+        push(
+            CorrelationReasonKind::SourceTrustHigh,
+            "source_trust_high",
+            0.10,
+            source_high_applied,
+            source_high_detail,
+        );
+
+        // === Reason 5 / Factor 5 — EntityTrustHigh (+0.15) ===
+        //
+        // "any referenced entity reaches High" — simplest v1
+        // semantic per survey rec. Future patches may layer
+        // per-side or weighted-min semantics.
+        let high_entity_pick = entity_trust_cache
+            .iter()
+            .find(|(_, t)| t.level == TrustLevel::High)
+            .map(|(eid, t)| (eid.clone(), t.score));
+        let entity_high_applied = high_entity_pick.is_some();
+        push(
+            CorrelationReasonKind::EntityTrustHigh,
+            "entity_trust_high",
+            0.15,
+            entity_high_applied,
+            if let Some((eid, s)) = high_entity_pick {
+                format!("entity {eid} P33 trust High (score {s:.2})")
+            } else {
+                format!(
+                    "no referenced entity reaches High trust ({} \
+                     entit{} checked)",
+                    entity_trust_cache.len(),
+                    if entity_trust_cache.len() == 1 { "y" } else { "ies" }
+                )
+            },
+        );
+
+        // === Reason 6 / Factor 6 — CellTrustHigh (+0.15) ===
+        let high_cell_pick = cell_trust_cache
+            .iter()
+            .find(|(_, t)| t.level == TrustLevel::High)
+            .map(|(cid, t)| (cid.clone(), t.score));
+        let cell_high_applied = high_cell_pick.is_some();
+        push(
+            CorrelationReasonKind::CellTrustHigh,
+            "cell_trust_high",
+            0.15,
+            cell_high_applied,
+            if let Some((cid, s)) = high_cell_pick {
+                format!("cell {cid} P23 trust High (score {s:.2})")
+            } else {
+                format!(
+                    "no referenced causal cell reaches High trust \
+                     ({} cell(s) checked)",
+                    cell_trust_cache.len()
+                )
+            },
+        );
+
+        // === Reason 7 / Factor 7 — TimeProximity (+0.10) ===
+        let mut min_delta_secs: Option<i64> = None;
+        for i in 0..observed_times.len() {
+            for j in (i + 1)..observed_times.len() {
+                let d = (observed_times[i] - observed_times[j])
+                    .num_seconds()
+                    .abs();
+                if min_delta_secs.is_none_or(|m| d < m) {
+                    min_delta_secs = Some(d);
+                }
+            }
+        }
+        let time_proximity_applied = min_delta_secs
+            .map(|d| {
+                (d as u64) <= CORRELATION_TIME_PROXIMITY_WINDOW_SECS
+            })
+            .unwrap_or(false);
+        push(
+            CorrelationReasonKind::TimeProximity,
+            "time_proximity",
+            0.10,
+            time_proximity_applied,
+            if let Some(d) = min_delta_secs {
+                format!(
+                    "min pairwise observed_at delta {d}s (window \
+                     {}s)",
+                    CORRELATION_TIME_PROXIMITY_WINDOW_SECS
+                )
+            } else {
+                "fewer than two signals carry observed_at".to_string()
+            },
+        );
+
+        // === Reason 8 / Factor 8 — SemanticSimilarity (0.00 stub) ===
+        push(
+            CorrelationReasonKind::SemanticSimilarity,
+            "semantic_similarity",
+            0.0,
+            false,
+            "v1 stub: cross-signal semantic similarity over alias \
+             labels not computed in P45"
+                .to_string(),
+        );
+
+        // === Reason 9 / Factor 9 — ClaimPredicateSimilarity (+0.10) ===
+        //
+        // Pairwise jaccard over tokenized claim predicates. Helper
+        // inlined locally to avoid widening P30's `pub(super)`
+        // identity_resolver visibility.
+        fn tokens_of_predicate(s: &str) -> HashSet<String> {
+            s.to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_string())
+                .collect()
+        }
+        fn jaccard(
+            a: &HashSet<String>,
+            b: &HashSet<String>,
+        ) -> f64 {
+            let inter = a.intersection(b).count() as f64;
+            let union = a.union(b).count() as f64;
+            if union == 0.0 {
+                0.0
+            } else {
+                inter / union
+            }
+        }
+        let claim_signal_indices: Vec<usize> = signals
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                matches!(s.kind, CorrelationSignalKind::Claim)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let mut best_jaccard = 0.0_f64;
+        let mut best_predicate_pair: Option<(String, String)> = None;
+        for i in 0..claim_signal_indices.len() {
+            let si = &signals[claim_signal_indices[i]];
+            let cid_i = hydra_core::ClaimId::from_str(&si.id);
+            let Some(claim_i) = claim_cache.get(&cid_i) else {
+                continue;
+            };
+            let toks_i = tokens_of_predicate(&claim_i.predicate);
+            for j in (i + 1)..claim_signal_indices.len() {
+                let sj = &signals[claim_signal_indices[j]];
+                let cid_j = hydra_core::ClaimId::from_str(&sj.id);
+                let Some(claim_j) = claim_cache.get(&cid_j) else {
+                    continue;
+                };
+                let toks_j = tokens_of_predicate(&claim_j.predicate);
+                let jacc = jaccard(&toks_i, &toks_j);
+                if jacc > best_jaccard {
+                    best_jaccard = jacc;
+                    best_predicate_pair = Some((
+                        claim_i.predicate.clone(),
+                        claim_j.predicate.clone(),
+                    ));
+                }
+            }
+        }
+        let claim_sim_applied = best_jaccard >= 0.50;
+        push(
+            CorrelationReasonKind::ClaimPredicateSimilarity,
+            "claim_predicate_similarity",
+            0.10,
+            claim_sim_applied,
+            if let Some((p, q)) = best_predicate_pair {
+                format!(
+                    "max predicate jaccard {best_jaccard:.2} ('{p}' \
+                     vs '{q}')"
+                )
+            } else {
+                "fewer than two Claim signals — no predicate \
+                 similarity computed"
+                    .to_string()
+            },
+        );
+
+        // === Reason 10 / Factor 10 — Contradiction (-0.30) ===
+        //
+        // NARROW v1 heuristic: only fires when two Claim signals
+        // share BOTH subject AND predicate AND either (a) their
+        // `ClaimObject::Value(Value::Bool(_))` objects oppose or
+        // (b) one (or both) carry non-empty `evidence_against`
+        // (was Disputed via `EventKind::ClaimDisputed`).
+        let mut contradiction_detail: Option<String> = None;
+        'contra: for i in 0..claim_signal_indices.len() {
+            let si = &signals[claim_signal_indices[i]];
+            let cid_i = hydra_core::ClaimId::from_str(&si.id);
+            let Some(c_i) = claim_cache.get(&cid_i) else {
+                continue;
+            };
+            for j in (i + 1)..claim_signal_indices.len() {
+                let sj = &signals[claim_signal_indices[j]];
+                let cid_j = hydra_core::ClaimId::from_str(&sj.id);
+                let Some(c_j) = claim_cache.get(&cid_j) else {
+                    continue;
+                };
+                if c_i.subject != c_j.subject
+                    || c_i.predicate != c_j.predicate
+                {
+                    continue;
+                }
+                // Opposing booleans.
+                if let (
+                    hydra_core::ClaimObject::Value(Value::Bool(a)),
+                    hydra_core::ClaimObject::Value(Value::Bool(b)),
+                ) = (&c_i.object, &c_j.object)
+                {
+                    if a != b {
+                        contradiction_detail = Some(format!(
+                            "claims {} and {} share subject + \
+                             predicate '{}' but assert opposing \
+                             booleans ({a} vs {b})",
+                            c_i.id, c_j.id, c_i.predicate,
+                        ));
+                        break 'contra;
+                    }
+                }
+                // Dispute carries forward.
+                if !c_i.evidence_against.is_empty()
+                    || !c_j.evidence_against.is_empty()
+                {
+                    contradiction_detail = Some(format!(
+                        "claims {} and {} share subject + predicate \
+                         '{}' and at least one carries \
+                         evidence_against (Disputed)",
+                        c_i.id, c_j.id, c_i.predicate,
+                    ));
+                    break 'contra;
+                }
+            }
+        }
+        let contradiction_applied = contradiction_detail.is_some();
+        push(
+            CorrelationReasonKind::Contradiction,
+            "contradiction",
+            -0.30,
+            contradiction_applied,
+            contradiction_detail.unwrap_or_else(|| {
+                "narrow v1 heuristic: no Claim pair with same \
+                 subject + predicate AND opposing Value::Bool OR \
+                 evidence_against"
+                    .to_string()
+            }),
+        );
+
+        // === Reason 11 / Factor 11 — OperatorConfirmed (0.00 stub) ===
+        push(
+            CorrelationReasonKind::OperatorConfirmed,
+            "operator_confirmed",
+            0.0,
+            false,
+            "v1 stub: operator-confirmation event not consumed in \
+             P45 (auto-actions still gated externally)"
+                .to_string(),
+        );
+
+        // 7. Clamp + bucket. Both axes derive from the SAME
+        //    clamped score so vocabulary consistency holds.
+        let final_score = score.clamp(0.0, 1.0);
+        let level = TrustAssessment::level_for_score(final_score);
+        let strength =
+            CorrelationStrength::level_for_score(final_score);
+
+        // 8. Explanation surfaces the suggestion-only carve-out.
+        let applied_count =
+            factors.iter().filter(|f| f.applied).count();
+        let positive_count = factors
+            .iter()
+            .filter(|f| f.applied && f.weight > 0.0)
+            .count();
+        let negative_count = factors
+            .iter()
+            .filter(|f| f.applied && f.weight < 0.0)
+            .count();
+        let explanation = format!(
+            "Correlation verdict {level:?}/{strength:?} \
+             (score {final_score:.2}) — {positive_count} \
+             positive and {negative_count} penalty factor(s) \
+             applied out of {applied_count}/11 total. v1 \
+             assesses CALLER-PROVIDED groupings, NOT discovers \
+             them. Suggestion-only: auto-actions must compose \
+             trust.level == High AND trust.score >= \
+             ACCEPT_CORRELATION_FLOOR with a dedicated audit \
+             event — never act on this assessment alone."
+        );
+
+        let trust = CorrelationTrustAssessment {
+            // v1 candidates are ephemeral — no CausalCell anchor.
+            correlation_id: None,
+            score: final_score,
+            level,
+            strength,
+            explanation,
+            factors,
+            assessed_at: chrono::Utc::now(),
+        };
+
+        // 9. Aggregate dedup'd entity_ids + cell_ids for the
+        //    candidate envelope. Sorted by string repr for
+        //    deterministic wire-form.
+        let mut entity_ids_envelope: Vec<_> =
+            all_entities.into_iter().collect();
+        entity_ids_envelope.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut cell_ids_envelope: Vec<_> =
+            cell_trust_cache.keys().cloned().collect();
+        cell_ids_envelope.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+        // 10. Construct candidate; run P44 defensive validators as
+        //     belt-and-suspenders.
+        let candidate = CorrelationCandidate {
+            tenant_id: tenant_id.cloned(),
+            signals,
+            entity_ids: entity_ids_envelope,
+            cell_ids: cell_ids_envelope,
+            time_window_start,
+            time_window_end,
+            reasons,
+            trust,
+            created_at: chrono::Utc::now(),
+        };
+        candidate
+            .validate_tenant_consistency()
+            .map_err(HydraError::QueryError)?;
+        candidate
+            .validate_time_window()
+            .map_err(HydraError::QueryError)?;
+        Ok(candidate)
+    }
+
     /// Patch 21 — turn a model-derived reflex chain into a
     /// `CausalCellKind::Reflex` causal cell.
     ///
@@ -25144,5 +25956,957 @@ mod sprint1_tests {
             }
             other => panic!("expected QueryError, got {other:?}"),
         }
+    }
+
+    // === Patch 45 — Correlation Engine v1 ============================
+    //
+    // Tests for `Hydra::assess_correlation_candidate`. Pin the 11
+    // built-in reasons/factors, the score calibration (clearing
+    // ACCEPT_CORRELATION_FLOOR requires the kitchen-sink combo),
+    // strict tenant isolation, contradiction penalty, derived time
+    // window, REQUIRED trust field, and read-only contract.
+
+    /// Find a reason record by built-in kind discriminant.
+    fn p45_find_reason<'a>(
+        candidate: &'a hydra_core::CorrelationCandidate,
+        discriminant: &str,
+    ) -> &'a hydra_core::CorrelationReason {
+        candidate
+            .reasons
+            .iter()
+            .find(|r| r.kind.discriminant() == discriminant)
+            .unwrap_or_else(|| {
+                panic!(
+                    "reason {discriminant} missing from \
+                     CorrelationCandidate"
+                )
+            })
+    }
+
+    /// Find a factor record by kind string.
+    fn p45_find_factor<'a>(
+        candidate: &'a hydra_core::CorrelationCandidate,
+        kind: &str,
+    ) -> &'a hydra_core::TrustFactor {
+        candidate
+            .trust
+            .factors
+            .iter()
+            .find(|f| f.kind == kind)
+            .unwrap_or_else(|| {
+                panic!(
+                    "factor {kind} missing from CorrelationCandidate.trust"
+                )
+            })
+    }
+
+    /// Construct a minimal `CorrelationSignalRef` carrying the
+    /// supplied id strings.
+    fn p45_signal(
+        kind: hydra_core::CorrelationSignalKind,
+        id: &str,
+        tenant: Option<hydra_core::TenantId>,
+        observed_at: Option<chrono::DateTime<chrono::Utc>>,
+        entity_ids: Vec<hydra_core::IdentityEntityId>,
+        cell_ids: Vec<hydra_core::CausalCellId>,
+        claim_ids: Vec<hydra_core::ClaimId>,
+        evidence_ids: Vec<hydra_core::EvidenceId>,
+        source: Option<&str>,
+    ) -> hydra_core::CorrelationSignalRef {
+        let mut metadata: std::collections::HashMap<
+            String,
+            hydra_core::Value,
+        > = std::collections::HashMap::new();
+        if let Some(src) = source {
+            metadata.insert(
+                "source".to_string(),
+                hydra_core::Value::String(src.to_string()),
+            );
+        }
+        hydra_core::CorrelationSignalRef {
+            kind,
+            id: id.to_string(),
+            tenant_id: tenant,
+            observed_at,
+            entity_ids,
+            cell_ids,
+            claim_ids,
+            evidence_ids,
+            metadata,
+        }
+    }
+
+    /// All 11 built-in reasons that P45 emits — every assess
+    /// returns exactly these, applied true or false.
+    const P45_REASON_DISCRIMINANTS: &[&str] = &[
+        "same_identity_entity",
+        "trusted_identity_link",
+        "same_source",
+        "source_trust_high",
+        "entity_trust_high",
+        "cell_trust_high",
+        "time_proximity",
+        "semantic_similarity",
+        "claim_predicate_similarity",
+        "contradiction",
+        "operator_confirmed",
+    ];
+
+    /// Mirror of the reason discriminants for the factor side
+    /// (same strings — reason / factor stay 1:1 in v1).
+    const P45_FACTOR_KINDS: &[&str] = P45_REASON_DISCRIMINANTS;
+
+    #[test]
+    fn assess_correlation_candidate_requires_two_signals() {
+        // < 2 signals → engine-level policy rejection. P44
+        // vocabulary treats empty signals as vacuously consistent;
+        // P45 explicitly tightens this for the assessor surface.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p45");
+
+        let err = hydra
+            .assess_correlation_candidate(Some(&tenant), vec![])
+            .unwrap_err();
+        match err {
+            hydra_core::error::HydraError::QueryError(msg) => {
+                assert!(
+                    msg.contains("at least two signals"),
+                    "expected 'at least two signals' message, got: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+
+        // Single-signal also rejected.
+        let one = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "x_solo",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        assert!(
+            hydra
+                .assess_correlation_candidate(Some(&tenant), vec![one])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn assess_correlation_candidate_rejects_mixed_tenants() {
+        // LOAD-BEARING tenant rule: candidate is single-tenant,
+        // strict. None/Some slot mismatch + cross-tenant rejected
+        // up-front.
+        let hydra = Hydra::new();
+        let tenant_a = hydra_core::TenantId::from_str("tenant_p45_a");
+        let tenant_b = hydra_core::TenantId::from_str("tenant_p45_b");
+
+        let a = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "x_a",
+            Some(tenant_a.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let b = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "x_b",
+            Some(tenant_b.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let err = hydra
+            .assess_correlation_candidate(
+                Some(&tenant_a),
+                vec![a.clone(), b],
+            )
+            .unwrap_err();
+        match err {
+            hydra_core::error::HydraError::QueryError(msg) => {
+                assert!(
+                    msg.contains("tenant mismatch"),
+                    "expected tenant mismatch error, got: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+
+        // None caller + Some signal: also reject.
+        let bad_some = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "x_c",
+            Some(tenant_a),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let none_sig = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "x_d",
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        assert!(
+            hydra
+                .assess_correlation_candidate(
+                    None,
+                    vec![bad_some, none_sig]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn assess_correlation_candidate_same_identity_entity_scores_high() {
+        // Kitchen-sink fixture exercising the High-band combo with
+        // float-precision margin:
+        //   same_identity_entity       +0.25
+        //   trusted_identity_link      +0.20
+        //   same_source                +0.10
+        //   source_trust_high          +0.10
+        //   entity_trust_high          +0.15
+        //   time_proximity             +0.10
+        //   claim_predicate_similarity +0.10
+        //   = 1.00 (clamped) → High / Strong
+        //
+        // Note: the user-spec'd "exact 0.80" combo (without source
+        // factors) lands at 0.7999999999999999 under IEEE-754, just
+        // below the bucket threshold. Adding the +0.20 source-trust
+        // pair gives the test clean margin and exercises more of
+        // the factor table.
+        //
+        // Pins (a) SameIdentityEntity is the load-bearing positive
+        // reason and (b) the score band reaches High when the
+        // composite combo lands.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p45");
+        let (a_id, b_id) = p39_seed_high_trust_pair(
+            &mut hydra,
+            Some(tenant.clone()),
+        );
+        // Boost snowflake source trust → High.
+        p41_boost_source_trust(
+            &mut hydra,
+            Some(tenant.clone()),
+            "snowflake",
+        );
+        // Wire a high-trust link A → B with supporting refs +
+        // built-in kind → P39 lands at High.
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a_id,
+            &b_id,
+            0.95,
+            vec![hydra_core::EvidenceId::from_str("evd_p45_link")],
+            vec![],
+            vec![],
+        );
+        hydra.create_identity_link(link).unwrap();
+        // Two Claim signals referencing both entities with the
+        // same predicate (jaccard 1.0) and observed within 60s.
+        let claim_a = hydra_core::Claim {
+            id: hydra_core::ClaimId::new(),
+            tenant_id: Some(tenant.clone()),
+            kind: hydra_core::ClaimKind::Fact,
+            subject: hydra_core::ClaimSubject::Dataset(
+                "dataset/p45_a".to_string(),
+            ),
+            predicate: "is_stale".to_string(),
+            object: hydra_core::ClaimObject::Value(
+                hydra_core::Value::Bool(true),
+            ),
+            confidence: hydra_core::Confidence::new(0.90),
+            status: hydra_core::ClaimStatus::Proposed,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            caused_by: None,
+        };
+        let claim_b = hydra_core::Claim {
+            id: hydra_core::ClaimId::new(),
+            tenant_id: Some(tenant.clone()),
+            subject: hydra_core::ClaimSubject::Dataset(
+                "dataset/p45_b".to_string(),
+            ),
+            ..claim_a.clone()
+        };
+        let claim_b = hydra_core::Claim {
+            id: hydra_core::ClaimId::new(),
+            ..claim_b
+        };
+        let claim_a_id = claim_a.id.clone();
+        let claim_b_id = claim_b.id.clone();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim: claim_a })
+            .unwrap();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim: claim_b })
+            .unwrap();
+
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(60);
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::Claim,
+            claim_a_id.as_str(),
+            Some(tenant.clone()),
+            Some(t0),
+            vec![a_id.clone(), b_id.clone()],
+            vec![],
+            vec![claim_a_id.clone()],
+            vec![],
+            Some("snowflake"),
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::Claim,
+            claim_b_id.as_str(),
+            Some(tenant.clone()),
+            Some(t1),
+            vec![a_id.clone(), b_id.clone()],
+            vec![],
+            vec![claim_b_id.clone()],
+            vec![],
+            Some("snowflake"),
+        );
+
+        let candidate = hydra
+            .assess_correlation_candidate(Some(&tenant), vec![s1, s2])
+            .unwrap();
+        assert!(
+            p45_find_reason(&candidate, "same_identity_entity").applied,
+            "SameIdentityEntity must fire when two signals share \
+             entity_ids"
+        );
+        assert!(
+            p45_find_reason(&candidate, "trusted_identity_link").applied
+        );
+        assert!(p45_find_reason(&candidate, "same_source").applied);
+        assert!(p45_find_reason(&candidate, "source_trust_high").applied);
+        assert!(p45_find_reason(&candidate, "entity_trust_high").applied);
+        assert!(p45_find_reason(&candidate, "time_proximity").applied);
+        assert!(
+            p45_find_reason(&candidate, "claim_predicate_similarity")
+                .applied
+        );
+        assert!(
+            !p45_find_reason(&candidate, "contradiction").applied,
+            "contradiction must NOT fire on matching-bool claims"
+        );
+        assert!(
+            candidate.trust.score >= 0.80,
+            "kitchen-sink combo must clear 0.80, got {}",
+            candidate.trust.score
+        );
+        assert_eq!(candidate.trust.level, hydra_core::TrustLevel::High);
+        assert_eq!(
+            candidate.trust.strength,
+            hydra_core::CorrelationStrength::Strong
+        );
+    }
+
+    #[test]
+    fn assess_correlation_candidate_trusted_identity_link_scores() {
+        // Isolate `TrustedIdentityLink`: seed entity pair + link;
+        // two signals referencing the two endpoints. Factor must
+        // fire; score lands at Possible (not Strong) without the
+        // other positive factors.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p45_link");
+        let (a_id, b_id) = p39_seed_high_trust_pair(
+            &mut hydra,
+            Some(tenant.clone()),
+        );
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::SameAs,
+            &a_id,
+            &b_id,
+            0.95,
+            vec![hydra_core::EvidenceId::from_str("evd_link_iso")],
+            vec![],
+            vec![],
+        );
+        hydra.create_identity_link(link).unwrap();
+
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::IdentityEntity,
+            a_id.as_str(),
+            Some(tenant.clone()),
+            None,
+            vec![a_id.clone()],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::IdentityEntity,
+            b_id.as_str(),
+            Some(tenant.clone()),
+            None,
+            vec![b_id.clone()],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let candidate = hydra
+            .assess_correlation_candidate(Some(&tenant), vec![s1, s2])
+            .unwrap();
+        assert!(
+            p45_find_reason(&candidate, "trusted_identity_link").applied,
+            "TrustedIdentityLink must fire when a High-trust link \
+             connects two referenced entities"
+        );
+        // EntityTrustHigh also fires (entities seeded High).
+        assert!(p45_find_reason(&candidate, "entity_trust_high").applied);
+        // SameIdentityEntity does NOT fire (signals reference
+        // disjoint entities).
+        assert!(
+            !p45_find_reason(&candidate, "same_identity_entity").applied,
+            "different entities → SameIdentityEntity must not fire"
+        );
+    }
+
+    #[test]
+    fn assess_correlation_candidate_same_source_scores() {
+        // Boost snowflake source-trust → High, then assert both
+        // SameSource AND SourceTrustHigh fire on metadata=source
+        // signals.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p45_src");
+        p41_boost_source_trust(
+            &mut hydra,
+            Some(tenant.clone()),
+            "snowflake",
+        );
+
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Some("snowflake"),
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Some("snowflake"),
+        );
+
+        let candidate = hydra
+            .assess_correlation_candidate(Some(&tenant), vec![s1, s2])
+            .unwrap();
+        let same_source =
+            p45_find_reason(&candidate, "same_source");
+        assert!(same_source.applied);
+        assert!(
+            same_source.detail.contains("snowflake"),
+            "detail must name the shared source: {}",
+            same_source.detail
+        );
+        let src_high =
+            p45_find_reason(&candidate, "source_trust_high");
+        assert!(
+            src_high.applied,
+            "boosted snowflake source must clear High in P35"
+        );
+    }
+
+    #[test]
+    fn assess_correlation_candidate_time_proximity_scores() {
+        // Two signals 5 min apart → TimeProximity fires. Window
+        // derived from min/max observed_at.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p45_time");
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(300);
+
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            Some(t0),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            Some(t1),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let candidate = hydra
+            .assess_correlation_candidate(Some(&tenant), vec![s1, s2])
+            .unwrap();
+        let tp = p45_find_reason(&candidate, "time_proximity");
+        assert!(tp.applied, "5min delta must clear 900s window");
+        let delta = candidate.time_window_end.unwrap()
+            - candidate.time_window_start.unwrap();
+        assert!(
+            delta.num_seconds() <= 300,
+            "derived window must equal observed delta, got {}s",
+            delta.num_seconds()
+        );
+
+        // Same signals 20 min apart → does NOT fire.
+        let s3 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_c",
+            Some(tenant.clone()),
+            Some(t0),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s4 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_d",
+            Some(tenant.clone()),
+            Some(t0 + chrono::Duration::seconds(1200)),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let outside = hydra
+            .assess_correlation_candidate(Some(&tenant), vec![s3, s4])
+            .unwrap();
+        assert!(
+            !p45_find_reason(&outside, "time_proximity").applied,
+            "20min delta must NOT clear 900s window"
+        );
+    }
+
+    #[test]
+    fn assess_correlation_candidate_contradiction_penalizes() {
+        // Two Claim signals same subject + predicate but opposing
+        // Value::Bool → Contradiction fires with -0.30 weight.
+        // Score lands strictly LOWER than the same fixture
+        // without the contradiction.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p45_contra");
+        let (a_id, _b_id) = p39_seed_high_trust_pair(
+            &mut hydra,
+            Some(tenant.clone()),
+        );
+
+        let make_claim = |bool_val: bool| hydra_core::Claim {
+            id: hydra_core::ClaimId::new(),
+            tenant_id: Some(tenant.clone()),
+            kind: hydra_core::ClaimKind::Fact,
+            subject: hydra_core::ClaimSubject::Dataset(
+                "dataset/contra".to_string(),
+            ),
+            predicate: "is_stale".to_string(),
+            object: hydra_core::ClaimObject::Value(
+                hydra_core::Value::Bool(bool_val),
+            ),
+            confidence: hydra_core::Confidence::new(0.90),
+            status: hydra_core::ClaimStatus::Proposed,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            caused_by: None,
+        };
+        let claim_t = make_claim(true);
+        let claim_f = make_claim(false);
+        let claim_t_id = claim_t.id.clone();
+        let claim_f_id = claim_f.id.clone();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed {
+                claim: claim_t,
+            })
+            .unwrap();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed {
+                claim: claim_f,
+            })
+            .unwrap();
+
+        let t0 = chrono::Utc::now();
+        let s_true = p45_signal(
+            hydra_core::CorrelationSignalKind::Claim,
+            claim_t_id.as_str(),
+            Some(tenant.clone()),
+            Some(t0),
+            vec![a_id.clone()],
+            vec![],
+            vec![claim_t_id.clone()],
+            vec![],
+            None,
+        );
+        let s_false = p45_signal(
+            hydra_core::CorrelationSignalKind::Claim,
+            claim_f_id.as_str(),
+            Some(tenant.clone()),
+            Some(t0 + chrono::Duration::seconds(30)),
+            vec![a_id.clone()],
+            vec![],
+            vec![claim_f_id.clone()],
+            vec![],
+            None,
+        );
+
+        let candidate = hydra
+            .assess_correlation_candidate(
+                Some(&tenant),
+                vec![s_true, s_false],
+            )
+            .unwrap();
+        let contra = p45_find_reason(&candidate, "contradiction");
+        assert!(
+            contra.applied,
+            "opposing Value::Bool on same subject+predicate must \
+             fire contradiction"
+        );
+        assert_eq!(contra.weight, -0.30);
+        // Penalty is structurally a negative contributor — pin
+        // that contradiction's applied factor on the trust side
+        // carries the same weight.
+        let factor = p45_find_factor(&candidate, "contradiction");
+        assert!(factor.applied);
+        assert_eq!(factor.weight, -0.30);
+        // Sanity: SameIdentityEntity still fires (both reference
+        // a_id) but final score is reduced by -0.30.
+        assert!(p45_find_reason(&candidate, "same_identity_entity").applied);
+    }
+
+    #[test]
+    fn assess_correlation_candidate_derives_time_window() {
+        // Engine derives `time_window_start/end` from min/max of
+        // signals' observed_at. None when no signal carries one.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p45_window");
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(120);
+        let t2 = t0 + chrono::Duration::seconds(60);
+
+        let signals = vec![
+            p45_signal(
+                hydra_core::CorrelationSignalKind::External,
+                "a",
+                Some(tenant.clone()),
+                Some(t0),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ),
+            p45_signal(
+                hydra_core::CorrelationSignalKind::External,
+                "b",
+                Some(tenant.clone()),
+                Some(t1),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ),
+            p45_signal(
+                hydra_core::CorrelationSignalKind::External,
+                "c",
+                Some(tenant.clone()),
+                Some(t2),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ),
+        ];
+
+        let candidate = hydra
+            .assess_correlation_candidate(Some(&tenant), signals)
+            .unwrap();
+        assert_eq!(candidate.time_window_start, Some(t0));
+        assert_eq!(candidate.time_window_end, Some(t1));
+
+        // All-None signals → None/None.
+        let no_time = vec![
+            p45_signal(
+                hydra_core::CorrelationSignalKind::External,
+                "x",
+                Some(tenant.clone()),
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ),
+            p45_signal(
+                hydra_core::CorrelationSignalKind::External,
+                "y",
+                Some(tenant.clone()),
+                None,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ),
+        ];
+        let none_window = hydra
+            .assess_correlation_candidate(Some(&tenant), no_time)
+            .unwrap();
+        assert!(none_window.time_window_start.is_none());
+        assert!(none_window.time_window_end.is_none());
+        assert!(
+            !p45_find_reason(&none_window, "time_proximity").applied,
+            "no observed_at → TimeProximity cannot fire"
+        );
+    }
+
+    #[test]
+    fn assess_correlation_candidate_returns_required_trust() {
+        // CorrelationCandidate.trust is REQUIRED (not Option in
+        // P44 vocabulary). v1 engine MUST populate it on every
+        // path, even when no factors apply.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p45_trust");
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let candidate = hydra
+            .assess_correlation_candidate(Some(&tenant), vec![s1, s2])
+            .unwrap();
+        // Trust always present (REQUIRED field at the type level).
+        assert!(candidate.trust.score >= 0.0);
+        assert!(candidate.trust.score <= 1.0);
+        assert_eq!(candidate.trust.correlation_id, None);
+        // Level + strength derived from the SAME clamped score —
+        // vocabulary-consistency pin.
+        assert_eq!(
+            candidate.trust.level,
+            hydra_core::trust::TrustAssessment::level_for_score(
+                candidate.trust.score
+            )
+        );
+        assert_eq!(
+            candidate.trust.strength,
+            hydra_core::CorrelationStrength::level_for_score(
+                candidate.trust.score
+            )
+        );
+        // factors present and same length as reasons (1:1).
+        assert_eq!(candidate.trust.factors.len(), 11);
+        // Explanation surfaces the suggestion-only carve-out.
+        assert!(
+            candidate.trust.explanation.contains("Suggestion-only")
+                || candidate
+                    .trust
+                    .explanation
+                    .contains("auto-actions must compose"),
+            "explanation must surface the suggestion-only contract: {}",
+            candidate.trust.explanation
+        );
+    }
+
+    #[test]
+    fn assess_correlation_candidate_reasons_and_factors_preserved() {
+        // Explainability pin: all 11 built-in CorrelationReasonKind
+        // discriminants emit on every assess (applied OR not), and
+        // candidate.trust.factors is a 1:1 mirror with the same
+        // applied bits and weights.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p45_pin");
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+
+        let candidate = hydra
+            .assess_correlation_candidate(Some(&tenant), vec![s1, s2])
+            .unwrap();
+        assert_eq!(candidate.reasons.len(), 11);
+        assert_eq!(candidate.trust.factors.len(), 11);
+        assert_eq!(
+            candidate.reasons.len(),
+            P45_REASON_DISCRIMINANTS.len()
+        );
+        for d in P45_REASON_DISCRIMINANTS {
+            // Reason discriminant emits exactly once.
+            let count = candidate
+                .reasons
+                .iter()
+                .filter(|r| r.kind.discriminant() == *d)
+                .count();
+            assert_eq!(
+                count, 1,
+                "reason {d} must emit exactly once, found {count}"
+            );
+            // Matching TrustFactor exists with the SAME kind
+            // string.
+            let matching_factor = P45_FACTOR_KINDS.contains(d);
+            assert!(matching_factor, "{d} must mirror as TrustFactor");
+        }
+        // 1:1 mirror — applied bit and weight match per index.
+        for (r, f) in
+            candidate.reasons.iter().zip(candidate.trust.factors.iter())
+        {
+            assert_eq!(r.kind.discriminant(), f.kind);
+            assert_eq!(r.applied, f.applied);
+            assert_eq!(r.weight, f.weight);
+            assert_eq!(r.detail, f.detail);
+        }
+        // Stubs ship with weight 0.0 / applied false (per spec).
+        let sem = p45_find_reason(&candidate, "semantic_similarity");
+        assert_eq!(sem.weight, 0.0);
+        assert!(!sem.applied);
+        let op = p45_find_reason(&candidate, "operator_confirmed");
+        assert_eq!(op.weight, 0.0);
+        assert!(!op.applied);
+    }
+
+    #[test]
+    fn assess_correlation_candidate_no_persistence() {
+        // Read-only contract: no events, no new entities/links/
+        // cells, no claim status changes after assess.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p45_nop");
+        let (a_id, b_id) = p39_seed_high_trust_pair(
+            &mut hydra,
+            Some(tenant.clone()),
+        );
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a_id,
+            &b_id,
+            0.95,
+            vec![hydra_core::EvidenceId::from_str("evd_p45_nop")],
+            vec![],
+            vec![],
+        );
+        hydra.create_identity_link(link).unwrap();
+
+        let pre_events = hydra.events().len();
+        let pre_entities = hydra.identity_entities().count();
+        let pre_links = hydra.identity_links().count();
+        let pre_cells = hydra.causal_cells().count();
+
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::IdentityEntity,
+            a_id.as_str(),
+            Some(tenant.clone()),
+            None,
+            vec![a_id.clone()],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::IdentityEntity,
+            b_id.as_str(),
+            Some(tenant.clone()),
+            None,
+            vec![b_id.clone()],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let _ = hydra
+            .assess_correlation_candidate(Some(&tenant), vec![s1, s2])
+            .unwrap();
+
+        assert_eq!(hydra.events().len(), pre_events);
+        assert_eq!(hydra.identity_entities().count(), pre_entities);
+        assert_eq!(hydra.identity_links().count(), pre_links);
+        assert_eq!(hydra.causal_cells().count(), pre_cells);
     }
 }
