@@ -5650,6 +5650,232 @@ impl Hydra {
         self.create_causal_cell(cell)
     }
 
+    /// Patch 47 — anchor a trust-gated `CorrelationCandidate` as
+    /// a durable `CausalCellKind::Incident` cell.
+    ///
+    /// Closes the correlation arc's durability gap: P45 made
+    /// correlations assessable; P47 makes trusted correlations
+    /// durable Hydra memory. After this:
+    ///
+    /// ```text
+    /// CorrelationCandidate
+    ///   → trust gate (High/Strong, score >= ACCEPT_CORRELATION_FLOOR)
+    ///   → CausalCellKind::Incident
+    ///   → replayable / snapshot-preserved causal story
+    /// ```
+    ///
+    /// ## "Trust the supplied verdict" contract
+    ///
+    /// **v1 does NOT re-call `assess_correlation_candidate`.**
+    /// P47 trusts the verdict on `candidate.trust` as-supplied
+    /// and anchors that historical decision. The caller is
+    /// responsible for assembling a recent + valid verdict (the
+    /// public path is: `assess_correlation_candidate(...)` →
+    /// review verdict → `anchor_correlation_candidate(...)`
+    /// with the SAME candidate). Pinned by
+    /// `anchor_correlation_candidate_does_not_reassess_candidate`.
+    ///
+    /// ## Trust gate (fail-fast, all required)
+    ///
+    /// 1. `actor.as_str()` is non-empty
+    /// 2. caller's `tenant_id` argument equals `candidate.tenant_id`
+    ///    (strict — `None == None`, `Some(t) == Some(t)`)
+    /// 3. `candidate.validate_tenant_consistency()` passes
+    ///    (belt-and-suspenders — P45 already enforces this)
+    /// 4. `candidate.validate_time_window()` passes
+    /// 5. `candidate.signals.len() >= 2`
+    /// 6. Trust triple-gate:
+    ///    `level == High` AND `strength == Strong` AND
+    ///    `score >= ACCEPT_CORRELATION_FLOOR` (0.80)
+    ///
+    /// Any failure surfaces as `HydraError::QueryError`. No
+    /// audit-trail emission on rejection (the call is purely
+    /// query at that point).
+    ///
+    /// ## Cell field mapping
+    ///
+    /// - `id`: minted fresh (`CausalCellId::new()`)
+    /// - `tenant_id`: from `candidate.tenant_id`
+    /// - `kind`: `CausalCellKind::Incident` (built-in v1)
+    /// - `subject`: `"correlation.{N}_signals"` deterministic
+    /// - `evidence_ids` / `claim_ids`: first-seen dedupe union
+    ///   across `candidate.signals.evidence_ids` / `claim_ids`
+    ///   (mirrors P22 compose order)
+    /// - `child_cell_ids`: `candidate.cell_ids.clone()` (P45
+    ///   already deduplicated and sorted)
+    /// - `source_events` / `action_ids` / `outcome_ids` /
+    ///   `observation_run_ids`: `Vec::new()` — correlation has
+    ///   no top-level event / action / outcome / observation
+    ///   surface in v1
+    /// - `trust_score`: `Some(candidate.trust.score)` — preserve
+    ///   the P43 verdict verbatim
+    /// - `summary`: deterministic prose surfacing signal count,
+    ///   entity count, cell count, strength, trust
+    /// - `caused_by`: `None` — correlation is MULTI-ORIGIN; a
+    ///   future patch may emit a `CorrelationAnchored` event
+    ///   and stamp `caused_by` with its id (NOT in v1)
+    /// - `created_by`: caller-supplied `actor`
+    /// - `created_at`: `chrono::Utc::now()` at anchor time (NOT
+    ///   `candidate.created_at` — the anchoring event is a
+    ///   distinct operator action)
+    ///
+    /// ## v1 boundary
+    ///
+    /// **NO** HTTP. **NO** SDK. **NO** discovery scan. **NO**
+    /// new event variant — reuses `EventKind::CausalCellCreated`.
+    /// **NO** correlation-store (cells are looked up via
+    /// `Hydra::causal_cell` / `causal_cells` like any other
+    /// cell). **NO** dedup / fingerprint — repeated anchors of
+    /// the same logical candidate produce distinct cells (the
+    /// caller is the policy authority).
+    ///
+    /// Entity-level membership is preserved in the cell only
+    /// through the dedupe'd `claim_ids` / `evidence_ids` and
+    /// the `summary` count — `CausalCell` v1 has no
+    /// `entity_ids` field. Accepted limitation.
+    pub fn anchor_correlation_candidate(
+        &mut self,
+        tenant_id: Option<&hydra_core::TenantId>,
+        candidate: hydra_core::CorrelationCandidate,
+        actor: hydra_core::ActorId,
+    ) -> hydra_core::error::Result<hydra_core::CausalCell> {
+        use hydra_core::error::HydraError;
+        use hydra_core::trust::ACCEPT_CORRELATION_FLOOR;
+        use hydra_core::{
+            CausalCell, CausalCellId, CausalCellKind, CorrelationStrength,
+            TrustLevel,
+        };
+        use std::collections::HashSet;
+
+        // 1. Actor non-empty. Mirrors P41 hydra.rs:2595-2599
+        //    invalid-actor pattern.
+        if actor.as_str().is_empty() {
+            return Err(HydraError::QueryError(
+                "anchor rejected: invalid actor (empty)".to_string(),
+            ));
+        }
+
+        // 2. Caller-tenant ↔ candidate-tenant equality (strict).
+        //    Done BEFORE the candidate self-validators so the
+        //    caller sees the caller-vs-candidate framing first.
+        if candidate.tenant_id.as_ref() != tenant_id {
+            return Err(HydraError::QueryError(format!(
+                "anchor rejected: tenant mismatch (caller {:?} vs \
+                 candidate {:?})",
+                tenant_id, candidate.tenant_id,
+            )));
+        }
+
+        // 3-4. P44 self-validators. Belt-and-suspenders — P45
+        //      already enforces these, but re-running them at the
+        //      anchor boundary protects against
+        //      manually-constructed candidates (typical for
+        //      operator-edited verdicts).
+        candidate
+            .validate_tenant_consistency()
+            .map_err(HydraError::QueryError)?;
+        candidate
+            .validate_time_window()
+            .map_err(HydraError::QueryError)?;
+
+        // 5. Engine min-signals policy. Mirrors P45 hydra.rs:4540
+        //    so the anchor boundary doesn't widen the contract.
+        if candidate.signals.len() < 2 {
+            return Err(HydraError::QueryError(
+                "anchor rejected: correlation requires at least \
+                 two signals"
+                    .to_string(),
+            ));
+        }
+
+        // 6. Triple trust gate. P47 trusts the SUPPLIED verdict
+        //    — does NOT re-run `assess_correlation_candidate`.
+        //    All three axes must hold simultaneously; partial
+        //    fits (e.g., Strong strength but Medium level)
+        //    surface the full numeric+enum context in the
+        //    rejection.
+        let trust = &candidate.trust;
+        if !(trust.level == TrustLevel::High
+            && trust.strength == CorrelationStrength::Strong
+            && trust.score >= ACCEPT_CORRELATION_FLOOR)
+        {
+            return Err(HydraError::QueryError(format!(
+                "anchor rejected: trust below High/Strong \
+                 (score={:.3}, level={:?}, strength={:?})",
+                trust.score, trust.level, trust.strength,
+            )));
+        }
+
+        // 7. First-seen dedupe union of claim_ids + evidence_ids
+        //    across signals. Mirrors P22 compose pattern
+        //    (hydra.rs:5536-5586): HashSet for membership +
+        //    Vec for ordered output. Signal iteration order is
+        //    preserved as candidate.signals order.
+        let mut claim_ids: Vec<hydra_core::ClaimId> = Vec::new();
+        let mut claim_seen: HashSet<hydra_core::ClaimId> =
+            HashSet::new();
+        let mut evidence_ids: Vec<hydra_core::EvidenceId> = Vec::new();
+        let mut evidence_seen: HashSet<hydra_core::EvidenceId> =
+            HashSet::new();
+        for signal in &candidate.signals {
+            for id in &signal.claim_ids {
+                if claim_seen.insert(id.clone()) {
+                    claim_ids.push(id.clone());
+                }
+            }
+            for id in &signal.evidence_ids {
+                if evidence_seen.insert(id.clone()) {
+                    evidence_ids.push(id.clone());
+                }
+            }
+        }
+
+        // 8. Deterministic summary. Format pinned so dashboards
+        //    can pattern-match across anchor events. Does NOT
+        //    serialize entity_ids/cell_ids JSON — accepted v1
+        //    limitation (CausalCell has no entity_ids field).
+        let summary = Some(format!(
+            "correlation anchor: {} signals, {} entities, {} cells, \
+             strength={:?}, trust={:.2}",
+            candidate.signals.len(),
+            candidate.entity_ids.len(),
+            candidate.cell_ids.len(),
+            candidate.trust.strength,
+            candidate.trust.score,
+        ));
+
+        // 9. Inline literal — every field set explicitly (no
+        //    default-shortcut). Mirrors P21/P22 cell-construction
+        //    convention exactly.
+        let cell = CausalCell {
+            id: CausalCellId::new(),
+            tenant_id: candidate.tenant_id.clone(),
+            kind: CausalCellKind::Incident,
+            subject: format!(
+                "correlation.{}_signals",
+                candidate.signals.len()
+            ),
+            source_events: Vec::new(),
+            evidence_ids,
+            claim_ids,
+            action_ids: Vec::new(),
+            outcome_ids: Vec::new(),
+            observation_run_ids: Vec::new(),
+            child_cell_ids: candidate.cell_ids.clone(),
+            trust_score: Some(candidate.trust.score),
+            summary,
+            created_by: actor,
+            created_at: chrono::Utc::now(),
+            caused_by: None,
+        };
+
+        // 10. Delegate to the Patch 20 create path so the existing
+        //     `EventKind::CausalCellCreated` event, replay, store
+        //     cascade, and snapshot inclusion all apply without
+        //     re-implementing.
+        self.create_causal_cell(cell)
+    }
+
     /// Patch 26 — compose `hydra.health` from the latest self-
     /// health reflex cells.
     ///
@@ -26908,5 +27134,693 @@ mod sprint1_tests {
         assert_eq!(hydra.identity_entities().count(), pre_entities);
         assert_eq!(hydra.identity_links().count(), pre_links);
         assert_eq!(hydra.causal_cells().count(), pre_cells);
+    }
+
+    // === Patch 47 — Correlation CausalCell Anchoring ================
+
+    /// Build a `CorrelationCandidate` literal with caller-
+    /// controlled trust verdict. Lets negative-trust tests skip
+    /// the assess engine — anchor MUST trust the supplied
+    /// verdict (does NOT reassess).
+    #[allow(clippy::too_many_arguments)]
+    fn p47_synthetic_candidate(
+        tenant: Option<hydra_core::TenantId>,
+        signals: Vec<hydra_core::CorrelationSignalRef>,
+        score: f64,
+        level: hydra_core::TrustLevel,
+        strength: hydra_core::CorrelationStrength,
+        entity_ids: Vec<hydra_core::IdentityEntityId>,
+        cell_ids: Vec<hydra_core::CausalCellId>,
+    ) -> hydra_core::CorrelationCandidate {
+        let now = chrono::Utc::now();
+        hydra_core::CorrelationCandidate {
+            tenant_id: tenant,
+            signals,
+            entity_ids,
+            cell_ids,
+            time_window_start: None,
+            time_window_end: None,
+            reasons: vec![],
+            trust: hydra_core::CorrelationTrustAssessment {
+                correlation_id: None,
+                score,
+                level,
+                strength,
+                explanation: "p47 synthetic verdict".to_string(),
+                factors: vec![],
+                assessed_at: now,
+            },
+            created_at: now,
+        }
+    }
+
+    #[test]
+    fn anchor_correlation_candidate_creates_cell_when_high_trust() {
+        // Drive the kitchen-sink fixture from P45 to land a real
+        // High/Strong candidate, then anchor.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p47");
+        let (a_id, b_id) = p39_seed_high_trust_pair(
+            &mut hydra,
+            Some(tenant.clone()),
+        );
+        p41_boost_source_trust(
+            &mut hydra,
+            Some(tenant.clone()),
+            "snowflake",
+        );
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a_id,
+            &b_id,
+            0.95,
+            vec![hydra_core::EvidenceId::from_str("evd_p47_link")],
+            vec![],
+            vec![],
+        );
+        hydra.create_identity_link(link).unwrap();
+        // Two Claim signals matching predicate, both reference
+        // a + b. Same kitchen-sink shape used in P45's
+        // `same_identity_entity_scores_high`.
+        let claim_a = hydra_core::Claim {
+            id: hydra_core::ClaimId::new(),
+            tenant_id: Some(tenant.clone()),
+            kind: hydra_core::ClaimKind::Fact,
+            subject: hydra_core::ClaimSubject::Dataset(
+                "dataset/p47_a".to_string(),
+            ),
+            predicate: "is_stale".to_string(),
+            object: hydra_core::ClaimObject::Value(
+                hydra_core::Value::Bool(true),
+            ),
+            confidence: hydra_core::Confidence::new(0.90),
+            status: hydra_core::ClaimStatus::Proposed,
+            evidence_for: vec![],
+            evidence_against: vec![],
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            caused_by: None,
+        };
+        let claim_b = hydra_core::Claim {
+            id: hydra_core::ClaimId::new(),
+            subject: hydra_core::ClaimSubject::Dataset(
+                "dataset/p47_b".to_string(),
+            ),
+            ..claim_a.clone()
+        };
+        let claim_a_id = claim_a.id.clone();
+        let claim_b_id = claim_b.id.clone();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim: claim_a })
+            .unwrap();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim: claim_b })
+            .unwrap();
+        let t0 = chrono::Utc::now();
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::Claim,
+            claim_a_id.as_str(),
+            Some(tenant.clone()),
+            Some(t0),
+            vec![a_id.clone(), b_id.clone()],
+            vec![],
+            vec![claim_a_id.clone()],
+            vec![],
+            Some("snowflake"),
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::Claim,
+            claim_b_id.as_str(),
+            Some(tenant.clone()),
+            Some(t0 + chrono::Duration::seconds(60)),
+            vec![a_id.clone(), b_id.clone()],
+            vec![],
+            vec![claim_b_id.clone()],
+            vec![],
+            Some("snowflake"),
+        );
+        let candidate = hydra
+            .assess_correlation_candidate(Some(&tenant), vec![s1, s2])
+            .unwrap();
+        // Confirm fixture really hit High/Strong before anchoring
+        // — protects this test if calibration drifts.
+        assert_eq!(
+            candidate.trust.level,
+            hydra_core::TrustLevel::High
+        );
+        assert_eq!(
+            candidate.trust.strength,
+            hydra_core::CorrelationStrength::Strong
+        );
+        let actor = hydra_core::ActorId::from_str("actor_ops");
+        let cell = hydra
+            .anchor_correlation_candidate(
+                Some(&tenant),
+                candidate.clone(),
+                actor.clone(),
+            )
+            .unwrap();
+        assert_eq!(cell.kind, hydra_core::CausalCellKind::Incident);
+        assert_eq!(cell.tenant_id.as_ref(), Some(&tenant));
+        assert_eq!(cell.created_by, actor);
+        assert!(cell.subject.starts_with("correlation."));
+        // Cell is in the store and retrievable.
+        let stored = hydra.causal_cell(&cell.id).expect("cell stored");
+        assert_eq!(stored, &cell);
+    }
+
+    #[test]
+    fn anchor_correlation_candidate_rejects_low_trust() {
+        // Synthetic verdict below the gate. Anchor must reject
+        // with the standard rejection wording.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p47_low");
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let candidate = p47_synthetic_candidate(
+            Some(tenant.clone()),
+            vec![s1, s2],
+            0.30,
+            hydra_core::TrustLevel::Low,
+            hydra_core::CorrelationStrength::Weak,
+            vec![],
+            vec![],
+        );
+        let err = hydra
+            .anchor_correlation_candidate(
+                Some(&tenant),
+                candidate,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap_err();
+        match err {
+            hydra_core::error::HydraError::QueryError(msg) => {
+                assert!(
+                    msg.contains("trust below"),
+                    "expected 'trust below' message, got: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anchor_correlation_candidate_rejects_non_strong_strength() {
+        // High level + High-band score but strength == Possible.
+        // All three trust axes must hold simultaneously.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p47_strength");
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let candidate = p47_synthetic_candidate(
+            Some(tenant.clone()),
+            vec![s1, s2],
+            0.90,
+            hydra_core::TrustLevel::High,
+            hydra_core::CorrelationStrength::Possible,
+            vec![],
+            vec![],
+        );
+        let err = hydra
+            .anchor_correlation_candidate(
+                Some(&tenant),
+                candidate,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap_err();
+        match err {
+            hydra_core::error::HydraError::QueryError(msg) => {
+                assert!(
+                    msg.contains("trust below"),
+                    "expected 'trust below' message, got: {msg}"
+                );
+                // Rejection surfaces all three axes for
+                // debuggability — strength=Possible should be
+                // visible.
+                assert!(msg.contains("Possible"), "msg: {msg}");
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anchor_correlation_candidate_rejects_tenant_mismatch() {
+        // Caller tenant_a, candidate.tenant_id = tenant_b → reject.
+        let mut hydra = Hydra::new();
+        let tenant_a = hydra_core::TenantId::from_str("tenant_p47_a");
+        let tenant_b = hydra_core::TenantId::from_str("tenant_p47_b");
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant_b.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant_b.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        // Trust verdict is HIGH/STRONG so the trust gate isn't
+        // what trips this test — the tenant mismatch is.
+        let candidate = p47_synthetic_candidate(
+            Some(tenant_b.clone()),
+            vec![s1, s2],
+            0.95,
+            hydra_core::TrustLevel::High,
+            hydra_core::CorrelationStrength::Strong,
+            vec![],
+            vec![],
+        );
+        let err = hydra
+            .anchor_correlation_candidate(
+                Some(&tenant_a),
+                candidate,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap_err();
+        match err {
+            hydra_core::error::HydraError::QueryError(msg) => {
+                assert!(
+                    msg.contains("tenant"),
+                    "expected tenant-mismatch message, got: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anchor_correlation_candidate_rejects_empty_actor() {
+        // Empty actor → reject before any trust evaluation.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p47_actor");
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let candidate = p47_synthetic_candidate(
+            Some(tenant.clone()),
+            vec![s1, s2],
+            0.95,
+            hydra_core::TrustLevel::High,
+            hydra_core::CorrelationStrength::Strong,
+            vec![],
+            vec![],
+        );
+        let err = hydra
+            .anchor_correlation_candidate(
+                Some(&tenant),
+                candidate,
+                hydra_core::ActorId::from_str(""),
+            )
+            .unwrap_err();
+        match err {
+            hydra_core::error::HydraError::QueryError(msg) => {
+                assert!(
+                    msg.contains("invalid actor"),
+                    "expected 'invalid actor' message, got: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anchor_correlation_candidate_preserves_trust_score() {
+        // The supplied trust score lands on `cell.trust_score`
+        // verbatim — anchor preserves the P43 verdict.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p47_score");
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let candidate = p47_synthetic_candidate(
+            Some(tenant.clone()),
+            vec![s1, s2],
+            0.87,
+            hydra_core::TrustLevel::High,
+            hydra_core::CorrelationStrength::Strong,
+            vec![],
+            vec![],
+        );
+        let cell = hydra
+            .anchor_correlation_candidate(
+                Some(&tenant),
+                candidate,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let stored = cell.trust_score.expect("trust_score Some");
+        assert!(
+            (stored - 0.87).abs() < 1e-9,
+            "expected exact 0.87 preservation, got {stored}"
+        );
+    }
+
+    #[test]
+    fn anchor_correlation_candidate_includes_signal_claims_evidence_cells() {
+        // Two signals with overlapping claim_ids/evidence_ids
+        // + the candidate carries cell_ids. Resulting cell
+        // dedupes claims+evidence (first-seen order) and copies
+        // candidate.cell_ids → child_cell_ids.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p47_refs");
+        let claim_a = hydra_core::ClaimId::from_str("clm_p47_a");
+        let claim_b = hydra_core::ClaimId::from_str("clm_p47_b");
+        let evidence_x = hydra_core::EvidenceId::from_str("evd_p47_x");
+        let evidence_y = hydra_core::EvidenceId::from_str("evd_p47_y");
+        let cell_p = hydra_core::CausalCellId::from_str("cell_p47_p");
+        let cell_q = hydra_core::CausalCellId::from_str("cell_p47_q");
+
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![claim_a.clone(), claim_b.clone()],
+            vec![evidence_x.clone()],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            // Overlapping claim_a + new claim_b ordering →
+            // dedupe must keep first-seen order.
+            vec![claim_a.clone(), claim_b.clone()],
+            vec![evidence_x.clone(), evidence_y.clone()],
+            None,
+        );
+        let candidate = p47_synthetic_candidate(
+            Some(tenant.clone()),
+            vec![s1, s2],
+            0.95,
+            hydra_core::TrustLevel::High,
+            hydra_core::CorrelationStrength::Strong,
+            vec![],
+            vec![cell_p.clone(), cell_q.clone()],
+        );
+        let cell = hydra
+            .anchor_correlation_candidate(
+                Some(&tenant),
+                candidate,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        // Claim dedupe: signal-1 [a, b] → signal-2 [a, b]; final
+        // [a, b] (first-seen).
+        assert_eq!(cell.claim_ids, vec![claim_a, claim_b]);
+        // Evidence dedupe: signal-1 [x] → signal-2 [x, y]; final
+        // [x, y].
+        assert_eq!(cell.evidence_ids, vec![evidence_x, evidence_y]);
+        // child_cell_ids comes from candidate.cell_ids verbatim.
+        assert_eq!(cell.child_cell_ids, vec![cell_p, cell_q]);
+        // v1 has no action/outcome/observation/source surface.
+        assert!(cell.action_ids.is_empty());
+        assert!(cell.outcome_ids.is_empty());
+        assert!(cell.observation_run_ids.is_empty());
+        assert!(cell.source_events.is_empty());
+    }
+
+    #[test]
+    fn anchor_correlation_candidate_uses_existing_causal_cell_event() {
+        // No new event variant; exactly ONE CausalCellCreated
+        // appended per anchor call. Pinned via diff.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p47_event");
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let candidate = p47_synthetic_candidate(
+            Some(tenant.clone()),
+            vec![s1, s2],
+            0.95,
+            hydra_core::TrustLevel::High,
+            hydra_core::CorrelationStrength::Strong,
+            vec![],
+            vec![],
+        );
+        let pre_events = hydra.events().len();
+        let cell = hydra
+            .anchor_correlation_candidate(
+                Some(&tenant),
+                candidate,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .unwrap();
+        let post_events: Vec<_> =
+            hydra.events().into_iter().cloned().collect();
+        assert_eq!(post_events.len(), pre_events + 1);
+        // The newly-emitted event MUST be CausalCellCreated with
+        // the same cell — no new event variants.
+        let last = post_events.last().unwrap();
+        match &last.kind {
+            hydra_core::EventKind::CausalCellCreated {
+                cell: emitted,
+            } => {
+                assert_eq!(emitted.id, cell.id);
+                assert_eq!(emitted.kind, hydra_core::CausalCellKind::Incident);
+            }
+            other => panic!(
+                "expected CausalCellCreated event, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn anchor_correlation_candidate_snapshot_restore_preserves_cell() {
+        // Replay-via-snapshot pattern mirrors
+        // `snapshot_restore_preserves_causal_cells` at hydra.rs:19428.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p47_snap");
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let candidate = p47_synthetic_candidate(
+            Some(tenant.clone()),
+            vec![s1, s2],
+            0.90,
+            hydra_core::TrustLevel::High,
+            hydra_core::CorrelationStrength::Strong,
+            vec![],
+            vec![],
+        );
+        let actor = hydra_core::ActorId::from_str("actor_ops");
+        let cell = hydra
+            .anchor_correlation_candidate(
+                Some(&tenant),
+                candidate,
+                actor.clone(),
+            )
+            .unwrap();
+        // Snapshot + body replay.
+        let manifest = hydra.snapshot(actor.clone()).unwrap();
+        let body = hydra
+            .snapshot_store()
+            .body(&manifest.id)
+            .expect("snapshot body present")
+            .clone();
+        // The cell body itself must round-trip on the body.
+        assert!(
+            body.causal_cells.iter().any(|c| c.id == cell.id),
+            "snapshot body must carry the anchored cell"
+        );
+        // Replay events into a fresh engine; cell comes back.
+        let mut fresh = Hydra::new();
+        fresh.recover_from_events(body.events.clone()).unwrap();
+        let restored = fresh
+            .causal_cell(&cell.id)
+            .expect("cell restored after replay");
+        assert_eq!(restored, &cell);
+    }
+
+    #[test]
+    fn anchor_correlation_candidate_does_not_reassess_candidate() {
+        // LOAD-BEARING contract: P47 trusts the supplied verdict.
+        // Synthetic candidate carries High/Strong/0.95 but its
+        // signals reference DISJOINT, non-trusted entities that a
+        // reassess would never score high. Anchor must succeed
+        // and preserve 0.95 verbatim.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p47_trust");
+        // Disjoint signals: NO shared entities, NO link, no
+        // source — a reassess would land near zero.
+        let s1 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let s2 = p45_signal(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_b",
+            Some(tenant.clone()),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
+        let candidate = p47_synthetic_candidate(
+            Some(tenant.clone()),
+            vec![s1, s2],
+            0.95,
+            hydra_core::TrustLevel::High,
+            hydra_core::CorrelationStrength::Strong,
+            vec![],
+            vec![],
+        );
+        let cell = hydra
+            .anchor_correlation_candidate(
+                Some(&tenant),
+                candidate,
+                hydra_core::ActorId::from_str("actor_ops"),
+            )
+            .expect("anchor must trust supplied verdict, not reassess");
+        // Score preserved verbatim — the engine did NOT recompute.
+        assert_eq!(cell.trust_score, Some(0.95));
+        assert_eq!(cell.kind, hydra_core::CausalCellKind::Incident);
     }
 }
