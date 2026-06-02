@@ -18,6 +18,7 @@ pub mod replication;
 pub mod trust;
 pub mod causal_cell;
 pub mod identity;
+pub mod correlation;
 
 pub use id::{
     ActionId, ActorId, ApprovalId, CascadeId, CausalCellId, ClaimId, CommitId, EdgeId, EventId,
@@ -32,6 +33,7 @@ pub use identity::{
     MatchLevel, SemanticIdentityMatchAssessment, SemanticIdentityMatchCandidate,
     SourceTrustAssessment,
 };
+pub use correlation::{CorrelationStrength, CorrelationTrustAssessment};
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
     Claim,
@@ -122,6 +124,7 @@ pub mod prelude {
         IdentityMatchTrustAssessment, MatchLevel, SemanticIdentityMatchAssessment,
         SemanticIdentityMatchCandidate, SourceTrustAssessment,
     };
+    pub use crate::correlation::{CorrelationStrength, CorrelationTrustAssessment};
     pub use crate::error::{HydraError, Result};
     pub use crate::event::{Event, EventKind, Value};
     pub use crate::epistemic::{
