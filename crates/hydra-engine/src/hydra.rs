@@ -3863,6 +3863,317 @@ impl Hydra {
         })
     }
 
+    /// Patch 39 — Identity Link Trust v1.
+    ///
+    /// Read-only structural trust verdict over a persisted
+    /// `IdentityLink` (P37 vocabulary). v1 evaluates four signals:
+    ///
+    /// - the author's stated confidence in the edge
+    /// - the trust of both endpoint entities (via P33
+    ///   `assess_identity_entity_trust`)
+    /// - presence of supporting audit references
+    ///   (`evidence_ids` / `claim_ids` / `cell_ids` — presence
+    ///   only; v0 does NOT validate that referenced ids exist)
+    /// - well-formedness of the link kind (built-in vs Custom)
+    ///
+    /// ## Suggestion-only contract
+    ///
+    /// **v1 assesses STRUCTURAL trustworthiness, NOT SEMANTIC
+    /// correctness.** A link asserting
+    /// `Dashboard --OwnedBy--> Table` scores identically to the
+    /// sensible `Service --OwnedBy--> User` because v1 has no
+    /// kind-compatibility matrix. That lands in P41+.
+    ///
+    /// Weights are calibrated for explainability, not
+    /// correctness. False positives are expected. Auto-actions
+    /// (accept-semantic-match, auto-merge, downstream
+    /// propagation) MUST NOT consume `IdentityLinkTrustAssessment`
+    /// alone — compose with semantic validation, endpoint
+    /// match-trust (P32), endpoint entity-trust (P33),
+    /// source-trust (P35), explicit operator approval, AND a
+    /// dedicated audit event.
+    ///
+    /// ## LOAD-BEARING acyclicity contract
+    ///
+    /// Link-trust depends on entity-trust. **Entity-trust MUST
+    /// NOT depend on link-trust.** The two P33 calls below are
+    /// the only sanctioned trust-trust recursion in v1; the
+    /// inverse direction is permanently forbidden. If a future
+    /// patch wants "entity is trustworthy because trusted links
+    /// reference it," route through a separate aggregate,
+    /// NEVER back through `assess_identity_entity_trust`.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Load link strictly within `tenant_id`. Unknown id +
+    ///    wrong tenant + `None`/`Some` slot mismatch all return
+    ///    `QueryError("unknown identity link: {id}")` —
+    ///    indistinguishable by design (no cross-tenant
+    ///    existence leak).
+    /// 2. Recurse into endpoint entity-trust for `from` and
+    ///    `to` via P33 — see acyclicity contract.
+    /// 3. Apply 11 factors (3-way confidence mutex + 2
+    ///    implicit-middle entity-trust pairs + binary refs
+    ///    mutex + binary kind mutex).
+    /// 4. Clamp summed score to `[0.0, 1.0]` and bucket via
+    ///    `TrustAssessment::level_for_score`.
+    ///
+    /// ## Mutation
+    ///
+    /// `&self`. No events, no store changes. Pinned by
+    /// `assess_identity_link_trust_does_not_mutate_store`.
+    pub fn assess_identity_link_trust(
+        &self,
+        tenant_id: Option<&hydra_core::TenantId>,
+        link_id: &hydra_core::IdentityLinkId,
+    ) -> hydra_core::error::Result<
+        hydra_core::IdentityLinkTrustAssessment,
+    > {
+        use hydra_core::error::HydraError;
+        use hydra_core::{trust::TrustAssessment, IdentityLinkKind, TrustFactor};
+
+        // 1. Strict tenant-isolated load. `Hydra::identity_link`
+        //    returns cross-tenant; the verdict method MUST
+        //    explicitly check tenant equality. Wrong tenant +
+        //    None/Some slot mismatch + genuine miss all collapse
+        //    into the same `"unknown identity link"` error.
+        let link = match self.identity_link(link_id) {
+            Some(l) if l.tenant_id.as_ref() == tenant_id => l.clone(),
+            _ => {
+                return Err(HydraError::QueryError(format!(
+                    "unknown identity link: {link_id}"
+                )));
+            }
+        };
+
+        // 2. LOAD-BEARING acyclicity contract: link-trust depends
+        //    on entity-trust. Entity-trust MUST NOT depend on
+        //    link-trust. These two calls are the only sanctioned
+        //    trust-trust recursion in v1; the inverse direction
+        //    is permanently forbidden. See module docstring.
+        let from_trust = self
+            .assess_identity_entity_trust(tenant_id, &link.from_entity_id)?;
+        let to_trust = self
+            .assess_identity_entity_trust(tenant_id, &link.to_entity_id)?;
+
+        // 3. Apply factors. Helper closure mirrors P32 / P33 /
+        //    P35's push pattern — every factor record emits, with
+        //    `applied=true` only when the condition fires.
+        let mut factors: Vec<TrustFactor> = Vec::with_capacity(11);
+        let mut score = 0.0_f64;
+        let push_factor =
+            |factors: &mut Vec<TrustFactor>,
+             score: &mut f64,
+             kind: &str,
+             weight: f64,
+             applied: bool,
+             detail: String| {
+                if applied {
+                    *score += weight;
+                }
+                factors.push(TrustFactor {
+                    kind: kind.to_string(),
+                    weight,
+                    applied,
+                    detail,
+                });
+            };
+
+        // === Confidence tier (3-way mutex, always exactly one) ===
+        let conf = link.confidence.value();
+        let conf_high = conf >= 0.80;
+        let conf_medium = !conf_high && conf >= 0.50;
+        let conf_low = !conf_high && !conf_medium;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "link_confidence_high",
+            0.25,
+            conf_high,
+            format!("link confidence {conf:.2} (≥ 0.80)"),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "link_confidence_medium",
+            0.10,
+            conf_medium,
+            format!("link confidence {conf:.2} (0.50–0.80)"),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "link_confidence_low",
+            -0.20,
+            conf_low,
+            format!("link confidence {conf:.2} (< 0.50)"),
+        );
+
+        // === From-entity trust (implicit middle band) ===
+        //
+        // P33 score thresholds:
+        //   >= 0.80 → from_entity_trust_high (+0.15)
+        //   <= 0.40 → from_entity_trust_low  (-0.15)
+        //   middle  → NEITHER fires (mirrors P35 honest-middle
+        //             pattern; fresh entities in Low band are
+        //             neutral here, not penalized)
+        let from_high = from_trust.score >= 0.80;
+        let from_low = from_trust.score <= 0.40;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "from_entity_trust_high",
+            0.15,
+            from_high,
+            format!(
+                "from entity P33 trust {:.2} ({:?})",
+                from_trust.score, from_trust.level
+            ),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "from_entity_trust_low",
+            -0.15,
+            from_low,
+            format!(
+                "from entity P33 trust {:.2} (≤ 0.40)",
+                from_trust.score
+            ),
+        );
+
+        // === To-entity trust (implicit middle band) ===
+        let to_high = to_trust.score >= 0.80;
+        let to_low = to_trust.score <= 0.40;
+        push_factor(
+            &mut factors,
+            &mut score,
+            "to_entity_trust_high",
+            0.15,
+            to_high,
+            format!(
+                "to entity P33 trust {:.2} ({:?})",
+                to_trust.score, to_trust.level
+            ),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "to_entity_trust_low",
+            -0.15,
+            to_low,
+            format!(
+                "to entity P33 trust {:.2} (≤ 0.40)",
+                to_trust.score
+            ),
+        );
+
+        // === Supporting references (binary mutex) ===
+        //
+        // Presence-only — v1 does NOT validate that referenced
+        // ids actually exist in their respective stores. Future
+        // patches (P41+) may layer referential-integrity checks.
+        let has_refs = !link.evidence_ids.is_empty()
+            || !link.claim_ids.is_empty()
+            || !link.cell_ids.is_empty();
+        let ref_count = link.evidence_ids.len()
+            + link.claim_ids.len()
+            + link.cell_ids.len();
+        push_factor(
+            &mut factors,
+            &mut score,
+            "supporting_references_present",
+            0.15,
+            has_refs,
+            if has_refs {
+                format!(
+                    "{ref_count} supporting reference(s) \
+                     (evidence/claim/cell ids)"
+                )
+            } else {
+                "no supporting references".to_string()
+            },
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "no_supporting_references",
+            -0.05,
+            !has_refs,
+            if has_refs {
+                format!("{ref_count} supporting reference(s) present")
+            } else {
+                "link carries no audit-trail references".to_string()
+            },
+        );
+
+        // === Kind well-formedness (binary mutex) ===
+        let is_custom = matches!(&link.kind, IdentityLinkKind::Custom(_));
+        push_factor(
+            &mut factors,
+            &mut score,
+            "built_in_kind",
+            0.10,
+            !is_custom,
+            format!("kind '{}' is a built-in variant", link.kind.discriminant()),
+        );
+        push_factor(
+            &mut factors,
+            &mut score,
+            "custom_kind",
+            -0.05,
+            is_custom,
+            if is_custom {
+                format!(
+                    "kind '{}' is a Custom variant — soft signal",
+                    link.kind.discriminant()
+                )
+            } else {
+                format!(
+                    "kind '{}' is built-in",
+                    link.kind.discriminant()
+                )
+            },
+        );
+
+        // 4. Clamp and bucket.
+        let final_score = score.clamp(0.0, 1.0);
+        let level = TrustAssessment::level_for_score(final_score);
+
+        // 5. Build explanation. Surfaces the structural-not-
+        //    semantic warning so dashboards see the v1 contract
+        //    without parsing the docstring.
+        let applied_count =
+            factors.iter().filter(|f| f.applied).count();
+        let positive_count = factors
+            .iter()
+            .filter(|f| f.applied && f.weight > 0.0)
+            .count();
+        let negative_count = factors
+            .iter()
+            .filter(|f| f.applied && f.weight < 0.0)
+            .count();
+        let explanation = format!(
+            "Link verdict {level:?} (score {final_score:.2}) — \
+             {positive_count} positive factor(s) and {negative_count} \
+             penalty factor(s) applied out of {applied_count} total. \
+             v1 measures STRUCTURAL trust (confidence, endpoint \
+             entity-trust, supporting refs, kind well-formedness); \
+             v1 does NOT validate SEMANTIC correctness — kind \
+             compatibility lands in P41+. Auto-actions must compose \
+             with separate gates."
+        );
+
+        Ok(hydra_core::IdentityLinkTrustAssessment {
+            link_id: link.id.clone(),
+            score: final_score,
+            level,
+            explanation,
+            factors,
+            assessed_at: chrono::Utc::now(),
+        })
+    }
+
     /// Patch 21 — turn a model-derived reflex chain into a
     /// `CausalCellKind::Reflex` causal cell.
     ///
@@ -22403,6 +22714,834 @@ mod sprint1_tests {
             p35_find_factor(&a, "low_reliability_evidence_from_source").applied,
             "all-below-0.40 must fire low_reliability_evidence_from_source"
         );
+    }
+
+    // === Patch 39 — IdentityLinkTrustAssessment tests ===
+    //
+    // v1 structural trust verdict over a persisted IdentityLink.
+    // 11 factors: 3-way confidence mutex + 2 implicit-middle
+    // entity-trust pairs (from + to) + binary refs mutex + binary
+    // kind mutex. Ceiling 0.80 = TrustLevel::High floor exactly.
+
+    /// Helper: find a P39 factor record by name.
+    fn p39_find_factor<'a>(
+        a: &'a hydra_core::IdentityLinkTrustAssessment,
+        kind: &str,
+    ) -> &'a hydra_core::TrustFactor {
+        a.factors
+            .iter()
+            .find(|f| f.kind == kind)
+            .unwrap_or_else(|| {
+                panic!(
+                    "factor {kind} missing from \
+                     IdentityLinkTrustAssessment"
+                )
+            })
+    }
+
+    /// Build two well-formed Dataset entities under `tenant` so
+    /// the resulting P33 trust verdicts both land in the High
+    /// band (worked example a of P33). Returns their ids.
+    /// Mirrors `p37_seed_entity_pair` shape but explicitly tunes
+    /// for high-trust endpoints.
+    fn p39_seed_high_trust_pair(
+        hydra: &mut Hydra,
+        tenant: Option<hydra_core::TenantId>,
+    ) -> (hydra_core::IdentityEntityId, hydra_core::IdentityEntityId) {
+        // P33 worked example (a): high confidence (0.95) +
+        // multi-source aliases (3 distinct sources) + metadata
+        // → score 0.85 → High.
+        let a = make_entity_for_p33(
+            tenant.clone(),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/p39_a",
+            "Dataset P39 A",
+            vec![
+                alias_for("snowflake", "analytics", "p39_a"),
+                alias_for("dbt", "models", "p39_a"),
+                alias_for("looker", "finance", "p39_a"),
+            ],
+            hydra_core::Confidence::new(0.95),
+            2,
+        );
+        let b = make_entity_for_p33(
+            tenant,
+            hydra_core::IdentityEntityKind::Service,
+            "service/p39_b",
+            "Service P39 B",
+            vec![
+                alias_for("github", "ops", "p39_b"),
+                alias_for("dbt", "models", "p39_b_svc"),
+                alias_for("looker", "ops", "p39_b_svc"),
+            ],
+            hydra_core::Confidence::new(0.95),
+            2,
+        );
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        hydra.create_identity_entity(a).unwrap();
+        hydra.create_identity_entity(b).unwrap();
+        (a_id, b_id)
+    }
+
+    /// Build two low-trust Dataset entities — single alias,
+    /// single source, no metadata — so P33 lands them in the
+    /// Low/Unknown band (≤ 0.40 → fires `*_entity_trust_low`).
+    fn p39_seed_low_trust_pair(
+        hydra: &mut Hydra,
+        tenant: Option<hydra_core::TenantId>,
+    ) -> (hydra_core::IdentityEntityId, hydra_core::IdentityEntityId) {
+        // P33 worked example (c): zero-alias high-conf scores
+        // ~0.45 (Low). For ≤ 0.40 we go zero-alias + medium
+        // confidence (0.60) → ~0.20 → fires _low.
+        let a = make_entity_for_p33(
+            tenant.clone(),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/p39_lo_a",
+            "Lo A",
+            vec![], // zero aliases — bites P33 hard
+            hydra_core::Confidence::new(0.60),
+            0,
+        );
+        let b = make_entity_for_p33(
+            tenant,
+            hydra_core::IdentityEntityKind::Service,
+            "service/p39_lo_b",
+            "Lo B",
+            vec![],
+            hydra_core::Confidence::new(0.60),
+            0,
+        );
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        hydra.create_identity_entity(a).unwrap();
+        hydra.create_identity_entity(b).unwrap();
+        (a_id, b_id)
+    }
+
+    fn p39_make_link_with(
+        tenant: Option<hydra_core::TenantId>,
+        kind: hydra_core::IdentityLinkKind,
+        from: &hydra_core::IdentityEntityId,
+        to: &hydra_core::IdentityEntityId,
+        confidence: f64,
+        evidence_ids: Vec<hydra_core::EvidenceId>,
+        claim_ids: Vec<hydra_core::ClaimId>,
+        cell_ids: Vec<hydra_core::CausalCellId>,
+    ) -> hydra_core::IdentityLink {
+        let now = chrono::Utc::now();
+        hydra_core::IdentityLink {
+            id: hydra_core::IdentityLinkId::new(),
+            tenant_id: tenant,
+            kind,
+            from_entity_id: from.clone(),
+            to_entity_id: to.clone(),
+            confidence: hydra_core::Confidence::new(confidence),
+            evidence_ids,
+            claim_ids,
+            cell_ids,
+            metadata: std::collections::HashMap::new(),
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: now,
+            caused_by: None,
+        }
+    }
+
+    #[test]
+    fn assess_identity_link_trust_happy_path_high_verdict() {
+        // Worked example (a) — ceiling case: high confidence +
+        // both endpoints High-trust + supporting refs + built-in
+        // kind → 0.25 + 0.15 + 0.15 + 0.15 + 0.10 = 0.80 → High.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        let (a, b) = p39_seed_high_trust_pair(&mut hydra, Some(tenant.clone()));
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+            0.95,
+            vec![hydra_core::EvidenceId::from_str("evd_audit_1")],
+            vec![],
+            vec![],
+        );
+        let link_id = link.id.clone();
+        hydra.create_identity_link(link).unwrap();
+
+        let assessment = hydra
+            .assess_identity_link_trust(Some(&tenant), &link_id)
+            .unwrap();
+        assert_eq!(assessment.link_id, link_id);
+        assert!(
+            assessment.score >= 0.80,
+            "best-case must reach the 0.80 ceiling; got {}",
+            assessment.score
+        );
+        assert_eq!(assessment.level, hydra_core::trust::TrustLevel::High);
+        assert!(p39_find_factor(&assessment, "link_confidence_high").applied);
+        assert!(p39_find_factor(&assessment, "from_entity_trust_high").applied);
+        assert!(p39_find_factor(&assessment, "to_entity_trust_high").applied);
+        assert!(p39_find_factor(&assessment, "supporting_references_present").applied);
+        assert!(p39_find_factor(&assessment, "built_in_kind").applied);
+        // Penalty factors all unapplied.
+        assert!(!p39_find_factor(&assessment, "link_confidence_low").applied);
+        assert!(!p39_find_factor(&assessment, "from_entity_trust_low").applied);
+        assert!(!p39_find_factor(&assessment, "to_entity_trust_low").applied);
+        assert!(!p39_find_factor(&assessment, "no_supporting_references").applied);
+        assert!(!p39_find_factor(&assessment, "custom_kind").applied);
+    }
+
+    #[test]
+    fn assess_identity_link_trust_unknown_link_returns_query_error() {
+        // Pinned new error string introduced by P39 — no existing
+        // "unknown identity link" string anywhere else in the
+        // codebase.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        let ghost = hydra_core::IdentityLinkId::new();
+        let result = hydra.assess_identity_link_trust(Some(&tenant), &ghost);
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(
+                    msg.contains("unknown identity link"),
+                    "expected unknown-identity-link error, got: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_identity_link_trust_wrong_tenant_indistinguishable_from_missing() {
+        // LOAD-BEARING pin: a link that exists in tenant_a is
+        // INDISTINGUISHABLE from a genuinely missing link when
+        // probed from tenant_b. Same `"unknown identity link"`
+        // error — no cross-tenant existence leak.
+        let mut hydra = Hydra::new();
+        let tenant_a = hydra_core::TenantId::from_str("tenant_a");
+        let tenant_b = hydra_core::TenantId::from_str("tenant_b");
+        let (a, b) = p39_seed_high_trust_pair(&mut hydra, Some(tenant_a.clone()));
+        let link = p39_make_link_with(
+            Some(tenant_a),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+            0.9,
+            vec![],
+            vec![],
+            vec![],
+        );
+        let link_id = link.id.clone();
+        hydra.create_identity_link(link).unwrap();
+        // Probe from tenant_b.
+        let result = hydra.assess_identity_link_trust(Some(&tenant_b), &link_id);
+        match result {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown identity link"));
+            }
+            other => panic!("expected QueryError, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assess_identity_link_trust_none_tenant_strict_isolation() {
+        // LOAD-BEARING pin (both directions). None-tenanted
+        // links are invisible to Some(t) callers AND vice versa.
+        // P37 forces link.tenant == from.tenant == to.tenant, so
+        // we seed None-tenanted endpoints + a None-tenanted link.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        let (a, b) = p39_seed_high_trust_pair(&mut hydra, None);
+        let link = p39_make_link_with(
+            None,
+            hydra_core::IdentityLinkKind::SameAs,
+            &a,
+            &b,
+            0.9,
+            vec![],
+            vec![],
+            vec![],
+        );
+        let link_id = link.id.clone();
+        hydra.create_identity_link(link).unwrap();
+
+        // Direction 1: Some(t) probe of None-tenanted link → unknown.
+        let r1 = hydra.assess_identity_link_trust(Some(&tenant), &link_id);
+        match r1 {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown identity link"));
+            }
+            other => panic!("expected QueryError, got: {other:?}"),
+        }
+        // Direction 2: None probe sees the link.
+        let r2 = hydra.assess_identity_link_trust(None, &link_id).unwrap();
+        assert_eq!(r2.link_id, link_id);
+
+        // Now create a Some(t)-tenanted link and verify the None
+        // probe doesn't see IT either.
+        let (ta, tb) =
+            p39_seed_high_trust_pair(&mut hydra, Some(tenant.clone()));
+        let tlink = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &ta,
+            &tb,
+            0.9,
+            vec![],
+            vec![],
+            vec![],
+        );
+        let tlink_id = tlink.id.clone();
+        hydra.create_identity_link(tlink).unwrap();
+        let r3 = hydra.assess_identity_link_trust(None, &tlink_id);
+        match r3 {
+            Err(hydra_core::error::HydraError::QueryError(msg)) => {
+                assert!(msg.contains("unknown identity link"));
+            }
+            other => panic!("expected QueryError, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_confidence_factors_mutually_exclusive() {
+        // 3-way mutex: confidence_high / _medium / _low always
+        // emits exactly one applied=true. Different link kinds
+        // per iteration so P37's duplicate-pair-kind check
+        // doesn't bite — confidence buckets are orthogonal to
+        // the kind dimension.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        let (a, b) = p39_seed_high_trust_pair(&mut hydra, Some(tenant.clone()));
+
+        for (conf, kind, expected_kind) in [
+            (
+                0.95,
+                hydra_core::IdentityLinkKind::DependsOn,
+                "link_confidence_high",
+            ),
+            (
+                0.65,
+                hydra_core::IdentityLinkKind::OwnedBy,
+                "link_confidence_medium",
+            ),
+            (
+                0.30,
+                hydra_core::IdentityLinkKind::ProducedBy,
+                "link_confidence_low",
+            ),
+        ] {
+            let link = p39_make_link_with(
+                Some(tenant.clone()),
+                kind,
+                &a,
+                &b,
+                conf,
+                vec![],
+                vec![],
+                vec![],
+            );
+            let link_id = link.id.clone();
+            hydra.create_identity_link(link).unwrap();
+            let assessment = hydra
+                .assess_identity_link_trust(Some(&tenant), &link_id)
+                .unwrap();
+            let applied: Vec<&str> = assessment
+                .factors
+                .iter()
+                .filter(|f| {
+                    f.kind == "link_confidence_high"
+                        || f.kind == "link_confidence_medium"
+                        || f.kind == "link_confidence_low"
+                })
+                .filter(|f| f.applied)
+                .map(|f| f.kind.as_str())
+                .collect();
+            assert_eq!(applied, vec![expected_kind], "conf {conf}");
+        }
+    }
+
+    #[test]
+    fn entity_trust_factors_middle_band_fires_neither() {
+        // Implicit-middle pin: endpoints in the 0.40 < score <
+        // 0.80 band fire NEITHER `*_entity_trust_high` nor
+        // `*_entity_trust_low`. P33 worked example (a) for one
+        // endpoint (High) + a deliberately middle endpoint.
+        //
+        // Building a middle-band entity is tricky because P33
+        // is calibrated for the extremes. A two-source entity
+        // with medium confidence + 1 metadata entry typically
+        // lands in the 0.50-0.70 range. We construct one
+        // deliberately and assert the middle-band behavior.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        // High endpoint
+        let high = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/mid_high",
+            "High",
+            vec![
+                alias_for("snowflake", "ns", "high"),
+                alias_for("dbt", "ns", "high"),
+                alias_for("looker", "ns", "high"),
+            ],
+            hydra_core::Confidence::new(0.95),
+            2,
+        );
+        // Middle endpoint: 2 aliases + 1 source-diverse + no
+        // metadata → typically lands middle band.
+        let mid = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Service,
+            "service/middle",
+            "Middle",
+            vec![
+                alias_for("snowflake", "ns", "mid_a"),
+                alias_for("snowflake", "ns", "mid_b"), // same source twice
+            ],
+            hydra_core::Confidence::new(0.85),
+            0,
+        );
+        let high_id = high.id.clone();
+        let mid_id = mid.id.clone();
+        hydra.create_identity_entity(high).unwrap();
+        hydra.create_identity_entity(mid).unwrap();
+
+        // Sanity: confirm the middle entity is actually middle.
+        let mid_trust = hydra
+            .assess_identity_entity_trust(Some(&tenant), &mid_id)
+            .unwrap();
+        assert!(
+            mid_trust.score > 0.40 && mid_trust.score < 0.80,
+            "middle entity must land in implicit-middle band; \
+             got {} — adjust the fixture if P33 calibration \
+             changes",
+            mid_trust.score
+        );
+
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &high_id,
+            &mid_id,
+            0.9,
+            vec![],
+            vec![],
+            vec![],
+        );
+        let link_id = link.id.clone();
+        hydra.create_identity_link(link).unwrap();
+        let assessment = hydra
+            .assess_identity_link_trust(Some(&tenant), &link_id)
+            .unwrap();
+        // High side fires _high.
+        assert!(p39_find_factor(&assessment, "from_entity_trust_high").applied);
+        assert!(!p39_find_factor(&assessment, "from_entity_trust_low").applied);
+        // Middle side fires NEITHER.
+        assert!(
+            !p39_find_factor(&assessment, "to_entity_trust_high").applied,
+            "middle endpoint must NOT fire high"
+        );
+        assert!(
+            !p39_find_factor(&assessment, "to_entity_trust_low").applied,
+            "middle endpoint must NOT fire low"
+        );
+    }
+
+    #[test]
+    fn supporting_references_factors_mutually_exclusive() {
+        // Binary mutex: exactly one of present/absent fires.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        let (a, b) = p39_seed_high_trust_pair(&mut hydra, Some(tenant.clone()));
+        // Variant 1: no refs.
+        let l1 = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+            0.9,
+            vec![],
+            vec![],
+            vec![],
+        );
+        let id1 = l1.id.clone();
+        hydra.create_identity_link(l1).unwrap();
+        let a1 = hydra
+            .assess_identity_link_trust(Some(&tenant), &id1)
+            .unwrap();
+        assert!(!p39_find_factor(&a1, "supporting_references_present").applied);
+        assert!(p39_find_factor(&a1, "no_supporting_references").applied);
+        // Variant 2: with refs (different kind to dodge dup-pair).
+        let l2 = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::OwnedBy,
+            &a,
+            &b,
+            0.9,
+            vec![hydra_core::EvidenceId::from_str("evd_x")],
+            vec![],
+            vec![],
+        );
+        let id2 = l2.id.clone();
+        hydra.create_identity_link(l2).unwrap();
+        let a2 = hydra
+            .assess_identity_link_trust(Some(&tenant), &id2)
+            .unwrap();
+        assert!(p39_find_factor(&a2, "supporting_references_present").applied);
+        assert!(!p39_find_factor(&a2, "no_supporting_references").applied);
+    }
+
+    #[test]
+    fn kind_factors_mutually_exclusive() {
+        // Binary mutex on built_in vs Custom.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        let (a, b) = p39_seed_high_trust_pair(&mut hydra, Some(tenant.clone()));
+        let l_built = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+            0.9,
+            vec![],
+            vec![],
+            vec![],
+        );
+        let id_built = l_built.id.clone();
+        hydra.create_identity_link(l_built).unwrap();
+        let a_built = hydra
+            .assess_identity_link_trust(Some(&tenant), &id_built)
+            .unwrap();
+        assert!(p39_find_factor(&a_built, "built_in_kind").applied);
+        assert!(!p39_find_factor(&a_built, "custom_kind").applied);
+
+        let l_custom = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::Custom("kpi_owner_of".to_string()),
+            &a,
+            &b,
+            0.9,
+            vec![],
+            vec![],
+            vec![],
+        );
+        let id_custom = l_custom.id.clone();
+        hydra.create_identity_link(l_custom).unwrap();
+        let a_custom = hydra
+            .assess_identity_link_trust(Some(&tenant), &id_custom)
+            .unwrap();
+        assert!(!p39_find_factor(&a_custom, "built_in_kind").applied);
+        assert!(p39_find_factor(&a_custom, "custom_kind").applied);
+    }
+
+    #[test]
+    fn supporting_references_present_fires_on_any_nonempty_list() {
+        // Independently flips on evidence-only / claim-only /
+        // cell-only refs. Pin so a future refactor doesn't
+        // collapse the disjunction.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        let (a, b) = p39_seed_high_trust_pair(&mut hydra, Some(tenant.clone()));
+        // evidence-only.
+        let l1 = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+            0.9,
+            vec![hydra_core::EvidenceId::from_str("evd_1")],
+            vec![],
+            vec![],
+        );
+        let id1 = l1.id.clone();
+        hydra.create_identity_link(l1).unwrap();
+        assert!(p39_find_factor(
+            &hydra
+                .assess_identity_link_trust(Some(&tenant), &id1)
+                .unwrap(),
+            "supporting_references_present"
+        )
+        .applied);
+        // claim-only.
+        let l2 = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::OwnedBy,
+            &a,
+            &b,
+            0.9,
+            vec![],
+            vec![hydra_core::ClaimId::from_str("claim_1")],
+            vec![],
+        );
+        let id2 = l2.id.clone();
+        hydra.create_identity_link(l2).unwrap();
+        assert!(p39_find_factor(
+            &hydra
+                .assess_identity_link_trust(Some(&tenant), &id2)
+                .unwrap(),
+            "supporting_references_present"
+        )
+        .applied);
+        // cell-only.
+        let l3 = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::ProducedBy,
+            &a,
+            &b,
+            0.9,
+            vec![],
+            vec![],
+            vec![hydra_core::CausalCellId::from_str("cell_1")],
+        );
+        let id3 = l3.id.clone();
+        hydra.create_identity_link(l3).unwrap();
+        assert!(p39_find_factor(
+            &hydra
+                .assess_identity_link_trust(Some(&tenant), &id3)
+                .unwrap(),
+            "supporting_references_present"
+        )
+        .applied);
+    }
+
+    #[test]
+    fn assess_identity_link_trust_includes_all_factors_always() {
+        // Explainability contract pin — all 11 factor records
+        // emit on every assessment, applied OR not.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        let (a, b) = p39_seed_high_trust_pair(&mut hydra, Some(tenant.clone()));
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+            0.9,
+            vec![],
+            vec![],
+            vec![],
+        );
+        let link_id = link.id.clone();
+        hydra.create_identity_link(link).unwrap();
+        let assessment = hydra
+            .assess_identity_link_trust(Some(&tenant), &link_id)
+            .unwrap();
+        let expected = [
+            "link_confidence_high",
+            "link_confidence_medium",
+            "link_confidence_low",
+            "from_entity_trust_high",
+            "from_entity_trust_low",
+            "to_entity_trust_high",
+            "to_entity_trust_low",
+            "supporting_references_present",
+            "no_supporting_references",
+            "built_in_kind",
+            "custom_kind",
+        ];
+        for k in &expected {
+            let _ = p39_find_factor(&assessment, k);
+        }
+        assert_eq!(assessment.factors.len(), expected.len());
+        // Some unapplied present (penalty factors when happy path).
+        assert!(assessment.factors.iter().any(|f| !f.applied));
+    }
+
+    #[test]
+    fn assess_identity_link_trust_does_not_validate_kind_appropriateness() {
+        // Pin the v1 contract: P39 does NOT validate semantic
+        // appropriateness. A nonsense `Dashboard --OwnedBy-->
+        // Service` link scores identically to a sensible
+        // `Service --OwnedBy--> User` because v1 only looks at
+        // structural signals. Kind-compat lands in P41+.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+
+        // Two high-trust entity pairs with different kinds. Both
+        // pairs use the same shape — only the entity kinds differ.
+        let dashboard = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dashboard,
+            "dashboard/x",
+            "Dash X",
+            vec![
+                alias_for("snowflake", "viz", "dash_x"),
+                alias_for("dbt", "viz", "dash_x"),
+                alias_for("looker", "viz", "dash_x"),
+            ],
+            hydra_core::Confidence::new(0.95),
+            2,
+        );
+        let service = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Service,
+            "service/x",
+            "Svc X",
+            vec![
+                alias_for("github", "ops", "svc_x"),
+                alias_for("dbt", "models", "svc_x"),
+                alias_for("looker", "finance", "svc_x"),
+            ],
+            hydra_core::Confidence::new(0.95),
+            2,
+        );
+        let user = make_entity_for_p33(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::User,
+            "user/alice",
+            "Alice",
+            vec![
+                alias_for("github", "users", "alice"),
+                alias_for("slack", "users", "alice"),
+                alias_for("okta", "users", "alice"),
+            ],
+            hydra_core::Confidence::new(0.95),
+            2,
+        );
+        let dash_id = dashboard.id.clone();
+        let svc_id = service.id.clone();
+        let user_id = user.id.clone();
+        hydra.create_identity_entity(dashboard).unwrap();
+        hydra.create_identity_entity(service).unwrap();
+        hydra.create_identity_entity(user).unwrap();
+
+        // Nonsensical: Dashboard --OwnedBy--> Service.
+        let nonsense = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::OwnedBy,
+            &dash_id,
+            &svc_id,
+            0.95,
+            vec![hydra_core::EvidenceId::from_str("evd_n")],
+            vec![],
+            vec![],
+        );
+        let n_id = nonsense.id.clone();
+        hydra.create_identity_link(nonsense).unwrap();
+
+        // Sensible: Service --OwnedBy--> User.
+        let sensible = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::OwnedBy,
+            &svc_id,
+            &user_id,
+            0.95,
+            vec![hydra_core::EvidenceId::from_str("evd_s")],
+            vec![],
+            vec![],
+        );
+        let s_id = sensible.id.clone();
+        hydra.create_identity_link(sensible).unwrap();
+
+        let a_n = hydra
+            .assess_identity_link_trust(Some(&tenant), &n_id)
+            .unwrap();
+        let a_s = hydra
+            .assess_identity_link_trust(Some(&tenant), &s_id)
+            .unwrap();
+        assert!(
+            (a_n.score - a_s.score).abs() < 1e-9,
+            "v1 must NOT distinguish semantic appropriateness; \
+             got nonsense={} sensible={}",
+            a_n.score,
+            a_s.score
+        );
+        assert_eq!(a_n.level, a_s.level);
+    }
+
+    #[test]
+    fn assess_identity_link_trust_does_not_mutate_store() {
+        // LOAD-BEARING anti-mutation pin. The assessment is
+        // read-only — no events, no store changes. Mirrors P30
+        // / P32 / P33 / P35 contracts.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        let (a, b) = p39_seed_high_trust_pair(&mut hydra, Some(tenant.clone()));
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a,
+            &b,
+            0.9,
+            vec![],
+            vec![],
+            vec![],
+        );
+        let link_id = link.id.clone();
+        hydra.create_identity_link(link).unwrap();
+
+        let pre_entities = hydra.identity_entities().count();
+        let pre_links = hydra.identity_links().count();
+        let pre_events = hydra.events().len();
+        let _ = hydra
+            .assess_identity_link_trust(Some(&tenant), &link_id)
+            .unwrap();
+        assert_eq!(hydra.identity_entities().count(), pre_entities);
+        assert_eq!(hydra.identity_links().count(), pre_links);
+        assert_eq!(hydra.events().len(), pre_events);
+    }
+
+    #[test]
+    fn assess_identity_link_trust_valid_custom_kind_emits_custom_kind_only() {
+        // A valid Custom label (non-empty, non-sentinel, non-
+        // built-in collision) correctly fires `custom_kind` and
+        // NOT `built_in_kind`.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        let (a, b) = p39_seed_high_trust_pair(&mut hydra, Some(tenant.clone()));
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::Custom("kpi_owner_of".to_string()),
+            &a,
+            &b,
+            0.95,
+            vec![hydra_core::EvidenceId::from_str("evd_k")],
+            vec![],
+            vec![],
+        );
+        let link_id = link.id.clone();
+        hydra.create_identity_link(link).unwrap();
+        let assessment = hydra
+            .assess_identity_link_trust(Some(&tenant), &link_id)
+            .unwrap();
+        let custom = p39_find_factor(&assessment, "custom_kind");
+        assert!(custom.applied);
+        assert!(custom.detail.contains("kpi_owner_of"));
+        assert!(!p39_find_factor(&assessment, "built_in_kind").applied);
+    }
+
+    #[test]
+    fn assess_identity_link_trust_worst_case_clamps_to_zero() {
+        // Worked example (c): low confidence + both endpoints
+        // low-trust + no refs + Custom kind →
+        // -0.20 - 0.15 - 0.15 - 0.05 - 0.05 = -0.60
+        // → clamp 0 → Unknown.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p39");
+        let (a, b) = p39_seed_low_trust_pair(&mut hydra, Some(tenant.clone()));
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::Custom("legacy_rel".to_string()),
+            &a,
+            &b,
+            0.30, // low confidence
+            vec![],
+            vec![],
+            vec![],
+        );
+        let link_id = link.id.clone();
+        hydra.create_identity_link(link).unwrap();
+        let assessment = hydra
+            .assess_identity_link_trust(Some(&tenant), &link_id)
+            .unwrap();
+        assert_eq!(assessment.score, 0.0);
+        assert_eq!(assessment.level, hydra_core::trust::TrustLevel::Unknown);
+        assert!(p39_find_factor(&assessment, "link_confidence_low").applied);
+        assert!(p39_find_factor(&assessment, "from_entity_trust_low").applied);
+        assert!(p39_find_factor(&assessment, "to_entity_trust_low").applied);
+        assert!(p39_find_factor(&assessment, "no_supporting_references").applied);
+        assert!(p39_find_factor(&assessment, "custom_kind").applied);
     }
 
     // === Patch 23 — CausalCell trust folding ===

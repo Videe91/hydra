@@ -857,6 +857,82 @@ impl IdentityLink {
     }
 }
 
+// === Patch 39 — Identity Link Trust v1 ============================
+//
+// `IdentityLinkTrustAssessment` is a STRUCTURAL trust verdict over
+// a persisted `IdentityLink` (P37 vocabulary). v1 evaluates four
+// signals:
+//
+//   - the author's stated confidence in the edge
+//   - the trust of both endpoint entities (via P33
+//     `assess_identity_entity_trust`)
+//   - presence of supporting audit references
+//     (`evidence_ids` / `claim_ids` / `cell_ids`)
+//   - well-formedness of the link kind (built-in vs Custom)
+//
+// **v1 does NOT validate SEMANTIC correctness.** A link asserting
+// `Dashboard --OwnedBy--> Table` scores identically to the
+// semantically sensible `Service --OwnedBy--> User` because v1
+// has no kind-compatibility matrix (which link kinds make sense
+// between which entity-kind pairs). Kind-compatibility is
+// deferred to P41+.
+//
+// **LOAD-BEARING acyclicity contract**: link-trust depends on
+// entity-trust. **Entity-trust MUST NOT depend on link-trust.**
+// Any future "entity is trustworthy because trusted links
+// reference it" signal must route through a separate aggregate,
+// NEVER back through `assess_identity_entity_trust`. The two
+// P33 calls inside `assess_identity_link_trust` are the only
+// sanctioned trust-trust recursion in v1; the inverse is
+// permanently forbidden.
+//
+// **Auto-actions (accept-semantic-match, auto-merge, downstream
+// propagation) MUST NOT consume `IdentityLinkTrustAssessment`
+// alone.** Compose with separate semantic validation, endpoint
+// match-trust (P32) ≥ High, endpoint entity-trust (P33) ≥ High,
+// source-trust (P35), explicit operator approval, and emission
+// of a dedicated audit event (e.g. `IdentityLinkAccepted` —
+// P41+).
+//
+// Fresh entities (zero aliases, no metadata) depress link trust
+// by design via `from/to_entity_trust_low`. Re-assess after the
+// entities accrue aliases / evidence / supporting cells.
+
+/// Trust verdict over a single `IdentityLink`. Produced by
+/// `Hydra::assess_identity_link_trust`.
+///
+/// Field semantics:
+///
+/// - `link_id` — the link being judged.
+/// - `score` — P39 trust score, clamped to `[0.0, 1.0]`. Sum of
+///   applied factor weights; can dip below 0 pre-clamp when
+///   penalties dominate. Maximum reachable in v1 is `0.80`
+///   (positive ceiling — exactly the `TrustLevel::High` floor;
+///   clearing High requires EVERY positive factor to fire).
+/// - `level` — `TrustLevel` bucket via the shared thresholds
+///   (≥0.80 High, ≥0.50 Medium, ≥0.20 Low, else Unknown).
+/// - `explanation` — short prose summary including the
+///   structural-not-semantic warning so operator dashboards
+///   surface the v1 contract.
+/// - `factors` — ALL 11 evaluated factors (applied AND unapplied
+///   — same explainability contract as P9 / P23 / P30 / P32 /
+///   P33 / P35).
+/// - `assessed_at` — wall-clock at compute.
+///
+/// **Unknown / wrong-tenant / `None`-`Some`-mismatch link** all
+/// surface as `QueryError("unknown identity link: {id}")` —
+/// indistinguishable by design (no cross-tenant existence leak;
+/// mirrors P32 / P33 / P35).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdentityLinkTrustAssessment {
+    pub link_id: IdentityLinkId,
+    pub score: f64,
+    pub level: crate::trust::TrustLevel,
+    pub explanation: String,
+    pub factors: Vec<TrustFactor>,
+    pub assessed_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1616,5 +1692,85 @@ mod tests {
         assert!(json.contains("\"kind\":\"DependsOn\""));
         let restored: IdentityLink = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, link);
+    }
+
+    // === Patch 39 — IdentityLinkTrustAssessment tests ===
+
+    fn p39_sample_link_trust_assessment() -> IdentityLinkTrustAssessment {
+        IdentityLinkTrustAssessment {
+            link_id: IdentityLinkId::from_str("idl_xyz"),
+            score: 0.80,
+            level: crate::trust::TrustLevel::High,
+            explanation: "Link verdict High (score 0.80) — 5 positive \
+                          factor(s) and 0 penalty factor(s) applied out \
+                          of 5 total. v1 measures STRUCTURAL trust; v1 \
+                          does NOT validate SEMANTIC correctness."
+                .to_string(),
+            factors: vec![
+                TrustFactor {
+                    kind: "link_confidence_high".to_string(),
+                    weight: 0.25,
+                    applied: true,
+                    detail: "link confidence 0.95 (≥ 0.80)".to_string(),
+                },
+                TrustFactor {
+                    kind: "link_confidence_low".to_string(),
+                    weight: -0.20,
+                    applied: false,
+                    detail: "link confidence 0.95 (< 0.50)".to_string(),
+                },
+            ],
+            assessed_at: chrono::DateTime::parse_from_rfc3339(
+                "2026-06-01T12:00:00Z",
+            )
+            .unwrap()
+            .with_timezone(&Utc),
+        }
+    }
+
+    #[test]
+    fn identity_link_trust_assessment_serde_round_trip() {
+        // Full envelope must round-trip through serde. Pinned
+        // so the future P40 wire surface lands without
+        // rewriting fixtures.
+        let assessment = p39_sample_link_trust_assessment();
+        let json = serde_json::to_string(&assessment).unwrap();
+        assert!(json.contains("\"level\":\"High\""));
+        let restored: IdentityLinkTrustAssessment =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, assessment);
+    }
+
+    #[test]
+    fn identity_link_trust_assessment_pascal_case_wire_form() {
+        // Wire field names pinned exactly — guards against
+        // accidental `#[serde(rename_all)]` drift breaking the
+        // P40 HTTP contract.
+        let assessment = p39_sample_link_trust_assessment();
+        let json = serde_json::to_string(&assessment).unwrap();
+        assert!(json.contains("\"link_id\":\"idl_xyz\""));
+        assert!(json.contains("\"score\":"));
+        assert!(json.contains("\"level\":\"High\""));
+        assert!(json.contains("\"explanation\":"));
+        assert!(json.contains("\"factors\":"));
+        assert!(json.contains("\"assessed_at\":"));
+    }
+
+    #[test]
+    fn identity_link_trust_assessment_level_matches_trust_thresholds() {
+        // Pin that `level` is the SHARED `TrustLevel` (≥0.80
+        // High, ≥0.50 Medium, ≥0.20 Low, else Unknown). The v1
+        // ceiling 0.80 lands exactly at the High floor.
+        for (score, expected) in [
+            (0.80_f64, crate::trust::TrustLevel::High), // v1 ceiling exactly
+            (0.50, crate::trust::TrustLevel::Medium),
+            (0.20, crate::trust::TrustLevel::Low),
+            (0.00, crate::trust::TrustLevel::Unknown),
+        ] {
+            let mut a = p39_sample_link_trust_assessment();
+            a.score = score;
+            a.level = crate::trust::TrustAssessment::level_for_score(score);
+            assert_eq!(a.level, expected, "score = {score}");
+        }
     }
 }
