@@ -47,6 +47,7 @@ from ._types import (
     IdentityLink,
     IdentityLinkId,
     IdentityLinkKind,
+    IdentityLinkTrustAssessment,
     IdentityMatchTrustAssessment,
     SemanticIdentityMatchAssessment,
     SourceTrustAssessment,
@@ -1355,6 +1356,65 @@ class Hydra:
             tenant=tenant,
         )
         return SourceTrustAssessment.model_validate(raw)
+
+    # ========================================================================
+    # Identity link trust (Patch 40 — wire surface over P39 verdict)
+    # ========================================================================
+
+    async def assess_identity_link_trust(
+        self,
+        link_id: IdentityLinkId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityLinkTrustAssessment:
+        """Read the Patch 39 trust verdict over a persisted
+        `IdentityLink` (`GET /trust/identity/links/{link_id}`
+        — Patch 40 wire).
+
+        Returns the typed envelope with `score`, `level`
+        (`TrustLevel`), `explanation`, and all 11 P39 factor
+        records (applied AND unapplied — explainability
+        contract).
+
+        Strict tenant scoping: requires `X-Hydra-Tenant`
+        (propagated automatically); unknown link, wrong tenant,
+        `None`-tenanted link under tenanted query, AND endpoint-
+        entity miss during the P33 walk inside P39 all surface
+        as `HydraNotFoundError` — indistinguishable by design.
+        Endpoint-entity errors are mapped to 404 (not 500) to
+        prevent cross-tenant endpoint-existence leaks.
+
+        ## Strategic warning (P39 carry-forward)
+
+        **v1 measures STRUCTURAL trust, NOT semantic
+        correctness.** A link like
+        `Dashboard --OwnedBy--> Service` scores identically to
+        the sensible `Service --OwnedBy--> User` — kind
+        compatibility is deferred to P41+.
+
+        **LOAD-BEARING acyclicity contract**: link-trust depends
+        on entity-trust. Entity-trust MUST NOT depend on link-
+        trust.
+
+        Auto-actions and accept-semantic-match workflows MUST
+        NOT consume this verdict alone. Compose with:
+          - separate semantic validation (P41+ kind compatibility)
+          - match trust (`assess_identity_match_trust`)
+          - entity trust (`assess_identity_entity_trust`)
+          - source trust (`assess_source_trust`)
+          - explicit operator approval
+          - a durable audit event (P41+ `IdentityLinkAccepted`)
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header
+          - 404 → `HydraNotFoundError`: unknown id, wrong tenant,
+            `None`-tenanted link, OR endpoint-entity miss
+        """
+        raw = await self._http.get(
+            _paths.trust_identity_link_path(link_id),
+            tenant=tenant,
+        )
+        return IdentityLinkTrustAssessment.model_validate(raw)
 
     async def _ingest(
         self,

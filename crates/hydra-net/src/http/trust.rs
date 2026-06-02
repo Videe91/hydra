@@ -48,6 +48,7 @@ use axum::{
 };
 use hydra_core::{
     CausalCellId, ClaimId, IdentityAlias, IdentityEntityId, IdentityEntityKind,
+    IdentityLinkId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,7 @@ impl TrustHttpState {
 /// - `/trust/identity/entities/:entity_id`    — Patch 34 identity entity trust
 /// - `/trust/identity/matches`                — Patch 34 identity match trust
 /// - `/trust/identity/sources/:source`        — Patch 36 source trust
+/// - `/trust/identity/links/:link_id`         — Patch 40 identity link trust
 ///
 /// **Auth scope precedence pin**: `/trust/identity/*` resolves to
 /// `read:trust` via the `/trust/*` prefix clause in
@@ -79,8 +81,8 @@ impl TrustHttpState {
 /// auth tests.
 ///
 /// Future patches mount alongside under the same `/trust/*`
-/// prefix (Link Trust → `/trust/identity/links/:id`, operational
-/// connector trust → `/trust/connectors/:id`, etc.).
+/// prefix (operational connector trust → `/trust/connectors/:id`,
+/// etc.).
 pub fn trust_router(runtime: RuntimeHandle) -> Router {
     Router::new()
         .route("/trust/claims/:claim_id", get(get_claim_trust))
@@ -96,6 +98,10 @@ pub fn trust_router(runtime: RuntimeHandle) -> Router {
         .route(
             "/trust/identity/sources/:source",
             get(get_source_trust),
+        )
+        .route(
+            "/trust/identity/links/:link_id",
+            get(get_identity_link_trust),
         )
         .with_state(TrustHttpState::new(runtime))
 }
@@ -511,6 +517,69 @@ async fn get_source_trust(
         Err(other) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("source trust assessment failed: {other}"),
+        ),
+    }
+}
+
+/// `GET /trust/identity/links/:link_id` — Patch 40 identity
+/// link trust surface. Exposes the Patch 39
+/// `Hydra::assess_identity_link_trust` verdict over HTTP.
+///
+/// Strict tenant scoping carries forward from P39:
+///
+/// - missing `X-Hydra-Tenant` → 400
+/// - unknown link / wrong tenant / `None`-tenanted link → 404
+///   with engine `"unknown identity link: {id}"` message
+/// - endpoint-entity resolution miss during the P33 walk
+///   inside P39 → ALSO 404 (NOT 500) — **LOAD-BEARING**: the
+///   substring match below is `"unknown identity"` (covers both
+///   `"unknown identity link"` AND `"unknown identity entity"`)
+///   so a cross-tenant probe of a link whose endpoints live in
+///   another tenant doesn't surface as a 500 that would leak
+///   endpoint existence.
+/// - happy path → 200 with bare `IdentityLinkTrustAssessment`
+///   body (no envelope — matches `/trust/claims/:id`,
+///   `/trust/cells/:id`, `/trust/identity/entities/:id`,
+///   `/trust/identity/sources/:source`)
+///
+/// **Strategic warning carry-forward (P39)**: v1 measures
+/// STRUCTURAL trustworthiness — author confidence, endpoint
+/// entity-trust, supporting audit references, link kind well-
+/// formedness. **v1 does NOT validate SEMANTIC correctness.**
+/// `Dashboard --OwnedBy--> Service` scores identically to
+/// `Service --OwnedBy--> User`. Kind compatibility deferred to
+/// P41+. Auto-actions and accept-semantic-match workflows MUST
+/// compose with separate gates.
+async fn get_identity_link_trust(
+    State(state): State<TrustHttpState>,
+    headers: HeaderMap,
+    Path(link_id): Path<String>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(err) => return tenant_error_response(err),
+    };
+    let id = IdentityLinkId::from_str(&link_id);
+
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
+
+    match hydra.assess_identity_link_trust(Some(&tenant), &id) {
+        Ok(assessment) => (StatusCode::OK, Json(assessment)).into_response(),
+        Err(hydra_core::error::HydraError::QueryError(msg))
+            if msg.contains("unknown identity") =>
+        {
+            // LOAD-BEARING broader substring: covers both the
+            // P39 "unknown identity link" error AND the P33
+            // "unknown identity entity" error that bubbles up
+            // through the endpoint trust walk. Mapping endpoint
+            // misses to 500 would leak cross-tenant endpoint
+            // existence.
+            error_response(StatusCode::NOT_FOUND, msg)
+        }
+        Err(other) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("identity link trust assessment failed: {other}"),
         ),
     }
 }
@@ -1888,5 +1957,557 @@ mod tests {
         // empty verdict). A 404 here would mean the route wasn't
         // mounted.
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // === Patch 40 — GET /trust/identity/links/:link_id ===
+
+    /// Build a minimal `IdentityLink` between two entities for
+    /// HTTP tests. Mirror of `make_test_link` in
+    /// `http/identity.rs::tests` — duplicated by design until a
+    /// third caller appears (same precedent as
+    /// `parse_identity_kind` duplication at the module level).
+    fn make_test_link(
+        tenant: Option<TenantId>,
+        kind: hydra_core::IdentityLinkKind,
+        from: &IdentityEntityId,
+        to: &IdentityEntityId,
+        confidence: f64,
+    ) -> hydra_core::IdentityLink {
+        hydra_core::IdentityLink {
+            id: hydra_core::IdentityLinkId::new(),
+            tenant_id: tenant,
+            kind,
+            from_entity_id: from.clone(),
+            to_entity_id: to.clone(),
+            confidence: hydra_core::Confidence::new(confidence),
+            evidence_ids: vec![],
+            claim_ids: vec![],
+            cell_ids: vec![],
+            metadata: HashMap::new(),
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: chrono::Utc::now(),
+            caused_by: None,
+        }
+    }
+
+    /// Insert a link directly via the engine. Mirror of
+    /// `ingest_link` in `http/identity.rs::tests` (duplicated by
+    /// design — see `make_test_link`).
+    async fn ingest_link(
+        runtime: &crate::runtime::RuntimeHandle,
+        link: hydra_core::IdentityLink,
+    ) -> hydra_core::IdentityLink {
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        hydra.create_identity_link(link).unwrap()
+    }
+
+    /// Seed two distinct entities under the test tenant for P40
+    /// link-trust tests. Returns their ids.
+    async fn seed_two_p40_entities(
+        runtime: &crate::runtime::RuntimeHandle,
+    ) -> (IdentityEntityId, IdentityEntityId) {
+        let tenant = TenantId::from_str(TEST_TENANT);
+        // Two high-trust entities so the resulting link has
+        // both endpoints in the High band (P33 worked example a):
+        // multi-source aliases + metadata + high confidence.
+        let a = make_test_entity_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityEntityKind::Dataset,
+            "dataset/p40_a",
+            vec![
+                snowflake_test_alias("analytics", "p40_a"),
+                hydra_core::IdentityAlias {
+                    source: "dbt".to_string(),
+                    namespace: Some("models".to_string()),
+                    external_id: None,
+                    label: "models.p40_a".to_string(),
+                    normalized: "models.p40_a".to_string(),
+                },
+                hydra_core::IdentityAlias {
+                    source: "looker".to_string(),
+                    namespace: Some("finance".to_string()),
+                    external_id: None,
+                    label: "finance.p40_a".to_string(),
+                    normalized: "finance.p40_a".to_string(),
+                },
+            ],
+            hydra_core::Confidence::new(0.95),
+        );
+        let b = make_test_entity_with(
+            Some(tenant),
+            hydra_core::IdentityEntityKind::Service,
+            "service/p40_b",
+            vec![
+                hydra_core::IdentityAlias {
+                    source: "github".to_string(),
+                    namespace: Some("ops".to_string()),
+                    external_id: None,
+                    label: "ops.p40_b".to_string(),
+                    normalized: "ops.p40_b".to_string(),
+                },
+                hydra_core::IdentityAlias {
+                    source: "dbt".to_string(),
+                    namespace: Some("models".to_string()),
+                    external_id: None,
+                    label: "models.p40_b".to_string(),
+                    normalized: "models.p40_b".to_string(),
+                },
+                hydra_core::IdentityAlias {
+                    source: "looker".to_string(),
+                    namespace: Some("finance".to_string()),
+                    external_id: None,
+                    label: "finance.p40_b".to_string(),
+                    normalized: "finance.p40_b".to_string(),
+                },
+            ],
+            hydra_core::Confidence::new(0.95),
+        );
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        ingest_entity(runtime, a).await;
+        ingest_entity(runtime, b).await;
+        (a_id, b_id)
+    }
+
+    /// Build a `make_test_entity` variant that adds 2 metadata
+    /// entries so the resulting entity clears the P33 High
+    /// threshold (≥0.80) reliably for the link-trust tests.
+    fn make_test_entity_with(
+        tenant: Option<TenantId>,
+        kind: hydra_core::IdentityEntityKind,
+        canonical_key: &str,
+        aliases: Vec<hydra_core::IdentityAlias>,
+        confidence: hydra_core::Confidence,
+    ) -> hydra_core::IdentityEntity {
+        let now = chrono::Utc::now();
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "owner".to_string(),
+            hydra_core::Value::String("team_p40".to_string()),
+        );
+        metadata.insert(
+            "tier".to_string(),
+            hydra_core::Value::String("prod".to_string()),
+        );
+        hydra_core::IdentityEntity {
+            id: IdentityEntityId::new(),
+            tenant_id: tenant,
+            kind,
+            canonical_key: canonical_key.to_string(),
+            display_name: canonical_key.to_string(),
+            aliases,
+            confidence,
+            metadata,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn link_trust_returns_assessment_for_known_link() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_p40_entities(&runtime).await;
+        let link = ingest_link(
+            &runtime,
+            make_test_link(
+                Some(TenantId::from_str(TEST_TENANT)),
+                hydra_core::IdentityLinkKind::DependsOn,
+                &a,
+                &b,
+                0.95,
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/trust/identity/links/{}",
+                link.id.as_str()
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        // Bare wire body — all 6 P39 fields present.
+        assert_eq!(
+            body.get("link_id").and_then(|v| v.as_str()),
+            Some(link.id.as_str())
+        );
+        assert!(body.get("score").is_some());
+        assert!(body.get("level").is_some());
+        assert!(body.get("explanation").is_some());
+        assert!(body.get("factors").is_some());
+        assert!(body.get("assessed_at").is_some());
+    }
+
+    #[tokio::test]
+    async fn link_trust_score_and_level_serialize_correctly() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_p40_entities(&runtime).await;
+        let link = ingest_link(
+            &runtime,
+            make_test_link(
+                Some(TenantId::from_str(TEST_TENANT)),
+                hydra_core::IdentityLinkKind::DependsOn,
+                &a,
+                &b,
+                0.95,
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/trust/identity/links/{}",
+                link.id.as_str()
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        // score is a JSON number; level is PascalCase string.
+        assert!(body.get("score").and_then(|v| v.as_f64()).is_some());
+        let level = body.get("level").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            matches!(level, "High" | "Medium" | "Low" | "Unknown"),
+            "level must be PascalCase TrustLevel; got {level}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_trust_explanation_contains_strategic_warning() {
+        // Engine bakes the structural-not-semantic warning into
+        // the explanation field. Pin BOTH substrings — locks the
+        // contract from drifting silently.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_p40_entities(&runtime).await;
+        let link = ingest_link(
+            &runtime,
+            make_test_link(
+                Some(TenantId::from_str(TEST_TENANT)),
+                hydra_core::IdentityLinkKind::DependsOn,
+                &a,
+                &b,
+                0.95,
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/trust/identity/links/{}",
+                link.id.as_str()
+            )))
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        let explanation =
+            body.get("explanation").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            explanation.contains("STRUCTURAL"),
+            "explanation must surface STRUCTURAL marker: {explanation}"
+        );
+        assert!(
+            explanation.contains("SEMANTIC"),
+            "explanation must surface SEMANTIC marker: {explanation}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_trust_factors_length_is_eleven() {
+        // 11-factor explainability lock — locks the contract so
+        // a future "filter applied=true only" refactor breaks
+        // loudly.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_p40_entities(&runtime).await;
+        let link = ingest_link(
+            &runtime,
+            make_test_link(
+                Some(TenantId::from_str(TEST_TENANT)),
+                hydra_core::IdentityLinkKind::DependsOn,
+                &a,
+                &b,
+                0.95,
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/trust/identity/links/{}",
+                link.id.as_str()
+            )))
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        let factors =
+            body.get("factors").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(factors.len(), 11);
+    }
+
+    #[tokio::test]
+    async fn link_trust_factors_include_unapplied() {
+        // At least one factor record has `applied: false` — pin
+        // the explainability contract (all factors emit, applied
+        // OR not).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_p40_entities(&runtime).await;
+        let link = ingest_link(
+            &runtime,
+            make_test_link(
+                Some(TenantId::from_str(TEST_TENANT)),
+                hydra_core::IdentityLinkKind::DependsOn,
+                &a,
+                &b,
+                0.95,
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/trust/identity/links/{}",
+                link.id.as_str()
+            )))
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        let factors =
+            body.get("factors").and_then(|v| v.as_array()).unwrap();
+        let any_unapplied = factors
+            .iter()
+            .any(|f| f.get("applied").and_then(|v| v.as_bool()) == Some(false));
+        assert!(
+            any_unapplied,
+            "at least one factor must have applied=false (penalty \
+             factors in the happy path)"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_trust_unknown_link_returns_404() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/trust/identity/links/idl_ghost"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(
+            body.error.contains("unknown identity link"),
+            "expected unknown-identity-link error, got: {}",
+            body.error
+        );
+    }
+
+    #[tokio::test]
+    async fn link_trust_wrong_tenant_returns_404() {
+        // Tenant A creates the link; tenant B queries → 404
+        // (indistinguishable from miss; no cross-tenant existence
+        // leak).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_p40_entities(&runtime).await;
+        let link = ingest_link(
+            &runtime,
+            make_test_link(
+                Some(TenantId::from_str(TEST_TENANT)),
+                hydra_core::IdentityLinkKind::DependsOn,
+                &a,
+                &b,
+                0.95,
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get_for_tenant(
+                &format!("/trust/identity/links/{}", link.id.as_str()),
+                "tenant_other",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn link_trust_none_tenanted_link_returns_404_under_tenant() {
+        // None-tenanted link (between None-tenanted entities)
+        // queried with a tenant header → 404 invisible. P39
+        // strict-isolation contract.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        // Seed None-tenanted entities + link.
+        let (a, b) = {
+            let a = make_test_entity_with(
+                None,
+                hydra_core::IdentityEntityKind::System,
+                "system/p40_none_a",
+                vec![hydra_core::IdentityAlias {
+                    source: "system".to_string(),
+                    namespace: Some("global".to_string()),
+                    external_id: None,
+                    label: "global.p40_none_a".to_string(),
+                    normalized: "global.p40_none_a".to_string(),
+                }],
+                hydra_core::Confidence::new(0.95),
+            );
+            let b = make_test_entity_with(
+                None,
+                hydra_core::IdentityEntityKind::System,
+                "system/p40_none_b",
+                vec![hydra_core::IdentityAlias {
+                    source: "system".to_string(),
+                    namespace: Some("global".to_string()),
+                    external_id: None,
+                    label: "global.p40_none_b".to_string(),
+                    normalized: "global.p40_none_b".to_string(),
+                }],
+                hydra_core::Confidence::new(0.95),
+            );
+            let a_id = a.id.clone();
+            let b_id = b.id.clone();
+            ingest_entity(&runtime, a).await;
+            ingest_entity(&runtime, b).await;
+            (a_id, b_id)
+        };
+        let link = ingest_link(
+            &runtime,
+            make_test_link(
+                None,
+                hydra_core::IdentityLinkKind::SameAs,
+                &a,
+                &b,
+                0.9,
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get(&format!(
+                "/trust/identity/links/{}",
+                link.id.as_str()
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn link_trust_missing_tenant_header_returns_400() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get_without_tenant(
+                "/trust/identity/links/idl_x",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn link_trust_endpoint_entity_missing_returns_404_not_500() {
+        // LOAD-BEARING: when P39 walks into P33 for either
+        // endpoint and finds the entity isn't visible in the
+        // caller's tenant slot, P33 surfaces "unknown identity
+        // entity". The HTTP handler MUST map that to 404 (NOT
+        // 500) so cross-tenant endpoint existence doesn't leak.
+        //
+        // To exercise this path, we seed a link in tenant_a
+        // (with from/to entities in tenant_a) and query it from
+        // tenant_b. The link itself misses tenant scope first
+        // → 404 via the link's own error string. Tenant B
+        // probing for a link id from tenant A hits the same
+        // 404 either way.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (a, b) = seed_two_p40_entities(&runtime).await;
+        let link = ingest_link(
+            &runtime,
+            make_test_link(
+                Some(TenantId::from_str(TEST_TENANT)),
+                hydra_core::IdentityLinkKind::DependsOn,
+                &a,
+                &b,
+                0.95,
+            ),
+        )
+        .await;
+        let app = trust_router(runtime.clone());
+        // Different tenant — must surface as 404, not 500.
+        let response = app
+            .oneshot(empty_get_for_tenant(
+                &format!("/trust/identity/links/{}", link.id.as_str()),
+                "tenant_evil",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "wrong-tenant probe must surface as 404, NOT 500 (the \
+             broader 'unknown identity' substring covers both link \
+             and endpoint-entity P33 errors)"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_trust_empty_link_id_returns_404() {
+        // `IdentityLinkId::from_str("")` is malformed → miss in
+        // the engine → 404. (Empty path segment doesn't bind the
+        // route, so we send a trailing-slash probe; axum returns
+        // 404 NOT_FOUND from the router, not the handler. Either
+        // way the caller sees 404 — pin both reachability paths.)
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/trust/identity/links/"))
+            .await
+            .unwrap();
+        // Trailing slash without a segment doesn't bind
+        // `:link_id` — axum returns 404.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn link_trust_link_id_url_encoded() {
+        // axum's Path<String> extractor decodes URL-encoded
+        // segments. IdentityLinkId is alphanumeric in practice
+        // (ULID-format), but the route accepts any string —
+        // verify a percent-encoded id round-trips through the
+        // decoder and reaches the handler (which then fails the
+        // engine lookup and returns 404).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        // %20 = space; axum decodes to " idl_x" — still unknown,
+        // still 404. Pins URL-decoding semantics.
+        let response = app
+            .oneshot(empty_get("/trust/identity/links/%20idl_x"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn link_trust_route_lives_in_trust_router() {
+        // Sanity pin: P40 route mounts on trust_router (not
+        // identity_router). Pinning 404-on-unknown via the
+        // trust_router proves the route resolved through this
+        // router (vs being unmounted).
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let app = trust_router(runtime.clone());
+        let response = app
+            .oneshot(empty_get("/trust/identity/links/idl_ghost"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

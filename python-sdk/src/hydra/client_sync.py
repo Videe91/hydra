@@ -64,6 +64,7 @@ from ._types import (
     IdentityLink,
     IdentityLinkId,
     IdentityLinkKind,
+    IdentityLinkTrustAssessment,
     IdentityMatchTrustAssessment,
     SourceTrustAssessment,
     SemanticIdentityMatchAssessment,
@@ -823,6 +824,29 @@ class HydraSync:
             tenant=tenant,
         )
         return SourceTrustAssessment.model_validate(raw)
+
+    # ========================================================================
+    # Identity link trust (Patch 40) — sync mirror
+    # ========================================================================
+
+    def assess_identity_link_trust(
+        self,
+        link_id: IdentityLinkId,
+        *,
+        tenant: TenantId | None = None,
+    ) -> IdentityLinkTrustAssessment:
+        """Sync mirror of `Hydra.assess_identity_link_trust`
+        (Patch 39 engine, Patch 40 wire). Trust verdict over a
+        persisted `IdentityLink` edge — STRUCTURAL only, NOT
+        semantic correctness. Acyclicity contract: link-trust
+        depends on entity-trust; entity-trust MUST NOT depend
+        on link-trust. See the async docstring for the full
+        suggestion-only contract."""
+        raw = self._http.get(
+            _paths.trust_identity_link_path(link_id),
+            tenant=tenant,
+        )
+        return IdentityLinkTrustAssessment.model_validate(raw)
 
     def _ingest(
         self,

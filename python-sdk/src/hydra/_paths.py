@@ -418,6 +418,34 @@ def trust_identity_source_path(source: str) -> str:
     return f"/trust/identity/sources/{_seg(source)}"
 
 
+def trust_identity_link_path(link_id: str) -> str:
+    """`GET /trust/identity/links/{link_id}` — Patch 40
+    identity-link trust. Reads the Patch 39 verdict over a
+    persisted `IdentityLink` edge.
+
+    Strict tenant-scoped: missing `X-Hydra-Tenant` → 400.
+    Unknown link / wrong-tenant link / `None`-tenanted link /
+    endpoint-entity miss during the P33 walk all surface as
+    404 (indistinguishable — the substring match is `"unknown
+    identity"`, which covers both `"unknown identity link"`
+    and `"unknown identity entity"` to prevent cross-tenant
+    endpoint-existence leaks).
+
+    Auth scope: `read:trust` (NOT `read:identity`) — the
+    `/trust/*` prefix clause wins precedence over `/identity/*`.
+    The sibling P38 read route `/identity/links/{id}` requires
+    `read:identity`; distinct surface, distinct scope.
+
+    Returns a bare `IdentityLinkTrustAssessment` body — the
+    same no-envelope convention as the other `/trust/identity/*`
+    trust routes.
+
+    **v1 contract**: STRUCTURAL trust only. NOT semantic
+    correctness. Auto-actions MUST compose with separate gates.
+    """
+    return f"/trust/identity/links/{_seg(link_id)}"
+
+
 def trust_cell_path(cell_id: str) -> str:
     """`GET /trust/cells/{cell_id}` — read-only trust assessment
     of one CausalCell (Patch 24). Folds the Patch 23 12-factor

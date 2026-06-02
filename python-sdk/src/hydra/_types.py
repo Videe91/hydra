@@ -2177,6 +2177,66 @@ class SourceTrustAssessment(BaseModel):
     assessed_at: str
 
 
+# === Patch 39 + Patch 40 — IdentityLink trust wire type ===
+#
+# Patch 39 shipped the engine-only IdentityLinkTrustAssessment
+# verdict over a persisted `IdentityLink` (P37 vocab + P38 wire).
+# Patch 40 exposes that verdict over HTTP + SDK under the
+# `/trust/identity/*` namespace, mirroring P34 entity-trust /
+# P36 source-trust.
+#
+# **v1 measures STRUCTURAL trust, NOT semantic correctness.**
+# A link like `Dashboard --OwnedBy--> Service` scores identically
+# to the semantically sensible `Service --OwnedBy--> User` —
+# kind-compatibility validation is deferred to P41+.
+#
+# **LOAD-BEARING acyclicity contract** (carries from P39):
+# link-trust depends on entity-trust; entity-trust MUST NOT
+# depend on link-trust. Auto-actions and accept-semantic-match
+# workflows MUST compose with separate gates (match-trust +
+# entity-trust + source-trust + operator approval + audit
+# event).
+
+
+class IdentityLinkTrustAssessment(BaseModel):
+    """Response shape of `hy.assess_identity_link_trust(...)`
+    (Patch 39 engine, Patch 40 wire).
+
+    Trust verdict over a persisted `IdentityLink` edge.
+
+    **v1 measures STRUCTURAL trustworthiness — author confidence
+    in the edge, trust of both endpoint entities, presence of
+    supporting audit references, well-formedness of the link
+    kind. v1 does NOT validate SEMANTIC correctness.**
+
+    `Dashboard --OwnedBy--> Service` may score identically to
+    `Service --OwnedBy--> User` — kind compatibility is deferred
+    to P41+. Auto-actions (accept-semantic-match, auto-merge,
+    downstream propagation) MUST NOT consume this verdict alone;
+    compose with semantic validation, match trust, entity trust,
+    source trust, operator approval, AND a durable audit event.
+
+    **LOAD-BEARING acyclicity contract**: link-trust depends on
+    entity-trust. Entity-trust MUST NOT depend on link-trust.
+    Future "entity trusted because trusted links reference it"
+    signals must route through a separate aggregate, NEVER back
+    through `assess_identity_entity_trust`.
+
+    `factors` always carries all 11 P39 records (applied AND
+    unapplied — explainability contract; don't filter
+    `applied=false` client-side).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    link_id: IdentityLinkId
+    score: float
+    level: TrustLevel
+    explanation: str
+    factors: list[TrustFactor]
+    assessed_at: str
+
+
 # === Patch 24 — CausalCell trust folding wire types ===
 #
 # Reuses the existing `TrustLevel` Literal and `TrustFactor`

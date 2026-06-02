@@ -1139,6 +1139,30 @@ mod tests {
             ),
             vec!["read:trust"]
         );
+        // Patch 40 — Identity link trust route. Same precedence
+        // rule. **LOAD-BEARING**: must resolve to `read:trust`,
+        // NOT `read:identity`. P38 mounts `GET /identity/links/:id`
+        // → `read:identity`; P40 mounts `GET /trust/identity/links/:id`
+        // → `read:trust`. The `/trust/*` prefix clause must win
+        // over `/identity/*` for the `/trust/identity/links/*`
+        // namespace; reordering would silently downgrade auth.
+        assert_eq!(
+            required_scopes_for(
+                &Method::GET,
+                "/trust/identity/links/idl_abc"
+            ),
+            vec!["read:trust"]
+        );
+        // Defensive complement: confirm the P38 sibling route
+        // (NO `/trust/` prefix) still resolves to `read:identity`
+        // — proves both clauses coexist without conflict.
+        assert_eq!(
+            required_scopes_for(
+                &Method::GET,
+                "/identity/links/idl_abc"
+            ),
+            vec!["read:identity"]
+        );
         // Patch 25 — CausalCell read/query routes. Cells are graph
         // data (composition primitive), gated under `read:query`.
         // Cell TRUST stays under `/trust/cells/*` → `read:trust`;

@@ -95,6 +95,7 @@ from ._types import (
     IdentityLink,
     IdentityLinkId,
     IdentityLinkKind,
+    IdentityLinkTrustAssessment,
     IdentityMatchTrustAssessment,
     MatchLevel,
     SemanticIdentityMatchAssessment,
@@ -296,6 +297,12 @@ __all__ = [
     "IdentityLink",
     "IdentityLinkId",
     "IdentityLinkKind",
+    # IdentityLink trust (Patch 39 engine + Patch 40 wire).
+    # Trust verdict over a persisted `IdentityLink` edge —
+    # STRUCTURAL only, NOT semantic correctness. Acyclicity:
+    # link-trust depends on entity-trust; entity-trust MUST
+    # NOT depend on link-trust.
+    "IdentityLinkTrustAssessment",
     # Identity trust HTTP/SDK (Patch 34 — exposes P32/P33
     # verdicts over `/trust/identity/*` + the SDK methods
     # `assess_identity_entity_trust` and
