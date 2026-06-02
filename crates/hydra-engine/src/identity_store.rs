@@ -36,12 +36,31 @@
 //! snapshot restore and bypasses the checks (the source data is
 //! trusted by definition).
 
+use chrono::{DateTime, Utc};
 use hydra_core::{
     error::{HydraError, Result},
-    Event, EventKind, IdentityAlias, IdentityEntity, IdentityEntityId,
+    Event, EventId, EventKind, IdentityAlias, IdentityEntity, IdentityEntityId,
     IdentityEntityKind, TenantId,
 };
 use std::collections::{BTreeSet, HashMap};
+
+/// Patch 41 — outcome of `IdentityStore::add_alias`. Distinguishes
+/// the freshly-attached case from the idempotent re-acceptance
+/// case so the Hydra wrapper can SKIP event emission when the
+/// alias was already present on the same entity (load-bearing —
+/// duplicate `IdentityAliasAdded` events would pollute the audit
+/// log and break replay determinism if a future patch tightens
+/// alias-index semantics).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AddAliasOutcome {
+    /// Alias was new on this entity; the store mutated and the
+    /// caller MUST ingest `EventKind::IdentityAliasAdded`.
+    Added(IdentityEntity),
+    /// Alias was already present on this entity (idempotent re-
+    /// accept). Store was NOT mutated; caller MUST skip event
+    /// emission. Pin via `accept_is_idempotent_no_duplicate_event`.
+    AlreadyPresent(IdentityEntity),
+}
 
 /// Reserved sentinel for `None` tenant slots in the canonical-key
 /// index. Same rationale as the alias-key sentinels exported by
@@ -214,16 +233,133 @@ impl IdentityStore {
         Ok(entity)
     }
 
+    // === Patch 41 — Append alias to existing entity ===
+
+    /// Append `alias` to an existing entity. Validates the alias
+    /// (sentinels / empty), rejects cross-entity conflicts as a
+    /// hard error, and is idempotent on same-entity duplicates
+    /// (returns `AlreadyPresent` — caller must SKIP event
+    /// emission).
+    ///
+    /// **Validate-before-mutate**: every check runs BEFORE any
+    /// store mutation. A rejected call leaves the entity
+    /// untouched. Mirrors the `create_entity` audit-log-on-
+    /// rejection-stays-untouched contract.
+    ///
+    /// Targeted mutation (NOT a destructive `insert_entity`
+    /// round-trip): we `get_mut` the entity, push the alias,
+    /// update `updated_at` + `caused_by`, and insert the single
+    /// new index entry in `by_alias`. By-kind / by-tenant /
+    /// by-canonical-key indexes are unchanged because the
+    /// canonical fields themselves are immutable.
+    ///
+    /// Used by `Hydra::accept_semantic_identity_match` AFTER all
+    /// three trust gates pass; replayed verbatim by `apply_event`
+    /// without re-running uniqueness checks (replay trusts the
+    /// log — same stance as `IdentityEntityCreated`).
+    pub fn add_alias(
+        &mut self,
+        entity_id: &IdentityEntityId,
+        alias: IdentityAlias,
+        updated_at: DateTime<Utc>,
+        caused_by: Option<EventId>,
+    ) -> Result<AddAliasOutcome> {
+        // 1. Validate the alias up front (sentinel / empty
+        //    rejection). Cheap, deterministic, and definitive.
+        alias.validate().map_err(HydraError::QueryError)?;
+
+        // 2. Load the entity. Missing entity → unified P32 / P33
+        //    pattern: `"unknown identity entity: {id}"`.
+        let entity = self.by_id.get(entity_id).ok_or_else(|| {
+            HydraError::QueryError(format!(
+                "unknown identity entity: {entity_id}"
+            ))
+        })?;
+
+        // 3. Idempotent same-entity dedup: if the alias is
+        //    already on this entity (matched by the full
+        //    structural equality of all 5 fields), return
+        //    AlreadyPresent so the caller skips event emission.
+        //    Belt-and-suspenders: also check the index key (a
+        //    same-tenant alias with identical (source, namespace,
+        //    normalized) but a different `label` / `external_id`
+        //    would NOT be a structural match but WOULD collide
+        //    in `by_alias`).
+        let key = alias.index_key(entity.tenant_id.as_ref());
+        let alias_already_on_this_entity = entity
+            .aliases
+            .iter()
+            .any(|a| a.index_key(entity.tenant_id.as_ref()) == key);
+        if alias_already_on_this_entity {
+            return Ok(AddAliasOutcome::AlreadyPresent(entity.clone()));
+        }
+
+        // 4. Cross-entity alias conflict — hard error. The
+        //    by_alias index already maps this key to a DIFFERENT
+        //    entity. Mirrors `create_entity` line 206-209 exactly.
+        if let Some(existing) = self.by_alias.get(&key) {
+            return Err(HydraError::QueryError(format!(
+                "alias '{key}' already mapped to a different entity \
+                 {existing} — operator must merge entities through a \
+                 SameAs workflow (P43+), not re-point aliases"
+            )));
+        }
+
+        // 5. All checks passed — append the alias + update
+        //    indexes + bump `updated_at`. Targeted mutation
+        //    avoids the destructive `insert_entity` round-trip.
+        let entity_id_clone = entity_id.clone();
+        if let Some(e) = self.by_id.get_mut(&entity_id_clone) {
+            e.aliases.push(alias.clone());
+            e.updated_at = updated_at;
+            e.caused_by = caused_by;
+        }
+        self.by_alias.insert(key, entity_id_clone.clone());
+
+        // Return the updated entity. Safe to unwrap — we just
+        // mutated it.
+        let updated = self
+            .by_id
+            .get(&entity_id_clone)
+            .expect("entity present (just mutated)")
+            .clone();
+        Ok(AddAliasOutcome::Added(updated))
+    }
+
     // === Event ingest ===
 
-    /// Apply one event. Patch 29's only relevant variant is
-    /// `IdentityEntityCreated`. Replay does NOT re-run the
-    /// uniqueness checks because the original `create_entity`
-    /// call already validated; replay is meant to be a faithful
-    /// state rebuild. Same pattern other stores follow.
+    /// Apply one event. Patch 29 handles `IdentityEntityCreated`;
+    /// Patch 41 adds `IdentityAliasAdded` replay. Replay does NOT
+    /// re-run uniqueness or trust checks — the original Hydra
+    /// method already validated; replay is a faithful state
+    /// rebuild. Same pattern other stores follow.
     pub fn apply_event(&mut self, event: &Event) -> Result<()> {
-        if let EventKind::IdentityEntityCreated { entity } = &event.kind {
-            self.insert_entity(entity.clone());
+        match &event.kind {
+            EventKind::IdentityEntityCreated { entity } => {
+                self.insert_entity(entity.clone());
+            }
+            EventKind::IdentityAliasAdded {
+                entity_id,
+                alias,
+                updated_at,
+                caused_by,
+                ..
+            } => {
+                // Replay branch — trust the log. Append + index
+                // unconditionally; no validation. If the
+                // referenced entity is somehow missing on replay
+                // (genuine engine corruption), silently skip
+                // rather than error — mirrors the
+                // `IdentityEntityCreated` no-op stance.
+                if let Some(entity) = self.by_id.get_mut(entity_id) {
+                    let key = alias.index_key(entity.tenant_id.as_ref());
+                    entity.aliases.push(alias.clone());
+                    entity.updated_at = *updated_at;
+                    entity.caused_by = caused_by.clone();
+                    self.by_alias.insert(key, entity_id.clone());
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

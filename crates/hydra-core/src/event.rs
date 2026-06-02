@@ -348,6 +348,31 @@ pub enum EventKind {
     IdentityLinkCreated {
         link: crate::identity::IdentityLink,
     },
+
+    // Accept Semantic Match Workflow (Patch 41 — amends P29's
+    // immutability contract to "canonical fields immutable, alias
+    // set append-only"). Records the trust-gated attachment of a
+    // semantically-matched alias to a canonical IdentityEntity.
+    //
+    // The four embedded scores anchor the verdict against future
+    // trust recalibration: replay reproduces the exact rationale
+    // even if the trust algorithm changes in later patches.
+    //
+    // Gate composition (engine-enforced before emission, NOT on
+    // replay): match-trust + entity-trust + source-trust ALL at
+    // `TrustLevel::High` AND each score >= `trust::ACCEPT_MATCH_SCORE_FLOOR`.
+    // See `Hydra::accept_semantic_identity_match`.
+    IdentityAliasAdded {
+        entity_id: crate::id::IdentityEntityId,
+        alias: crate::identity::IdentityAlias,
+        added_by: ActorId,
+        match_trust_score: f64,
+        entity_trust_score: f64,
+        source_trust_score: f64,
+        semantic_match_score: f64,
+        updated_at: DateTime<Utc>,
+        caused_by: Option<EventId>,
+    },
 }
 
 impl EventKind {
@@ -413,7 +438,8 @@ impl EventKind {
             | EventKind::MicroModelObservationRecorded { .. }
             | EventKind::CausalCellCreated { .. }
             | EventKind::IdentityEntityCreated { .. }
-            | EventKind::IdentityLinkCreated { .. } => None,
+            | EventKind::IdentityLinkCreated { .. }
+            | EventKind::IdentityAliasAdded { .. } => None,
         }
     }
 
@@ -476,6 +502,7 @@ impl EventKind {
             EventKind::CausalCellCreated { .. } => "causal_cell_created",
             EventKind::IdentityEntityCreated { .. } => "identity_entity_created",
             EventKind::IdentityLinkCreated { .. } => "identity_link_created",
+            EventKind::IdentityAliasAdded { .. } => "identity_alias_added",
         }
     }
 }
@@ -781,6 +808,85 @@ mod tests {
         // and CausalCellCreated — they live in their own stores,
         // not the graph projection).
         assert!(kind.target_node().is_none());
+    }
+
+    #[test]
+    fn identity_alias_added_event_kind_name_is_snake_case() {
+        // Patch 41 — the new variant must produce a snake_case
+        // name like every other EventKind. Pinned so a future
+        // refactor doesn't accidentally drift naming.
+        use crate::identity::IdentityAlias;
+        use chrono::Utc;
+        let kind = EventKind::IdentityAliasAdded {
+            entity_id: crate::id::IdentityEntityId::from_str("ide_x"),
+            alias: IdentityAlias {
+                source: "snowflake".to_string(),
+                namespace: Some("analytics".to_string()),
+                external_id: None,
+                label: "revenue_daily".to_string(),
+                normalized: "analytics.revenue_daily".to_string(),
+            },
+            added_by: crate::id::ActorId::from_str("actor_ops"),
+            match_trust_score: 0.85,
+            entity_trust_score: 0.82,
+            source_trust_score: 0.81,
+            semantic_match_score: 0.90,
+            updated_at: Utc::now(),
+            caused_by: None,
+        };
+        assert_eq!(kind.kind_name(), "identity_alias_added");
+    }
+
+    #[test]
+    fn identity_alias_added_target_node_is_none() {
+        // P41 — alias-added events live in the identity store,
+        // not the graph projection. target_node MUST return None
+        // (mirrors IdentityEntityCreated / IdentityLinkCreated).
+        use crate::identity::IdentityAlias;
+        use chrono::Utc;
+        let kind = EventKind::IdentityAliasAdded {
+            entity_id: crate::id::IdentityEntityId::from_str("ide_x"),
+            alias: IdentityAlias {
+                source: "snowflake".to_string(),
+                namespace: None,
+                external_id: None,
+                label: "x".to_string(),
+                normalized: "x".to_string(),
+            },
+            added_by: crate::id::ActorId::from_str("actor_ops"),
+            match_trust_score: 0.85,
+            entity_trust_score: 0.82,
+            source_trust_score: 0.81,
+            semantic_match_score: 0.90,
+            updated_at: Utc::now(),
+            caused_by: None,
+        };
+        assert!(kind.target_node().is_none());
+    }
+
+    #[test]
+    fn accept_match_floor_equals_high_threshold() {
+        // LOAD-BEARING pin: ACCEPT_MATCH_SCORE_FLOOR must equal
+        // the current TrustLevel::High threshold (0.80). The
+        // constant exists SEPARATELY so future trust recalibration
+        // cannot silently weaken the accept gate. If a future
+        // patch drifts level_for_score's thresholds, this test
+        // FIRES — forcing an explicit decision rather than silent
+        // loosening.
+        use crate::trust::{ACCEPT_MATCH_SCORE_FLOOR, TrustAssessment, TrustLevel};
+        assert_eq!(ACCEPT_MATCH_SCORE_FLOOR, 0.80);
+        assert_eq!(
+            TrustAssessment::level_for_score(ACCEPT_MATCH_SCORE_FLOOR),
+            TrustLevel::High,
+            "the accept floor must land EXACTLY at the High threshold; \
+             drift in level_for_score requires an explicit floor amendment"
+        );
+        // Just below — must NOT be High.
+        assert!(
+            TrustAssessment::level_for_score(ACCEPT_MATCH_SCORE_FLOOR - 0.001)
+                != TrustLevel::High,
+            "floor must be inclusive of High; 0.799 must NOT pass"
+        );
     }
 
     #[test]

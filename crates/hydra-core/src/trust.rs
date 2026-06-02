@@ -115,6 +115,22 @@ impl TrustAssessment {
     }
 }
 
+/// Patch 41 — pinned floor for `Hydra::accept_semantic_identity_match`.
+///
+/// Equals the current `TrustLevel::High` threshold (0.80), but
+/// **defined as a separate constant** so future trust
+/// recalibration cannot silently lower the accept-match gate
+/// without an explicit amendment + test bump. The gate composes
+/// `level == TrustLevel::High AND score >= ACCEPT_MATCH_SCORE_FLOOR`
+/// across THREE axes (match + entity + source) — belt-and-
+/// suspenders so a one-day relaxation of the `High` threshold
+/// alone doesn't weaken P41's gate.
+///
+/// If a future patch wants to drift the trust thresholds, the
+/// `accept_floor_equals_high_threshold` test will fire — forcing
+/// an explicit decision rather than silent loosening.
+pub const ACCEPT_MATCH_SCORE_FLOOR: f64 = 0.80;
+
 // === Patch 23 — CausalCell trust folding ===========================
 //
 // Cell trust is structurally different from claim trust: it walks

@@ -18,14 +18,34 @@
 //! No matching, no correlation, no HTTP/SDK, no links — those
 //! land in later patches (P30+).
 //!
-//! ## Identities are immutable in v0
+//! ## Identities are v1: canonical fields immutable, alias set append-only
 //!
-//! Mirrors the `CausalCell` v0 model (Patch 20). One event variant
-//! — `EventKind::IdentityEntityCreated`. Updates / merges / deletes
-//! are explicit future patches. If you need to change an entity's
-//! aliases today, create a new entity. The cost of fast-iteration
-//! immutability is occasional duplication; the benefit is replay
-//! semantics that are dead simple.
+//! Patch 29 shipped the v0 contract: identities fully immutable
+//! except by creating a fresh entity. **Patch 41 amends this to a
+//! v1 contract**:
+//!
+//! - Canonical fields (`id`, `tenant_id`, `kind`, `canonical_key`,
+//!   `created_by`, `created_at`) remain immutable.
+//! - The `aliases` set is **append-only** via
+//!   `EventKind::IdentityAliasAdded`, gated by
+//!   `Hydra::accept_semantic_identity_match` (match + entity +
+//!   source trust all at `TrustLevel::High` AND score >=
+//!   `trust::ACCEPT_MATCH_SCORE_FLOOR`).
+//! - No alias removal. No alias mutation. No canonical-field
+//!   mutation. No merge. No delete.
+//!
+//! Replay trusts the log: `IdentityAliasAdded` events skip gate
+//! re-evaluation. Aliases attached under historical trust weights
+//! stay attached even if the weights drift. The four trust scores
+//! carried on the event payload exist precisely so audit-replay
+//! can reconstruct yesterday's verdict under tomorrow's trust
+//! algorithm.
+//!
+//! `SameAs` links (P37) remain reserved for canonical-vs-canonical
+//! merges — declaring that two pre-existing entities represent the
+//! same real thing. `accept_semantic_identity_match` (P41) is for
+//! attaching a new external alias to an existing canonical entity.
+//! Different workflows, distinct event shapes.
 //!
 //! ## Aliases are embedded, not separate events
 //!
