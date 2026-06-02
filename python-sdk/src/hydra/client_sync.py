@@ -638,6 +638,39 @@ class HydraSync:
         )
 
     # ========================================================================
+    # Accept Semantic Match (Patch 42) — sync mirror
+    # ========================================================================
+
+    def accept_semantic_identity_match(
+        self,
+        *,
+        candidate_entity_id: IdentityEntityId,
+        alias: IdentityAlias,
+        added_by: ActorId,
+        tenant: TenantId | None = None,
+    ) -> IdentityEntity:
+        """Sync mirror of `Hydra.accept_semantic_identity_match`
+        (Patch 41 engine, Patch 42 wire). Trust-gated alias
+        attach: composes match (Strong) + entity (High) + source
+        (High) gates with all scores >= 0.80. Idempotent
+        re-accept returns same body shape — wire cannot
+        distinguish first-accept from no-op. STRUCTURAL trust
+        only — auto-actions MUST compose with semantic
+        validation + operator approval + durable audit. See the
+        async docstring for the full suggestion-only contract."""
+        body = {
+            "candidate_entity_id": candidate_entity_id,
+            "alias": alias.model_dump(mode="json"),
+            "added_by": added_by,
+        }
+        raw = self._http.post(
+            _paths.identity_matches_accept_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return IdentityEntity.model_validate(raw["entity"])
+
+    # ========================================================================
     # IdentityLink (Patch 38) — sync mirrors
     # ========================================================================
 

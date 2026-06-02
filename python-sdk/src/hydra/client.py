@@ -1002,6 +1002,73 @@ class Hydra:
         )
 
     # ========================================================================
+    # Accept Semantic Match (Patch 42 — wire surface over P41)
+    # ========================================================================
+
+    async def accept_semantic_identity_match(
+        self,
+        *,
+        candidate_entity_id: IdentityEntityId,
+        alias: IdentityAlias,
+        added_by: ActorId,
+        tenant: TenantId | None = None,
+    ) -> IdentityEntity:
+        """Trust-gated alias attach (`POST /identity/matches/accept`
+        — Patch 41 engine, Patch 42 wire).
+
+        Composes three trust gates inside the engine:
+          - match trust: P30 `match_level == "Strong"` AND
+            `match_score >= 0.80`
+          - entity trust: P33 `level == "High"` AND `score >= 0.80`
+          - source trust: P35 `level == "High"` AND `score >= 0.80`
+
+        On success appends `alias` to the candidate entity AND
+        emits a durable `IdentityAliasAdded` audit event with
+        all four verdict scores embedded. Returns the updated
+        `IdentityEntity` (wrapped `{entity: ...}` on the wire,
+        unwrapped here for SDK ergonomics).
+
+        ## Idempotency
+
+        Re-accepting an already-present alias on the same
+        entity returns the same entity body without emitting a
+        duplicate event. **The wire cannot distinguish
+        first-accept from no-op re-accept** — both return 200
+        with identical body shape.
+
+        ## Strategic warning (P41 carry-forward)
+
+        v1 measures STRUCTURAL trust, NOT semantic correctness.
+        Auto-actions and accept-semantic-match workflows MUST
+        compose this gate with semantic validation, operator
+        approval, and durable audit. Calibrated for
+        explainability, not correctness — false positives are
+        possible. Engine embeds all four verdict scores on the
+        audit event so replay can reconstruct yesterday's
+        verdict even if trust weights drift in a future patch.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header;
+            invalid alias (empty source / sentinel); empty
+            actor; cross-entity alias conflict; any trust gate
+            failure
+          - 404 → `HydraNotFoundError`: unknown candidate /
+            wrong-tenant candidate (unified — no cross-tenant
+            existence leak)
+        """
+        body = {
+            "candidate_entity_id": candidate_entity_id,
+            "alias": alias.model_dump(mode="json"),
+            "added_by": added_by,
+        }
+        raw = await self._http.post(
+            _paths.identity_matches_accept_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return IdentityEntity.model_validate(raw["entity"])
+
+    # ========================================================================
     # IdentityLink (Patch 38 — wire surface over P37 vocabulary)
     # ========================================================================
 

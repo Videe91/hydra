@@ -1212,6 +1212,19 @@ mod tests {
             required_scopes_for(&Method::POST, "/identity/entities"),
             vec!["write:identity"]
         );
+        // Patch 42 — Accept Semantic Match. Lives under
+        // /identity/* (mutates the Identity Graph), so the
+        // existing `/identity/*` mutating clause covers it.
+        // Pinned so a future clause reorder or scope rename
+        // fires here. Idempotent re-accept and first-accept
+        // both require `write:identity`.
+        assert_eq!(
+            required_scopes_for(
+                &Method::POST,
+                "/identity/matches/accept"
+            ),
+            vec!["write:identity"]
+        );
         // Patch 38 — IdentityLink HTTP routes. Same `/identity/*`
         // prefix clause covers them; no auth code changed.
         // Regression pins so a future clause reorder or scope

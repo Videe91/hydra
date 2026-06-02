@@ -641,6 +641,31 @@ def identity_matches_path() -> str:
     return "/identity/matches"
 
 
+def identity_matches_accept_path() -> str:
+    """`POST /identity/matches/accept` — Patch 42 trust-gated
+    semantic match acceptance. Body:
+    `{candidate_entity_id, alias, added_by}`. Tenant from
+    `X-Hydra-Tenant` header (NOT body).
+
+    Engine composes 3 gates (match `Strong` + entity `High` +
+    source `High`, all scores >= 0.80). On success appends
+    alias to candidate AND emits `IdentityAliasAdded` audit
+    event with all 4 verdict scores embedded. Returns wrapped
+    `{entity: IdentityEntity}`. Idempotent re-accept returns
+    the same body shape — wire CANNOT distinguish first-accept
+    from no-op re-accept (engine collapses outcome).
+
+    Auth: `write:identity` (mutates the Identity Graph).
+
+    Status:
+      missing tenant → 400
+      unknown / wrong-tenant candidate → 404 ("unknown identity entity")
+      invalid alias / empty actor / conflict / gate failure → 400
+      success → 200 (always; idempotent indistinguishable)
+    """
+    return "/identity/matches/accept"
+
+
 def identity_link_path(link_id: str) -> str:
     """`GET /identity/links/{link_id}` — Patch 38 single-link
     lookup. Tenant-scoped: missing `X-Hydra-Tenant` → 400; wrong

@@ -46,11 +46,11 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use hydra_core::{
-    IdentityAlias, IdentityEntity, IdentityEntityId, IdentityEntityKind,
+    ActorId, IdentityAlias, IdentityEntity, IdentityEntityId, IdentityEntityKind,
     IdentityLink, IdentityLinkId, IdentityLinkKind,
     SemanticIdentityMatchAssessment,
 };
@@ -108,6 +108,10 @@ pub fn identity_router(runtime: RuntimeHandle) -> Router {
             get(list_identity_entities).post(create_identity_entity),
         )
         .route("/identity/matches", get(suggest_identity_matches))
+        .route(
+            "/identity/matches/accept",
+            post(accept_semantic_match),
+        )
         .route("/identity/links/:link_id", get(get_identity_link))
         .route(
             "/identity/links",
@@ -773,6 +777,115 @@ fn paginate_links_response(
         next_cursor,
     })
     .into_response()
+}
+
+// === Patch 42 — Accept Semantic Match HTTP =========================
+//
+// Wire surface over P41's `Hydra::accept_semantic_identity_match`.
+// Trust-gated alias attach — the governed semantic write path
+// that closes the P29-P41 identity arc.
+//
+// Lives under `/identity/*` (NOT `/trust/*`) because it MUTATES
+// the Identity Graph. Auth: `write:identity` — covered
+// automatically by the existing `/identity/*` mutating clause
+// at `auth.rs:389`.
+//
+// **Response shape**: wrapped `{entity: IdentityEntity}` —
+// matches P31 `POST /identity/entities` convention. The engine
+// collapses the idempotent re-accept outcome (returns the same
+// entity body), so the wire cannot distinguish first-accept
+// from no-op re-accept. Both return 200.
+
+/// Request body for `POST /identity/matches/accept`.
+///
+/// `candidate_entity_id` + `alias` + `added_by`. Tenant comes
+/// from `X-Hydra-Tenant`, NOT the body (mirrors P31/P38
+/// anti-smuggling rule — the alias has no tenant field, but
+/// the candidate's tenant slot is derived from its existing
+/// state, and the gate enforces strict tenant match).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AcceptSemanticMatchRequest {
+    pub candidate_entity_id: String,
+    pub alias: IdentityAlias,
+    pub added_by: String,
+}
+
+/// `POST /identity/matches/accept` — Patch 42 wire over P41.
+///
+/// Trust-gated alias attach. Composes three gates inside the
+/// engine (match + entity + source) at `TrustLevel::High` AND
+/// score `>= ACCEPT_MATCH_SCORE_FLOOR` (0.80). On success
+/// appends `alias` to the candidate entity AND emits a durable
+/// `IdentityAliasAdded` audit event with all four verdict
+/// scores embedded for replay-deterministic reconstruction.
+///
+/// ## Status mapping
+///
+/// - missing `X-Hydra-Tenant` → **400**
+/// - unknown candidate / wrong-tenant candidate → **404**
+///   (substring match `"unknown identity entity"` — P41's
+///   unified error for miss + tenant mismatch)
+/// - invalid alias (empty source / sentinel) → **400**
+/// - empty `added_by` → **400**
+/// - cross-entity alias conflict → **400** (engine names the
+///   existing entity so operators can resolve via a future
+///   `SameAs` merge workflow)
+/// - any gate failure (match below Strong / entity below High /
+///   source below High) → **400**
+/// - success (first accept OR idempotent re-accept) → **200**
+///   with `{entity: IdentityEntity}`
+/// - unexpected engine error → **500**
+///
+/// ## Suggestion-only-contract carry-forward (from P41)
+///
+/// v1 measures STRUCTURAL trust, NOT semantic correctness.
+/// Auto-actions and accept-semantic-match workflows MUST
+/// compose this gate with semantic validation, operator
+/// approval, and durable audit. The gate is calibrated for
+/// explainability — false positives are possible. The engine
+/// embeds all four verdict scores on the audit event so
+/// replay can reconstruct yesterday's verdict even if trust
+/// weights drift in a future patch.
+async fn accept_semantic_match(
+    State(state): State<IdentityHttpState>,
+    headers: HeaderMap,
+    Json(req): Json<AcceptSemanticMatchRequest>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(err) => return tenant_error_response(err),
+    };
+    let candidate_id = IdentityEntityId::from_str(&req.candidate_entity_id);
+    let actor = ActorId::from_str(&req.added_by);
+
+    let hydra = state.runtime.hydra();
+    let mut hydra = hydra.write().await;
+    match hydra.accept_semantic_identity_match(
+        Some(&tenant),
+        &candidate_id,
+        req.alias,
+        actor,
+    ) {
+        Ok(entity) => {
+            (StatusCode::OK, Json(IdentityEntityResponse { entity }))
+                .into_response()
+        }
+        Err(hydra_core::error::HydraError::QueryError(msg))
+            if msg.contains("unknown identity entity") =>
+        {
+            error_response(StatusCode::NOT_FOUND, msg)
+        }
+        Err(hydra_core::error::HydraError::QueryError(msg)) => {
+            // Everything else: invalid alias, empty actor,
+            // cross-entity conflict, gate failures (match /
+            // entity / source below floor).
+            error_response(StatusCode::BAD_REQUEST, msg)
+        }
+        Err(other) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("accept_semantic_identity_match failed: {other}"),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1907,5 +2020,436 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&read_body_bytes(r).await).unwrap();
         assert!(body.get("links").is_some());
+    }
+
+    // === Patch 42 — POST /identity/matches/accept ===
+    //
+    // Wire surface over P41 accept_semantic_identity_match.
+    // Test fixtures mirror P41's calibration: candidate has 3
+    // aliases sharing normalized="x.p41_a" across distinct
+    // (source, namespace) tuples, plus matching canonical_key
+    // tokens, plus reliable evidence + boost entities so source
+    // trust clears High. The proposed alias is
+    // snowflake/finance/x.p41_a (NEW source+namespace combo).
+
+    /// Build a high-trust candidate identical in shape to
+    /// `p41_seed_high_trust_candidate` (in hydra.rs::sprint1_tests)
+    /// — duplicated here because test helpers don't cross
+    /// modules. Same `parse_identity_kind` duplication precedent.
+    fn p42_seed_candidate(
+        tenant: &str,
+    ) -> (
+        hydra_core::IdentityEntity,
+        Vec<hydra_core::IdentityEntity>,
+        hydra_core::Evidence,
+    ) {
+        let now = chrono::Utc::now();
+        let tenant_id = TenantId::from_str(tenant);
+
+        // Helper to build an alias with shared normalized.
+        let shared_alias = |source: &str, namespace: &str| {
+            IdentityAlias {
+                source: source.to_string(),
+                namespace: Some(namespace.to_string()),
+                external_id: Some("X_P41_A".to_string()),
+                label: "x.p41_a".to_string(),
+                normalized: "x.p41_a".to_string(),
+            }
+        };
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "owner".to_string(),
+            hydra_core::Value::String("team_p42".to_string()),
+        );
+        metadata.insert(
+            "tier".to_string(),
+            hydra_core::Value::String("prod".to_string()),
+        );
+
+        let candidate = IdentityEntity {
+            id: IdentityEntityId::new(),
+            tenant_id: Some(tenant_id.clone()),
+            kind: IdentityEntityKind::Dataset,
+            canonical_key: "x.p41_a".to_string(),
+            display_name: "x.p41_a".to_string(),
+            aliases: vec![
+                shared_alias("snowflake", "analytics"),
+                shared_alias("dbt", "models"),
+                shared_alias("looker", "finance"),
+            ],
+            confidence: hydra_core::Confidence::new(0.95),
+            metadata,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+
+        // Boost source trust: 2 more high-trust entities + 1
+        // reliable evidence record (mirrors p41_boost_source_trust).
+        let boost_alias = |source: &str, ns: &str, name: &str| {
+            IdentityAlias {
+                source: source.to_string(),
+                namespace: Some(ns.to_string()),
+                external_id: Some(format!("{ns}.{name}").to_uppercase()),
+                label: format!("{ns}.{name}"),
+                normalized: format!("{ns}.{name}"),
+            }
+        };
+        let mut metadata2 = HashMap::new();
+        metadata2.insert(
+            "tier".to_string(),
+            hydra_core::Value::String("prod".to_string()),
+        );
+        let boost_a = IdentityEntity {
+            id: IdentityEntityId::new(),
+            tenant_id: Some(tenant_id.clone()),
+            kind: IdentityEntityKind::Table,
+            canonical_key: "table/p42_boost_a".to_string(),
+            display_name: "Boost A".to_string(),
+            aliases: vec![
+                boost_alias("snowflake", "ns_boost", "boost_t"),
+                boost_alias("dbt", "models", "boost_t"),
+                boost_alias("looker", "finance", "boost_t"),
+            ],
+            confidence: hydra_core::Confidence::new(0.95),
+            metadata: metadata2.clone(),
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        let boost_b = IdentityEntity {
+            id: IdentityEntityId::new(),
+            tenant_id: Some(tenant_id.clone()),
+            kind: IdentityEntityKind::Service,
+            canonical_key: "service/p42_boost_b".to_string(),
+            display_name: "Boost B".to_string(),
+            aliases: vec![
+                boost_alias("snowflake", "ns_boost2", "boost_s"),
+                boost_alias("github", "ops", "boost_s"),
+                boost_alias("dbt", "models", "boost_s_extra"),
+            ],
+            confidence: hydra_core::Confidence::new(0.95),
+            metadata: metadata2,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+
+        let evidence = hydra_core::Evidence {
+            id: hydra_core::EvidenceId::new(),
+            tenant_id: Some(tenant_id),
+            source: hydra_core::EvidenceSource::Warehouse {
+                system: "snowflake".to_string(),
+                database: Some("analytics".to_string()),
+                schema: None,
+                table: None,
+            },
+            payload: hydra_core::EvidencePayload {
+                kind: "p42_boost".to_string(),
+                data: HashMap::new(),
+            },
+            reliability: hydra_core::Confidence::new(0.90),
+            observed_at: now,
+            recorded_at: now,
+            caused_by: None,
+        };
+
+        (candidate, vec![boost_a, boost_b], evidence)
+    }
+
+    /// Insert candidate + boost entities + evidence so the
+    /// accept gate can clear High. Returns the candidate id.
+    async fn p42_seed_accept_setup(
+        runtime: &crate::runtime::RuntimeHandle,
+        tenant: &str,
+    ) -> IdentityEntityId {
+        let (candidate, boosts, evidence) = p42_seed_candidate(tenant);
+        let cand_id = candidate.id.clone();
+        let hydra = runtime.hydra();
+        let mut hydra = hydra.write().await;
+        hydra.create_identity_entity(candidate).unwrap();
+        for b in boosts {
+            hydra.create_identity_entity(b).unwrap();
+        }
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded { evidence })
+            .unwrap();
+        cand_id
+    }
+
+    /// The alias the operator wants to attach. Engineered to
+    /// score P30 Strong against the seeded candidate:
+    /// normalized matches existing aliases; canonical_key tokens
+    /// match; source and namespace both match existing aliases.
+    /// (snowflake, finance, x.p41_a) is the NEW (source,
+    /// namespace) tuple.
+    fn p42_accept_alias() -> IdentityAlias {
+        IdentityAlias {
+            source: "snowflake".to_string(),
+            namespace: Some("finance".to_string()),
+            external_id: Some("P42_NEW".to_string()),
+            label: "x.p41_a".to_string(),
+            normalized: "x.p41_a".to_string(),
+        }
+    }
+
+    fn accept_request_body(
+        candidate_id: &IdentityEntityId,
+        alias: &IdentityAlias,
+        actor: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "candidate_entity_id": candidate_id.as_str(),
+            "alias": alias,
+            "added_by": actor,
+        })
+    }
+
+    #[tokio::test]
+    async fn accept_semantic_match_attaches_alias() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let cand_id = p42_seed_accept_setup(&runtime, TEST_TENANT).await;
+        let alias = p42_accept_alias();
+        let body = accept_request_body(&cand_id, &alias, "actor_ops");
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(json_post("/identity/matches/accept", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed: IdentityEntityResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert_eq!(parsed.entity.id, cand_id);
+        // 4 aliases now: 3 seeded + 1 attached.
+        assert_eq!(parsed.entity.aliases.len(), 4);
+        assert!(parsed
+            .entity
+            .aliases
+            .iter()
+            .any(|a| a.source == "snowflake"
+                && a.namespace.as_deref() == Some("finance")
+                && a.normalized == "x.p41_a"));
+    }
+
+    #[tokio::test]
+    async fn accept_semantic_match_requires_tenant_header() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let cand_id = p42_seed_accept_setup(&runtime, TEST_TENANT).await;
+        let alias = p42_accept_alias();
+        let body = accept_request_body(&cand_id, &alias, "actor_ops");
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(json_post_without_tenant(
+                "/identity/matches/accept",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn accept_semantic_match_rejects_unknown_candidate() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let _ = p42_seed_accept_setup(&runtime, TEST_TENANT).await;
+        let ghost = IdentityEntityId::new();
+        let alias = p42_accept_alias();
+        let body = accept_request_body(&ghost, &alias, "actor_ops");
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(json_post("/identity/matches/accept", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let err: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(err.error.contains("unknown identity entity"));
+    }
+
+    #[tokio::test]
+    async fn accept_semantic_match_rejects_wrong_tenant_candidate() {
+        // LOAD-BEARING: candidate exists in TEST_TENANT but
+        // queried via a different tenant header → 404 unified
+        // (indistinguishable from "doesn't exist"). No
+        // cross-tenant existence leak.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let cand_id = p42_seed_accept_setup(&runtime, TEST_TENANT).await;
+        let alias = p42_accept_alias();
+        let body = accept_request_body(&cand_id, &alias, "actor_ops");
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(json_post_for_tenant(
+                "/identity/matches/accept",
+                "tenant_other",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn accept_semantic_match_rejects_invalid_alias() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let cand_id = p42_seed_accept_setup(&runtime, TEST_TENANT).await;
+        // Empty source rejected by IdentityAlias::validate.
+        let bad_alias = IdentityAlias {
+            source: "".to_string(),
+            namespace: None,
+            external_id: None,
+            label: "x".to_string(),
+            normalized: "x".to_string(),
+        };
+        let body = accept_request_body(&cand_id, &bad_alias, "actor_ops");
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(json_post("/identity/matches/accept", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn accept_semantic_match_rejects_empty_actor() {
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let cand_id = p42_seed_accept_setup(&runtime, TEST_TENANT).await;
+        let alias = p42_accept_alias();
+        let body = accept_request_body(&cand_id, &alias, "");
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(json_post("/identity/matches/accept", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(err.error.contains("invalid actor"));
+    }
+
+    #[tokio::test]
+    async fn accept_semantic_match_rejects_cross_entity_conflict() {
+        // LOAD-BEARING: a second entity owns the proposed alias.
+        // P41 must reject with hard error naming the owner.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let cand_id = p42_seed_accept_setup(&runtime, TEST_TENANT).await;
+        let alias = p42_accept_alias();
+        // Inject another entity that ALREADY owns the proposed
+        // alias (snowflake/finance/x.p41_a).
+        let hydra = runtime.hydra();
+        let now = chrono::Utc::now();
+        let owner = IdentityEntity {
+            id: IdentityEntityId::new(),
+            tenant_id: Some(TenantId::from_str(TEST_TENANT)),
+            kind: IdentityEntityKind::Source,
+            canonical_key: "source/p42_alias_owner".to_string(),
+            display_name: "Alias Owner".to_string(),
+            aliases: vec![alias.clone()],
+            confidence: hydra_core::Confidence::new(0.9),
+            metadata: HashMap::new(),
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: now,
+            updated_at: now,
+            caused_by: None,
+        };
+        {
+            let mut h = hydra.write().await;
+            h.create_identity_entity(owner).unwrap();
+        }
+        let body = accept_request_body(&cand_id, &alias, "actor_ops");
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(json_post("/identity/matches/accept", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(err.error.contains("already mapped to a different entity"));
+    }
+
+    #[tokio::test]
+    async fn accept_semantic_match_rejects_when_gate_fails() {
+        // Skip the source-trust boost — source-trust will fall
+        // below High and the gate blocks. Validates the gate
+        // failure path surfaces as 400 with the "trust below
+        // High" message.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let (candidate, _boosts, _evidence) = p42_seed_candidate(TEST_TENANT);
+        let cand_id = candidate.id.clone();
+        {
+            let hydra = runtime.hydra();
+            let mut h = hydra.write().await;
+            h.create_identity_entity(candidate).unwrap();
+            // Intentionally skip boost entities + evidence so
+            // source_trust falls below High.
+        }
+        let alias = p42_accept_alias();
+        let body = accept_request_body(&cand_id, &alias, "actor_ops");
+        let app = identity_router(runtime.clone());
+        let response = app
+            .oneshot(json_post("/identity/matches/accept", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err: ErrorResponse =
+            serde_json::from_slice(&read_body_bytes(response).await).unwrap();
+        assert!(
+            err.error.contains("trust below High"),
+            "expected gate failure message, got: {}",
+            err.error
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_semantic_match_idempotent_reaccept_returns_entity() {
+        // LOAD-BEARING: re-accept returns 200 + same entity body.
+        // Wire CANNOT distinguish first-accept from idempotent
+        // no-op (engine collapses outcome). Audit log gains
+        // exactly 1 IdentityAliasAdded across both calls.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let cand_id = p42_seed_accept_setup(&runtime, TEST_TENANT).await;
+        let alias = p42_accept_alias();
+        let body = accept_request_body(&cand_id, &alias, "actor_ops");
+        let app = identity_router(runtime.clone());
+        // First accept.
+        let r1 = app
+            .clone()
+            .oneshot(json_post("/identity/matches/accept", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let parsed_1: IdentityEntityResponse =
+            serde_json::from_slice(&read_body_bytes(r1).await).unwrap();
+        let aliases_after_first = parsed_1.entity.aliases.len();
+        // Re-accept — must return 200 with same body shape.
+        let r2 = app
+            .oneshot(json_post("/identity/matches/accept", body))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        let parsed_2: IdentityEntityResponse =
+            serde_json::from_slice(&read_body_bytes(r2).await).unwrap();
+        assert_eq!(parsed_2.entity.id, cand_id);
+        assert_eq!(
+            parsed_2.entity.aliases.len(),
+            aliases_after_first,
+            "idempotent re-accept must NOT duplicate the alias"
+        );
+        // Audit log: exactly 1 IdentityAliasAdded event.
+        let hydra = runtime.hydra();
+        let h = hydra.read().await;
+        let count = h
+            .events()
+            .iter()
+            .filter(|e| matches!(
+                &e.kind,
+                hydra_core::EventKind::IdentityAliasAdded { .. }
+            ))
+            .count();
+        assert_eq!(count, 1, "idempotent re-accept must NOT emit duplicate event");
     }
 }
