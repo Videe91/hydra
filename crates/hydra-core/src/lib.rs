@@ -33,7 +33,11 @@ pub use identity::{
     MatchLevel, SemanticIdentityMatchAssessment, SemanticIdentityMatchCandidate,
     SourceTrustAssessment,
 };
-pub use correlation::{CorrelationStrength, CorrelationTrustAssessment};
+pub use correlation::{
+    CorrelationCandidate, CorrelationReason, CorrelationReasonKind,
+    CorrelationSignalKind, CorrelationSignalRef, CorrelationStrength,
+    CorrelationTrustAssessment,
+};
 pub use event::{Event, EventKind, Value};
 pub use epistemic::{
     Claim,
@@ -124,7 +128,11 @@ pub mod prelude {
         IdentityMatchTrustAssessment, MatchLevel, SemanticIdentityMatchAssessment,
         SemanticIdentityMatchCandidate, SourceTrustAssessment,
     };
-    pub use crate::correlation::{CorrelationStrength, CorrelationTrustAssessment};
+    pub use crate::correlation::{
+        CorrelationCandidate, CorrelationReason, CorrelationReasonKind,
+        CorrelationSignalKind, CorrelationSignalRef, CorrelationStrength,
+        CorrelationTrustAssessment,
+    };
     pub use crate::error::{HydraError, Result};
     pub use crate::event::{Event, EventKind, Value};
     pub use crate::epistemic::{
