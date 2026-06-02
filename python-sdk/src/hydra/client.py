@@ -39,6 +39,8 @@ from ._types import (
     CausalCellId,
     CausalCellKind,
     CausalCellTrustAssessment,
+    CorrelationCandidate,
+    CorrelationSignalRef,
     IdentityAlias,
     IdentityEntity,
     IdentityEntityId,
@@ -1482,6 +1484,74 @@ class Hydra:
             tenant=tenant,
         )
         return IdentityLinkTrustAssessment.model_validate(raw)
+
+    # ========================================================================
+    # Correlation (Patch 46 — wire surface over P43/P44/P45)
+    # ========================================================================
+
+    async def assess_correlation_candidate(
+        self,
+        signals: list[CorrelationSignalRef],
+        *,
+        tenant: TenantId | None = None,
+    ) -> CorrelationCandidate:
+        """Assess whether a caller-provided set of signals belong
+        to the same real-world story (`POST /correlations/assess`
+        — Patch 45 engine, Patch 46 wire).
+
+        Returns a fully-populated `CorrelationCandidate` whose
+        REQUIRED `trust: CorrelationTrustAssessment` carries:
+          - `score: float` (clamped to `[0.0, 1.0]`)
+          - `level: TrustLevel` — confidence in the verdict
+          - `strength: CorrelationStrength` — correlation strength
+            (NOTE: `"None"` is a STRING value, distinct from
+            Python's `None`)
+          - 11 explainable `factors` (applied AND unapplied)
+
+        The candidate also carries 11 `reasons` mirroring the
+        trust factors 1:1 (kind / applied / weight / detail).
+
+        ## Anti-smuggling (HTTP layer)
+
+        The server OVERWRITES every `signal.tenant_id` with the
+        `X-Hydra-Tenant` header value before the engine sees
+        them. A body-supplied tenant on any signal is IGNORED.
+        This prevents callers from smuggling cross-tenant
+        references.
+
+        ## v1 boundary (P45 carry-forward)
+
+        v1 ASSESSES caller-supplied groupings, NOT discovers
+        them. No persistence; the returned candidate has no
+        `id` field — it's ephemeral. Future P47 may anchor
+        accepted candidates to a `CausalCell::Incident`.
+
+        Weights are calibrated for EXPLAINABILITY, NOT
+        correctness. Auto-actions on a candidate MUST compose
+        `trust.level == "High" AND trust.score >= 0.80` with a
+        dedicated audit event — never act on this response
+        alone.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header;
+            < 2 signals; invalid signal kind
+          - 404 → `HydraNotFoundError`: unknown / cross-tenant
+            referenced entity / cell / claim / evidence
+            (collapsed by the engine to prevent cross-tenant
+            existence enumeration)
+
+        Auth: `read:correlation` (despite POST method — engine
+        is `&self` read-only; POST chosen only for body shape).
+        """
+        body = {
+            "signals": [s.model_dump(mode="json") for s in signals],
+        }
+        raw = await self._http.post(
+            _paths.correlations_assess_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return CorrelationCandidate.model_validate(raw["candidate"])
 
     async def _ingest(
         self,

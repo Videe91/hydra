@@ -389,6 +389,19 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
         if path == "/identity" || path.starts_with("/identity/") {
             return vec!["write:identity"];
         }
+        // Patch 46 — `POST /correlations/assess` is a `&self`
+        // read-only engine call but uses POST for body shape
+        // (a `Vec<CorrelationSignalRef>` request payload).
+        // Required scope is `read:correlation` despite the
+        // POST method — correlation can reveal cross-object
+        // relationships and gets its own dedicated scope (NOT
+        // covered by `read:query` / `read:identity` /
+        // `read:trust`). Prefix-based so future GET routes
+        // under `/correlations/*` inherit automatically via
+        // the reads block below.
+        if path == "/correlations" || path.starts_with("/correlations/") {
+            return vec!["read:correlation"];
+        }
         return Vec::new();
     }
     // Reads.
@@ -450,6 +463,16 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
     // automatically via this prefix.
     if path == "/identity" || path.starts_with("/identity/") {
         return vec!["read:identity"];
+    }
+    // Patch 46 — Correlation engine surface. Distinct from
+    // `read:query` (graph data), `read:identity` (entities),
+    // and `read:trust` (governance verdicts) because
+    // correlation reveals cross-object relationships across
+    // claim / cell / entity / link / source surfaces.
+    // Future GET routes under `/correlations/*` inherit
+    // automatically via this prefix.
+    if path == "/correlations" || path.starts_with("/correlations/") {
+        return vec!["read:correlation"];
     }
     Vec::new()
 }
@@ -1247,6 +1270,24 @@ mod tests {
         assert_eq!(
             required_scopes_for(&Method::POST, "/identity/links"),
             vec!["write:identity"]
+        );
+        // Patch 46 — Correlation HTTP. `POST /correlations/assess`
+        // is `&self` read-only at the engine (no persistence,
+        // pinned by `assess_correlation_candidate_no_persistence`),
+        // but uses POST for the body-shaped request. Required
+        // scope is `read:correlation` — NOT `read:query` /
+        // `read:identity` / `read:trust`. Pin both POST and a
+        // future GET path under the same prefix.
+        assert_eq!(
+            required_scopes_for(
+                &Method::POST,
+                "/correlations/assess"
+            ),
+            vec!["read:correlation"]
+        );
+        assert_eq!(
+            required_scopes_for(&Method::GET, "/correlations/can_abc"),
+            vec!["read:correlation"]
         );
         // OPTIONS always has no scope requirement (CORS preflight).
         assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());

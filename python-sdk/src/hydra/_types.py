@@ -2404,3 +2404,183 @@ class AutoApprovalDecision(BaseModel):
     trust: TrustAssessment | None = None
     action_id: str
     approved_by: str | None = None
+
+
+# === Patch 46 — Correlation wire types ====================
+#
+# Patch 43 shipped the correlation TRUST CONTRACT (`CorrelationStrength`
+# + `CorrelationTrustAssessment`). Patch 44 shipped the candidate
+# vocabulary (`CorrelationSignalKind` / `CorrelationSignalRef` /
+# `CorrelationReasonKind` / `CorrelationReason` /
+# `CorrelationCandidate`). Patch 45 shipped the engine method that
+# emits them. Patch 46 exposes the engine over HTTP + SDK:
+#
+#   POST /correlations/assess
+#   hy.assess_correlation_candidate(signals, *, tenant=None)
+#
+# **v1 ASSESSES caller-provided groupings, NOT discovers them.**
+# The future correlation arc layers anchoring (P47+ — turn an
+# accepted candidate into a `CausalCellKind::Incident`) and
+# discovery (P48+ — scan + cluster) on top of this wire surface.
+#
+# **`"None"` gotcha**: `CorrelationStrength.None` is a STRING
+# value (no correlation), NOT Python's `None`. Same trip as
+# `MatchLevel.None`. Operators reading dashboards / SDK clients
+# comparing levels must guard `result.trust.strength == "None"`,
+# never `result.trust.strength is None`.
+
+CorrelationStrength = Literal["Strong", "Possible", "Weak", "None"]
+"""Correlation strength banding. NOTE: `"None"` is a string
+value (no correlation), distinct from Python's `None`. Mirrors
+`MatchLevel` exactly."""
+
+# Built-ins: PascalCase strings ("Claim" / "Evidence" /
+# "CausalCell" / "IdentityEntity" / "IdentityLink" / "Source" /
+# "External"). Custom: `{"Custom": "label"}`. Wire form matches
+# `IdentityLinkKind` and `IdentityEntityKind` exactly.
+CorrelationSignalKind = str | dict[str, str]
+
+# Built-ins (11): "SameIdentityEntity" / "TrustedIdentityLink" /
+# "SameSource" / "SourceTrustHigh" / "EntityTrustHigh" /
+# "CellTrustHigh" / "TimeProximity" / "SemanticSimilarity" /
+# "ClaimPredicateSimilarity" / "Contradiction" /
+# "OperatorConfirmed". Custom: `{"Custom": "label"}`.
+CorrelationReasonKind = str | dict[str, str]
+
+
+class CorrelationSignalRef(BaseModel):
+    """One signal participating in a `CorrelationCandidate`.
+
+    Mirrors `hydra_core::CorrelationSignalRef` (Patch 44 vocab).
+
+    `id` is a free-form string — `kind` disambiguates which
+    store the engine resolves it against (claim_id / evidence_id
+    / cell_id / etc.). Cross-store id arrays
+    (`entity_ids` / `cell_ids` / `claim_ids` / `evidence_ids`)
+    are pre-extracted auxiliary references the engine reads
+    when computing factors; they MUST be same-tenant in the
+    target tenant or the assess call returns 404
+    "unknown {kind}".
+
+    **`tenant_id` is OVERWRITTEN by the HTTP layer** at
+    `POST /correlations/assess` time from the `X-Hydra-Tenant`
+    header (anti-smuggling). Any body-supplied value is ignored.
+
+    `observed_at` is `None` when the signal carries no single
+    timestamp (e.g., a CausalCell summary). The
+    `TimeProximity` factor fires only when at least one pair
+    of signals both have `Some(observed_at)`.
+
+    `metadata["source"]` (when a non-empty string) feeds the
+    P45 `SameSource` / `SourceTrustHigh` factor resolution.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: CorrelationSignalKind
+    id: str
+    tenant_id: TenantId | None = None
+    observed_at: str | None = None
+    entity_ids: list[IdentityEntityId] = Field(default_factory=list)
+    cell_ids: list[CausalCellId] = Field(default_factory=list)
+    claim_ids: list[ClaimId] = Field(default_factory=list)
+    evidence_ids: list[EvidenceId] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CorrelationReason(BaseModel):
+    """One reason the engine cited for grouping signals into a
+    `CorrelationCandidate`. Mirrors
+    `hydra_core::CorrelationReason`.
+
+    Shape mirrors `TrustFactor` (kind / weight / applied /
+    detail) but is a distinct TYPE — `TrustFactor` explains
+    TRUST scoring, `CorrelationReason` explains story
+    GROUPING. The engine emits one record per evaluated reason
+    (applied OR not — explainability contract).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: CorrelationReasonKind
+    weight: float
+    applied: bool
+    detail: str
+
+
+class CorrelationTrustAssessment(BaseModel):
+    """Two-axis trust verdict over a `CorrelationCandidate`
+    (Patch 43 vocab, Patch 45 engine).
+
+    Mirrors `hydra_core::CorrelationTrustAssessment`. Both axes
+    derive from the SAME clamped score:
+
+      - `level: TrustLevel`         — confidence in the verdict
+      - `strength: CorrelationStrength` — correlation strength itself
+
+    `correlation_id` is `None` for ephemeral v1 candidates
+    (P46 wire). A future patch (P47+) will anchor accepted
+    candidates to a `CausalCellKind::Incident` and populate
+    this field.
+
+    `factors` always carries all 11 records — applied AND
+    unapplied — mirroring `CorrelationCandidate.reasons` 1:1.
+
+    **Suggestion-only contract** (carries from P45): weights
+    are calibrated for EXPLAINABILITY, not correctness.
+    Auto-actions MUST compose
+    `level == "High" AND score >= 0.80` plus a dedicated audit
+    event — never act on this assessment alone.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    correlation_id: CausalCellId | None = None
+    score: float
+    level: TrustLevel
+    strength: CorrelationStrength
+    explanation: str
+    factors: list[TrustFactor]
+    assessed_at: str
+
+
+class CorrelationCandidate(BaseModel):
+    """A grouping of signals the engine believes belong to the
+    same real-world story, with reasons, time window, and a
+    REQUIRED trust verdict (Patch 44 vocab, Patch 45 engine,
+    Patch 46 wire).
+
+    Mirrors `hydra_core::CorrelationCandidate`. **No `id` in
+    v1** — candidates are ephemeral; the engine constructs the
+    candidate from caller-supplied signals on each
+    `assess_correlation_candidate` call. Future P47 may
+    anchor accepted candidates to a CausalCell.
+
+    `tenant_id` is the candidate tenant (overwritten by the
+    HTTP layer from `X-Hydra-Tenant`). Every signal in
+    `signals` carries the same tenant (validated by the
+    engine).
+
+    `entity_ids` / `cell_ids` are dedup'd aggregates extracted
+    from the signal cross-refs — surfaced so callers don't
+    need to re-walk the signal list.
+
+    `time_window_start` / `time_window_end` are derived from
+    `min` / `max` of `signal.observed_at` (None/None when no
+    signal carries one).
+
+    `trust` is REQUIRED — `CorrelationCandidate` never exists
+    without a verdict (the load-bearing P43 commitment).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: TenantId | None = None
+    signals: list[CorrelationSignalRef] = Field(default_factory=list)
+    entity_ids: list[IdentityEntityId] = Field(default_factory=list)
+    cell_ids: list[CausalCellId] = Field(default_factory=list)
+    time_window_start: str | None = None
+    time_window_end: str | None = None
+    reasons: list[CorrelationReason] = Field(default_factory=list)
+    trust: CorrelationTrustAssessment
+    created_at: str

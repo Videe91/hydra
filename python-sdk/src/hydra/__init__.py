@@ -87,6 +87,13 @@ from ._types import (
     CausalCellId,
     CausalCellKind,
     CausalCellTrustAssessment,
+    CorrelationCandidate,
+    CorrelationReason,
+    CorrelationReasonKind,
+    CorrelationSignalKind,
+    CorrelationSignalRef,
+    CorrelationStrength,
+    CorrelationTrustAssessment,
     IdentityAlias,
     IdentityEntity,
     IdentityEntityId,
@@ -275,6 +282,18 @@ __all__ = [
     # tagged `{"Custom": "label"}` form.
     "CausalCell",
     "CausalCellKind",
+    # Correlation engine (Patch 43 trust vocab, Patch 44 candidate
+    # vocab, Patch 45 engine, Patch 46 HTTP/SDK). Two-axis
+    # verdict (`strength` + `level`). `CorrelationStrength.None`
+    # is a STRING value (no correlation), distinct from
+    # Python's `None`. Surface via `assess_correlation_candidate`.
+    "CorrelationCandidate",
+    "CorrelationReason",
+    "CorrelationReasonKind",
+    "CorrelationSignalKind",
+    "CorrelationSignalRef",
+    "CorrelationStrength",
+    "CorrelationTrustAssessment",
     # Identity Graph (Patch 29 vocab, Patch 30 matcher, Patch 31
     # HTTP/SDK). `IdentityEntity` is the canonical primitive;
     # `IdentityAlias` is one source-specific name; `MatchLevel`

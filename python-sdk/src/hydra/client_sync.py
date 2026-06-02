@@ -56,6 +56,8 @@ from ._types import (
     CausalCellId,
     CausalCellKind,
     CausalCellTrustAssessment,
+    CorrelationCandidate,
+    CorrelationSignalRef,
     IdentityAlias,
     IdentityEntity,
     IdentityEntityId,
@@ -880,6 +882,35 @@ class HydraSync:
             tenant=tenant,
         )
         return IdentityLinkTrustAssessment.model_validate(raw)
+
+    # ========================================================================
+    # Correlation (Patch 46) — sync mirror
+    # ========================================================================
+
+    def assess_correlation_candidate(
+        self,
+        signals: list[CorrelationSignalRef],
+        *,
+        tenant: TenantId | None = None,
+    ) -> CorrelationCandidate:
+        """Sync mirror of `Hydra.assess_correlation_candidate`
+        (Patch 45 engine, Patch 46 wire). Assess whether a
+        caller-provided set of signals belong to the same
+        real-world story. Returns a `CorrelationCandidate` with
+        REQUIRED trust verdict (two-axis: `level` + `strength`).
+        The server OVERWRITES every `signal.tenant_id` with the
+        `X-Hydra-Tenant` header (anti-smuggling). v1 assesses
+        caller-provided groupings — does NOT discover. See the
+        async docstring for the full suggestion-only contract."""
+        body = {
+            "signals": [s.model_dump(mode="json") for s in signals],
+        }
+        raw = self._http.post(
+            _paths.correlations_assess_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return CorrelationCandidate.model_validate(raw["candidate"])
 
     def _ingest(
         self,

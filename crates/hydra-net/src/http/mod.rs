@@ -3,6 +3,7 @@ pub mod causal_cells;
 pub mod identity;
 pub mod commit_stream;
 pub mod commits;
+pub mod correlations;
 pub mod diagnostics;
 pub mod events;
 pub mod ingest;
@@ -39,6 +40,10 @@ pub use commit_stream::{
     CommitStreamQuery, COMMIT_STREAM_CAPACITY,
 };
 pub use commits::{commits_router, CommitsHttpState};
+pub use correlations::{
+    correlations_router, AssessCorrelationCandidateRequest,
+    CorrelationCandidateResponse, CorrelationsHttpState,
+};
 pub use micromodels::{
     micromodels_router, EvaluateActionFailureRateRequest,
     EvaluateActionFailureRateResponse, EvaluateAgentLoopStormRequest,

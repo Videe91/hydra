@@ -695,3 +695,29 @@ def identity_entity_links_path(entity_id: str) -> str:
     listing links to prevent existence enumeration through link
     counts)."""
     return f"/identity/entities/{_seg(entity_id)}/links"
+
+
+def correlations_assess_path() -> str:
+    """`POST /correlations/assess` — Patch 46 wire over Patch 45.
+    Body: `{signals: [CorrelationSignalRef, ...]}`. Tenant from
+    `X-Hydra-Tenant` header — server OVERWRITES every
+    `signal.tenant_id` with the header value (anti-smuggling).
+    Returns wrapped `{candidate: CorrelationCandidate}`.
+
+    Engine assesses caller-provided groupings (does NOT
+    discover); v1 emits 11 reasons + 11 trust factors over the
+    supplied signals.
+
+    Auth: `read:correlation` (despite POST method — body shape
+    only; engine is `&self` read-only).
+
+    Status:
+      missing tenant → 400
+      < 2 signals → 400 ("correlation requires at least two signals")
+      invalid signal kind → 400
+      unknown / wrong-tenant referenced entity / cell / claim /
+      evidence → 404 ("unknown {kind}: {id}" — collapsed to
+      prevent cross-tenant existence leak)
+      success → 200
+    """
+    return "/correlations/assess"
