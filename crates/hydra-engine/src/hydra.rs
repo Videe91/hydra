@@ -5227,6 +5227,404 @@ impl Hydra {
         Ok(candidate)
     }
 
+    /// Patch 49 — Correlation Discovery Scan v1.
+    ///
+    /// Given a seed `CorrelationSignalRef`, walks existing
+    /// Hydra memory (identity links, identity entities, causal
+    /// cells, claims) to find RELATED signals and proposes
+    /// ranked `CorrelationCandidate`s using the same scoring
+    /// authority as Patch 45 (`assess_correlation_candidate`).
+    ///
+    /// **v1 is SEED-ANCHORED, NOT global scan.** The walk uses
+    /// only the paths the seed itself provides — outgoing/
+    /// incoming identity links from `seed.entity_ids`, cells
+    /// overlapping `seed.cell_ids` / `seed.claim_ids` /
+    /// `seed.evidence_ids`, claims overlapping `seed.evidence_ids`.
+    /// No full identity-entity iteration. No source-wide
+    /// alias scan. No global cell scan beyond tenant + window
+    /// filter.
+    ///
+    /// ## Boundary
+    ///
+    /// - **Read-only**: `&self`. Pinned by
+    ///   `discover_correlation_candidates_does_not_persist`.
+    /// - **Does NOT anchor**: caller chooses which candidates
+    ///   (if any) to anchor via P47 `anchor_correlation_candidate`.
+    /// - No HTTP / SDK / scheduler / background job in v1.
+    ///
+    /// ## Per-record signal extraction
+    ///
+    /// Each related Hydra record becomes a typed
+    /// `CorrelationSignalRef` carrying that record's id,
+    /// tenant, timestamp, and the cross-store id-vectors the
+    /// engine can derive from it.
+    ///
+    /// Records WITHOUT a usable timestamp are skipped — the
+    /// time window only fences signals whose `observed_at` is
+    /// `Some(_)`, so we exclude None-timestamp records from
+    /// the related-signals pool entirely to keep window
+    /// semantics deterministic.
+    ///
+    /// ## Pairwise scoring
+    ///
+    /// Each related signal pairs with the seed and is scored
+    /// independently via
+    /// `assess_correlation_candidate(tenant_id, vec![seed.clone(),
+    /// related])`. Each result is a 2-signal candidate that
+    /// can be interpreted on its own — no giant N-signal
+    /// grouping in v1.
+    ///
+    /// ## Filter + sort
+    ///
+    /// Filter: `candidate.trust.score >= 0.20` (equivalent to
+    /// `strength != CorrelationStrength::None`).
+    ///
+    /// Sort:
+    /// 1. `trust.score` DESC
+    /// 2. tie-break on `(related_signal.kind.discriminant(),
+    ///    related_signal.id)` ASC — deterministic across runs.
+    ///
+    /// Truncate to `limit` AFTER sort.
+    ///
+    /// ## Cost bound
+    ///
+    /// Related-signal pool is capped at
+    /// `MAX_RELATED_SIGNALS_PER_SCAN = 200` (mirrors P35's
+    /// `MAX_SOURCE_ENTITIES_FOR_TRUST`). If accumulation hits
+    /// the cap, the scan truncates silently in v1 — telemetry
+    /// is deferred.
+    ///
+    /// ## Suggestion-only contract (P45 carry-forward)
+    ///
+    /// v1 PROPOSES groupings; it doesn't decide them.
+    /// Auto-actions on a discovered candidate must still
+    /// compose `level == High AND score >=
+    /// ACCEPT_CORRELATION_FLOOR` plus a dedicated audit event
+    /// (caller is the policy authority).
+    pub fn discover_correlation_candidates(
+        &self,
+        tenant_id: Option<&hydra_core::TenantId>,
+        seed: hydra_core::CorrelationSignalRef,
+        window_secs: u64,
+        limit: usize,
+    ) -> hydra_core::error::Result<Vec<hydra_core::CorrelationCandidate>>
+    {
+        use hydra_core::error::HydraError;
+        use hydra_core::{
+            CorrelationSignalKind, CorrelationSignalRef,
+        };
+        use std::collections::{HashMap, HashSet};
+
+        /// Cost cap on the related-signals pool. Mirrors P35's
+        /// `MAX_SOURCE_ENTITIES_FOR_TRUST` — bounded scan keeps
+        /// discovery deterministic on growing stores.
+        const MAX_RELATED_SIGNALS_PER_SCAN: usize = 200;
+
+        // 1. Seed validation (fail-fast, before any walks).
+        seed.kind.validate().map_err(HydraError::QueryError)?;
+        if seed.tenant_id.as_ref() != tenant_id {
+            return Err(HydraError::QueryError(format!(
+                "seed tenant mismatch (caller {:?} vs seed {:?})",
+                tenant_id, seed.tenant_id,
+            )));
+        }
+        if window_secs == 0 {
+            return Err(HydraError::QueryError(
+                "window_secs must be > 0".to_string(),
+            ));
+        }
+        if limit == 0 {
+            return Err(HydraError::QueryError(
+                "limit must be > 0".to_string(),
+            ));
+        }
+
+        // 2. Time-window anchor. v1 requires the seed itself
+        //    to carry an `observed_at`; otherwise we have no
+        //    anchor against which to fence other signals.
+        let Some(seed_time) = seed.observed_at else {
+            // No anchor → no related signals can be gated by
+            // the window. Return empty rather than walk
+            // unbounded.
+            return Ok(Vec::new());
+        };
+        let window =
+            chrono::Duration::seconds(window_secs as i64);
+        let window_start = seed_time - window;
+        let window_end = seed_time + window;
+        let in_window = |t: chrono::DateTime<chrono::Utc>| -> bool {
+            t >= window_start && t <= window_end
+        };
+
+        // 3. Build the related-signals pool. Dedupe by
+        //    (kind.discriminant(), id) string pair so a record
+        //    reached via two paths only assesses once. Cap at
+        //    MAX_RELATED_SIGNALS_PER_SCAN.
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut related: Vec<CorrelationSignalRef> = Vec::new();
+        let seed_key = (seed.kind.discriminant(), seed.id.clone());
+        seen.insert(seed_key);
+        let try_push = |related: &mut Vec<CorrelationSignalRef>,
+                        seen: &mut HashSet<(String, String)>,
+                        signal: CorrelationSignalRef|
+         -> bool {
+            let key = (signal.kind.discriminant(), signal.id.clone());
+            if seen.contains(&key) {
+                return false;
+            }
+            if related.len() >= MAX_RELATED_SIGNALS_PER_SCAN {
+                return false;
+            }
+            seen.insert(key);
+            related.push(signal);
+            true
+        };
+
+        // --- Walk 1: IdentityLinks + opposite endpoints ---
+        //
+        // For each entity referenced by the seed, surface
+        // outgoing + incoming links AND the opposite endpoint
+        // as a related IdentityEntity signal. Both kinds gate
+        // on the same window (link.created_at /
+        // entity.updated_at).
+        for eid in &seed.entity_ids {
+            for link in self.identity_links_for_entity(eid) {
+                if link.tenant_id.as_ref() != tenant_id {
+                    continue;
+                }
+                if !in_window(link.created_at) {
+                    continue;
+                }
+                // Minimal cross-refs: only the two link
+                // endpoints (which the link constructor
+                // already validated exist). Skipping link's
+                // `evidence_ids` / `claim_ids` / `cell_ids` —
+                // those are non-validated audit refs per P37
+                // and P45 would otherwise hard-error on
+                // dangling ids.
+                let link_signal = CorrelationSignalRef {
+                    kind: CorrelationSignalKind::IdentityLink,
+                    id: link.id.to_string(),
+                    tenant_id: link.tenant_id.clone(),
+                    observed_at: Some(link.created_at),
+                    entity_ids: vec![
+                        link.from_entity_id.clone(),
+                        link.to_entity_id.clone(),
+                    ],
+                    cell_ids: Vec::new(),
+                    claim_ids: Vec::new(),
+                    evidence_ids: Vec::new(),
+                    metadata: HashMap::new(),
+                };
+                try_push(&mut related, &mut seen, link_signal);
+
+                let other_endpoint = if &link.from_entity_id == eid {
+                    &link.to_entity_id
+                } else {
+                    &link.from_entity_id
+                };
+                if let Some(entity) =
+                    self.identity_entity(other_endpoint)
+                {
+                    if entity.tenant_id.as_ref() == tenant_id
+                        && in_window(entity.updated_at)
+                    {
+                        let entity_signal = CorrelationSignalRef {
+                            kind:
+                                CorrelationSignalKind::IdentityEntity,
+                            id: entity.id.to_string(),
+                            tenant_id: entity.tenant_id.clone(),
+                            observed_at: Some(entity.updated_at),
+                            entity_ids: vec![entity.id.clone()],
+                            cell_ids: Vec::new(),
+                            claim_ids: Vec::new(),
+                            evidence_ids: Vec::new(),
+                            metadata: HashMap::new(),
+                        };
+                        try_push(
+                            &mut related,
+                            &mut seen,
+                            entity_signal,
+                        );
+                    }
+                }
+                if related.len() >= MAX_RELATED_SIGNALS_PER_SCAN {
+                    break;
+                }
+            }
+            if related.len() >= MAX_RELATED_SIGNALS_PER_SCAN {
+                break;
+            }
+        }
+
+        // --- Walk 2: CausalCells overlapping seed refs ---
+        //
+        // A cell is "related" when it shares a claim/evidence/
+        // cell reference with the seed. Tenant-scoped + window-
+        // gated on `cell.created_at`.
+        let seed_claim_set: HashSet<_> =
+            seed.claim_ids.iter().cloned().collect();
+        let seed_evidence_set: HashSet<_> =
+            seed.evidence_ids.iter().cloned().collect();
+        let seed_cell_set: HashSet<_> =
+            seed.cell_ids.iter().cloned().collect();
+        if related.len() < MAX_RELATED_SIGNALS_PER_SCAN {
+            for cell in self.causal_cells() {
+                if related.len() >= MAX_RELATED_SIGNALS_PER_SCAN {
+                    break;
+                }
+                if cell.tenant_id.as_ref() != tenant_id {
+                    continue;
+                }
+                if !in_window(cell.created_at) {
+                    continue;
+                }
+                let overlaps_claim = cell
+                    .claim_ids
+                    .iter()
+                    .any(|c| seed_claim_set.contains(c));
+                let overlaps_evidence = cell
+                    .evidence_ids
+                    .iter()
+                    .any(|e| seed_evidence_set.contains(e));
+                let overlaps_seed_child = cell
+                    .child_cell_ids
+                    .iter()
+                    .any(|c| seed_cell_set.contains(c));
+                let seed_carries_this_cell =
+                    seed_cell_set.contains(&cell.id);
+                if !(overlaps_claim
+                    || overlaps_evidence
+                    || overlaps_seed_child
+                    || seed_carries_this_cell)
+                {
+                    continue;
+                }
+                // Minimal cross-refs: only the cell itself.
+                // Cells' `claim_ids` / `evidence_ids` may be
+                // non-validated audit refs (the P21 reflex
+                // converter populates them from real records,
+                // but synthetic / external cells may not).
+                // Propagating them would risk P45 hard-error
+                // on dangling refs.
+                let cell_signal = CorrelationSignalRef {
+                    kind: CorrelationSignalKind::CausalCell,
+                    id: cell.id.to_string(),
+                    tenant_id: cell.tenant_id.clone(),
+                    observed_at: Some(cell.created_at),
+                    entity_ids: Vec::new(),
+                    cell_ids: vec![cell.id.clone()],
+                    claim_ids: Vec::new(),
+                    evidence_ids: Vec::new(),
+                    metadata: HashMap::new(),
+                };
+                try_push(&mut related, &mut seen, cell_signal);
+            }
+        }
+
+        // --- Walk 3: Claims overlapping seed refs ---
+        //
+        // A claim is "related" when it shares an evidence id
+        // with the seed OR when its id appears in the seed's
+        // claim_ids (the latter surfaces the seed's own
+        // referenced claims as related signals — useful when
+        // the seed is itself something other than a Claim).
+        if related.len() < MAX_RELATED_SIGNALS_PER_SCAN {
+            for claim in self.epistemic_store().all_claims() {
+                if related.len() >= MAX_RELATED_SIGNALS_PER_SCAN {
+                    break;
+                }
+                if claim.tenant_id.as_ref() != tenant_id {
+                    continue;
+                }
+                if !in_window(claim.created_at) {
+                    continue;
+                }
+                let overlaps_evidence = claim
+                    .evidence_for
+                    .iter()
+                    .any(|e| seed_evidence_set.contains(e));
+                let seed_carries_this_claim =
+                    seed_claim_set.contains(&claim.id);
+                if !(overlaps_evidence || seed_carries_this_claim)
+                {
+                    continue;
+                }
+                // Minimal cross-refs: only the claim's own id.
+                // `claim.evidence_for` ids may reference
+                // unresolved evidence (e.g., evidence that was
+                // disputed-and-removed); P45 would hard-error
+                // on the resolution walk. Propagating them
+                // would also widen the (already-walked) scan
+                // pool unnecessarily.
+                let claim_signal = CorrelationSignalRef {
+                    kind: CorrelationSignalKind::Claim,
+                    id: claim.id.to_string(),
+                    tenant_id: claim.tenant_id.clone(),
+                    observed_at: Some(claim.created_at),
+                    entity_ids: Vec::new(),
+                    cell_ids: Vec::new(),
+                    claim_ids: vec![claim.id.clone()],
+                    evidence_ids: Vec::new(),
+                    metadata: HashMap::new(),
+                };
+                try_push(&mut related, &mut seen, claim_signal);
+            }
+        }
+
+        // 4. Pairwise scoring. P45 is the scoring authority —
+        //    each (seed, related) pair becomes a 2-signal
+        //    candidate. Track which related signal produced
+        //    which candidate so the tie-break sort can use it.
+        let mut scored: Vec<(
+            hydra_core::CorrelationCandidate,
+            (String, String),
+        )> = Vec::with_capacity(related.len());
+        for r in related {
+            let key = (r.kind.discriminant(), r.id.clone());
+            match self.assess_correlation_candidate(
+                tenant_id,
+                vec![seed.clone(), r],
+            ) {
+                Ok(candidate) => {
+                    // Filter: only keep candidates that cleared
+                    // the no-correlation floor.
+                    if candidate.trust.score >= 0.20 {
+                        scored.push((candidate, key));
+                    }
+                }
+                // A per-pair assess failure (e.g., reference
+                // resolution miss on the related signal) MUST
+                // NOT kill the whole discovery. Skip silently
+                // in v1 — telemetry deferred.
+                Err(_) => continue,
+            }
+        }
+
+        // 5. Sort DESC by trust.score, ASC tie-break on
+        //    (related signal kind discriminant, id). Both
+        //    fields are stable across runs.
+        scored.sort_by(|a, b| {
+            // total_cmp avoids the NaN-headache from f64
+            // partial_cmp; scores are produced by P45's
+            // clamp([0,1]) so NaN is impossible, but total_cmp
+            // is the principled choice.
+            b.0.trust
+                .score
+                .total_cmp(&a.0.trust.score)
+                .then_with(|| a.1 .0.cmp(&b.1 .0))
+                .then_with(|| a.1 .1.cmp(&b.1 .1))
+        });
+
+        // 6. Truncate to limit and return.
+        let out: Vec<_> = scored
+            .into_iter()
+            .take(limit)
+            .map(|(c, _)| c)
+            .collect();
+        Ok(out)
+    }
+
     /// Patch 21 — turn a model-derived reflex chain into a
     /// `CausalCellKind::Reflex` causal cell.
     ///
@@ -27822,5 +28220,798 @@ mod sprint1_tests {
         // Score preserved verbatim — the engine did NOT recompute.
         assert_eq!(cell.trust_score, Some(0.95));
         assert_eq!(cell.kind, hydra_core::CausalCellKind::Incident);
+    }
+
+    // === Patch 49 — Correlation Discovery Scan v1 ===================
+
+    /// Build a minimal seed `CorrelationSignalRef` for P49
+    /// discovery tests. Defaults `observed_at` to NOW so the
+    /// window gate has an anchor; defaults metadata empty.
+    #[allow(clippy::too_many_arguments)]
+    fn p49_seed(
+        kind: hydra_core::CorrelationSignalKind,
+        id: &str,
+        tenant: Option<hydra_core::TenantId>,
+        observed_at: Option<chrono::DateTime<chrono::Utc>>,
+        entity_ids: Vec<hydra_core::IdentityEntityId>,
+        cell_ids: Vec<hydra_core::CausalCellId>,
+        claim_ids: Vec<hydra_core::ClaimId>,
+        evidence_ids: Vec<hydra_core::EvidenceId>,
+    ) -> hydra_core::CorrelationSignalRef {
+        hydra_core::CorrelationSignalRef {
+            kind,
+            id: id.to_string(),
+            tenant_id: tenant,
+            observed_at,
+            entity_ids,
+            cell_ids,
+            claim_ids,
+            evidence_ids,
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Build a Claim with controlled timestamp + evidence_for
+    /// list — used to seed the all_claims pool with a record
+    /// the discovery walk will recognize as related to a
+    /// shared-evidence seed.
+    #[allow(clippy::too_many_arguments)]
+    fn p49_make_claim(
+        tenant: Option<hydra_core::TenantId>,
+        evidence_for: Vec<hydra_core::EvidenceId>,
+        created_at: chrono::DateTime<chrono::Utc>,
+        subject: hydra_core::ClaimSubject,
+        predicate: &str,
+    ) -> hydra_core::Claim {
+        hydra_core::Claim {
+            id: hydra_core::ClaimId::new(),
+            tenant_id: tenant,
+            kind: hydra_core::ClaimKind::Fact,
+            subject,
+            predicate: predicate.to_string(),
+            object: hydra_core::ClaimObject::Value(
+                hydra_core::Value::Bool(true),
+            ),
+            confidence: hydra_core::Confidence::new(0.90),
+            status: hydra_core::ClaimStatus::Proposed,
+            evidence_for,
+            evidence_against: vec![],
+            valid_from: created_at,
+            valid_until: None,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at,
+            updated_at: created_at,
+            caused_by: None,
+        }
+    }
+
+    #[test]
+    fn discover_correlation_candidates_requires_seed_tenant() {
+        // seed.tenant_id != tenant_id arg → QueryError.
+        let hydra = Hydra::new();
+        let tenant_a = hydra_core::TenantId::from_str("tenant_p49_a");
+        let tenant_b = hydra_core::TenantId::from_str("tenant_p49_b");
+        let seed = p49_seed(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant_b),
+            Some(chrono::Utc::now()),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let err = hydra
+            .discover_correlation_candidates(
+                Some(&tenant_a),
+                seed,
+                300,
+                10,
+            )
+            .unwrap_err();
+        match err {
+            hydra_core::error::HydraError::QueryError(msg) => {
+                assert!(
+                    msg.contains("seed tenant mismatch"),
+                    "expected seed tenant message, got: {msg}"
+                );
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+
+        // window_secs == 0 → also rejects.
+        let seed2 = p49_seed(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(hydra_core::TenantId::from_str("tenant_p49_a")),
+            Some(chrono::Utc::now()),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let err = hydra
+            .discover_correlation_candidates(
+                Some(&hydra_core::TenantId::from_str("tenant_p49_a")),
+                seed2,
+                0,
+                10,
+            )
+            .unwrap_err();
+        match err {
+            hydra_core::error::HydraError::QueryError(msg) => {
+                assert!(msg.contains("window_secs must be > 0"));
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+
+        // limit == 0 → also rejects.
+        let seed3 = p49_seed(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(hydra_core::TenantId::from_str("tenant_p49_a")),
+            Some(chrono::Utc::now()),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let err = hydra
+            .discover_correlation_candidates(
+                Some(&hydra_core::TenantId::from_str("tenant_p49_a")),
+                seed3,
+                300,
+                0,
+            )
+            .unwrap_err();
+        match err {
+            hydra_core::error::HydraError::QueryError(msg) => {
+                assert!(msg.contains("limit must be > 0"));
+            }
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_correlation_candidates_finds_same_entity_claims() {
+        // Seed shares an evidence id with an ingested claim;
+        // discovery surfaces that claim as a Claim signal. To
+        // clear the >= 0.20 score filter, the pair must hit
+        // SameSource + SourceTrustHigh — boost snowflake
+        // source trust and have the claim's evidence resolve
+        // to it. The seed declares the same source via
+        // metadata so SameSource fires across the pair.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p49_claim");
+        p41_boost_source_trust(
+            &mut hydra,
+            Some(tenant.clone()),
+            "snowflake",
+        );
+        // Ingest an Evidence whose source maps cleanly to
+        // "snowflake" via the P35 Warehouse variant — P49's
+        // claim signal resolves source via claim → evidence.
+        let evidence = hydra_core::Evidence {
+            id: hydra_core::EvidenceId::new(),
+            tenant_id: Some(tenant.clone()),
+            source: hydra_core::EvidenceSource::Warehouse {
+                system: "snowflake".to_string(),
+                database: Some("analytics".to_string()),
+                schema: None,
+                table: None,
+            },
+            payload: hydra_core::EvidencePayload {
+                kind: "p49_claim_test".to_string(),
+                data: std::collections::HashMap::new(),
+            },
+            reliability: hydra_core::Confidence::new(0.90),
+            observed_at: chrono::Utc::now(),
+            recorded_at: chrono::Utc::now(),
+            caused_by: None,
+        };
+        let ev_id = evidence.id.clone();
+        hydra
+            .ingest(hydra_core::EventKind::EvidenceAdded {
+                evidence,
+            })
+            .unwrap();
+        let t0 = chrono::Utc::now();
+        let claim = p49_make_claim(
+            Some(tenant.clone()),
+            vec![ev_id.clone()],
+            t0,
+            hydra_core::ClaimSubject::Dataset(
+                "dataset/p49_subject".to_string(),
+            ),
+            "is_stale",
+        );
+        let claim_id = claim.id.clone();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim })
+            .unwrap();
+
+        // Seed carries the same evidence id; metadata["source"]
+        // declares "snowflake" so SameSource pairs with the
+        // claim's evidence-walked source.
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "source".to_string(),
+            hydra_core::Value::String("snowflake".to_string()),
+        );
+        let seed = hydra_core::CorrelationSignalRef {
+            kind: hydra_core::CorrelationSignalKind::Evidence,
+            id: ev_id.to_string(),
+            tenant_id: Some(tenant.clone()),
+            observed_at: Some(t0),
+            entity_ids: vec![],
+            cell_ids: vec![],
+            claim_ids: vec![],
+            evidence_ids: vec![ev_id.clone()],
+            metadata,
+        };
+        let candidates = hydra
+            .discover_correlation_candidates(
+                Some(&tenant),
+                seed,
+                3600,
+                10,
+            )
+            .unwrap();
+        // At least one candidate; the related signal in it
+        // must be the Claim we ingested.
+        assert!(!candidates.is_empty(), "expected at least one match");
+        let found_claim = candidates.iter().any(|c| {
+            c.signals.iter().any(|s| {
+                matches!(
+                    s.kind,
+                    hydra_core::CorrelationSignalKind::Claim
+                ) && s.id == claim_id.to_string()
+            })
+        });
+        assert!(
+            found_claim,
+            "claim with shared evidence must surface as related"
+        );
+    }
+
+    #[test]
+    fn discover_correlation_candidates_finds_nearby_cells() {
+        // Seed shares a claim id with an ingested cell; the
+        // cell surfaces as a CausalCell signal. Cell carries
+        // a high trust_score so the resulting pair's
+        // CellTrustHigh factor fires (+0.15), which combined
+        // with TimeProximity (+0.10) clears the 0.20 filter.
+        //
+        // The seed's `claim_ids` must reference a REAL
+        // ingested claim (P45 strict-resolves every signal
+        // reference; dangling ids hard-error and drop the
+        // candidate silently).
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p49_cell");
+        let t0 = chrono::Utc::now();
+        let claim = p49_make_claim(
+            Some(tenant.clone()),
+            vec![],
+            t0,
+            hydra_core::ClaimSubject::Dataset(
+                "dataset/p49_cell".to_string(),
+            ),
+            "p49_cell",
+        );
+        let claim_id = claim.id.clone();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim })
+            .unwrap();
+        let cell = ingest_synthetic_cell(
+            &mut hydra,
+            Some(tenant.clone()),
+            "p49.cell.shared",
+            vec![],
+            vec![claim_id.clone()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Some(0.95),
+            None,
+        );
+        let seed = p49_seed(
+            hydra_core::CorrelationSignalKind::Claim,
+            claim_id.as_str(),
+            Some(tenant.clone()),
+            Some(t0),
+            vec![],
+            vec![],
+            vec![claim_id.clone()],
+            vec![],
+        );
+        let candidates = hydra
+            .discover_correlation_candidates(
+                Some(&tenant),
+                seed,
+                3600,
+                10,
+            )
+            .unwrap();
+        let found_cell = candidates.iter().any(|c| {
+            c.signals.iter().any(|s| {
+                matches!(
+                    s.kind,
+                    hydra_core::CorrelationSignalKind::CausalCell
+                ) && s.id == cell.id.to_string()
+            })
+        });
+        assert!(
+            found_cell,
+            "cell sharing a claim_id must surface as related"
+        );
+    }
+
+    #[test]
+    fn discover_correlation_candidates_uses_identity_links() {
+        // Two entities linked High-trust; seed references one
+        // endpoint. Discovery surfaces BOTH the link AND the
+        // other endpoint.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p49_link");
+        let (a_id, b_id) = p39_seed_high_trust_pair(
+            &mut hydra,
+            Some(tenant.clone()),
+        );
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a_id,
+            &b_id,
+            0.95,
+            vec![hydra_core::EvidenceId::from_str("evd_p49_l")],
+            vec![],
+            vec![],
+        );
+        let link_id = link.id.clone();
+        hydra.create_identity_link(link).unwrap();
+
+        let t0 = chrono::Utc::now();
+        let seed = p49_seed(
+            hydra_core::CorrelationSignalKind::IdentityEntity,
+            a_id.as_str(),
+            Some(tenant.clone()),
+            Some(t0),
+            vec![a_id.clone()],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let candidates = hydra
+            .discover_correlation_candidates(
+                Some(&tenant),
+                seed,
+                3600,
+                10,
+            )
+            .unwrap();
+        let found_link = candidates.iter().any(|c| {
+            c.signals.iter().any(|s| {
+                matches!(
+                    s.kind,
+                    hydra_core::CorrelationSignalKind::IdentityLink
+                ) && s.id == link_id.to_string()
+            })
+        });
+        let found_other_entity = candidates.iter().any(|c| {
+            c.signals.iter().any(|s| {
+                matches!(
+                    s.kind,
+                    hydra_core::CorrelationSignalKind::IdentityEntity
+                ) && s.id == b_id.to_string()
+            })
+        });
+        assert!(found_link, "outgoing link must surface as related");
+        assert!(
+            found_other_entity,
+            "opposite endpoint entity must surface as related"
+        );
+    }
+
+    #[test]
+    fn discover_correlation_candidates_respects_window() {
+        // Two cells: one INSIDE seed.observed_at ± window_secs,
+        // one OUTSIDE. Discovery must only return the inside
+        // one. Both cells share an ingested claim id with the
+        // seed; cells carry high trust so candidates clear the
+        // 0.20 filter when found.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p49_win");
+        let t_seed = chrono::Utc::now();
+        let claim = p49_make_claim(
+            Some(tenant.clone()),
+            vec![],
+            t_seed,
+            hydra_core::ClaimSubject::Dataset(
+                "dataset/p49_win".to_string(),
+            ),
+            "p49_win",
+        );
+        let claim_id = claim.id.clone();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim })
+            .unwrap();
+        // Inside cell — ingested NOW; falls within the 300s window.
+        let inside_cell = ingest_synthetic_cell(
+            &mut hydra,
+            Some(tenant.clone()),
+            "p49.cell.inside",
+            vec![],
+            vec![claim_id.clone()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Some(0.95),
+            None,
+        );
+        // Manually-constructed outside cell — created_at is
+        // far past the window, so the in_window filter rejects.
+        // Use create_causal_cell with a hand-built CausalCell
+        // whose created_at is t_seed - 24h.
+        let outside_t = t_seed - chrono::Duration::hours(24);
+        let outside_cell = hydra_core::CausalCell {
+            id: hydra_core::CausalCellId::new(),
+            tenant_id: Some(tenant.clone()),
+            kind: hydra_core::CausalCellKind::Reflex,
+            subject: "p49.cell.outside".to_string(),
+            source_events: vec![],
+            evidence_ids: vec![],
+            claim_ids: vec![claim_id.clone()],
+            action_ids: vec![],
+            outcome_ids: vec![],
+            observation_run_ids: vec![],
+            child_cell_ids: vec![],
+            trust_score: Some(0.95),
+            summary: None,
+            created_by: hydra_core::ActorId::from_str("actor_ops"),
+            created_at: outside_t,
+            caused_by: None,
+        };
+        let outside_id = outside_cell.id.clone();
+        hydra.create_causal_cell(outside_cell).unwrap();
+
+        let seed = p49_seed(
+            hydra_core::CorrelationSignalKind::Claim,
+            claim_id.as_str(),
+            Some(tenant.clone()),
+            Some(t_seed),
+            vec![],
+            vec![],
+            vec![claim_id.clone()],
+            vec![],
+        );
+        let candidates = hydra
+            .discover_correlation_candidates(
+                Some(&tenant),
+                seed,
+                300, // 5min window
+                10,
+            )
+            .unwrap();
+        let inside_seen = candidates.iter().any(|c| {
+            c.signals.iter().any(|s| {
+                s.id == inside_cell.id.to_string()
+            })
+        });
+        let outside_seen = candidates.iter().any(|c| {
+            c.signals.iter().any(|s| s.id == outside_id.to_string())
+        });
+        assert!(inside_seen, "inside-window cell must be returned");
+        assert!(
+            !outside_seen,
+            "outside-window cell must be filtered out"
+        );
+    }
+
+    #[test]
+    fn discover_correlation_candidates_respects_limit() {
+        // Build 5 cells that all share an INGESTED claim id
+        // with the seed; pass limit=2 and assert exactly 2
+        // returned. All cells carry high trust so each pair
+        // clears the 0.20 filter.
+        let mut hydra = Hydra::new();
+        let tenant =
+            hydra_core::TenantId::from_str("tenant_p49_limit");
+        let now = chrono::Utc::now();
+        let claim = p49_make_claim(
+            Some(tenant.clone()),
+            vec![],
+            now,
+            hydra_core::ClaimSubject::Dataset(
+                "dataset/p49_limit".to_string(),
+            ),
+            "p49_limit",
+        );
+        let claim_id = claim.id.clone();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim })
+            .unwrap();
+        let mut cell_ids = vec![];
+        for i in 0..5 {
+            let cell = ingest_synthetic_cell(
+                &mut hydra,
+                Some(tenant.clone()),
+                &format!("p49.cell.lim_{i}"),
+                vec![],
+                vec![claim_id.clone()],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                Some(0.95),
+                None,
+            );
+            cell_ids.push(cell.id.clone());
+        }
+        let seed = p49_seed(
+            hydra_core::CorrelationSignalKind::Claim,
+            claim_id.as_str(),
+            Some(tenant.clone()),
+            Some(chrono::Utc::now()),
+            vec![],
+            vec![],
+            vec![claim_id.clone()],
+            vec![],
+        );
+        let candidates = hydra
+            .discover_correlation_candidates(
+                Some(&tenant),
+                seed,
+                3600,
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            candidates.len(),
+            2,
+            "limit must cap returned candidates"
+        );
+    }
+
+    #[test]
+    fn discover_correlation_candidates_sorts_by_score() {
+        // Mix of related signals expected to score differently
+        // (one path: link A→B with HIGH entity trust + high
+        // TrustedIdentityLink → ~0.70; another: a cell sharing
+        // a claim_id with the seed at lower trust → ~0.25).
+        // Result must be sorted DESC by score.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p49_sort");
+        let (a_id, b_id) = p39_seed_high_trust_pair(
+            &mut hydra,
+            Some(tenant.clone()),
+        );
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a_id,
+            &b_id,
+            0.95,
+            vec![],
+            vec![],
+            vec![],
+        );
+        hydra.create_identity_link(link).unwrap();
+        // Cell path: ingest a claim, then a high-trust cell
+        // that references it; seed claim_ids points to the
+        // same claim so P45 reference resolution succeeds.
+        let now = chrono::Utc::now();
+        let claim = p49_make_claim(
+            Some(tenant.clone()),
+            vec![],
+            now,
+            hydra_core::ClaimSubject::Dataset(
+                "dataset/p49_sort".to_string(),
+            ),
+            "p49_sort",
+        );
+        let claim_id = claim.id.clone();
+        hydra
+            .ingest(hydra_core::EventKind::ClaimProposed { claim })
+            .unwrap();
+        ingest_synthetic_cell(
+            &mut hydra,
+            Some(tenant.clone()),
+            "p49.cell.weak",
+            vec![],
+            vec![claim_id.clone()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Some(0.95),
+            None,
+        );
+
+        let seed = p49_seed(
+            hydra_core::CorrelationSignalKind::IdentityEntity,
+            a_id.as_str(),
+            Some(tenant.clone()),
+            Some(chrono::Utc::now()),
+            vec![a_id.clone()],
+            vec![],
+            vec![claim_id.clone()],
+            vec![],
+        );
+        let candidates = hydra
+            .discover_correlation_candidates(
+                Some(&tenant),
+                seed,
+                3600,
+                10,
+            )
+            .unwrap();
+        assert!(candidates.len() >= 2);
+        // Strictly DESC: scores[0] >= scores[1] >= ... .
+        for pair in candidates.windows(2) {
+            assert!(
+                pair[0].trust.score >= pair[1].trust.score,
+                "results must be sorted DESC by score: {} vs {}",
+                pair[0].trust.score,
+                pair[1].trust.score,
+            );
+        }
+    }
+
+    #[test]
+    fn discover_correlation_candidates_returns_empty_when_no_matches() {
+        // Seed with no entity_ids / claim_ids / evidence_ids /
+        // cell_ids → no walk path fires → empty Vec.
+        let hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p49_empty");
+        let seed = p49_seed(
+            hydra_core::CorrelationSignalKind::External,
+            "ext_a",
+            Some(tenant.clone()),
+            Some(chrono::Utc::now()),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let candidates = hydra
+            .discover_correlation_candidates(
+                Some(&tenant),
+                seed,
+                3600,
+                10,
+            )
+            .unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn discover_correlation_candidates_does_not_persist() {
+        // Read-only contract — no events / entities / links /
+        // cells / claims appear after the call.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p49_nop");
+        let (a_id, b_id) = p39_seed_high_trust_pair(
+            &mut hydra,
+            Some(tenant.clone()),
+        );
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a_id,
+            &b_id,
+            0.95,
+            vec![hydra_core::EvidenceId::from_str("evd_p49_nop")],
+            vec![],
+            vec![],
+        );
+        hydra.create_identity_link(link).unwrap();
+
+        let pre_events = hydra.events().len();
+        let pre_entities = hydra.identity_entities().count();
+        let pre_links = hydra.identity_links().count();
+        let pre_cells = hydra.causal_cells().count();
+        let pre_claims =
+            hydra.epistemic_store().all_claims().count();
+
+        let seed = p49_seed(
+            hydra_core::CorrelationSignalKind::IdentityEntity,
+            a_id.as_str(),
+            Some(tenant.clone()),
+            Some(chrono::Utc::now()),
+            vec![a_id.clone()],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let _ = hydra
+            .discover_correlation_candidates(
+                Some(&tenant),
+                seed,
+                3600,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(hydra.events().len(), pre_events);
+        assert_eq!(hydra.identity_entities().count(), pre_entities);
+        assert_eq!(hydra.identity_links().count(), pre_links);
+        assert_eq!(hydra.causal_cells().count(), pre_cells);
+        assert_eq!(
+            hydra.epistemic_store().all_claims().count(),
+            pre_claims
+        );
+    }
+
+    #[test]
+    fn discover_correlation_candidates_calls_assessor_contract() {
+        // Every returned candidate must satisfy the P45 assess
+        // contract: signals.len() == 2 (pairwise), 11 reasons,
+        // 11 trust factors, valid score range, level + strength
+        // derived from the same clamped score.
+        let mut hydra = Hydra::new();
+        let tenant = hydra_core::TenantId::from_str("tenant_p49_contract");
+        let (a_id, b_id) = p39_seed_high_trust_pair(
+            &mut hydra,
+            Some(tenant.clone()),
+        );
+        let link = p39_make_link_with(
+            Some(tenant.clone()),
+            hydra_core::IdentityLinkKind::DependsOn,
+            &a_id,
+            &b_id,
+            0.95,
+            vec![hydra_core::EvidenceId::from_str("evd_p49_ctr")],
+            vec![],
+            vec![],
+        );
+        hydra.create_identity_link(link).unwrap();
+        let seed = p49_seed(
+            hydra_core::CorrelationSignalKind::IdentityEntity,
+            a_id.as_str(),
+            Some(tenant.clone()),
+            Some(chrono::Utc::now()),
+            vec![a_id.clone()],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let candidates = hydra
+            .discover_correlation_candidates(
+                Some(&tenant),
+                seed,
+                3600,
+                10,
+            )
+            .unwrap();
+        assert!(!candidates.is_empty());
+        for c in &candidates {
+            // Pairwise.
+            assert_eq!(c.signals.len(), 2);
+            // P45 explainability contract.
+            assert_eq!(c.reasons.len(), 11);
+            assert_eq!(c.trust.factors.len(), 11);
+            assert!(c.trust.score >= 0.0 && c.trust.score <= 1.0);
+            assert_eq!(
+                c.trust.level,
+                hydra_core::trust::TrustAssessment::level_for_score(
+                    c.trust.score
+                )
+            );
+            assert_eq!(
+                c.trust.strength,
+                hydra_core::CorrelationStrength::level_for_score(
+                    c.trust.score
+                )
+            );
+            // Filter: every returned candidate must clear the
+            // strength != None floor.
+            assert!(
+                c.trust.score >= 0.20,
+                "filter must drop score < 0.20, got {}",
+                c.trust.score,
+            );
+        }
     }
 }
