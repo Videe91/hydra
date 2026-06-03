@@ -884,7 +884,7 @@ class HydraSync:
         return IdentityLinkTrustAssessment.model_validate(raw)
 
     # ========================================================================
-    # Correlation (Patch 46/48) — sync mirrors
+    # Correlation (Patch 46/48/50) — sync mirrors
     # ========================================================================
 
     def assess_correlation_candidate(
@@ -944,6 +944,41 @@ class HydraSync:
             tenant=tenant,
         )
         return CausalCell.model_validate(raw["cell"])
+
+    def discover_correlation_candidates(
+        self,
+        seed: CorrelationSignalRef,
+        *,
+        window_secs: int = 900,
+        limit: int = 10,
+        tenant: TenantId | None = None,
+    ) -> list[CorrelationCandidate]:
+        """Sync mirror of `Hydra.discover_correlation_candidates`
+        (Patch 49 engine, Patch 50 wire). Given a seed signal,
+        return a ranked list of related correlation candidates
+        from existing Hydra memory.
+
+        The server OVERWRITES `seed.tenant_id` from the
+        `X-Hydra-Tenant` header (mirrors P46 assess, NOT P48
+        anchor's validate-stance). v1 boundary: seed-anchored
+        walk, pairwise P45 scoring, score >= 0.20 filter, sort
+        DESC by trust.score with deterministic tie-break,
+        truncated to `limit`. See the async docstring for the
+        full discovery + suggestion-only contract."""
+        body = {
+            "seed": seed.model_dump(mode="json"),
+            "window_secs": window_secs,
+            "limit": limit,
+        }
+        raw = self._http.post(
+            _paths.correlations_discover_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return [
+            CorrelationCandidate.model_validate(c)
+            for c in raw["candidates"]
+        ]
 
     def _ingest(
         self,

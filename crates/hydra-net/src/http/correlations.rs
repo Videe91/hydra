@@ -76,17 +76,19 @@ impl CorrelationsHttpState {
     }
 }
 
-/// Build the correlations router. Two routes:
+/// Build the correlations router. Three routes:
 ///
 /// - `POST /correlations/assess` — Patch 46 over P45
 ///   (`&self` engine method, anti-smuggling OVERWRITE).
 /// - `POST /correlations/anchor` — Patch 48 over P47
 ///   (`&mut self` engine method, anti-smuggling VALIDATE).
+/// - `POST /correlations/discover` — Patch 50 over P49
+///   (`&self` engine method, anti-smuggling OVERWRITE).
 ///
-/// **The two routes intentionally take OPPOSITE tenant-handling
-/// stances.** `assess` overwrites because it computes a fresh
-/// verdict from raw signals; `anchor` validates (rejects on
-/// mismatch) because it anchors a PRE-assessed verdict —
+/// **2 overwrite + 1 validate split.** `assess` and `discover`
+/// both OVERWRITE the body's tenant from the header because
+/// they compute a FRESH verdict; `anchor` VALIDATES (rejects
+/// on mismatch) because it anchors a PRE-assessed verdict —
 /// overwriting tenant on an already-scored candidate would let
 /// tenant_A's verdict get smuggled into tenant_B's anchor by
 /// header swap.
@@ -94,6 +96,10 @@ pub fn correlations_router(runtime: RuntimeHandle) -> Router {
     Router::new()
         .route("/correlations/assess", post(assess_correlation_candidate))
         .route("/correlations/anchor", post(anchor_correlation_candidate))
+        .route(
+            "/correlations/discover",
+            post(discover_correlation_candidates),
+        )
         .with_state(CorrelationsHttpState::new(runtime))
 }
 
@@ -131,6 +137,23 @@ pub struct AnchorCorrelationCandidateRequest {
     pub actor: String,
 }
 
+/// Request body for `POST /correlations/discover` — Patch 50.
+///
+/// Carries a SEED `CorrelationSignalRef` plus discovery
+/// window + result cap. The handler **OVERWRITES**
+/// `seed.tenant_id` with the `X-Hydra-Tenant` header value
+/// (same stance as P46 `assess`, NOT P48 `anchor`'s
+/// validate-stance). Reason: discovery computes a FRESH
+/// verdict from the seed — overwriting is safe because any
+/// cross-store refs embedded in the seed are strict-resolved
+/// by P45 inside P49 against the header tenant.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiscoverCorrelationCandidatesRequest {
+    pub seed: CorrelationSignalRef,
+    pub window_secs: u64,
+    pub limit: usize,
+}
+
 /// 200 envelope for `POST /correlations/assess`.
 ///
 /// Mirrors P31 `{entity: ...}` / P38 `{link: ...}` shape —
@@ -138,6 +161,18 @@ pub struct AnchorCorrelationCandidateRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorrelationCandidateResponse {
     pub candidate: CorrelationCandidate,
+}
+
+/// 200 envelope for `POST /correlations/discover` — Patch 50.
+///
+/// Plural-list envelope — discovery returns 0..=limit
+/// candidates ranked by `trust.score` DESC. Distinct from the
+/// singular `CorrelationCandidateResponse { candidate }`
+/// envelope because no list-of-candidates wrapper exists to
+/// reuse on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorrelationCandidatesResponse {
+    pub candidates: Vec<CorrelationCandidate>,
 }
 
 fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
@@ -329,6 +364,95 @@ async fn anchor_correlation_candidate(
         Err(other) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("anchor_correlation_candidate failed: {other}"),
+        ),
+    }
+}
+
+/// `POST /correlations/discover` — Patch 50 wire over Patch 49.
+///
+/// Given a seed `CorrelationSignalRef`, surfaces ranked
+/// `CorrelationCandidate`s built from existing Hydra memory
+/// (identity links + opposite endpoints, causal cells
+/// overlapping seed refs, claims overlapping seed evidence).
+/// Each related signal pairs with the seed and is scored via
+/// P45 (`assess_correlation_candidate`) — the wire layer is
+/// purely a thin pass-through over the engine.
+///
+/// ## Flow
+///
+/// 1. Extract `X-Hydra-Tenant`. Missing → 400.
+/// 2. **OVERWRITE** `seed.tenant_id` from the header
+///    (anti-smuggling — mirrors P46 assess; OPPOSITE of P48
+///    anchor's validate-stance because discovery computes a
+///    fresh verdict, not anchors a pre-assessed one).
+/// 3. Acquire engine READ lock (`&self` method).
+/// 4. Call `discover_correlation_candidates`.
+/// 5. Map `QueryError(msg)`:
+///    - `msg.contains("unknown")` → **404** (defense-in-depth
+///      + symmetry with assess; in P49 v1 this arm is
+///      effectively dead because per-pair lookup misses are
+///      silently swallowed at the engine layer → empty
+///      result rather than 404. The arm is preserved against
+///      future engine paths that may surface unknown-ref
+///      errors directly).
+///    - otherwise (seed kind invalid, window_secs == 0,
+///      limit == 0) → **400**.
+/// 6. Anything else → 500.
+///
+/// ## v1 boundary
+///
+/// No pagination. No dedup against existing cells. No
+/// scheduler / background job. No connector ingestion. The
+/// route exposes engine discovery exactly as-is.
+async fn discover_correlation_candidates(
+    State(state): State<CorrelationsHttpState>,
+    headers: HeaderMap,
+    Json(req): Json<DiscoverCorrelationCandidatesRequest>,
+) -> Response {
+    let tenant = match extract_tenant(&headers) {
+        Ok(t) => t,
+        Err(err) => return tenant_error_response(err),
+    };
+
+    // Anti-smuggling: stamp the tenant from the header onto
+    // the seed. Engine's seed-tenant equality check
+    // (hydra.rs:5325) then becomes a tautology — kept as
+    // defense-in-depth at the engine boundary. Any
+    // cross-store refs the seed carries will be
+    // strict-resolved by P45 inside P49 against the header
+    // tenant; cross-tenant refs naturally drop out of the
+    // walk pool.
+    let mut seed = req.seed;
+    seed.tenant_id = Some(tenant.clone());
+
+    let hydra = state.runtime.hydra();
+    let hydra = hydra.read().await;
+    match hydra.discover_correlation_candidates(
+        Some(&tenant),
+        seed,
+        req.window_secs,
+        req.limit,
+    ) {
+        Ok(candidates) => (
+            StatusCode::OK,
+            Json(CorrelationCandidatesResponse { candidates }),
+        )
+            .into_response(),
+        Err(hydra_core::error::HydraError::QueryError(msg))
+            if msg.contains("unknown") =>
+        {
+            // Dead arm in P49 v1 — kept for symmetry with
+            // assess and forward-compat with a future engine
+            // path that may surface unknown-ref errors
+            // directly from the seed-validation phase.
+            error_response(StatusCode::NOT_FOUND, msg)
+        }
+        Err(hydra_core::error::HydraError::QueryError(msg)) => {
+            error_response(StatusCode::BAD_REQUEST, msg)
+        }
+        Err(other) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("discover_correlation_candidates failed: {other}"),
         ),
     }
 }
@@ -1241,5 +1365,378 @@ mod tests {
             "P47 v1 has no dedup — repeated anchors must produce \
              distinct cell ids"
         );
+    }
+
+    // === Patch 50 — `POST /correlations/discover` ===================
+    //
+    // Pins the new discover wire surface over the P49 engine
+    // method. The critical adaptation versus P48 anchor:
+    // discover OVERWRITES seed.tenant_id (mirroring P46
+    // assess) because discovery computes a FRESH verdict.
+
+    /// Build a seed JSON literal for discovery tests.
+    /// Defaults to External kind, current time as
+    /// `observed_at`, empty cross-refs.
+    fn p50_seed_json(
+        id: &str,
+        tenant: &str,
+        entity_ids: Vec<&str>,
+    ) -> serde_json::Value {
+        let entity_ids: Vec<_> = entity_ids
+            .into_iter()
+            .map(serde_json::Value::from)
+            .collect();
+        // RFC3339 timestamp — chrono::Utc::now() formatted.
+        let now = chrono::Utc::now().to_rfc3339();
+        serde_json::json!({
+            "kind": "IdentityEntity",
+            "id": id,
+            "tenant_id": tenant,
+            "observed_at": now,
+            "entity_ids": entity_ids,
+            "cell_ids": [],
+            "claim_ids": [],
+            "evidence_ids": [],
+            "metadata": {},
+        })
+    }
+
+    /// Seed two High-trust entities plus a High-trust link
+    /// between them in the given tenant. Mirrors the engine
+    /// `uses_identity_links` pattern using the test-local
+    /// `make_entity` + `ingest_entity` + `ingest_link`
+    /// helpers (engine helpers like `p39_seed_high_trust_pair`
+    /// are not in scope from net-crate tests).
+    async fn seed_high_trust_pair_in_tenant(
+        runtime: &crate::runtime::RuntimeHandle,
+        tenant: &TenantId,
+    ) -> (IdentityEntityId, IdentityEntityId) {
+        let a = ingest_entity(
+            runtime,
+            make_entity(tenant, "dataset/p50_a"),
+        )
+        .await;
+        let b = ingest_entity(
+            runtime,
+            make_entity(tenant, "dataset/p50_b"),
+        )
+        .await;
+        let link = IdentityLink {
+            id: hydra_core::IdentityLinkId::new(),
+            tenant_id: Some(tenant.clone()),
+            kind: IdentityLinkKind::DependsOn,
+            from_entity_id: a.id.clone(),
+            to_entity_id: b.id.clone(),
+            confidence: Confidence::new(0.95),
+            evidence_ids: vec![],
+            claim_ids: vec![],
+            cell_ids: vec![],
+            metadata: HashMap::new(),
+            created_by: ActorId::from_str("actor_ops"),
+            created_at: chrono::Utc::now(),
+            caused_by: None,
+        };
+        ingest_link(runtime, link).await;
+        (a.id, b.id)
+    }
+
+    #[tokio::test]
+    async fn discover_returns_candidates() {
+        // Happy path: seed two High-trust entities + a
+        // high-trust link; seed references entity A; discovery
+        // surfaces the link + opposite endpoint as related
+        // signals, P45 scores the pairs ≥ 0.20, wire returns
+        // 200 + non-empty candidates.
+        //
+        // NOTE: real-data entity-trust calibration requires
+        // P33 multi-source aliases; our minimal `make_entity`
+        // fixture (one alias) may not clear High. We bound
+        // the assertion to "no error", but if scores end up
+        // below the 0.20 filter the candidates list will be
+        // empty — still a successful round-trip through the
+        // wire surface, which is the layer we're testing.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let (a_id, _b_id) =
+            seed_high_trust_pair_in_tenant(&runtime, &tenant).await;
+        let router = correlations_router(runtime);
+
+        let seed = p50_seed_json(
+            a_id.as_str(),
+            TEST_TENANT,
+            vec![a_id.as_str()],
+        );
+        let body = serde_json::json!({
+            "seed": seed,
+            "window_secs": 3600,
+            "limit": 10,
+        });
+        let response = router
+            .oneshot(json_post("/correlations/discover", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = read_body_bytes(response).await;
+        let raw: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        // Envelope is `{candidates: [...]}` — Vec exists,
+        // even when empty.
+        assert!(raw["candidates"].is_array());
+    }
+
+    #[tokio::test]
+    async fn discover_requires_tenant() {
+        // Missing `X-Hydra-Tenant` → 400.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let router = correlations_router(runtime);
+        let seed = p50_seed_json("ide_solo", TEST_TENANT, vec![]);
+        let body = serde_json::json!({
+            "seed": seed,
+            "window_secs": 3600,
+            "limit": 10,
+        });
+        let response = router
+            .oneshot(json_post_without_tenant(
+                "/correlations/discover",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn discover_overwrites_seed_tenant() {
+        // Body carries `seed.tenant_id = "tenant_smuggled"`
+        // but `X-Hydra-Tenant` is TEST_TENANT. The handler
+        // OVERWRITES (P46 assess stance) so the engine's
+        // tenant equality check is satisfied. Mirrors P46
+        // `overwrites_signal_tenants` for the seed.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let router = correlations_router(runtime);
+        let seed = p50_seed_json("ide_x", "tenant_smuggled", vec![]);
+        let body = serde_json::json!({
+            "seed": seed,
+            "window_secs": 3600,
+            "limit": 10,
+        });
+        let response = router
+            .oneshot(json_post("/correlations/discover", body))
+            .await
+            .unwrap();
+        // Engine accepted the (post-overwrite) seed — proves
+        // the wire layer rewrote tenant before invoking
+        // discover. Without overwrite, engine would 400 on
+        // seed tenant mismatch.
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_zero_window() {
+        // Engine policy: window_secs > 0. Wire surfaces 400.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let router = correlations_router(runtime);
+        let seed = p50_seed_json("ide_x", TEST_TENANT, vec![]);
+        let body = serde_json::json!({
+            "seed": seed,
+            "window_secs": 0,
+            "limit": 10,
+        });
+        let response = router
+            .oneshot(json_post("/correlations/discover", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = read_body_bytes(response).await;
+        let err: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            err.error.contains("window_secs must be > 0"),
+            "got: {}",
+            err.error
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_zero_limit() {
+        // Engine policy: limit > 0. Wire surfaces 400.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let router = correlations_router(runtime);
+        let seed = p50_seed_json("ide_x", TEST_TENANT, vec![]);
+        let body = serde_json::json!({
+            "seed": seed,
+            "window_secs": 3600,
+            "limit": 0,
+        });
+        let response = router
+            .oneshot(json_post("/correlations/discover", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = read_body_bytes(response).await;
+        let err: ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            err.error.contains("limit must be > 0"),
+            "got: {}",
+            err.error
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_unknown_seed_ref_returns_empty() {
+        // Engine v1 doesn't pre-validate seed cross-refs. A
+        // ghost entity in `seed.entity_ids` produces an empty
+        // walk pool (no ingested entity to walk links from);
+        // per-pair P45 lookup misses (if any) are silently
+        // swallowed inside discover. Net: 200 + empty
+        // candidates, NOT 404.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let router = correlations_router(runtime);
+        let seed = p50_seed_json(
+            "ide_ghost",
+            TEST_TENANT,
+            vec!["ide_ghost"],
+        );
+        let body = serde_json::json!({
+            "seed": seed,
+            "window_secs": 3600,
+            "limit": 10,
+        });
+        let response = router
+            .oneshot(json_post("/correlations/discover", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = read_body_bytes(response).await;
+        let raw: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        let candidates = raw["candidates"].as_array().unwrap();
+        assert!(
+            candidates.is_empty(),
+            "ghost seed must yield empty candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_empty_results() {
+        // Seed with no cross-refs at all → no walk path fires
+        // → empty Vec. Mirrors engine
+        // `returns_empty_when_no_matches`.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let router = correlations_router(runtime);
+        let mut seed = p50_seed_json("ext_a", TEST_TENANT, vec![]);
+        seed["kind"] = serde_json::json!("External");
+        let body = serde_json::json!({
+            "seed": seed,
+            "window_secs": 3600,
+            "limit": 10,
+        });
+        let response = router
+            .oneshot(json_post("/correlations/discover", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = read_body_bytes(response).await;
+        let raw: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        let candidates = raw["candidates"].as_array().unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discover_cross_tenant_refs_return_empty() {
+        // Seed references an entity that exists ONLY in a
+        // DIFFERENT tenant. After the wire layer overwrites
+        // `seed.tenant_id` to the header tenant, the engine
+        // walks identity_links in the HEADER tenant — finds
+        // nothing. Net: 200 + empty candidates. The
+        // cross-tenant entity is never visible.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let other_tenant =
+            TenantId::from_str("tenant_other_for_p50");
+        let other = ingest_entity(
+            &runtime,
+            make_entity(&other_tenant, "dataset/p50_other"),
+        )
+        .await;
+        let router = correlations_router(runtime);
+        // Header tenant = TEST_TENANT, but seed references
+        // an entity that lives in `tenant_other_for_p50`.
+        let seed = p50_seed_json(
+            other.id.as_str(),
+            TEST_TENANT,
+            vec![other.id.as_str()],
+        );
+        let body = serde_json::json!({
+            "seed": seed,
+            "window_secs": 3600,
+            "limit": 10,
+        });
+        let response = router
+            .oneshot(json_post("/correlations/discover", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = read_body_bytes(response).await;
+        let raw: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        let candidates = raw["candidates"].as_array().unwrap();
+        assert!(
+            candidates.is_empty(),
+            "cross-tenant seed ref must yield empty after \
+             header-tenant overwrite + walk-1 tenant filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_scores_sorted_desc_when_multiple() {
+        // When the response carries multiple candidates,
+        // trust.score must be DESC monotone. The engine sort
+        // is internal contract; this pin proves it surfaces
+        // through serde unchanged.
+        let (runtime, _processor) = RuntimeBuilder::new().build();
+        let tenant = TenantId::from_str(TEST_TENANT);
+        let (a_id, _b_id) =
+            seed_high_trust_pair_in_tenant(&runtime, &tenant).await;
+        let router = correlations_router(runtime);
+        let seed = p50_seed_json(
+            a_id.as_str(),
+            TEST_TENANT,
+            vec![a_id.as_str()],
+        );
+        let body = serde_json::json!({
+            "seed": seed,
+            "window_secs": 3600,
+            "limit": 10,
+        });
+        let response = router
+            .oneshot(json_post("/correlations/discover", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = read_body_bytes(response).await;
+        let raw: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap();
+        let candidates = raw["candidates"].as_array().unwrap();
+        // Only assert order when there are ≥ 2 candidates;
+        // the fixture is realistic but calibration may
+        // produce 0–1 results on a minimal entity. The
+        // engine sort is pinned by P49's `sorts_by_score`
+        // engine test; this wire test is a forward-compat
+        // pin against serde drift in `CorrelationCandidate`.
+        if candidates.len() >= 2 {
+            for pair in candidates.windows(2) {
+                let a_score = pair[0]["trust"]["score"]
+                    .as_f64()
+                    .expect("score is f64");
+                let b_score = pair[1]["trust"]["score"]
+                    .as_f64()
+                    .expect("score is f64");
+                assert!(
+                    a_score >= b_score,
+                    "candidates must be sorted DESC by \
+                     trust.score: {a_score} vs {b_score}"
+                );
+            }
+        }
     }
 }

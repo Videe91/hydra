@@ -1336,6 +1336,21 @@ mod tests {
             ),
             vec!["read:correlation"]
         );
+        // Patch 50 — `POST /correlations/discover` is `&self`
+        // read-only at the engine (no persistence, P49), but
+        // uses POST for the body-shaped request. Falls
+        // through the P48 anchor exact-match and into the
+        // P46 `/correlations/*` prefix → `read:correlation`.
+        // Pinned so a future ordering regression (e.g.,
+        // extending the P48 exact-match to a prefix that
+        // would swallow discover) fires here.
+        assert_eq!(
+            required_scopes_for(
+                &Method::POST,
+                "/correlations/discover"
+            ),
+            vec!["read:correlation"]
+        );
         // OPTIONS always has no scope requirement (CORS preflight).
         assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());
         // Routes with no entry don't require any scope.
@@ -1376,6 +1391,16 @@ mod tests {
         assert!(!rejected_on_follower(
             &Method::POST,
             "/correlations/assess"
+        ));
+        // Patch 50 — `POST /correlations/discover` is `&self`
+        // read-only; must stay OPEN on followers (no
+        // `CausalCellCreated` emission, no mutation). If a
+        // future patch reorders `rejected_on_follower` and
+        // accidentally captures discover under the anchor
+        // exact-match, this pin fires.
+        assert!(!rejected_on_follower(
+            &Method::POST,
+            "/correlations/discover"
         ));
         // Any PUT / PATCH / DELETE on an unknown path is also rejected
         // because the classifier defaults to blocking mutating methods

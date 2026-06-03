@@ -1486,7 +1486,7 @@ class Hydra:
         return IdentityLinkTrustAssessment.model_validate(raw)
 
     # ========================================================================
-    # Correlation (Patch 46/48 — wire surface over P43/P44/P45/P47)
+    # Correlation (Patch 46/48/50 — wire surface over P43/P44/P45/P47/P49)
     # ========================================================================
 
     async def assess_correlation_candidate(
@@ -1632,6 +1632,92 @@ class Hydra:
             tenant=tenant,
         )
         return CausalCell.model_validate(raw["cell"])
+
+    async def discover_correlation_candidates(
+        self,
+        seed: CorrelationSignalRef,
+        *,
+        window_secs: int = 900,
+        limit: int = 10,
+        tenant: TenantId | None = None,
+    ) -> list[CorrelationCandidate]:
+        """Given a seed signal, discover related correlation
+        candidates from existing Hydra memory
+        (`POST /correlations/discover` — Patch 49 engine, Patch
+        50 wire). Returns a ranked list of typed
+        `CorrelationCandidate`s (envelope `{candidates: [...]}`
+        unwrapped for SDK ergonomics).
+
+        ## Anti-smuggling (HTTP layer) — OVERWRITES seed tenant
+
+        Unlike `anchor_correlation_candidate` (which VALIDATES
+        tenants because it anchors a PRE-assessed verdict), the
+        discover server OVERWRITES `seed.tenant_id` from the
+        `X-Hydra-Tenant` header — same stance as
+        `assess_correlation_candidate`, because discovery
+        computes a FRESH verdict from the seed. Any cross-store
+        refs the seed carries are then strict-resolved by P45
+        against the header tenant; cross-tenant refs naturally
+        drop out of the walk pool.
+
+        ## Discovery contract (P49 carry-forward)
+
+        - Seed-anchored, NOT global scan. Walks identity links
+          from `seed.entity_ids`, opposite-endpoint entities,
+          causal cells overlapping seed's claim/evidence/cell
+          refs, and claims overlapping seed's evidence/claim
+          refs. Bounded by `MAX_RELATED_SIGNALS_PER_SCAN = 200`
+          (silent truncation in v1).
+        - Each related signal pairs with the seed and is scored
+          by P45 `assess_correlation_candidate`. Per-pair
+          failures (e.g., resolution miss on a related signal)
+          are silently swallowed.
+        - Filter: `score >= 0.20` (equivalent to
+          `strength != "None"`).
+        - Sort: DESC by `trust.score`; tie-break ASC by
+          `(related_signal.kind.discriminant(),
+          related_signal.id)`.
+        - Truncate to `limit` after sort.
+
+        Returns an EMPTY list when no related signals pass the
+        filter — NOT an error. Callers should not assume
+        non-empty.
+
+        ## Suggestion-only contract
+
+        Discovery PROPOSES groupings; it doesn't decide them.
+        Auto-actions on a discovered candidate MUST compose
+        `trust.level == "High" AND trust.score >= 0.80` plus a
+        dedicated audit event — never act on a discovered
+        candidate alone. The full operator loop is:
+        `discover → review → anchor` (P47/P48).
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant
+            header, `window_secs == 0`, `limit == 0`,
+            invalid seed kind.
+          - 404 → `HydraNotFoundError`: reserved for future
+            engine paths that may surface unknown-ref errors
+            directly. In P49 v1 this arm is unreachable from
+            real engine behavior — kept for forward-compat /
+            symmetry with `assess`.
+
+        Auth: `read:correlation` (route is `&self` read-only).
+        """
+        body = {
+            "seed": seed.model_dump(mode="json"),
+            "window_secs": window_secs,
+            "limit": limit,
+        }
+        raw = await self._http.post(
+            _paths.correlations_discover_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return [
+            CorrelationCandidate.model_validate(c)
+            for c in raw["candidates"]
+        ]
 
     async def _ingest(
         self,

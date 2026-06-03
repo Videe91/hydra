@@ -697,6 +697,30 @@ def identity_entity_links_path(entity_id: str) -> str:
     return f"/identity/entities/{_seg(entity_id)}/links"
 
 
+def correlations_discover_path() -> str:
+    """`POST /correlations/discover` — Patch 50 wire over Patch 49.
+    Body: `{seed: CorrelationSignalRef, window_secs: int, limit: int}`.
+    Tenant from `X-Hydra-Tenant` header — server OVERWRITES
+    `seed.tenant_id` with the header value (anti-smuggling;
+    mirrors P46 assess, NOT P48 anchor's validate-stance,
+    because discovery computes a fresh verdict). Returns
+    wrapped `{candidates: [CorrelationCandidate, ...]}`.
+
+    Auth: `read:correlation` (route is `&self` read-only).
+
+    Status:
+      missing tenant → 400
+      window_secs == 0 / limit == 0 / invalid seed kind → 400
+      unknown / cross-tenant referenced entity / cell / claim /
+      evidence → 200 + empty candidates (P49 v1 silently
+      swallows per-pair lookup misses; the wire's 404 arm is
+      reserved for future engine paths)
+      success → 200 with 0..=limit candidates sorted by
+                trust.score DESC
+    """
+    return "/correlations/discover"
+
+
 def correlations_anchor_path() -> str:
     """`POST /correlations/anchor` — Patch 48 wire over Patch 47.
     Body: `{candidate: CorrelationCandidate, actor: str}`. Tenant

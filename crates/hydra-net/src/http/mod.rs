@@ -43,7 +43,8 @@ pub use commits::{commits_router, CommitsHttpState};
 pub use correlations::{
     correlations_router, AnchorCorrelationCandidateRequest,
     AssessCorrelationCandidateRequest, CorrelationCandidateResponse,
-    CorrelationsHttpState,
+    CorrelationCandidatesResponse, CorrelationsHttpState,
+    DiscoverCorrelationCandidatesRequest,
 };
 pub use micromodels::{
     micromodels_router, EvaluateActionFailureRateRequest,
