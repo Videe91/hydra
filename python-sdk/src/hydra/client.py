@@ -1486,7 +1486,7 @@ class Hydra:
         return IdentityLinkTrustAssessment.model_validate(raw)
 
     # ========================================================================
-    # Correlation (Patch 46 — wire surface over P43/P44/P45)
+    # Correlation (Patch 46/48 — wire surface over P43/P44/P45/P47)
     # ========================================================================
 
     async def assess_correlation_candidate(
@@ -1552,6 +1552,86 @@ class Hydra:
             tenant=tenant,
         )
         return CorrelationCandidate.model_validate(raw["candidate"])
+
+    async def anchor_correlation_candidate(
+        self,
+        candidate: CorrelationCandidate,
+        *,
+        actor: ActorId,
+        tenant: TenantId | None = None,
+    ) -> CausalCell:
+        """Anchor a trust-gated `CorrelationCandidate` as a
+        durable `CausalCellKind::Incident`
+        (`POST /correlations/anchor` — Patch 47 engine, Patch 48
+        wire). Returns the typed `CausalCell` (envelope
+        `{cell: ...}` unwrapped for SDK ergonomics).
+
+        ## Anti-smuggling (HTTP layer) — VALIDATES, does NOT overwrite
+
+        Unlike `assess_correlation_candidate` (which overwrites
+        every `signal.tenant_id` from the header because the
+        verdict is computed AFTER normalization), the anchor
+        server VALIDATES strict equality between the
+        `X-Hydra-Tenant` header and BOTH `candidate.tenant_id`
+        AND every `signal.tenant_id`. Mismatch → 400. This
+        prevents a tenant_A-assessed verdict from being smuggled
+        into tenant_B's anchor by header swap.
+
+        SDK callers should ensure the candidate already carries
+        the intended tenant (it will if it was produced by
+        `assess_correlation_candidate`); cross-tenant operator
+        workflows must supply both `tenant=...` AND a candidate
+        whose tenant matches.
+
+        ## "Trust the supplied verdict" contract (P47)
+
+        The server does NOT re-call
+        `assess_correlation_candidate`. It trusts the verdict on
+        `candidate.trust` as-supplied and anchors that
+        historical decision. The
+        `trust_score` on the returned cell exactly equals
+        `candidate.trust.score` (load-bearing — pinned by
+        `anchor_correlation_preserves_trust_score`).
+
+        ## Trust gate
+
+        All three must hold simultaneously, else 400:
+          - `candidate.trust.level == "High"`
+          - `candidate.trust.strength == "Strong"`
+          - `candidate.trust.score >= 0.80`
+            (`ACCEPT_CORRELATION_FLOOR`)
+
+        Plus: `candidate.signals` must have >= 2 entries;
+        `actor` must be non-empty.
+
+        ## No dedup / fingerprint
+
+        v1 has no idempotency / dedup. Calling this method twice
+        with the same body intentionally produces TWO distinct
+        `CausalCell`s with different ids. Caller is the policy
+        authority.
+
+        Errors:
+          - 400 → `HydraValidationError`: missing tenant header;
+            candidate tenant mismatch; signal tenant mismatch;
+            invalid actor (empty); < 2 signals; trust below
+            gate. (No 404 path — the engine performs no
+            entity / cell / claim / evidence lookups; every
+            engine rejection is caller-fixable.)
+
+        Auth: `write:correlation` (route MUTATES — distinct from
+        `read:correlation` for `assess`).
+        """
+        body = {
+            "candidate": candidate.model_dump(mode="json"),
+            "actor": str(actor),
+        }
+        raw = await self._http.post(
+            _paths.correlations_anchor_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return CausalCell.model_validate(raw["cell"])
 
     async def _ingest(
         self,

@@ -884,7 +884,7 @@ class HydraSync:
         return IdentityLinkTrustAssessment.model_validate(raw)
 
     # ========================================================================
-    # Correlation (Patch 46) — sync mirror
+    # Correlation (Patch 46/48) — sync mirrors
     # ========================================================================
 
     def assess_correlation_candidate(
@@ -911,6 +911,39 @@ class HydraSync:
             tenant=tenant,
         )
         return CorrelationCandidate.model_validate(raw["candidate"])
+
+    def anchor_correlation_candidate(
+        self,
+        candidate: CorrelationCandidate,
+        *,
+        actor: ActorId,
+        tenant: TenantId | None = None,
+    ) -> CausalCell:
+        """Sync mirror of `Hydra.anchor_correlation_candidate`
+        (Patch 47 engine, Patch 48 wire). Anchor a trust-gated
+        `CorrelationCandidate` as a durable
+        `CausalCellKind::Incident`. Returns the typed
+        `CausalCell`.
+
+        The server VALIDATES (does NOT overwrite) both
+        `candidate.tenant_id` and every `signal.tenant_id`
+        against `X-Hydra-Tenant`; mismatch → 400. P47's
+        load-bearing "trust the supplied verdict" contract holds
+        — the server does NOT re-call
+        `assess_correlation_candidate`.
+
+        See the async docstring for the full trust-gate +
+        no-dedup contract."""
+        body = {
+            "candidate": candidate.model_dump(mode="json"),
+            "actor": str(actor),
+        }
+        raw = self._http.post(
+            _paths.correlations_anchor_path(),
+            json=body,
+            tenant=tenant,
+        )
+        return CausalCell.model_validate(raw["cell"])
 
     def _ingest(
         self,

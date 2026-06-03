@@ -697,6 +697,33 @@ def identity_entity_links_path(entity_id: str) -> str:
     return f"/identity/entities/{_seg(entity_id)}/links"
 
 
+def correlations_anchor_path() -> str:
+    """`POST /correlations/anchor` — Patch 48 wire over Patch 47.
+    Body: `{candidate: CorrelationCandidate, actor: str}`. Tenant
+    from `X-Hydra-Tenant` header — server VALIDATES (does NOT
+    overwrite) `candidate.tenant_id` and every
+    `signal.tenant_id` against the header value. Mismatch → 400.
+
+    Anchors a trust-gated `CorrelationCandidate` as a durable
+    `CausalCellKind::Incident`. Returns wrapped
+    `{cell: CausalCell}`.
+
+    Auth: `write:correlation` (route MUTATES — creates a
+    CausalCell + emits `CausalCellCreated`; distinct scope from
+    P46's `read:correlation` for `assess`).
+
+    Status:
+      missing tenant → 400
+      candidate / signal tenant mismatch → 400
+      invalid actor (empty) → 400
+      < 2 signals → 400
+      trust below High/Strong / score < 0.80 → 400
+      success → 200 (no dedup — repeated POSTs intentionally
+                     produce DISTINCT cells)
+    """
+    return "/correlations/anchor"
+
+
 def correlations_assess_path() -> str:
     """`POST /correlations/assess` — Patch 46 wire over Patch 45.
     Body: `{signals: [CorrelationSignalRef, ...]}`. Tenant from

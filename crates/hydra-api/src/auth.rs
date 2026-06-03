@@ -389,6 +389,21 @@ pub fn required_scopes_for(method: &Method, path: &str) -> Vec<&'static str> {
         if path == "/identity" || path.starts_with("/identity/") {
             return vec!["write:identity"];
         }
+        // Patch 48 — `POST /correlations/anchor` MUTATES state
+        // (creates a `CausalCellKind::Incident`). Requires
+        // `write:correlation` — distinct from
+        // `read:correlation` which gates `POST /correlations/assess`
+        // (read-only despite the POST method).
+        //
+        // **CRITICAL ORDERING**: this exact-match clause MUST
+        // precede the `/correlations/*` prefix clause below,
+        // else the prefix would silently downgrade `anchor` to
+        // `read:correlation` — pinned by the
+        // `required_scopes_table_covers_write_and_read_buckets`
+        // ordering pin.
+        if path == "/correlations/anchor" {
+            return vec!["write:correlation"];
+        }
         // Patch 46 — `POST /correlations/assess` is a `&self`
         // read-only engine call but uses POST for body shape
         // (a `Vec<CorrelationSignalRef>` request payload).
@@ -532,6 +547,14 @@ pub fn rejected_on_follower(method: &Method, path: &str) -> bool {
         return true;
     }
     if path.starts_with("/maintenance/") {
+        return true;
+    }
+    // Patch 48 — `POST /correlations/anchor` creates a durable
+    // `CausalCellKind::Incident` and emits a
+    // `CausalCellCreated` event. Mutation → Leader-only.
+    // `POST /correlations/assess` (P46) stays open because it
+    // is `&self` read-only despite the POST method.
+    if path == "/correlations/anchor" {
         return true;
     }
     // Everything else: keep open (unknown routes return 404 from the
@@ -1289,6 +1312,30 @@ mod tests {
             required_scopes_for(&Method::GET, "/correlations/can_abc"),
             vec!["read:correlation"]
         );
+        // Patch 48 — `POST /correlations/anchor` MUTATES state
+        // (creates a `CausalCellKind::Incident`). Required
+        // scope is `write:correlation` — distinct from
+        // `read:correlation`. LOAD-BEARING ORDERING: the
+        // exact-match clause must precede the
+        // `/correlations/*` prefix; if a future refactor
+        // reorders them, this pin fires before
+        // `/correlations/anchor` silently downgrades.
+        assert_eq!(
+            required_scopes_for(
+                &Method::POST,
+                "/correlations/anchor"
+            ),
+            vec!["write:correlation"]
+        );
+        // Ordering sanity — assess MUST stay read after the
+        // P48 exact-match clause lands.
+        assert_eq!(
+            required_scopes_for(
+                &Method::POST,
+                "/correlations/assess"
+            ),
+            vec!["read:correlation"]
+        );
         // OPTIONS always has no scope requirement (CORS preflight).
         assert!(required_scopes_for(&Method::OPTIONS, "/ingest").is_empty());
         // Routes with no entry don't require any scope.
@@ -1317,6 +1364,18 @@ mod tests {
         assert!(rejected_on_follower(
             &Method::POST,
             "/maintenance/compact"
+        ));
+        // Patch 48 — `POST /correlations/anchor` creates a
+        // durable `Incident` cell + emits `CausalCellCreated`.
+        // Mutation → Leader-only. `POST /correlations/assess`
+        // (P46) is `&self` read-only and stays open.
+        assert!(rejected_on_follower(
+            &Method::POST,
+            "/correlations/anchor"
+        ));
+        assert!(!rejected_on_follower(
+            &Method::POST,
+            "/correlations/assess"
         ));
         // Any PUT / PATCH / DELETE on an unknown path is also rejected
         // because the classifier defaults to blocking mutating methods
